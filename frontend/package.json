@@ -3,7 +3,7 @@
   "private": true,
   "version": "2.23.0",
   "license": "MIT",
-  "description": "dotNext Control Panel SPA — React + TanStack Query + Ant Design",
+  "description": "dotNext Control Panel SPA \u2014 React + TanStack Query + Ant Design",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -78,6 +78,7 @@
     "vitest": "^3.2.4"
   },
   "overrides": {
-    "nanoid": "^3.3.18"
+    "nanoid": "^3.3.18",
+    "follow-redirects": "^1.16.3"
   }
 }

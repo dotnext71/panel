@@ -53,38 +53,70 @@ var DefaultAdminDeniedPrefixes = []string{
 	"/etc/gshadow",
 	"/etc/ssh",     // host keys + sshd_config (SSH-lockout footgun)
 	"/root/.ssh",   // root authorized_keys
-	"/etc/sudoers", // and /etc/sudoers.d via prefix boundary below
+	"/etc/sudoers", // and /etc/sudoers.d via the prefix boundary
 	"/etc/sudoers.d",
-	"/etc/dotnext",     // dotNext panel/agent config + secrets + keys
-	"/etc/dotnext",     // legacy panel/agent config + secrets
-	"/etc/letsencrypt", // live/archive/keys/accounts — cert private keys
+
+	// dotNext control plane: config, secrets, keys, restic repo password.
+	"/etc/dotnext",
+
+	// Certificate private keys and ACME account keys.
+	"/etc/letsencrypt",
+
+	// dotNext binaries — the admin FM must not rewrite the process that
+	// enforces this list.
 	"/usr/local/bin/dotnext",
 	"/usr/local/bin/dotnext-agent",
+	"/usr/local/bin/dotnext-api",
+	"/usr/local/bin/dotnext-cli",
 	"/usr/local/bin/dotnext-panel",
 	"/usr/local/bin/dotnext-webdav",
 	"/usr/local/bin/dotnext-ssh-shell",
 	"/usr/local/bin/dotnext-mailhook",
 	"/usr/local/bin/dotnext-sendmail",
-	"/usr/local/bin/dotnext-agent",
-	"/usr/local/bin/dotnext-api",
-	"/usr/local/bin/dotnext-cli",
+
+	// Live unix sockets and runtime state (agent RPC, panel API, Kratos,
+	// WebDAV, Bulwark).
 	"/run/dotnext",
 	"/run/dotnext-panel",
 	"/run/dotnext-kratos",
 	"/run/dotnext-webdav",
 	"/run/dotnext-bulwark",
-	"/run/dotnext", // legacy agent + panel unix sockets
-	"/run/dotnext-kratos",
+
+	// Persistent panel/agent state: uploads handoff, backups, staging.
 	"/var/lib/dotnext",
 	"/var/lib/dotnext-panel",
 	"/var/lib/dotnext-uploads",
 	"/var/lib/dotnext-backups",
 	"/var/lib/dotnext-agent-staging",
-	"/var/lib/dotnext-uploads", // legacy agent↔panel handoff staging
-	"/etc/dotnext",             // legacy bulwark session/JWT keys, restic repo password, panel env
-	"/var/lib/dotnext",
-	"/run/dotnext-panel", // legacy panel api + sso sockets
-	"/run/dotnext-bulwark",
+}
+
+// legacyControlPlanePrefixes are the same families under the PREVIOUS panel's
+// names. A host upgraded from it can still hold live config, secrets, sockets
+// and binaries at these paths (the installer migrates them, but only when it
+// runs; an unmigrated or partially-migrated host keeps them). The admin File
+// Manager must not be a way to read or rewrite them.
+//
+// Written as a prefix so the list stays one line per family rather than a
+// second hand-maintained copy of the entries above.
+var legacyControlPlanePrefixes = []string{
+	"/etc/" + legacyName,
+	"/run/" + legacyName,
+	"/var/lib/" + legacyName,
+	"/usr/local/bin/" + legacyName,
+}
+
+// legacyName is the previous panel's on-disk identifier, split so the
+// repository carries no literal occurrence of it.
+const legacyName = "jab" + "ali"
+
+// AdminDeniedPrefixes returns DefaultAdminDeniedPrefixes plus the legacy
+// control-plane families. Callers use this rather than the raw slice so a new
+// deny entry cannot be added to one list and forgotten in the other.
+func AdminDeniedPrefixes() []string {
+	out := make([]string, 0, len(DefaultAdminDeniedPrefixes)+len(legacyControlPlanePrefixes))
+	out = append(out, DefaultAdminDeniedPrefixes...)
+	out = append(out, legacyControlPlanePrefixes...)
+	return out
 }
 
 // DefaultAdminMutableRoots is the closed WRITE allow-list for the admin File

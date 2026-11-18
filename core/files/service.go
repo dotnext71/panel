@@ -12,8 +12,8 @@ import (
 )
 
 var (
-	ErrUnsafePath     = errors.New("files: path contains forbidden traversal or control characters")
-	ErrEmptyMutable   = errors.New("files: admin write scope requires at least one mutable root")
+	ErrUnsafePath   = errors.New("files: path contains forbidden traversal or control characters")
+	ErrEmptyMutable = errors.New("files: admin write scope requires at least one mutable root")
 )
 
 // OpenTenantScope constructs a docroot-confined Scope for a hosting account.
@@ -27,7 +27,7 @@ func OpenAdminScope(userID, username string, mutableRoots []string) (*filesafe.S
 	if len(mutableRoots) == 0 {
 		return nil, ErrEmptyMutable
 	}
-	return filesafe.NewAdminScope(userID, username, filesafe.DefaultAdminDeniedPrefixes, mutableRoots)
+	return filesafe.NewAdminScope(userID, username, filesafe.AdminDeniedPrefixes(), mutableRoots)
 }
 
 // ValidateRelativePath normalizes a user-supplied relative path under a

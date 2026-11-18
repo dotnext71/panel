@@ -342,7 +342,7 @@ func (h *filesHandler) rejectAdminWriteOutOfScope(c *gin.Context, paths ...strin
 	// narrows to the fixed mutable roots, not /home/<user>); NewAdminScope only
 	// requires it to be non-empty, so a fixed placeholder is correct here.
 	scope, err := filesafe.NewAdminScope("", "admin-file-manager",
-		filesafe.DefaultAdminDeniedPrefixes, filesafe.DefaultAdminMutableRoots)
+		filesafe.AdminDeniedPrefixes(), filesafe.DefaultAdminMutableRoots)
 	if err != nil {
 		// The allow-list is a package constant; a construction failure is a
 		// server fault, never caller input. Fail CLOSED — never let an
