@@ -123,6 +123,44 @@ func (i Info) IsDebian() bool {
 	return i.Family == FamilyDebian
 }
 
+// Ubuntu releases this project supports or has verified. Ubuntu version IDs
+// are "YY.MM" (22.04, 24.04, 26.04), so MajorVersion is the two-digit year and
+// VersionID must be compared whole — "26" alone would also match 26.10.
+const (
+	UbuntuJammy    = "22.04"
+	UbuntuNoble    = "24.04"
+	UbuntuResolute = "26.04"
+)
+
+// IsUbuntu reports whether this host runs Ubuntu specifically (as opposed to
+// a Debian derivative that shares the family).
+func (i Info) IsUbuntu() bool {
+	return i.ID == "ubuntu"
+}
+
+// IsUbuntuRelease reports whether this host runs Ubuntu at exactly the given
+// VERSION_ID (e.g. UbuntuNoble).
+func (i Info) IsUbuntuRelease(versionID string) bool {
+	return i.IsUbuntu() && i.VersionID == versionID
+}
+
+// IsSupportedUbuntu reports true for the Ubuntu LTS releases this project
+// explicitly supports: 22.04, 24.04 and 26.04. Other Ubuntu versions still
+// install (they are Debian-family) but are untested — interim releases are
+// deliberately excluded: 25.10 reached end of life in July 2026 and neither
+// the ondrej PPA nor packages.sury.org publishes a suite for it, so the PHP
+// source would not resolve at all.
+func (i Info) IsSupportedUbuntu() bool {
+	if !i.IsUbuntu() {
+		return false
+	}
+	switch i.VersionID {
+	case UbuntuJammy, UbuntuNoble, UbuntuResolute:
+		return true
+	}
+	return false
+}
+
 // IsAlmaLinux8Or9Or10 reports true for AlmaLinux 8, 9, or 10.
 func (i Info) IsAlmaLinux8Or9Or10() bool {
 	return i.ID == "almalinux" && i.IsSupportedEL()

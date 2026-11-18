@@ -44,11 +44,11 @@ dn_detect_os() {
   export DOTNEXT_OS_ID="${ID:-unknown}"
   export DOTNEXT_OS_VERSION="${VERSION_ID:-unknown}"
   case "$DOTNEXT_OS_ID:$DOTNEXT_OS_VERSION" in
-    debian:12|debian:13|ubuntu:22.04|ubuntu:24.04)
+    debian:12|debian:13|ubuntu:22.04|ubuntu:24.04|ubuntu:26.04)
       return 0
       ;;
     *)
-      dn_warn "untested OS ${DOTNEXT_OS_ID} ${DOTNEXT_OS_VERSION}; Debian 12/13 or Ubuntu 22.04/24.04 recommended"
+      dn_warn "untested OS ${DOTNEXT_OS_ID} ${DOTNEXT_OS_VERSION}; Debian 12/13, Ubuntu 22.04/24.04/26.04 LTS, AlmaLinux/Rocky 8/9/10 recommended"
       return 0
       ;;
   esac

@@ -3,7 +3,8 @@
 #
 # dotNext Panel installer.
 #
-# What it does on a fresh Debian 13 or Ubuntu 24.04 root shell:
+# What it does on a fresh Debian 12/13, Ubuntu 22.04/24.04/26.04 LTS, or
+# AlmaLinux/Rocky 8/9/10 root shell:
 #   1. Installs base OS packages (git, curl, ca-certificates, build-essential).
 #   2. Installs Go 1.25.1 into /usr/local/go (idempotent).
 #   3. Creates a `dotnext` system user (no login) + /opt/dotnext state dir.
@@ -186,8 +187,9 @@ DotNext Panel installer.
 
 USAGE
   install.sh [INSTALL FLAGS]
-      Install or re-run (idempotent) on a fresh Debian 13 / Ubuntu 24.04
-      root shell. Typically piped:
+      Install or re-run (idempotent) on a fresh Debian 12/13,
+      Ubuntu 22.04/24.04/26.04 LTS, or AlmaLinux/Rocky 8/9/10 root
+      shell. Typically piped:
         curl -fsSL <repo>/install.sh | bash -s -- [flags]
 
   install.sh --uninstall [--purge-packages] [--yes]
@@ -1916,7 +1918,20 @@ preflight() {
     # shellcheck disable=SC1091
     . /etc/os-release
     case "${ID:-}" in
-      debian|ubuntu) _ok "OS: $PRETTY_NAME" ;;
+      debian) _ok "OS: $PRETTY_NAME" ;;
+      ubuntu)
+        # Ubuntu is a Debian derivative, so it installs, but the third-party
+        # sources (PHP, Docker, NodeSource) are suite-indexed: an unrecognised
+        # release can silently resolve to a stale or missing suite. Name the
+        # supported set here so the operator knows where they stand.
+        case "${VERSION_ID:-}" in
+          22.04|24.04|26.04) _ok "OS: $PRETTY_NAME (Ubuntu ${VERSION_ID} LTS)" ;;
+          25.10)
+            _die "Ubuntu 25.10 reached end of life in July 2026 and no PHP source publishes a 'questing' suite, so the install cannot complete. Use Ubuntu 24.04 or 26.04 LTS."
+            ;;
+          *) _warn "untested Ubuntu release '${VERSION_ID:-unknown}'; supported LTS releases: 22.04, 24.04, 26.04. Continuing anyway." ;;
+        esac
+        ;;
       almalinux)
         case "${OS_MAJOR:-}" in
           8|9|10) _ok "OS: $PRETTY_NAME (AlmaLinux EL${OS_MAJOR})" ;;
@@ -3528,26 +3543,42 @@ _install_sury_source() {
     # ppa:ondrej/php — same packages as packages.sury.org, served by
     # launchpad. No Fastly in front, no 418 risk. The launchpad
     # signing key has its own fingerprint distinct from Sury's.
-    _log "fetching Ubuntu PPA signing key for ondrej/php"
-    local lp_key
-    lp_key="$(mktemp)"
-    curl_ipv4_retry -fsSL --connect-timeout 15 --max-time 60 \
-      "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${LP_GPG_FINGERPRINT}" -o "$lp_key" \
-      || { rm -f "$lp_key"; _die "failed to fetch ondrej/php signing key from keyserver.ubuntu.com"; }
-    _install_pinned_gpg_key "$lp_key" "$LP_GPG_FINGERPRINT" "ondrej/php PPA" \
-      /usr/share/keyrings/sury-php.gpg binary
-    rm -f "$lp_key"
+    #
+    # BUT the PPA only publishes suites for releases Ondrej has built for.
+    # Ubuntu 26.04 (resolute) has NO PPA suite yet — asking apt for it makes
+    # every `apt-get update` fail with "404 Not Found … resolute Release",
+    # which takes down the whole install. packages.sury.org does publish a
+    # resolute suite, so on Ubuntu we probe the PPA first and fall back to it.
+    local ppa_url="https://ppa.launchpadcontent.net/ondrej/php/ubuntu/dists/${codename}/Release"
+    if curl_ipv4_retry -fsSL --connect-timeout 10 --max-time 30 -o /dev/null "$ppa_url" 2>/dev/null; then
+      _log "fetching Ubuntu PPA signing key for ondrej/php"
+      local lp_key
+      lp_key="$(mktemp)"
+      curl_ipv4_retry -fsSL --connect-timeout 15 --max-time 60 \
+        "https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${LP_GPG_FINGERPRINT}" -o "$lp_key" \
+        || { rm -f "$lp_key"; _die "failed to fetch ondrej/php signing key from keyserver.ubuntu.com"; }
+      _install_pinned_gpg_key "$lp_key" "$LP_GPG_FINGERPRINT" "ondrej/php PPA" \
+        /usr/share/keyrings/sury-php.gpg binary
+      rm -f "$lp_key"
 
-    cat > /etc/apt/sources.list.d/sury-php.list <<EOF
+      cat > /etc/apt/sources.list.d/sury-php.list <<EOF
 deb [signed-by=/usr/share/keyrings/sury-php.gpg] https://ppa.launchpadcontent.net/ondrej/php/ubuntu ${codename} main
 EOF
-    _ok "added ondrej/php PPA for ${codename} (launchpad mirror — bypasses Fastly)"
-    return
+      _ok "added ondrej/php PPA for ${codename} (launchpad mirror — bypasses Fastly)"
+      return
+    fi
+    _warn "ondrej/php PPA publishes no '${codename}' suite (Ubuntu ${codename}) — using packages.sury.org instead"
+    # Fall through to the Sury block below, which handles both Debian and the
+    # Ubuntu releases the PPA has not built for yet.
   fi
 
-  # Debian: packages.sury.org is the only option. The Fastly 418
-  # affects fewer Debian-on-VPS installs in practice; if it bites,
-  # the operator is currently the one to debug.
+  # packages.sury.org: the only PHP source on Debian, and the fallback on
+  # Ubuntu releases the ondrej PPA has not built a suite for (26.04/resolute
+  # today). Sury publishes suites for all supported Ubuntu releases and serves
+  # the same upstream packages, so PHP version selection is unchanged.
+  #
+  # The Fastly 418 affects fewer Debian-on-VPS installs in practice; if it
+  # bites, the operator is currently the one to debug.
   _log "downloading Sury GPG key (curl: connect 15s, total 60s)"
   local sury_key
   sury_key="$(mktemp)"

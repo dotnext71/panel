@@ -147,6 +147,65 @@ PRETTY_NAME="Debian GNU/Linux 13 (trixie)"`,
 // Rocky Linux is a binary-compatible rebuild: everything that keys off the
 // RHEL family must behave identically to AlmaLinux, and the family-wide
 // predicate must accept both.
+// Ubuntu releases supported by the panel: the three LTS releases. 26.04
+// (Resolute Raccoon) is the version this change adds; interim releases such as
+// 25.10 are intentionally unsupported.
+func TestParseOSRelease_UbuntuReleases(t *testing.T) {
+	cases := []struct {
+		name      string
+		raw       string
+		versionID string
+		supported bool
+	}{
+		{"22.04 jammy", "ID=ubuntu\nVERSION_ID=\"22.04\"\nVERSION_CODENAME=jammy", "22.04", true},
+		{"24.04 noble", "ID=ubuntu\nVERSION_ID=\"24.04\"\nVERSION_CODENAME=noble", "24.04", true},
+		// 25.10 is EOL (July 2026) and has no PHP suite in any repo: unsupported.
+		{"25.10 questing", "ID=ubuntu\nVERSION_ID=\"25.10\"\nVERSION_CODENAME=questing", "25.10", false},
+		{"26.04 resolute", "ID=ubuntu\nVERSION_ID=\"26.04\"\nVERSION_CODENAME=resolute", "26.04", true},
+		{"24.10 oracular", "ID=ubuntu\nVERSION_ID=\"24.10\"", "24.10", false},
+		{"18.04 bionic", "ID=ubuntu\nVERSION_ID=\"18.04\"", "18.04", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			info := ParseOSRelease(tc.raw)
+			if !info.IsUbuntu() {
+				t.Fatal("IsUbuntu() = false")
+			}
+			if !info.IsDebian() {
+				t.Fatal("Ubuntu must belong to the Debian family")
+			}
+			if info.IsSupportedUbuntu() != tc.supported {
+				t.Fatalf("IsSupportedUbuntu() = %v, want %v", info.IsSupportedUbuntu(), tc.supported)
+			}
+			if !info.IsUbuntuRelease(tc.versionID) {
+				t.Fatalf("IsUbuntuRelease(%q) = false", tc.versionID)
+			}
+		})
+	}
+}
+
+// Debian must never be mistaken for Ubuntu: the PHP/nginx/Docker sources differ
+// per release, and an "ubuntu" answer on Debian would select a nonexistent suite.
+func TestUbuntuPredicates_DoNotMatchDebian(t *testing.T) {
+	for _, raw := range []string{
+		"ID=debian\nVERSION_ID=\"13\"\nVERSION_CODENAME=trixie",
+		"ID=debian\nVERSION_ID=\"12\"\nVERSION_CODENAME=bookworm",
+	} {
+		info := ParseOSRelease(raw)
+		if info.IsUbuntu() || info.IsSupportedUbuntu() || info.IsUbuntuRelease("24.04") {
+			t.Fatalf("Debian (%s) matched a Ubuntu predicate: %+v", info.VersionID, info)
+		}
+		if !info.IsDebian() {
+			t.Fatalf("Debian %s not IsDebian()", info.VersionID)
+		}
+	}
+	// …and the reverse: Ubuntu must not satisfy the EL predicates.
+	u := ParseOSRelease("ID=ubuntu\nVERSION_ID=\"24.04\"")
+	if u.IsRHEL() || u.IsSupportedEL() || u.IsAlmaLinux8Or9Or10() || u.IsRocky8Or9Or10() {
+		t.Fatalf("Ubuntu matched an EL predicate: %+v", u)
+	}
+}
+
 func TestParseOSRelease_RockyParityWithAlma(t *testing.T) {
 	for _, major := range []string{"8.10", "9.5", "10.0"} {
 		t.Run("Rocky_"+major, func(t *testing.T) {
