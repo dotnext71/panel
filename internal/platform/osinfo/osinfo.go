@@ -125,7 +125,19 @@ func (i Info) IsDebian() bool {
 
 // IsAlmaLinux8Or9Or10 reports true for AlmaLinux 8, 9, or 10.
 func (i Info) IsAlmaLinux8Or9Or10() bool {
-	return i.ID == "almalinux" && (i.MajorVersion == 8 || i.MajorVersion == 9 || i.MajorVersion == 10)
+	return i.ID == "almalinux" && i.IsSupportedEL()
+}
+
+// IsRL9Family reports true for Rocky Linux 8, 9, or 10 (the explicitly
+// supported Enterprise Linux releases beyond AlmaLinux).
+func (i Info) IsRocky8Or9Or10() bool {
+	return i.ID == "rocky" && i.IsSupportedEL()
+}
+
+// IsSupportedEL reports true for any Enterprise Linux host on a major version
+// this project targets (8, 9, or 10), regardless of the exact rebuild.
+func (i Info) IsSupportedEL() bool {
+	return i.IsRHEL() && (i.MajorVersion == 8 || i.MajorVersion == 9 || i.MajorVersion == 10)
 }
 
 // PackageManager returns "dnf" on RHEL-family hosts and "apt" otherwise.

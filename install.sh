@@ -1880,7 +1880,7 @@ _php_pkg_name() {
   case "$ext" in
     mysql)     mapped="mysqlnd" ;;
     sqlite3)   mapped="pdo" ;;
-    curl|bz2)  mapped="common" ;;
+    curl|bz2|zip) mapped="common" ;;  # Remi SCL bundles these into php<n>-php-common
     readline)  mapped="cli" ;;
     dev)       mapped="devel" ;;
     xsl)       mapped="xml" ;;
@@ -1921,6 +1921,12 @@ preflight() {
         case "${OS_MAJOR:-}" in
           8|9|10) _ok "OS: $PRETTY_NAME (AlmaLinux EL${OS_MAJOR})" ;;
           *) _die "unsupported AlmaLinux major version '${OS_MAJOR:-unknown}'; supported versions are AlmaLinux 8, 9, and 10" ;;
+        esac
+        ;;
+      rocky)
+        case "${OS_MAJOR:-}" in
+          8|9|10) _ok "OS: $PRETTY_NAME (Rocky Linux EL${OS_MAJOR})" ;;
+          *) _die "unsupported Rocky Linux major version '${OS_MAJOR:-unknown}'; supported versions are Rocky Linux 8, 9, and 10" ;;
         esac
         ;;
       *)
@@ -2412,6 +2418,12 @@ _install_el_repos() {
     dnf module reset -y nginx >/dev/null 2>&1 || true
     dnf module enable -y nginx:1.24 >/dev/null 2>&1 || \
       dnf module enable -y nginx:1.22 >/dev/null 2>&1 || true
+    # EL8 also ships redis 5.0, which has no ACL support — the per-tenant
+    # `ACL SETUSER` provisioning (tenant_redis.go) needs Redis 6+. The redis:6
+    # module exists from AlmaLinux/Rocky (RHEL) 8.6 on; where it doesn't, the
+    # install keeps redis:5 and tenant cache isolation is unavailable.
+    dnf module reset -y redis >/dev/null 2>&1 || true
+    dnf module enable -y redis:6 >/dev/null 2>&1 || true
   else
     dnf config-manager --set-enabled crb >/dev/null 2>&1 || true
   fi
@@ -2434,22 +2446,30 @@ module_hotfixes=1
 NS_EL_EOF
   fi
 
-  # PowerDNS on AlmaLinux 8/9/10: EPEL provides pdns/pdns-recursor on EL8/9;
-  # ensure repo.powerdns.com EL repo is available when EPEL lacks them (e.g. EL10).
+  # PowerDNS on AlmaLinux/Rocky 8/9/10: EPEL provides pdns + pdns-recursor on
+  # all three (EL10's EPEL carries pdns 5.0 and recursor 5.4). Only when EPEL is
+  # missing them do we fall back to repo.powerdns.com — which does NOT publish
+  # auth-49 / rec-51 for EL10 (its EL10 tree starts at auth-50 / rec-53), so the
+  # pinned series must follow the EL major or the repo file is dead on EL10.
   if ! dnf -q info pdns-recursor >/dev/null 2>&1 || ! dnf -q info pdns-backend-mysql >/dev/null 2>&1; then
     if [[ ! -f /etc/yum.repos.d/powerdns.repo ]]; then
+      local pdns_auth_series="auth-49" pdns_rec_series="rec-51"
+      if [[ "$el_maj" -ge 10 ]]; then
+        pdns_auth_series="auth-50"
+        pdns_rec_series="rec-53"
+      fi
       cat > /etc/yum.repos.d/powerdns.repo <<PDNS_EL_EOF
-[powerdns-auth-49]
-name=PowerDNS authoritative 4.9 - EL${el_maj}
-baseurl=https://repo.powerdns.com/centos/\$basearch/${el_maj}/auth-49
+[powerdns-auth]
+name=PowerDNS authoritative - EL${el_maj}
+baseurl=https://repo.powerdns.com/centos/\$basearch/${el_maj}/${pdns_auth_series}
 gpgcheck=1
 gpgkey=https://repo.powerdns.com/FD380FBB-pub.asc
 enabled=1
 priority=90
 
-[powerdns-rec-51]
-name=PowerDNS recursor 5.1 - EL${el_maj}
-baseurl=https://repo.powerdns.com/centos/\$basearch/${el_maj}/rec-51
+[powerdns-rec]
+name=PowerDNS recursor - EL${el_maj}
+baseurl=https://repo.powerdns.com/centos/\$basearch/${el_maj}/${pdns_rec_series}
 gpgcheck=1
 gpgkey=https://repo.powerdns.com/FD380FBB-pub.asc
 enabled=1
@@ -2500,6 +2520,10 @@ _install_el_base_packages() {
     pdns pdns-backend-mysql pdns-recursor
     bind-utils
     firewalld
+    # `nft` backs the per-user PHP-FPM egress firewall (M34) and the CrowdSec
+    # diag loopback isolation. On Debian it arrives with ufw; on EL nothing in
+    # the list pulls the nftables CLI in, so without it both silently skip.
+    nftables
     whois
     "$redis_pkg"
     dbus

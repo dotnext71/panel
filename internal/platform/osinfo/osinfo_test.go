@@ -144,6 +144,48 @@ PRETTY_NAME="Debian GNU/Linux 13 (trixie)"`,
 	}
 }
 
+// Rocky Linux is a binary-compatible rebuild: everything that keys off the
+// RHEL family must behave identically to AlmaLinux, and the family-wide
+// predicate must accept both.
+func TestParseOSRelease_RockyParityWithAlma(t *testing.T) {
+	for _, major := range []string{"8.10", "9.5", "10.0"} {
+		t.Run("Rocky_"+major, func(t *testing.T) {
+			rocky := ParseOSRelease("ID=\"rocky\"\nID_LIKE=\"rhel centos fedora\"\nVERSION_ID=\"" + major + "\"")
+			alma := ParseOSRelease("ID=\"almalinux\"\nID_LIKE=\"rhel centos fedora\"\nVERSION_ID=\"" + major + "\"")
+
+			if !rocky.IsRHEL() {
+				t.Fatal("Rocky must be RHEL family")
+			}
+			if !rocky.IsSupportedEL() || !alma.IsSupportedEL() {
+				t.Fatalf("IsSupportedEL: rocky=%v alma=%v, want both true", rocky.IsSupportedEL(), alma.IsSupportedEL())
+			}
+			if !rocky.IsRocky8Or9Or10() || rocky.IsAlmaLinux8Or9Or10() {
+				t.Fatal("Rocky must match IsRocky8Or9Or10 and not IsAlmaLinux8Or9Or10")
+			}
+			if alma.IsRocky8Or9Or10() || !alma.IsAlmaLinux8Or9Or10() {
+				t.Fatal("Alma must match IsAlmaLinux8Or9Or10 and not IsRocky8Or9Or10")
+			}
+			// Everything both rebuilds must agree on.
+			pairs := map[string][2]string{
+				"package manager": {rocky.PackageManager(), alma.PackageManager()},
+				"ssh unit":        {rocky.SSHServiceName(), alma.SSHServiceName()},
+				"redis unit":      {rocky.RedisServiceName(), alma.RedisServiceName()},
+				"firewall":        {rocky.FirewallBackend(), alma.FirewallBackend()},
+				"MAC":             {rocky.MACBackend(), alma.MACBackend()},
+				"nologin":         {rocky.NologinShell(), alma.NologinShell()},
+				"pdns forwards":   {rocky.PowerDNSRecursorForwardsPath(), alma.PowerDNSRecursorForwardsPath()},
+				"php pool dir":    {rocky.PHPPoolDir("8.4"), alma.PHPPoolDir("8.4")},
+				"php fpm binary":  {rocky.PHPFPMBinary("8.4"), alma.PHPFPMBinary("8.4")},
+			}
+			for name, v := range pairs {
+				if v[0] != v[1] {
+					t.Errorf("%s: rocky=%q alma=%q", name, v[0], v[1])
+				}
+			}
+		})
+	}
+}
+
 func TestExtractPHPVersionFromPoolDir(t *testing.T) {
 	if v, ok := ExtractPHPVersionFromPoolDir("/etc/php/8.3/fpm/pool.d"); !ok || v != "8.3" {
 		t.Fatalf("debian pool dir = (%q, %v), want (8.3, true)", v, ok)

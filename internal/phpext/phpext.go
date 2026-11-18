@@ -135,6 +135,7 @@ var remiPackageSuffix = map[string]string{
 	"mysql":     "mysqlnd",
 	"readline":  "cli",
 	"redis":     "pecl-redis",
+	"zip":       "common", // Remi SCL ships zip inside php<n>-php-common
 	"sqlite3":   "pdo",
 	"ssh2":      "pecl-ssh2",
 	"xdebug":    "pecl-xdebug3",

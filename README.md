@@ -29,7 +29,7 @@
   <img src="https://img.shields.io/badge/Ant_Design-6-0170FE?logo=antdesign&logoColor=white" alt="Ant Design 6">
   <img src="https://img.shields.io/badge/MariaDB-11-003545?logo=mariadb&logoColor=white" alt="MariaDB 11">
   <img src="https://img.shields.io/badge/Debian-12%20%7C%2013-A81D33?logo=debian&logoColor=white" alt="Debian 12/13">
-  <img src="https://img.shields.io/badge/AlmaLinux-8%20%7C%209%20%7C%2010-0F4266?logo=almalinux&logoColor=white" alt="AlmaLinux 8/9/10">
+  <img src="https://img.shields.io/badge/AlmaLinux%20%2F%20Rocky-8%20%7C%209%20%7C%2010-0F4266?logo=almalinux&logoColor=white" alt="AlmaLinux / Rocky 8/9/10">
   <img src="https://img.shields.io/badge/License-MIT-yellow" alt="MIT">
 </p>
 
@@ -66,7 +66,7 @@ Production hosts leave the file absent and never carry demo code.
 
 ## Installation
 
-Install on a fresh supported Debian 12/13, Ubuntu 22.04/24.04, or AlmaLinux 8/9/10 server:
+Install on a fresh supported Debian 12/13, Ubuntu 22.04/24.04, or AlmaLinux / Rocky Linux 8, 9, 10 server:
 
 ```
 curl -fsSL https://raw.githubusercontent.com/dotnext71/panel/main/bootstrap.sh | sudo bash
@@ -295,7 +295,7 @@ Service stack (single-node default):
 
 ## Requirements
 
-- Fresh Debian 12/13, Ubuntu 22.04/24.04, or AlmaLinux 8/9/10 install (no pre-existing web or mail stack)
+- Fresh Debian 12/13, Ubuntu 22.04/24.04, or AlmaLinux / Rocky 8/9/10 install (no pre-existing web or mail stack)
 - 2 GB RAM minimum, 4 GB recommended — the same guidance as cPanel (on a ≤4 GB host the installer adds swap and caps the on-box SPA/Go build memory so it doesn't OOM; on 2 GB the build is slower but completes)
 - A domain for panel + mail (with glue records if hosting DNS)
 - PTR (reverse DNS) for mail hostname

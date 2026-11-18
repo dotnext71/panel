@@ -210,6 +210,31 @@ func TestResolvePackages_Sorting(t *testing.T) {
 	}
 }
 
+// Remi's SCL tree has no php<n>-php-zip: zip lives inside php<n>-php-common.
+// Asking for php84-php-zip made `dotnext` fail to install the zip extension on
+// every EL host (the package does not exist), while Debian's php8.4-zip does.
+func TestResolvePackagesForOS_ELZipMapsToCommon(t *testing.T) {
+	for _, os := range []osinfo.Info{
+		{ID: "almalinux", MajorVersion: 8, Family: osinfo.FamilyRHEL},
+		{ID: "almalinux", MajorVersion: 9, Family: osinfo.FamilyRHEL},
+		{ID: "rocky", MajorVersion: 9, Family: osinfo.FamilyRHEL},
+		{ID: "rocky", MajorVersion: 10, Family: osinfo.FamilyRHEL},
+	} {
+		got, err := ResolvePackagesForOS("8.4", "zip", os)
+		if err != nil {
+			t.Fatalf("%s %d: %v", os.ID, os.MajorVersion, err)
+		}
+		if len(got) != 1 || got[0] != "php84-php-common" {
+			t.Errorf("%s %d: zip = %v, want [php84-php-common]", os.ID, os.MajorVersion, got)
+		}
+	}
+	// Debian is untouched: its zip is a real, separate package.
+	deb, err := ResolvePackagesForOS("8.4", "zip", osinfo.Info{ID: "debian", MajorVersion: 13, Family: osinfo.FamilyDebian})
+	if err != nil || len(deb) != 1 || deb[0] != "php8.4-zip" {
+		t.Errorf("debian zip = %v (%v), want [php8.4-zip]", deb, err)
+	}
+}
+
 func TestResolvePackagesForOS_AlmaLinuxRemi(t *testing.T) {
 	alma := osinfo.Info{ID: "almalinux", MajorVersion: 9, Family: osinfo.FamilyRHEL}
 	cases := []struct {
