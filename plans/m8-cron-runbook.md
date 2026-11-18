@@ -359,11 +359,11 @@ sudo -u <user> XDG_RUNTIME_DIR=/run/user/$(id -u <user>) \
 
 ## Further Reading
 
-- **Architecture:** `/home/shuki/projects/dotnext2/plans/m8-cron.md` (§0-6 cover design, unit templates, and systemd invocation)
-- **API Reference:** `/home/shuki/projects/dotnext2/panel-api/internal/api/cron.go` (route shapes, error codes)
-- **Validator:** `/home/shuki/projects/dotnext2/panel-api/internal/cronvalidate/cron.go` (allowlist rules + test cases)
-- **Agent Commands:** `/home/shuki/projects/dotnext2/panel-agent/internal/commands/cron_*.go` (apply/remove/run_now/tail_log implementations)
-- **Reconciler:** `/home/shuki/projects/dotnext2/panel-api/internal/reconciler/cron_reconcile.go` (drift detection + orphan cleanup)
+- **Architecture:** `<repo-root>/plans/m8-cron.md` (§0-6 cover design, unit templates, and systemd invocation)
+- **API Reference:** `<repo-root>/panel-api/internal/api/cron.go` (route shapes, error codes)
+- **Validator:** `<repo-root>/panel-api/internal/cronvalidate/cron.go` (allowlist rules + test cases)
+- **Agent Commands:** `<repo-root>/panel-agent/internal/commands/cron_*.go` (apply/remove/run_now/tail_log implementations)
+- **Reconciler:** `<repo-root>/panel-api/internal/reconciler/cron_reconcile.go` (drift detection + orphan cleanup)
 
 ---
 

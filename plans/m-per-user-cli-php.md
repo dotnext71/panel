@@ -1,6 +1,6 @@
 # Blueprint — Per-user CLI PHP version (GH #184)
 
-**Status:** SHIPPED 2026-06-14 (ADR-0126; live-verified on mx). Option B chosen. **Owner:** shuki + Claude. **Date:** 2026-06-14.
+**Status:** SHIPPED 2026-06-14 (ADR-0126; live-verified on mx). Option B chosen. **Owner:** alice + Claude. **Date:** 2026-06-14.
 
 ## Problem (GH #184)
 

@@ -31,22 +31,22 @@ Passes on a fresh `install.sh`-provisioned host. Failure classes:
 ### Apply limits to one user
 
 ```bash
-dotnext limits apply shuki
+dotnext limits apply alice
 ```
 
 Recomputes their effective limits (package + override) and pushes them
 to the agent. Useful after:
-- An operator edited `/etc/systemd/system/dotnext-user-shuki.slice.d/limits.conf` by hand.
+- An operator edited `/etc/systemd/system/dotnext-user-alice.slice.d/limits.conf` by hand.
 - The reconciler is paused for SSO-key rotation and a user just had their package changed.
 
 ### View live usage
 
 ```bash
-dotnext limits status shuki
+dotnext limits status alice
 ```
 
 ```
-user       shuki
+user       alice
 disk       102400 KB / 5242880 KB
 memory     1073741824 B / 4294967296 B
 cpu        123456789012 ns total, quota 200%

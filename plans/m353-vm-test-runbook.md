@@ -56,7 +56,7 @@ If the dry-run plan matches your selection, proceed to the real VM install below
 
 ```bash
 sudo apt-get update && sudo apt-get install -y git
-git clone https://github.com/shukiv/dotnext-panel
+git clone https://github.com/dotnext71/panel
 cd dotnext2
 git checkout feat/tui-installer-t1
 ```

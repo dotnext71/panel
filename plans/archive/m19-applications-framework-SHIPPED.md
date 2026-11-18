@@ -1,7 +1,7 @@
 # Plan: M19 — Applications Framework (rename WordPress, register more apps)
 
 **Status:** Draft.
-**Owner:** shuki
+**Owner:** the dotNext team
 **Scope:** Rename the "WordPress" section to "Applications" and turn the
 existing WP install/delete/clone path into a generic 1-click installer
 framework that other CMS apps (DokuWiki, MediaWiki, Joomla, Drupal,
@@ -13,7 +13,7 @@ M10 ✅ (WordPress, the surface we're generalising). The
 (local commit, may not be on origin/main yet — check before Step 1).
 **Next migration after main HEAD:** `000046` (current head is `000045`).
 **Next ADR:** `0033-m19-applications-framework`.
-**Working directory:** `/home/shuki/projects/dotnext2-a` — branch off
+**Working directory:** `<repo-root>-a` — branch off
 `origin/main` per step.
 
 ---

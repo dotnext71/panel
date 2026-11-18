@@ -7,7 +7,7 @@
 # Blueprint: Safe per-user restore-side mail apply
 
 **Status**: proposed (ADR-0121)
-**Owner**: shukiv
+**Owner**: the dotNext team
 **Target**: re-enable Stalwart mail account-config restore, scoped +
 additive + dry-run-gated, after PR #376 disabled the unsafe version.
 

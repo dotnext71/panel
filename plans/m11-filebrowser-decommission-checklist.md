@@ -27,73 +27,73 @@
 
 | Path | Action | Notes |
 |------|--------|-------|
-| `/home/shuki/projects/dotnext2/install.sh` | **MODIFY** | Delete 4 functions: `install_filebrowser` (lines 1862–1945, 84 lines), `uninstall_filebrowser` (lines 1957–1968, 12 lines), `update_filebrowser` (lines 1970–2022, 53 lines), `ensure_filebrowser_running` (lines 2024–2040, 17 lines). Total: 166 lines. Keep other install functions. |
+| `<repo-root>/install.sh` | **MODIFY** | Delete 4 functions: `install_filebrowser` (lines 1862–1945, 84 lines), `uninstall_filebrowser` (lines 1957–1968, 12 lines), `update_filebrowser` (lines 1970–2022, 53 lines), `ensure_filebrowser_running` (lines 2024–2040, 17 lines). Total: 166 lines. Keep other install functions. |
 
 ### 2. Systemd & Service Management
 
 | Path | Action | Notes |
 |------|--------|-------|
-| `/home/shuki/projects/dotnext2/install/systemd/dotnext-filebrowser.service` | **DELETE** | Unit file for dotnext-filebrowser systemd service. ~35 lines. |
-| `/home/shuki/projects/dotnext2/install/systemd/tmpfiles-filebrowser.conf` | **DELETE** | tmpfiles.d drop-in for /run/dotnext-filebrowser directory creation. ~3 lines. |
+| `<repo-root>/install/systemd/dotnext-filebrowser.service` | **DELETE** | Unit file for dotnext-filebrowser systemd service. ~35 lines. |
+| `<repo-root>/install/systemd/tmpfiles-filebrowser.conf` | **DELETE** | tmpfiles.d drop-in for /run/dotnext-filebrowser directory creation. ~3 lines. |
 
 ### 3. Nginx Configuration
 
 | Path | Action | Notes |
 |------|--------|-------|
-| `/home/shuki/projects/dotnext2/install/nginx/dotnext-files.conf` | **DELETE** | HTTP-context map directive for auth routing. ~10 lines. |
-| `/home/shuki/projects/dotnext2/install/nginx/includes/dotnext-files.conf` | **DELETE** | Location block definitions for /files/ reverse proxy. ~40 lines. |
+| `<repo-root>/install/nginx/dotnext-files.conf` | **DELETE** | HTTP-context map directive for auth routing. ~10 lines. |
+| `<repo-root>/install/nginx/includes/dotnext-files.conf` | **DELETE** | Location block definitions for /files/ reverse proxy. ~40 lines. |
 
 ### 4. Agent Commands
 
 | Path | Action | Notes |
 |------|--------|-------|
-| `/home/shuki/projects/dotnext2/panel-api/internal/agent/cmd/filebrowser_user_ensure.go` | **DELETE** | Creates filebrowser users via CLI. Lines 32–110 (79 lines). Validates username/scope, executes filebrowser CLI. |
-| `/home/shuki/projects/dotnext2/panel-api/internal/agent/cmd/filebrowser_user_list.go` | **DELETE** | Lists filebrowser users. Lines 19–48 (30 lines). |
-| `/home/shuki/projects/dotnext2/panel-api/internal/agent/cmd/filebrowser_user_delete.go` | **DELETE** | Deletes filebrowser users via CLI. |
-| `/home/shuki/projects/dotnext2/panel-api/internal/agent/cmd/filebrowser_group_add.go` | **DELETE** | Adds filebrowser to user's Unix group & applies POSIX ACL. Lines 26–114 (89 lines). Uses usermod + setfacl. |
-| `/home/shuki/projects/dotnext2/panel-api/internal/agent/cmd/filebrowser_service_restart.go` | **DELETE** | Restarts systemd service. Lines 19–37 (19 lines). |
-| `/home/shuki/projects/dotnext2/panel-api/internal/agent/cmd/filebrowser_user_ensure_test.go` | **DELETE** | Unit tests for filebrowser_user_ensure. |
+| `<repo-root>/panel-api/internal/agent/cmd/filebrowser_user_ensure.go` | **DELETE** | Creates filebrowser users via CLI. Lines 32–110 (79 lines). Validates username/scope, executes filebrowser CLI. |
+| `<repo-root>/panel-api/internal/agent/cmd/filebrowser_user_list.go` | **DELETE** | Lists filebrowser users. Lines 19–48 (30 lines). |
+| `<repo-root>/panel-api/internal/agent/cmd/filebrowser_user_delete.go` | **DELETE** | Deletes filebrowser users via CLI. |
+| `<repo-root>/panel-api/internal/agent/cmd/filebrowser_group_add.go` | **DELETE** | Adds filebrowser to user's Unix group & applies POSIX ACL. Lines 26–114 (89 lines). Uses usermod + setfacl. |
+| `<repo-root>/panel-api/internal/agent/cmd/filebrowser_service_restart.go` | **DELETE** | Restarts systemd service. Lines 19–37 (19 lines). |
+| `<repo-root>/panel-api/internal/agent/cmd/filebrowser_user_ensure_test.go` | **DELETE** | Unit tests for filebrowser_user_ensure. |
 
 ### 5. Panel API Routes & Handlers
 
 | Path | Action | Notes |
 |------|--------|-------|
-| `/home/shuki/projects/dotnext2/panel-api/internal/api/routes/sso_filebrowser.go` | **DELETE** | Registers POST /api/v1/sso/filebrowser. Lines 24–27 (route reg), 45–82 (issueSSOToken handler + helper methods). ~80 lines total. |
-| `/home/shuki/projects/dotnext2/panel-api/internal/api/routes/sso_filebrowser_validate.go` | **DELETE** | Registers POST /api/v1/sso/filebrowser/validate. Lines 21–24 (route reg), 44–94 (validate handler). ~70 lines total. Listens on /var/run/dotnext-panel/sso.sock. |
-| `/home/shuki/projects/dotnext2/panel-api/internal/api/routes/sso_uds.go` | **MODIFY** | Delete conditional registration of sso_filebrowser_validate at line 62 (`if ssoSvc != nil { RegisterSSOFileBrowserValidateRoutes(...) }`). Keep UDS listener setup. ~10 lines removed. |
+| `<repo-root>/panel-api/internal/api/routes/sso_filebrowser.go` | **DELETE** | Registers POST /api/v1/sso/filebrowser. Lines 24–27 (route reg), 45–82 (issueSSOToken handler + helper methods). ~80 lines total. |
+| `<repo-root>/panel-api/internal/api/routes/sso_filebrowser_validate.go` | **DELETE** | Registers POST /api/v1/sso/filebrowser/validate. Lines 21–24 (route reg), 44–94 (validate handler). ~70 lines total. Listens on /var/run/dotnext-panel/sso.sock. |
+| `<repo-root>/panel-api/internal/api/routes/sso_uds.go` | **MODIFY** | Delete conditional registration of sso_filebrowser_validate at line 62 (`if ssoSvc != nil { RegisterSSOFileBrowserValidateRoutes(...) }`). Keep UDS listener setup. ~10 lines removed. |
 
 ### 6. Database & Models
 
 | Path | Action | Notes |
 |------|--------|-------|
-| `/home/shuki/projects/dotnext2/panel-api/internal/db/migrations/000034_create_filebrowser_sso_tokens.up.sql` | **DELETE** | Migration to create filebrowser_sso_tokens table. 12 lines. Used for 2-hour TTL SSO tokens. |
-| `/home/shuki/projects/dotnext2/panel-api/internal/db/migrations/000034_create_filebrowser_sso_tokens.down.sql` | **DELETE** | Migration down (DROP TABLE). 1 line. |
-| `/home/shuki/projects/dotnext2/panel-api/internal/models/filebrowser_sso_token.go` | **DELETE** | FileBrowserSSOToken struct definition. Contains ID, UserID, TokenHash, CreatedAt, ExpiresAt, UsedAt. |
-| `/home/shuki/projects/dotnext2/panel-api/internal/repository/filebrowser_sso_token_repository.go` | **DELETE** | Repository interface + implementation. Methods: Create, MarkUsed, DeleteExpired, FindByHash. |
+| `<repo-root>/panel-api/internal/db/migrations/000034_create_filebrowser_sso_tokens.up.sql` | **DELETE** | Migration to create filebrowser_sso_tokens table. 12 lines. Used for 2-hour TTL SSO tokens. |
+| `<repo-root>/panel-api/internal/db/migrations/000034_create_filebrowser_sso_tokens.down.sql` | **DELETE** | Migration down (DROP TABLE). 1 line. |
+| `<repo-root>/panel-api/internal/models/filebrowser_sso_token.go` | **DELETE** | FileBrowserSSOToken struct definition. Contains ID, UserID, TokenHash, CreatedAt, ExpiresAt, UsedAt. |
+| `<repo-root>/panel-api/internal/repository/filebrowser_sso_token_repository.go` | **DELETE** | Repository interface + implementation. Methods: Create, MarkUsed, DeleteExpired, FindByHash. |
 
 ### 7. Config Templates & Checksums
 
 | Path | Action | Notes |
 |------|--------|-------|
-| `/home/shuki/projects/dotnext2/install/filebrowser/config.json.tmpl` | **DELETE** | Template for filebrowser SQLite database config. |
-| `/home/shuki/projects/dotnext2/install/filebrowser/filebrowser-linux-amd64.sha256` | **DELETE** | SHA256 checksum for binary verification (v2.38.0). |
+| `<repo-root>/install/filebrowser/config.json.tmpl` | **DELETE** | Template for filebrowser SQLite database config. |
+| `<repo-root>/install/filebrowser/filebrowser-linux-amd64.sha256` | **DELETE** | SHA256 checksum for binary verification (v2.38.0). |
 
 ### 8. Frontend Components
 
 | Path | Action | Notes |
 |------|--------|-------|
-| `/home/shuki/projects/dotnext2/panel-ui/src/apiClient.ts` | **MODIFY** | Remove `ssoFileBrowser()` function (calls POST /api/v1/sso/filebrowser). Search for function definition and delete. ~10 lines. |
-| `/home/shuki/projects/dotnext2/panel-ui/src/shells/user/files/UserFilesLauncher.tsx` | **DELETE** | React component that renders file manager iframe. Lines 9–77 (69 lines). Calls ssoFileBrowser(), handles loading/error state. |
-| `/home/shuki/projects/dotnext2/panel-ui/tests/e2e/filebrowser.spec.ts` | **DELETE** | E2E tests for FileBrowser SSO flow. |
+| `<repo-root>/panel-ui/src/apiClient.ts` | **MODIFY** | Remove `ssoFileBrowser()` function (calls POST /api/v1/sso/filebrowser). Search for function definition and delete. ~10 lines. |
+| `<repo-root>/panel-ui/src/shells/user/files/UserFilesLauncher.tsx` | **DELETE** | React component that renders file manager iframe. Lines 9–77 (69 lines). Calls ssoFileBrowser(), handles loading/error state. |
+| `<repo-root>/panel-ui/tests/e2e/filebrowser.spec.ts` | **DELETE** | E2E tests for FileBrowser SSO flow. |
 
 ### 9. Documentation & Plans
 
 | Path | Action | Notes |
 |------|--------|-------|
-| `/home/shuki/projects/dotnext2/docs/adr/0027-m11-filebrowser-integration.md` | **DELETE or ARCHIVE** | ADR documenting M11 filebrowser integration decision. Mark as superseded by AntD file manager ADR. |
-| `/home/shuki/projects/dotnext2/docs/BLUEPRINT.md` | **MODIFY** | Find "M11: FileBrowser (SHIPPED)" section and update status to "DEPRECATED - Replaced by AntD File Manager" or remove entry. |
-| `/home/shuki/projects/dotnext2/plans/m11-filebrowser.md` | **DELETE or ARCHIVE** | Original integration plan. |
-| `/home/shuki/projects/dotnext2/plans/m11-filebrowser-runbook.md` | **DELETE or ARCHIVE** | Operational runbook. |
+| `<repo-root>/docs/adr/0027-m11-filebrowser-integration.md` | **DELETE or ARCHIVE** | ADR documenting M11 filebrowser integration decision. Mark as superseded by AntD file manager ADR. |
+| `<repo-root>/docs/BLUEPRINT.md` | **MODIFY** | Find "M11: FileBrowser (SHIPPED)" section and update status to "DEPRECATED - Replaced by AntD File Manager" or remove entry. |
+| `<repo-root>/plans/m11-filebrowser.md` | **DELETE or ARCHIVE** | Original integration plan. |
+| `<repo-root>/plans/m11-filebrowser-runbook.md` | **DELETE or ARCHIVE** | Operational runbook. |
 
 ### 10. Runtime State & Orphans (Cleanup via uninstall script)
 

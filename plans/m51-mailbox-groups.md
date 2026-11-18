@@ -1,6 +1,6 @@
 # M51 — Mailbox User Groups with Shared Resources
 
-GitHub issue: shukiv/dotnext-panel#201
+GitHub issue: dotnext71/panel#201
 ADR: docs/adr/0132-m51-mailbox-groups.md
 Status: BLUEPRINT (awaiting review → wave dispatch)
 

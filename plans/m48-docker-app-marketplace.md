@@ -1,8 +1,8 @@
 # Plan: M48 — Docker App Marketplace (admin-installable containerised apps)
 
 **Status:** Draft (2026-06-05).
-**Owner:** shuki
-**Scope:** Admin-only catalog of curated Docker apps with one-click install, auto domain + nginx reverse proxy wiring, lifecycle controls, backup, and update flow with rollback. Closes the second half of [GH#127](https://github.com/shukiv/dotnext-panel/issues/127). Admin-cron page (first half) shipped in PR #200.
+**Owner:** the dotNext team
+**Scope:** Admin-only catalog of curated Docker apps with one-click install, auto domain + nginx reverse proxy wiring, lifecycle controls, backup, and update flow with rollback. Closes the second half of [GH#127](https://github.com/dotnext71/panel/issues/127). Admin-cron page (first half) shipped in PR #200.
 **Depends on:**
 - M2 (domains + nginx vhost rendering)
 - M14 (notifications for update/rollback events)
@@ -12,7 +12,7 @@
 - M32 (panel cert + per-domain LE — app vhosts get TLS via the same path)
 **Next migration:** see Schema section.
 **Next ADR:** `0116-m48-docker-app-marketplace.md` — 12 decisions per the PR conversation.
-**Working directory:** `/home/shuki/projects/dotnext2` — branch `plan/m48-docker-app-marketplace`.
+**Working directory:** `<repo-root>` — branch `plan/m48-docker-app-marketplace`.
 
 ---
 

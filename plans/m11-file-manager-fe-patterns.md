@@ -12,7 +12,7 @@
 
 Routes are **statically defined in `/panel-ui/src/App.tsx`** using Refine's `resources` config + React Router:
 
-**File:** `/home/shuki/projects/dotnext2/panel-ui/src/App.tsx` (lines ~147–198)
+**File:** `<repo-root>/panel-ui/src/App.tsx` (lines ~147–198)
 
 ```tsx
 {
@@ -601,7 +601,7 @@ export const FilesBreadcrumb = ({ path, onNavigate }: FileBreadcrumbProps) => {
 
 ### Theme token definition
 
-**File:** `/home/shuki/projects/dotnext2/panel-ui/src/muiTheme.ts` (lines 1–150)
+**File:** `<repo-root>/panel-ui/src/muiTheme.ts` (lines 1–150)
 
 ```tsx
 const lightTokens: AliasToken = {
@@ -678,7 +678,7 @@ export const CustomFilePanel = () => {
 
 When an admin impersonates a user, they log in via a **one-shot session token** that the UI fetches via `/admin/users/:id/impersonate`:
 
-**File:** `/home/shuki/projects/dotnext2/panel-ui/src/shells/admin/users/UserImpersonateAction.tsx` (lines 17–28)
+**File:** `<repo-root>/panel-ui/src/shells/admin/users/UserImpersonateAction.tsx` (lines 17–28)
 
 ```tsx
 const handleImpersonate = async () => {
@@ -841,9 +841,9 @@ panel-ui/src/shells/user/files/
 
 ## References
 
-**API Client:** `/home/shuki/projects/dotnext2/panel-ui/src/apiClient.ts`  
-**Theme:** `/home/shuki/projects/dotnext2/panel-ui/src/muiTheme.ts`  
-**Cron (reference):** `/home/shuki/projects/dotnext2/panel-ui/src/shells/user/cron/`  
-**Databases (reference):** `/home/shuki/projects/dotnext2/panel-ui/src/shells/user/databases/`  
-**SSH Keys (reference):** `/home/shuki/projects/dotnext2/panel-ui/src/shells/user/ssh-keys/`  
-**SearchableTable:** `/home/shuki/projects/dotnext2/panel-ui/src/components/SearchableTable.tsx`
+**API Client:** `<repo-root>/panel-ui/src/apiClient.ts`  
+**Theme:** `<repo-root>/panel-ui/src/muiTheme.ts`  
+**Cron (reference):** `<repo-root>/panel-ui/src/shells/user/cron/`  
+**Databases (reference):** `<repo-root>/panel-ui/src/shells/user/databases/`  
+**SSH Keys (reference):** `<repo-root>/panel-ui/src/shells/user/ssh-keys/`  
+**SearchableTable:** `<repo-root>/panel-ui/src/components/SearchableTable.tsx`

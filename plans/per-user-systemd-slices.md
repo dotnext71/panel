@@ -455,7 +455,7 @@ Mark the work shipped; update authoritative docs; record learnings.
 1. `docs/BLUEPRINT.md`: add new §4.11 "Per-user systemd slices" summarizing what ships (files, services, API, UI) with cross-refs to ADR-0025 and runbook.
 2. `docs/adr/0023-m9-php-fpm-pool-manager.md`: add an "Amended 2026-04-18" note at top pointing at ADR-0025 for the runtime placement change.
 3. `docs/runbooks/per-user-slices.md`: flesh out diagnosis scripts — `systemd-cgls`, `systemctl status dotnext-fpm@<user>`, `systemctl show dotnext-user-<user>.slice`.
-4. Update memory files in `/home/shuki/.claude/projects/-home-shuki-projects-dotnext2/memory/`:
+4. Update memory files in `/home/alice/.claude/projects/<cbm-project-id>/memory/`:
    - `MEMORY.md`: add entry for per-user slices.
    - New `project_per_user_slices.md`.
 5. No code changes.

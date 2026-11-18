@@ -157,7 +157,7 @@ Rate-limit overrides on domains are intentionally absent — if per-domain custo
 Request:
 ```json
 {
-  "username": "shuki",
+  "username": "alice",
   "disk_quota_mb": 5120,
   "cpu_quota_percent": 200,
   "memory_limit_mb": 4096,
@@ -167,7 +167,7 @@ Request:
 }
 ```
 
-Drop-in rendered at `/etc/systemd/system/dotnext-user-shuki.slice.d/limits.conf`:
+Drop-in rendered at `/etc/systemd/system/dotnext-user-alice.slice.d/limits.conf`:
 ```ini
 [Slice]
 CPUQuota=200%
@@ -178,13 +178,13 @@ IOWriteBandwidthMax=/ 50M
 TasksMax=500
 ```
 
-Disk quota via `setquota -u shuki 5242880 5242880 0 0 /home` (blocks in 1KB units, explicit mount path). The `/home` arg is resolved at agent startup by `limits.QuotaMount()` via `/proc/mounts` lookup — NEVER use `-a` (would hit wrong mount on multi-partition hosts).
+Disk quota via `setquota -u alice 5242880 5242880 0 0 /home` (blocks in 1KB units, explicit mount path). The `/home` arg is resolved at agent startup by `limits.QuotaMount()` via `/proc/mounts` lookup — NEVER use `-a` (would hit wrong mount on multi-partition hosts).
 
 Response:
 ```json
 {
-  "username": "shuki",
-  "dropin_path": "/etc/systemd/system/dotnext-user-shuki.slice.d/limits.conf",
+  "username": "alice",
+  "dropin_path": "/etc/systemd/system/dotnext-user-alice.slice.d/limits.conf",
   "cgroup_applied": true,
   "quota_applied": true,
   "no_change": false
@@ -195,12 +195,12 @@ If `cgroup_applied=true` but `quota_applied=false`, the caller sees the partial-
 
 ### 5.2 `user.limits.report`
 
-Request: `{"username": "shuki"}`
+Request: `{"username": "alice"}`
 
 Response:
 ```json
 {
-  "username": "shuki",
+  "username": "alice",
   "disk": {"used_kb": 1048576, "limit_kb": 5242880},
   "memory": {"current_bytes": 2147483648, "max_bytes": 4294967296},
   "cpu": {"usage_nsec": 123456789012, "quota_percent": 200},
@@ -211,7 +211,7 @@ Response:
 
 ### 5.3 `user.limits.clear`
 
-Request: `{"username": "shuki"}`. Removes drop-in (`rm` + `daemon-reload`) and calls `setquota -u shuki 0 0 0 0 <home_mount>`. Idempotent.
+Request: `{"username": "alice"}`. Removes drop-in (`rm` + `daemon-reload`) and calls `setquota -u alice 0 0 0 0 <home_mount>`. Idempotent.
 
 ---
 

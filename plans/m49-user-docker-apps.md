@@ -286,9 +286,9 @@ POST   /docker-apps/:id/backup          own only; destination MUST be tenant-own
 
 ### Phase 0 — cgroup-nesting spike on mx — ✅ PASS (run 2026-06-21, Docker 29.5.3, systemd driver, cgroup v2)
 **Result: the architecture holds. §5 stands — no per-app accounting needed.** Evidence:
-- A rootful container launched with `--cgroup-parent=dotnext-user-shukivaknin.slice`
+- A rootful container launched with `--cgroup-parent=dotnext-user-alicebob.slice`
   nests as a systemd **scope**, not a raw dir:
-  `/dotnext.slice/dotnext-user.slice/dotnext-user-shukivaknin.slice/docker-<id>.scope`.
+  `/dotnext.slice/dotnext-user.slice/dotnext-user-alicebob.slice/docker-<id>.scope`.
 - **Survives `systemctl daemon-reload`** — systemd does NOT evict the docker
   scope (the eviction fear was the gating risk; disproven). The systemd cgroup
   driver makes the container a scope unit systemd itself manages.

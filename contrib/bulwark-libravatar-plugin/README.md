@@ -6,7 +6,7 @@ now lives in Bulwark's plugin marketplace repo, submitted as a PR:
 **https://github.com/bulwarkmail/plugins/pull/3**
 
 Source on the fork:
-https://github.com/shukiv/plugins/tree/add-libravatar-plugin/libravatar
+https://github.com/dotnext71/plugins/tree/add-libravatar-plugin/libravatar
 
 ## Background
 

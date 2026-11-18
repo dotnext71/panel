@@ -174,8 +174,8 @@ ALTER TABLE server_settings
   },
   "user": {
     "id": "01KQ…",
-    "username": "shukivaknin",
-    "email": "shukivaknin@gmail.com",
+    "username": "alicebob",
+    "email": "alicebob@gmail.com",
     "uid_at_source": 1001,
     "is_admin": false
   },
@@ -187,7 +187,7 @@ ALTER TABLE server_settings
   },
   "stages": [
     { "name": "home",      "status": "ok",      "tag": "stage=home",     "warnings": [] },
-    { "name": "databases", "status": "ok",      "tag": "stage=db",       "items": ["shukiv_wp"], "warnings": [] },
+    { "name": "databases", "status": "ok",      "tag": "stage=db",       "items": ["alice_wp"], "warnings": [] },
     { "name": "mailboxes", "status": "skipped", "tag": "stage=mail",     "warnings": ["stalwart_down"] },
     { "name": "dns",       "status": "ok",      "tag": "stage=dns",      "items": ["example.com"] },
     { "name": "cron",      "status": "ok",      "tag": "stage=cron" },
@@ -450,7 +450,7 @@ type backupRestoreParams struct {
 
 **Verification:**
 - Playwright spec at `panel-ui/tests/e2e/admin-backups.spec.ts`:
-  1. Create backup for user `shukivaknin` → assert job appears with status=queued.
+  1. Create backup for user `alicebob` → assert job appears with status=queued.
   2. Wait up to 60s for status=succeeded.
   3. Click Download → file downloads, magic bytes check `28 b5 2f fd` (zstd).
   4. Restore to a different user-id → wait succeeded → assert /home/<new-user> populated.
@@ -473,7 +473,7 @@ type backupRestoreParams struct {
 Self-backup uses identical worker. Difference: Auth claim must match `target_user_id`; cross-user GET returns 404 not 403.
 
 **Verification:**
-- Playwright user-shell spec: log in as `shukivaknin` → click Generate → wait succeeded → download.
+- Playwright user-shell spec: log in as `alicebob` → click Generate → wait succeeded → download.
 - Cross-user attempt: `alice` GET /me/backups/<bob's job-id> → 404.
 - Concurrency: two rapid clicks → first 200, second 409 with running job_id.
 

@@ -1,7 +1,7 @@
 # Blueprint: Per-user mail message backup + restore (JMAP Maildir)
 
 **Status**: proposed (ADR-0123, amends ADR-0122)
-**Owner**: shukiv
+**Owner**: the dotNext team
 **Goal**: historical mail messages restore on a per-account restore,
 multi-tenant-safe, reusing the existing import path.
 

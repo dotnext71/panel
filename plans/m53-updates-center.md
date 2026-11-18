@@ -19,7 +19,7 @@ update card → System Packages table (with **security severity** badge) →
    auto-applies ONLY if admin opts in (default OFF — bad self-update bricks
    the panel).
 2. **Changelog source** = *GitHub releases API* — `api.github.com/repos/
-   shukiv/dotnext-panel/releases` (public mirror, no auth, 200). Caveat: 0
+   dotnext71/panel/releases` (public mirror, no auth, 200). Caveat: 0
    releases today → empty-state until we cut releases. Cache in DB, TTL 6h.
 3. **Severity** = *apt security-suite tag* (coarse, zero deps). `apt list
    --upgradable` already shows the target suite in the `name/SUITE` token

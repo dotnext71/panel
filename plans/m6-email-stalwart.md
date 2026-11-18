@@ -1,12 +1,12 @@
 # Plan: M6 — Email via Stalwart Mail Server
 
 **Status:** Draft (2026-04-21). Rework in progress (v0.16 pivot, 2026-04-21 pm). See REWORK preamble below.
-**Owner:** shuki
+**Owner:** the dotNext team
 **Scope:** M6 per `docs/BLUEPRINT.md` §4.? (currently listed as PLANNED).
 **Depends on:** M1 ✅ (users), M2 ✅ (domains + nginx), M4 ✅ (DNS zones via PowerDNS), M7 ✅ (shadow-password + SSO pattern), M9.5 ✅ (per-user slices — Roundcube PHP app consumes this), M20 ✅ (Kratos — webmail SSO handoff).
 **Next migration:** `000054_create_mailboxes` (single migration groups 4 new columns + 2 tables; see step 1).
 **ADRs:** `0041-m6-mail-storage-rocksdb` (amended), `0042-m6-sql-directory-mailboxes-table` (amended), `0043-m6-dkim-key-rotation-policy`, `0044-m6-imap-migrate-deferred-to-m15`, **`0045-m6-stalwart-v016-pivot` (NEW — supersedes TOML-based sections of 0041)**.
-**Working directory:** `/home/shuki/projects/dotnext2-c` — branch `m6/email-stalwart` (this plan lives on that branch).
+**Working directory:** `<repo-root>-c` — branch `m6/email-stalwart` (this plan lives on that branch).
 **Baseline commit at plan time:** `44fdafc` (two commits ahead of `main`; rebase before dispatch).
 
 ---
@@ -72,7 +72,7 @@ this plan (step deliverables), ADRs 0041 + 0042 (amendment notes), ADR-0045 (new
 - **CI:** Gitea Actions runs `.gitea/workflows/ci.yml` on every push + PR (3 parallel jobs: Go tests + vet, vitest, Playwright E2E). Do not push to a branch without ensuring the three checks go green before asking for review — `act_runner` is host-mode and sometimes restarts.
 - **Go style:** `gofmt` + `go vet`; table-driven tests; `go test -race -count=1 ./...` must stay green. Handlers follow the `api.*HandlerConfig` injection pattern (see `panel-api/internal/api/databases.go`).
 - **Migrations:** golang-migrate, both `.up.sql` and `.down.sql`. Schema defaults live in SQL, not Go. Down migration must not silently drop data; drop the new table only.
-- **Agent wire:** NDJSON over UDS at `/run/dotnext/agent.sock`, `Default.Register("<command>", handler)` pattern in `panel-agent/internal/commands/`. Response struct JSON tags must match what the panel unmarshals **verbatim** — see `~/.claude/projects/-home-shuki-projects-dotnext2/memory/feedback_cross_boundary_contracts.md`. For every new command add a golden fixture in `testdata/` that both panel unmarshal + agent marshal round-trip (`panel-api/internal/agent/php_ext_contract_test.go` is the shape to copy).
+- **Agent wire:** NDJSON over UDS at `/run/dotnext/agent.sock`, `Default.Register("<command>", handler)` pattern in `panel-agent/internal/commands/`. Response struct JSON tags must match what the panel unmarshals **verbatim** — see `~/.claude/projects/<cbm-project-id>/memory/feedback_cross_boundary_contracts.md`. For every new command add a golden fixture in `testdata/` that both panel unmarshal + agent marshal round-trip (`panel-api/internal/agent/php_ext_contract_test.go` is the shape to copy).
 - **Installer helpers:** `_log` / `_ok` / `_warn` / `_err` only in `install.sh` (see `feedback_install_sh_logger`). Extend the tiny-logger block if needed, don't invent helpers.
 - **Installer is truth:** every required postcondition (systemd mask, perms, group membership) goes into `install.sh` (see `feedback_install_sh_is_truth`). No separate cutover CLIs that only run on the dev host.
 - **Shared code that both panel-api and panel-agent import** goes at repo root `internal/<package>/` (Go internal-rule; `internal/phpext/`, `internal/cronvalidate/`, `internal/filesafe/` are the precedent). For M6 this means `internal/mailaddr/` (email-address canonicalisation + validation, used by both the API handler and the agent JMAP call) and `internal/dkim/` (keygen + DNS-record rendering).
@@ -729,7 +729,7 @@ Each sub-agent dispatched for a step MUST:
 
 ## 6. Post-review operator decisions (2026-04-21)
 
-Operator (shuki) confirmed the §7 open questions with these choices; plan already reflects them:
+The operator confirmed the §7 open questions with these choices; plan already reflects them:
 
 1. **Webmail:** Bulwark 1.4.14 (not Roundcube). Step 8 fully rewritten for Next.js + JMAP. Single Node service on 127.0.0.1:3000, no per-user PHP-FPM, no separate webmail database. AGPL-v3 license trade-off noted in ADR-0041.
 2. **DKIM key type:** Ed25519 (not RSA-2048). Step 1 & 3 DKIM keygen switched to `crypto/ed25519`; DNS TXT record format updated to `k=ed25519`; ADR-0043 records the RFC 8463 compatibility trade-off and the RSA-2048 fallback-selector escape hatch for corporate-receiver delivery issues.

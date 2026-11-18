@@ -190,7 +190,7 @@ ${AGENT_EXEC} systemctl --user show -p ExecMainStatus -p InactiveExitTimestamp d
 - **Step 1**: ADR committed; sections for Context/Decision/Alternatives/Consequences present; lists ADR-0025 as predecessor.
 - **Step 2**: `go test ./panel-api/internal/repository/... -run CronJob` green; migration applied + rolled back cleanly on dev.
 - **Step 3**: `go test ./panel-api/internal/cronvalidate/... -count=1` green; ≥20 table rows covering injection, traversal, unicode, empty, allowlisted happy paths; `FuzzValidateCommand` target compiles and runs ≥10k iterations without crash. `ValidateCommand` returns parsed argv slice (not just error).
-- **Step 4**: Agent unit test of command dispatch; manual smoke on dev host creating/removing a test job for user `shuki` (proves `sudo -u <user> … systemctl --user` primary path works); `cron-precheck` helper installed by `install.sh` and refuses out-of-tree paths.
+- **Step 4**: Agent unit test of command dispatch; manual smoke on dev host creating/removing a test job for user `alice` (proves `sudo -u <user> … systemctl --user` primary path works); `cron-precheck` helper installed by `install.sh` and refuses out-of-tree paths.
 - **Step 5**: API integration tests green; reconciler test with mocked agent asserts orphan file deletion path fires.
 - **Step 6**: `npm run build` green; manual click-through in dev session.
 - **Step 7**: Playwright E2E green in CI (uses `page.waitForFunction(..., { timeout: 360_000 })` to allow ≥5 min for `last_run_at` population); runbook committed; BLUEPRINT changelog row added; memory index entry `project_m8_cron.md` written.

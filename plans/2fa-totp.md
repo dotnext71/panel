@@ -3,7 +3,7 @@
 **Status:** Draft (rewritten 2026-05-07 from bespoke-JWT plan to
 Kratos-native). Old plan predated M20 Kratos cutover and would have
 duplicated auth surface.
-**Owner:** shuki
+**Owner:** the dotNext team
 **Goal.** Every account that logs in with password can opt into TOTP
 as a second factor. Lookup-secret recovery codes recover from a lost
 phone. Admin break-glass CLI login is unaffected (escape hatch).

@@ -150,7 +150,7 @@ user@host` succeeds for the SFTP gateway.
 ### Step 5: bootstrap script + runbook update
 
 **Files:**
-- Update `/home/shuki/dotnext-test-bootstrap.sh` (and the mx copy)
+- Update `/home/alice/dotnext-test-bootstrap.sh` (and the mx copy)
   to use the new CLIs instead of the "TODO via UI" stub.
 - `plans/m41-operator-cli-extensions-runbook.md` covers:
   - command surface table (every flag, every subcommand)

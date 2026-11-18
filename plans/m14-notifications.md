@@ -505,7 +505,7 @@ Parallel windows:
 ## Cold-start cheat sheet
 
 ```bash
-cd /home/shuki/projects/dotnext2
+cd <repo-root>
 git fetch origin main && git checkout -b feat/m14-db-notifications origin/main
 # read plans/m14-notifications.md Step 1, then implement. Commit on branch.
 # merge to main after each step is green + tested on VM.

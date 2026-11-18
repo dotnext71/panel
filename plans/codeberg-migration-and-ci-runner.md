@@ -57,9 +57,9 @@ it. We are moving OFF it.
 
 ## 2. Prerequisites & credentials
 
-- **Working copy:** `/home/shuki/projects/dotnext2` (this repo). Default branch
+- **Working copy:** `<repo-root>` (this repo). Default branch
   `main`.
-- **Codeberg account:** `shukivaknin` (id 1023186, shukivaknin@gmail.com).
+- **Codeberg account:** `alicebob` (id 1023186, alicebob@gmail.com).
 - **Codeberg API token:** in `~/cred.md`, line `codeberg API Key:`. Read it at
   runtime; NEVER hardcode it into a file, commit, or log. Extract with:
   ```bash
@@ -101,7 +101,7 @@ it. We are moving OFF it.
 ## 4. Current in-flight state you must know
 
 - **Remotes today:** `origin` = dead Gitea (`gitea:dotnext-panel/dotnext.git`
-  push alias, port 2222), `github` = `git@github.com:shukiv/dotnext-panel.git`
+  push alias, port 2222), `github` = `git@github.com:dotnext71/panel.git`
   (public mirror). You will ADD a `codeberg` remote.
 - **Unmerged PR branches** exist locally and on the remotes (e.g.
   `chore/ci-optimize`, `fix/apparmor-dbus-service-state`,
@@ -140,8 +140,8 @@ tags. Reversible, no pipeline impact.
    push or an SSH key the operator adds to Codeberg. Token-URL example (do NOT
    commit the URL):
    ```bash
-   cd /home/shuki/projects/dotnext2
-   git remote add codeberg "https://shukivaknin:${CB}@codeberg.org/dotnext-panel/dotnext.git"
+   cd <repo-root>
+   git remote add codeberg "https://alicebob:${CB}@codeberg.org/dotnext-panel/dotnext.git"
    git push codeberg --all
    git push codeberg --tags
    ```

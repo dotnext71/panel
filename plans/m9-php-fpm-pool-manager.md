@@ -353,7 +353,7 @@ patterns are in `database_user_grant_repository.go`.
 ### Verification
 
 ```bash
-cd /home/shuki/projects/dotnext2/panel-api
+cd <repo-root>/panel-api
 go build ./...
 go test -race ./internal/repository/... -run "PHPPool|PhpPool"
 go vet ./...
@@ -441,7 +441,7 @@ Go's `text/template`.
 ### Verification
 
 ```bash
-cd /home/shuki/projects/dotnext2/panel-agent
+cd <repo-root>/panel-agent
 go build ./...
 go test -race ./internal/commands/... -run "PHPPool|PhpPool|PHPVersion"
 go vet ./...
@@ -512,7 +512,7 @@ inline (see `databases.go` for the pattern).
 ### Verification
 
 ```bash
-cd /home/shuki/projects/dotnext2/panel-api
+cd <repo-root>/panel-api
 go build ./...
 go test -race ./internal/api/... -run "PHPPool|PhpPool|DomainPHPPool"
 go vet ./...
@@ -572,11 +572,11 @@ entirely (static-only site).
 ### Verification
 
 ```bash
-cd /home/shuki/projects/dotnext2/panel-agent
+cd <repo-root>/panel-agent
 go build ./...
 go test -race ./internal/commands/... -run "DomainCreate|Template"
 go vet ./...
-cd /home/shuki/projects/dotnext2/panel-api
+cd <repo-root>/panel-api
 go test -race ./internal/reconciler/...
 ```
 
@@ -645,7 +645,7 @@ converges DB → system state for domains and DNS. Add a new pass
 ### Verification
 
 ```bash
-cd /home/shuki/projects/dotnext2/panel-api
+cd <repo-root>/panel-api
 go test -race ./internal/reconciler/... -run "PHPPool"
 ```
 
@@ -704,7 +704,7 @@ guide: match existing Refine resource patterns (see
 ### Verification
 
 ```bash
-cd /home/shuki/projects/dotnext2/panel-ui
+cd <repo-root>/panel-ui
 npx tsc -b
 npx vite build
 ```

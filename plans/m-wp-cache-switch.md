@@ -43,7 +43,7 @@ perms first (`stat /run/redis/redis.sock`, group membership).
 ## LIVE FINDING (2026-06-23) — isolation is genuinely blocking
 
 `stat /run/redis/redis.sock` → `srw-rw---- redis:dotnext-sockets`. A real tenant
-(`shukivaknin`, groups: own + www-data + dotnext-sftp) is **NOT** in
+(`alicebob`, groups: own + www-data + dotnext-sftp) is **NOT** in
 `dotnext-sockets` → `redis-cli PING` as that tenant = **"Permission denied"**.
 The `default` Redis user is `nopass ~* &* +@all` (no AUTH, full access), and this
 is the SAME Redis the M14 notification dispatcher uses (Redis Streams).

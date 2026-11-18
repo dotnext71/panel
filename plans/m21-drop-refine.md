@@ -1,7 +1,7 @@
 # M21 — Drop Refine (keep AntD, Kratos, react-router)
 
 **Status:** Blueprint — not yet dispatched. Wave A is dispatchable.
-**Branch:** `m21/drop-refine` (wt-b's worktree, `/home/shuki/projects/dotnext2-b/`).
+**Branch:** `m21/drop-refine` (wt-b's worktree, `<repo-root>/`).
 **Goal:** Remove the `@refinedev/*` packages. Replace them with a mainstream 2026 stack: React + AntD + TanStack Query + react-router v7 + a hand-rolled URL-synced table hook. The panel stays behaviorally identical; the chrome (auto-breadcrumbs, sticky save bar, auto-heading, auto-card container) goes away and pages render as plain AntD compositions.
 
 **Do NOT touch Kratos.** `Login.tsx`'s Kratos browser-flow handling, `kratos.ts`, `apiClient.ts`'s cookie mode, and the `/.ory/*` nginx proxy all stay unchanged. M20's auth model is load-bearing for M16 Hydra and is not part of this work.
@@ -359,7 +359,7 @@ These assertions MUST still pass end-to-end through the rewrite. wt-b should run
 
 ## 4. Dispatcher coordination
 
-- Branch: `m21/drop-refine` on wt-b (`/home/shuki/projects/dotnext2-b/`)
+- Branch: `m21/drop-refine` on wt-b (`<repo-root>/`)
 - Merge model: each wave lands on main via fast-forward from wt-b's branch. Run `~/projects/merge.sh` after each wave's commit-and-push.
 - Rebase onto main before final merge. If wt-a ships Wave F (Automation API) during M21, expect conflicts ONLY in `src/shells/*/applications/*` — coordinate by hand.
 - No cherry-picking across waves. Each wave is a self-contained commit (or commit pair if Wave A's 3 steps want separate commits).

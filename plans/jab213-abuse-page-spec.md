@@ -77,5 +77,5 @@ For non-abuse matters (support, sales, security vulnerability disclosure), see
 ## Acceptance check
 
 `curl -s https://dotnext-panel.com/abuse | grep -i abuse@` returns the address,
-and the footer of the homepage links to `/abuse`. Tell Shuki when it's live so
+and the footer of the homepage links to `/abuse`. Tell the dotNext team when it's live so
 the PSL reviewers find it on first look.

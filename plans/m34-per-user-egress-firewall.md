@@ -556,7 +556,7 @@ has landed `000103` (memory: `feedback_merge_audit_migrations`).
   "kind": "egress_drop_burst",
   "severity": "warn",
   "user_id": "01KQ...",
-  "username": "shukivaknin",
+  "username": "alicebob",
   "drops_in_window_60s": 142,
   "threshold": 50,
   "since": "2026-04-29T...",

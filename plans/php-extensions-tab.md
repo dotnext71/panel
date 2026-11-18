@@ -61,7 +61,7 @@ xdebug xml xmlreader xmlwriter xsl yaml zip
 ## 2. Pre-flight (dispatcher, once)
 
 ```bash
-cd /home/shuki/projects/dotnext2-b
+cd <repo-root>-b
 git status                                              # must be clean
 git fetch origin
 git log --oneline origin/main..HEAD | head             # your branch diff vs origin

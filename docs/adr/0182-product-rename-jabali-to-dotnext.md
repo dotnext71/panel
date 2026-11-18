@@ -48,7 +48,8 @@ The home repository is also moving to **https://github.com/dotnext71/panel**.
    still written as "Jabali Panel" in provenance documents (this ADR,
    `THIRD_PARTY_NOTICES`, `docs/LICENSING_AUDIT.md`, historical ADRs and
    `CHANGELOG.md`), because those records describe the upstream project, not us.
-   `jabali2` / `shukivaknin` appear only where git history is quoted.
+   The legacy repository name and account appear only where git history
+   is quoted.
 
 4. **Deliberately preserved (compatibility surface).** These spellings must NOT
    be "cleaned up"; each one is load-bearing:

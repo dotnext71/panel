@@ -1,12 +1,12 @@
 # Plan: M10 — WordPress 1-click install, delete, clone
 
 **Status:** Shipped (commits 85ed8b4…main HEAD). Final SHA pointer: this commit.
-**Owner:** shuki
+**Owner:** the dotNext team
 **Scope:** M10 per `docs/BLUEPRINT.md`
 **Depends on:** M2 ✅ (domains), M7 ✅ (databases + users + grants), M9 ✅ (per-user PHP-FPM pools), ADR-0025 ✅ (per-user slices)
 **Next migration:** `000033_create_wordpress_installs`
 **Next ADR:** `0026-m10-wordpress-installs`
-**Working directory:** `/home/shuki/projects/dotnext2` — branch `main`
+**Working directory:** `<repo-root>` — branch `main`
 
 ---
 
@@ -17,7 +17,7 @@
 - **Commit rhythm:** one commit per step, pushed directly to `main`. No PR workflow (gitea remote, no `gh` CLI). Conventional commits (`feat`, `fix`, `refactor`, `docs`, `test`).
 - **Go style:** `gofmt` + `go vet`; table-driven tests; `go test -race -count=1 ./...` must stay green. Handlers follow the existing `api.*HandlerConfig` injection pattern.
 - **Migrations:** golang-migrate, both `.up.sql` and `.down.sql`. Schema defaults live in SQL, not Go. Down migration must not silently drop data; drop the new table only.
-- **Agent wire:** NDJSON over UDS, `Default.Register("<command>", handler)` pattern in `panel-agent/internal/commands/`. Response struct JSON tags must match what the panel unmarshals **verbatim** — see `~/.claude/projects/-home-shuki-projects-dotnext2/memory/feedback_cross_boundary_contracts.md`. For every new command, add a golden fixture in `testdata/` that both the panel unmarshal test and the agent marshal test read, or boot a real agent over a temp UDS in the test.
+- **Agent wire:** NDJSON over UDS, `Default.Register("<command>", handler)` pattern in `panel-agent/internal/commands/`. Response struct JSON tags must match what the panel unmarshals **verbatim** — see `~/.claude/projects/<cbm-project-id>/memory/feedback_cross_boundary_contracts.md`. For every new command, add a golden fixture in `testdata/` that both the panel unmarshal test and the agent marshal test read, or boot a real agent over a temp UDS in the test.
 - **Helpers:** `_log` / `_ok` / `_warn` / `_die` only in `install.sh`. There is no `_error` — past installer steps broke because of that.
 - **umask gotcha:** `cat > file` inherits systemd's umask (0077/0027). Follow any `cat >` that targets a file read by another user with explicit `chown` + `chmod`.
 - **HTTPS only:** the panel is https-only on `:8443`; nginx default vhost listens on `:443` with the panel TLS cert. Do not introduce any plaintext or port-80-only paths.
@@ -90,7 +90,7 @@ Dispatch **Wave A first**, review both, then Wave B, and so on. Do **not** dispa
 Run all of these before committing any step:
 
 ```bash
-cd /home/shuki/projects/dotnext2
+cd <repo-root>
 go build ./...                                 # compiles
 go test -race -count=1 ./...                   # unit + integration green
 cd panel-ui && npx tsc -b                      # UI typecheck green
@@ -188,8 +188,8 @@ feat(m10): wordpress_installs schema + model + repository (ADR-0026)
 3. Request shape (`panel-agent/internal/commands/wordpress_install.go`):
    ```go
    type wordpressInstallReq struct {
-       OSUser      string `json:"os_user"`       // domain owner (e.g. "shuki")
-       Docroot     string `json:"docroot"`        // /home/shuki/domains/example.com/public_html
+       OSUser      string `json:"os_user"`       // domain owner (e.g. "alice")
+       Docroot     string `json:"docroot"`        // /home/alice/domains/example.com/public_html
        DBName      string `json:"db_name"`        // already-provisioned
        DBUser      string `json:"db_user"`        // already-provisioned
        DBPassword  string `json:"db_password"`    // plaintext, single-use

@@ -132,8 +132,8 @@ This is the seam: pages call `ownerResourceCrumbs(...)`, never hand-build URLs.
 ### 3.5 Breadcrumb-context preservation
 
 Owner-scoped pages keep `?user_id=` in their internal links so the breadcrumb
-trail and the back-path survive a hop (Users › shukivaknin › Domains →
-DomainEdit keeps the `Users › shukivaknin › Domains` prefix). DomainEdit reads
+trail and the back-path survive a hop (Users › alicebob › Domains →
+DomainEdit keeps the `Users › alicebob › Domains` prefix). DomainEdit reads
 `?user_id` (or falls back to the domain's own `user_id`) to build the prefix.
 
 ## 4. Backend (read-side filter wave)
@@ -177,8 +177,8 @@ shows recent rows per card, not just counts). DECIDED, not deferred.
   ADDED `useSearchParams` param** — it must compose with each list's existing
   search/sort/filter state (e.g. DomainList already manages `_filters` + search
   + sort); read+merge, never replace the param set.
-- **Wave E (E2E + ADR):** Playwright — `Users → shukivaknin → Domains →
-  example.com → Owner: shukivaknin` round trip + the sibling-dropdown pivot;
+- **Wave E (E2E + ADR):** Playwright — `Users → alicebob → Domains →
+  example.com → Owner: alicebob` round trip + the sibling-dropdown pivot;
   write ADR-0152. Depends on all.
 
 A → (B ‖ start) → C → D → E. B is parallelizable with A.

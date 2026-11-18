@@ -609,7 +609,7 @@ VM smoke: full five-feature walkthrough on `ssh -p 2222 root@192.168.100.150`. S
    - `cd panel-agent && TMPDIR=/var/tmp go vet ./... && go build ./... && go test -race ./...`
    - `cd panel-ui && npm run typecheck && npm run build && npm test`
 7. Open PR from `m27/crowdsec-extensions` → `main`. Commit: `docs(m27): runbook + E2E + VM smoke`.
-8. Update `~/.claude/projects/-home-shuki-projects-dotnext2/memory/MEMORY.md` with the M27 SHIPPED entry.
+8. Update `~/.claude/projects/<cbm-project-id>/memory/MEMORY.md` with the M27 SHIPPED entry.
 
 ### Verify
 

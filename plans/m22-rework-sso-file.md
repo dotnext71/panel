@@ -1,7 +1,7 @@
 # M22 Rework — Self-Deleting SSO File (Installatron / Softaculous Pattern)
 
 **Date**: 2026-04-21
-**Author**: shuki + Claude
+**Author**: alice + Claude
 **Status**: Blueprint — adversarial review folded in 2026-04-21, dispatchable
 **Supersedes**: M22 magic-link (mu-plugin + HMAC-callback) shipped 2026-04-21
 **Related ADRs**: 0039 (M22 magic-link, will be marked SUPERSEDED), 0040 (M22 SSO file design — this rework, NEW)

@@ -145,7 +145,7 @@ Commands:
 
 ### Verify
 ```bash
-cd /home/shuki/projects/dotnext2
+cd <repo-root>
 go test ./panel-agent/internal/commands/... -run Security -count=1
 # smoke via socket on VM:
 echo '{"id":"1","command":"security.ufw.status","params":{}}' | socat -t5 - UNIX-CONNECT:/run/dotnext/agent.sock
@@ -183,7 +183,7 @@ Two locations:
 
 ### Verify
 ```bash
-cd /home/shuki/projects/dotnext2 && go test ./panel-api/internal/repository/... -count=1
+cd <repo-root> && go test ./panel-api/internal/repository/... -count=1
 # then on VM:
 mariadb dotnext_panel -e "DESCRIBE domains" | grep modsec_enabled   # → column exists
 mariadb dotnext_panel -e "SELECT key_name, value FROM server_settings WHERE key_name LIKE 'modsec%'"   # 2 rows
@@ -246,7 +246,7 @@ Wire contract for `modsec/domains` — must use the same envelope as `/admin/ips
 
 ### Verify
 ```bash
-cd /home/shuki/projects/dotnext2 && go test ./panel-api/internal/api/... -run Security -count=1
+cd <repo-root> && go test ./panel-api/internal/api/... -run Security -count=1
 # smoke via curl (grab an admin session from Kratos first):
 curl -sk -H "Cookie: ory_kratos_session=..." https://dotnext-panel.local:8443/api/v1/admin/security/ufw/status | jq
 ```
@@ -287,7 +287,7 @@ Thread the two flags (domain.modsec_enabled + server_settings.modsec_global_enab
 
 ### Verify
 ```bash
-cd /home/shuki/projects/dotnext2 && go test ./panel-api/internal/nginxgen/... -count=1
+cd <repo-root> && go test ./panel-api/internal/nginxgen/... -count=1
 # on VM, enable global + one domain:
 curl -X PUT -d '{"engine_mode":"On","paranoia":1}' .../admin/security/modsec/global
 curl -X PATCH -d '{"modsec_enabled":true}' .../admin/security/modsec/domains/<id>
@@ -476,7 +476,7 @@ Parallel windows:
 
 ```bash
 # Where do I start? → Step 1. Read the Context brief, run Tasks, verify.
-cd /home/shuki/projects/dotnext2
+cd <repo-root>
 git checkout main && git pull
 git checkout -b feat/m26-security-foundation
 # ... implement Step 1 ...

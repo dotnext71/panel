@@ -1,7 +1,7 @@
 # M16 Rollback + M22 Magic-Link Admin Login — Plan
 
 **Date**: 2026-04-21
-**Author**: shuki + Claude
+**Author**: alice + Claude
 **Status**: dispatchable
 **Related ADRs**: 0036 (M16 — to be marked SUPERSEDED), 0038 (M16 rollback rationale, new), 0039 (M22 magic-link design, new)
 
