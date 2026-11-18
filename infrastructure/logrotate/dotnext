@@ -1,0 +1,173 @@
+# DotNext — logrotate drop-in.
+#
+# Covers log files NOT covered by the upstream package logrotate drop-
+# ins (nginx ships its own; letsencrypt ships its own). Each dotnext-
+# managed log path gets:
+#   - daily rotation
+#   - keep 14 days of history
+#   - gzip after 1 day
+#   - missingok / notifempty so a fresh host without the file doesn't
+#     log a rotation failure
+#   - copytruncate where the writer holds the file open (php-fpm) so
+#     we don't have to reload the daemon
+#
+# Re-running install.sh re-installs this file unchanged; logrotate
+# itself picks it up on its daily cron tick.
+
+/var/log/dotnext-bulwark/*.log
+/var/log/dotnext-panel/*.log
+/var/log/dotnext-agent/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}
+
+# /var/log/dotnext/ — canonical dir for the install log and any future
+# operator-facing log a dotnext script writes locally. Every install.sh run
+# and every `dotnext update` step appends to install.log; 8 weeks of history
+# is long enough to diagnose a regression after a quiet box. maxsize rotates
+# it early if something (a module-install retry loop, GH #2056) floods it.
+# nocreate because install.sh creates install.log, mode 0600, when it next
+# runs; no process keeps it open, so no copytruncate.
+/var/log/dotnext/*.log {
+    weekly
+    maxsize 50M
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    nocreate
+    su root adm
+}
+
+# M45 root-terminal asciinema recordings (ADR-0096). One .cast per
+# session, root:root 0640 (written by the root agent PTY broker). These
+# can contain secrets the admin typed — keep 26 weeks for incident
+# response, compress aggressively, never recreate (agent makes each
+# file on session open). su root root because the files are root-owned,
+# not adm-group like the install logs.
+/var/log/dotnext/terminal/*.cast {
+    weekly
+    rotate 26
+    compress
+    delaycompress
+    missingok
+    notifempty
+    nocreate
+    su root root
+}
+
+/var/log/php-fpm-*.log {
+    daily
+    rotate 14
+    maxsize 50M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    # su root root, NOT www-data. This glob covers per-tenant pool logs, and
+    # each is owned <tenant>:<tenant> mode 0640 — www-data is neither the
+    # owner nor in the group, so dropping to it means logrotate cannot open
+    # any of them:
+    #
+    #   error: error opening /var/log/php-fpm-cybe2e.log: Permission denied
+    #
+    # Every per-tenant log therefore never rotated (maxsize 50M never
+    # applied) and logrotate.service exited 1 on every daily run, which also
+    # masked any other rotation problem behind a permanently-failed unit.
+    # Only php-fpm-pma.log, which happens to be www-data-owned, worked.
+    #
+    # su exists to protect against a log DIRECTORY writable by a non-root
+    # user; /var/log is root:root 0755, so root here is both correct and no
+    # weaker. copytruncate means no new file is created in place, so the live
+    # log keeps its tenant ownership and php-fpm keeps writing — verified on
+    # a host: after rotation the original was still <tenant>:<tenant>.
+    su root root
+    postrotate
+        # PHP-FPM reopens its log on SIGUSR1 — sends to every running
+        # version on the host. copytruncate already keeps the writes
+        # flowing during rotation so SIGUSR1 is belt-and-braces only.
+        for unit in /etc/init.d/php*-fpm; do
+            [ -x "$unit" ] && systemctl kill -s USR1 "$(basename "$unit")" 2>/dev/null || true
+        done
+    endscript
+}
+
+# maldet (LMD) ships its OWN /etc/logrotate.d/maldet naming event_log,
+# clamscan_log and audit.log explicitly — the same "package already owns these"
+# situation as the nginx note below, and it bites harder. This block used to
+# open with a `/var/log/maldet/*.log` glob, which matches audit.log. logrotate
+# reads /etc/logrotate.d in name order, so `dotnext` claimed it first and
+# `maldet` then collided:
+#
+#   error: maldet:1 duplicate log entry for /var/log/maldet/audit.log
+#   error: found error in file maldet, skipping
+#   logrotate.service: Main process exited, code=exited, status=1/FAILURE
+#
+# A duplicate is a HARD error: logrotate discards maldet's ENTIRE config, so
+# event_log and clamscan_log — which only that file covers — stopped rotating,
+# and the unit sat permanently failed, masking every other rotation error
+# behind noise operators learn to ignore (JAB-181).
+#
+# So claim ONLY what maldet's own config misses: inotify_log has no .log suffix,
+# so its glob never matched it (JAB-154), and the real-time monitor (M33) holds
+# the file open while appending — copytruncate keeps that fd writing across the
+# rotation. Do not re-add a *.log glob here; it overlaps audit.log again.
+/var/log/maldet/inotify_log {
+    daily
+    rotate 30
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}
+
+/var/log/aide/*.log {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}
+
+# nginx logs (JAB-104): every log dotnext points nginx at lives under
+# /var/log/nginx/*.log —
+#   default.access.log        default.error.log
+#   dotnext-hostname.access.log dotnext-hostname.error.log
+#   dotnext-pma.access.log     dotnext-pma.error.log
+# The distro nginx package ships /etc/logrotate.d/nginx with a
+# `/var/log/nginx/*.log` glob (with the USR1 postrotate), which already
+# rotates ALL of the above — both the access AND error side. install.sh
+# never removes that drop-in, so we deliberately do NOT restate any
+# /var/log/nginx/* path here: a dotnext stanza would either duplicate the
+# distro glob (logrotate "duplicate log entry" noise) or, worse, cover only
+# one half of an access/error pair and create a false sense of coverage —
+# which is exactly the dotnext-pma.access-only stanza this comment replaced.
+
+# M8 per-user cron logs (#432). One subdir per hosting user under
+# /var/log/dotnext/cron/<user>/. maxsize caps a chatty cron from filling the
+# disk between daily ticks; rotate 7 + compress bounds retention. copytruncate
+# because the systemd-user cron writer keeps the file open.
+/var/log/dotnext/cron/*/*.log {
+    daily
+    rotate 7
+    maxsize 50M
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}

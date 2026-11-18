@@ -1,0 +1,212 @@
+package panelcmd
+
+import (
+	"testing"
+
+	"github.com/dotnext-panel/dotnext/internal/migrate/cpanel"
+
+	"github.com/dotnext-panel/dotnext/internal/models"
+)
+
+// The prune classifies "mail" as a cPanel service hostname because the IMPORTER
+// skips it — dotnext publishes its own mail A record when mail is enabled on the
+// domain. For zones that were imported BEFORE that filter existed, dotnext never
+// published one, so the imported CNAME is the only thing making the name
+// resolve.
+//
+// Measured on a live destination host: 69 of 71 migrated domains had their only
+// mail.<zone> record as that CNAME, and every one of those zones had
+// MX -> mail.<zone>. Pruning them would have made the MX target unresolvable,
+// and external senders cannot deliver to a domain whose MX does not resolve.
+//
+// That is a mail outage traded for a certificate cleanup. These tests pin the
+// refusal.
+
+func rec(name, typ, content string) models.DNSRecord {
+	return models.DNSRecord{Name: name, Type: typ, Content: content}
+}
+
+func TestWouldDanglingMX_ProductionShape(t *testing.T) {
+	// Verbatim from the live box: MX -> mail.example-r.com, and the only
+	// mail.example-r.com record is the imported CNAME to the apex.
+	recs := []models.DNSRecord{
+		rec("@", "MX", "mail.example-r.com"),
+		rec("mail", "CNAME", "example-r.com."),
+		rec("@", "A", "182.54.236.69"),
+		rec("cpanel", "A", "1.2.3.4"),
+		rec("webmail", "A", "1.2.3.4"),
+	}
+	mx, addressed := mailRoutingNames("example-r.com", recs)
+
+	if !mx["mail"] {
+		t.Fatalf("MX target not recognised: %v", mx)
+	}
+	if !wouldDanglingMX("mail", "CNAME", mx, addressed) {
+		t.Error("mail CNAME is the MX target's only record — deleting it breaks inbound mail")
+	}
+	// The genuinely dead cPanel names stay deletable; refusing everything would
+	// make the command useless and leave the certificate problem unfixed.
+	for _, n := range []string{"cpanel", "webmail"} {
+		if wouldDanglingMX(n, "A", mx, addressed) {
+			t.Errorf("%s is not an MX target and must still be pruned", n)
+		}
+	}
+}
+
+func TestWouldDanglingMX_SafeOnceDotNextPublishesItsOwn(t *testing.T) {
+	// Mail enabled in the panel: dotnext publishes mail A -> the box. Now the
+	// imported CNAME is genuinely redundant and can go.
+	recs := []models.DNSRecord{
+		rec("@", "MX", "mail.example.com."),
+		rec("mail", "A", "203.0.113.10"),
+		rec("mail", "CNAME", "example.com."),
+	}
+	mx, addressed := mailRoutingNames("example.com", recs)
+
+	if !addressed["mail"] {
+		t.Fatal("mail A record not seen")
+	}
+	if wouldDanglingMX("mail", "CNAME", mx, addressed) {
+		t.Error("with a surviving mail A record the CNAME is redundant and prunable")
+	}
+	// The address record itself is never a service-hostname match, but if it
+	// ever became one, deleting the MX target's address is the same outage.
+	if !wouldDanglingMX("mail", "A", mx, addressed) {
+		t.Error("deleting an MX target's address record must be refused")
+	}
+}
+
+func TestMailRoutingNames_MXContentForms(t *testing.T) {
+	// MX content varies: trailing dot or not, and some backends prepend the
+	// priority into the content. Missing the target means the guard silently
+	// stops guarding — the failure mode is deletion, so parsing must be liberal.
+	cases := []struct {
+		name    string
+		content string
+	}{
+		{"bare", "mail.example.com"},
+		{"trailing dot", "mail.example.com."},
+		{"priority prefixed", "10 mail.example.com."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			mx, _ := mailRoutingNames("example.com", []models.DNSRecord{rec("@", "MX", tc.content)})
+			if !mx["mail"] {
+				t.Fatalf("target not parsed from %q: %v", tc.content, mx)
+			}
+		})
+	}
+}
+
+func TestMailRoutingNames_ForeignAndApexTargets(t *testing.T) {
+	// An MX pointing outside the zone cannot be broken by deleting a record IN
+	// the zone, so it must not make local names undeletable.
+	mx, _ := mailRoutingNames("example.com", []models.DNSRecord{
+		rec("@", "MX", "aspmx.l.google.com."),
+		rec("webmail", "A", "1.2.3.4"),
+	})
+	if len(mx) != 0 {
+		t.Errorf("foreign MX target should register no local label, got %v", mx)
+	}
+	if wouldDanglingMX("webmail", "A", mx, map[string]bool{"webmail": true}) {
+		t.Error("Google-hosted mail must not block pruning local cPanel names")
+	}
+
+	// An apex MX target is recorded as "@" so an apex A is never pruned by a
+	// future predicate change.
+	mx2, _ := mailRoutingNames("example.com", []models.DNSRecord{rec("@", "MX", "example.com.")})
+	if !mx2["@"] {
+		t.Errorf("apex MX target not recorded: %v", mx2)
+	}
+}
+
+// A second box's shape, which is NOT the first one's and nearly caused a second
+// outage on the same day.
+//
+// There the mail record is an A, not a CNAME, and it is still the MX target:
+//
+//	example-c.co.il        MX  ->  mail.example-c.co.il
+//	mail.example-c.co.il   A   ->  <the box>
+//
+// 26 domains on that host looked like this, including the server's OWN mail
+// hostname. The pre-flight query that cleared the box asked for domains that had
+// a mail record but NO address record — which by construction excludes exactly
+// this set, so it returned zero and read as "safe".
+//
+// That is why the refusal belongs in the command and not in an operator's query:
+// the command sees the records it is about to delete, and cannot ask the wrong
+// question about them.
+func TestWouldDanglingMX_AddressRecordIsTheMXTarget(t *testing.T) {
+	recs := []models.DNSRecord{
+		rec("@", "MX", "mail.example-c.co.il"),
+		rec("mail", "A", "182.54.236.64"),
+		rec("autoconfig", "CNAME", "example-c.co.il."),
+		rec("autodiscover", "CNAME", "example-c.co.il."),
+	}
+	mx, addressed := mailRoutingNames("example-c.co.il", recs)
+
+	if !wouldDanglingMX("mail", "A", mx, addressed) {
+		t.Error("mail A is the MX target and its only provider — deleting it breaks inbound mail")
+	}
+	// The autodiscovery CNAMEs are not MX targets and stay prunable; refusing
+	// them too would leave the certificate-SAN problem unfixed.
+	for _, n := range []string{"autoconfig", "autodiscover"} {
+		if wouldDanglingMX(n, "CNAME", mx, addressed) {
+			t.Errorf("%s is not an MX target and must still be pruned", n)
+		}
+	}
+}
+
+// The second flaw of the same kind, found on a production host the same night.
+//
+// #941 stopped the prune deleting a record an MX depended on. It did not stop it
+// deleting records dotnext PUBLISHED. On that box every one of the 26 zones the
+// prune targeted was mail-enabled, and the whole remaining target set was ours:
+// 26 mail A records (held back by the dangling-MX guard) and 51
+// autoconfig/autodiscover CNAMEs pointing at them, at dnscompile's own TTL.
+// The honest answer for that box was ZERO records to remove, not 51 — and
+// nothing would have republished them, because the zone push is a full replace
+// from dns_records.
+//
+// Root cause is the same as #941: IsMailInfraRecordName was written to tell the
+// IMPORTER "skip these, we publish our own". Reused as a cleanup on a domain
+// where we did publish our own, it selects exactly those for deletion.
+func TestDotNextPublishesMailRecord(t *testing.T) {
+	// The hostname records dnscompile writes for a mail-enabled domain. These
+	// are the ones actually at risk: the prune only ever classifies A, AAAA and
+	// CNAME (IsMailInfraRecordName returns false for anything else), so MX, the
+	// DKIM/SPF/DMARC/TLS-RPT TXTs and the client-service SRVs are outside its
+	// reach entirely and were never in danger.
+	for _, tc := range []struct{ name, typ string }{
+		{"mail", "A"}, {"mail", "AAAA"},
+		{"autoconfig", "CNAME"}, {"autodiscover", "CNAME"},
+	} {
+		if !dotnextPublishesMailRecord(tc.name, tc.typ) {
+			t.Errorf("%s %s is published by dotnext and must never be pruned on a mail-enabled zone", tc.name, tc.typ)
+		}
+	}
+
+	// Pin that boundary, so widening the classifier later cannot silently pull
+	// DKIM or the MX into the deletion set without this failing first.
+	for _, tc := range []struct{ name, typ string }{
+		{"@", "MX"}, {"_dmarc", "TXT"}, {"dotnext._domainkey", "TXT"}, {"_imaps._tcp", "SRV"},
+	} {
+		if cpanel.IsMailInfraRecordName(tc.name, tc.typ) {
+			t.Errorf("%s %s is outside the prune's scope; classifying it brings it into the deletion set", tc.name, tc.typ)
+		}
+	}
+
+	// webmail is the exception: dotnext publishes no webmail record, so an
+	// imported one is still a dead cPanel hostname inflating the certificate
+	// SAN. Excluding it too would leave the problem this command exists for.
+	if dotnextPublishesMailRecord("webmail", "A") {
+		t.Error("webmail is not published by dotnext and must stay prunable")
+	}
+
+	// The pure cPanel names are not mail infrastructure at all.
+	for _, n := range []string{"cpanel", "whm", "webdisk", "ftp", "cpcalendars", "cpcontacts"} {
+		if dotnextPublishesMailRecord(n, "A") {
+			t.Errorf("%s is a cPanel service hostname, not ours", n)
+		}
+	}
+}

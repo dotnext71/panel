@@ -1,0 +1,4 @@
+# Cloudflare Pages (or any host honoring _redirects): serve the TUI bootstrap at
+# the short URL so `curl -fsSL https://get.dotnext-panel.com | bash` launches the
+# installer. Source of truth = GITHUB. 200 = rewrite (proxy body, no hop).
+/*  https://raw.githubusercontent.com/dotnext71/panel/main/bootstrap.sh  200

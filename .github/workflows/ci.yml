@@ -1,0 +1,447 @@
+# GitHub Actions CI — gate every PR against the test suite. Ported from the
+# retired Codeberg/Forgejo workflow when the project moved its source-of-truth
+# to GitHub (dotnext-panel/dotnext).
+#
+# JAB-238: PR CI runs on GITHUB-HOSTED runners (ubuntu-latest). This workflow
+# executes arbitrary code from any fork PR, and the repo is public — running
+# that code on persistent project infrastructure would be remote code
+# execution on our own box. Ephemeral GitHub-hosted runners make every PR run
+# single-use and isolated. Every workflow runs on GitHub-hosted runners;
+# the release and hotfix builds pin ubuntu-24.04 (see release.yml).
+#
+# Jobs (all run unconditionally): Go tests+vet, install.sh lint, dotnext-cache
+# plugin tests, vitest+eslint, secret scan (gitleaks), new dependency
+# vulnerabilities (OSV-Scanner, PRs only), static analysis (gosec,
+# Semgrep; advisory), Playwright E2E.
+
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# JAB-247 follow-up: PR CI executes fork code — the token must be read-only.
+permissions:
+  contents: read
+
+# Per-ref concurrency: PR pushes auto-supersede stale in-flight runs; main runs
+# always run to completion (each commit is an authoritative green/red record).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  GO_VERSION: "1.27.3"
+  NODE_VERSION: "20"
+
+jobs:
+  action-pins:
+    name: action refs pinned to SHAs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: reject mutable action references
+        # JAB-247: every `uses:` must be a local path (./) or pinned to a
+        # full 40-char commit SHA with the version in a trailing comment.
+        # A mutable tag/branch in a write-capable or trusted-runner
+        # workflow becomes arbitrary code the moment upstream moves it.
+        run: |
+          bad=$(grep -rnE '^[[:space:]]*(-[[:space:]]+)?uses:' .github/workflows .github/actions 2>/dev/null \
+            | grep -vE 'uses:[[:space:]]+\./' \
+            | grep -vE '@[0-9a-f]{40}([[:space:]]+#.*)?$' || true)
+          if [ -n "$bad" ]; then
+            echo "$bad"
+            echo "::error::mutable GitHub Action reference(s) found — pin to a full-length commit SHA (JAB-247)"
+            exit 1
+          fi
+          echo "all action references SHA-pinned"
+
+  sigbase-rule-gate:
+    name: signature-base rule gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Gate rule-pin bumps (JAB-248)
+        # The SIGBASE_COMMIT pin bump IS the rule-promotion step; this
+        # job is its promotion test: the pinned ruleset must compile
+        # under yara-x, and must not broad-match this repo's tree (the
+        # known-clean corpus). Skipped when the PR doesn't touch the pin.
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          if [ -n "$BASE_REF" ] && ! git diff "origin/$BASE_REF"...HEAD -- install.sh | grep -q SIGBASE_COMMIT; then
+            echo "SIGBASE_COMMIT unchanged — gate skipped"
+            exit 0
+          fi
+          scripts/check-sigbase-rules.sh install.sh .
+
+  go:
+    name: Go tests + vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # cache: true — ephemeral GitHub-hosted runners start cold every
+          # run (JAB-238); the tar-layer conflict noted here historically
+          # was specific to the old runner's persistent $GOMODCACHE.
+          cache: true
+      - name: go vet
+        run: make vet
+      - name: go test -race
+        run: make test
+
+  # Apply the full embedded migration chain to a real MariaDB so a migration
+  # that only fails against a production-shaped schema (e.g. server_settings at
+  # InnoDB's 65535-byte row ceiling → ERROR 1118) goes red on the PR instead of
+  # bricking a host on boot. GH #1766 / #1773. The job body is the reusable
+  # migrations-gate workflow, shared verbatim with release.yml's pre-publish
+  # gate so the two can never drift apart.
+  migrations:
+    uses: ./.github/workflows/migrations-gate.yml
+    with:
+      go-version: "1.27.3"
+
+  govulncheck:
+    name: govulncheck (Go stdlib + deps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      # JAB-185. Nothing in CI reported the dependency surface before this, so a
+      # stale toolchain or a vulnerable module could ship unnoticed -- the manual
+      # 2026-07-31 run found 32 reachable advisories against the go.mod floor,
+      # including archive/tar reachable from migration restore and encoding/pem
+      # reachable from SSL cert upload.
+      #
+      # continue-on-error while the backlog is worked down: the report is the
+      # point, and a red build on day one just trains people to ignore it. Flip
+      # this to a hard gate once the run is clean (tracked in JAB-185).
+      - name: govulncheck
+        continue-on-error: true
+        run: |
+          go run golang.org/x/vuln/cmd/govulncheck@latest ./... 2>&1 | tee govulncheck.txt
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo '### govulncheck'
+            echo
+            if grep -q 'No vulnerabilities found' govulncheck.txt 2>/dev/null; then
+              echo 'No known vulnerabilities.'
+            else
+              echo '```'
+              grep -E '^Vulnerability #|^    [A-Z]|Found in:|Fixed in:' govulncheck.txt 2>/dev/null \
+                | grep -vE 'Example traces|More info' | head -100
+              echo '```'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Secret scan of the commits a PR adds. A token, key or password pushed to
+  # this public repo can be read by anyone the moment it lands, so this is a
+  # gate. Only the PR's own commits are scanned, so the test fixtures and doc
+  # placeholders already in the tree are not reported again; --redact keeps a
+  # found value out of the public job log.
+  #
+  # A false positive: add a `gitleaks:allow` comment on that line, or add the
+  # finding's fingerprint from the job summary to .gitleaksignore.
+  secrets:
+    name: secret scan (gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Install gitleaks
+        run: go install github.com/zricethezav/gitleaks/v8@v8.30.1
+      - name: gitleaks
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # A PR: its commits. workflow_dispatch has no PR: the last commit.
+          if [ -n "$BASE" ]; then range="$BASE..HEAD"; else range="-1 HEAD"; fi
+          "$(go env GOPATH)/bin/gitleaks" git --no-banner --redact --exit-code 1 \
+            --report-format json --report-path gitleaks.json \
+            --log-opts="$range" .
+      - name: Summarise
+        if: always()
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          try:
+              found = json.load(open("gitleaks.json"))
+          except (OSError, ValueError):
+              found = None
+          print("### Secret scan (gitleaks)\n")
+          if found is None:
+              print("No report: the scan did not run.")
+          elif not found:
+              print("No secrets in this PR's commits.")
+          else:
+              print("| File | Line | Rule | Commit | Fingerprint |")
+              print("|---|---|---|---|---|")
+              for f in found:
+                  print(f"| `{f['File']}` | {f['StartLine']} | {f['RuleID']} | {f['Commit'][:9]} | `{f['Fingerprint']}` |")
+              print("\nRemove the secret from the PR's commits and rotate it. A false positive: add a `gitleaks:allow` comment on the line, or its fingerprint to `.gitleaksignore`.")
+          EOF
+
+  # Known vulnerabilities in the Go modules and npm packages, from OSV. A PR
+  # fails when it adds one rated high or critical (7.0 or more), or one with
+  # no rating, which Go's advisories never have. Base and head are scanned in
+  # the same run against the same database, so only a dependency the PR adds
+  # or changes can fail it; the ones already on main are listed, not counted
+  # (govulncheck above reports those).
+  vulns:
+    name: new dependency vulnerabilities (OSV-Scanner)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
+      - name: Install OSV-Scanner
+        # Needs a Go at least as new as osv-scanner's go.mod (1.27.0 for v2.7.0);
+        # this job builds it with GO_VERSION.
+        run: go install github.com/google/osv-scanner/v2/cmd/osv-scanner@v2.7.0
+      - name: Scan base and head
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          osv="$(go env GOPATH)/bin/osv-scanner"
+          scan() { # <checkout> <report>
+            local args=() rc=0
+            for f in go.mod support-claim/go.mod frontend/package-lock.json; do
+              if [ -f "$1/$f" ]; then args+=(-L "$1/$f"); fi
+            done
+            "$osv" scan source --format json "${args[@]}" > "$2" || rc=$?
+            # 0: nothing found, 1: something found; anything else failed.
+            [ "$rc" -le 1 ]
+          }
+          scan . head.json
+          git worktree add -q "$RUNNER_TEMP/base" "$BASE"
+          scan "$RUNNER_TEMP/base" base.json
+      - name: Compare
+        run: |
+          set -o pipefail
+          python3 scripts/check-new-vulns.py base.json head.json | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Static analysis, advisory: gosec over the Go code and Semgrep CE (Go,
+  # TypeScript and React rules) over the tree. Neither fails the build yet:
+  # gosec reports about 1,300 findings on main, many of them expected in an
+  # agent that runs commands and writes files as root. The job summary gives
+  # each tool's totals and, for a PR, the findings on the lines it adds.
+  sast:
+    name: static analysis (gosec, Semgrep), advisory
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: gosec
+        continue-on-error: true
+        run: |
+          go install github.com/securego/gosec/v2/cmd/gosec@v2.29.0
+          "$(go env GOPATH)/bin/gosec" -quiet -no-fail -fmt json -out gosec.json ./...
+      - name: Semgrep
+        continue-on-error: true
+        run: |
+          python3 -m venv "$RUNNER_TEMP/semgrep"
+          "$RUNNER_TEMP/semgrep/bin/pip" install --quiet semgrep==1.182.0
+          "$RUNNER_TEMP/semgrep/bin/semgrep" scan --metrics=off --quiet \
+            --config p/golang --config p/typescript --config p/react \
+            --json --output semgrep.json .
+      - name: Summarise
+        if: always()
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: python3 scripts/sast-summary.py gosec.json semgrep.json >> "$GITHUB_STEP_SUMMARY"
+
+  install-sh-lint:
+    name: install.sh phantom-function lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run lint
+        run: tools/lint-install-sh.sh
+
+  install-sh-tests:
+    name: install.sh regression tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Run install/tests
+        # These are per-incident regression guards (OOM sizing, /etc/hosts
+        # loopback shadow, pdns upstream, socket helpers). They existed but
+        # were never wired into CI, so two of them sat red on main for weeks
+        # while asserting nothing. A guard nobody runs is not a guard.
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          failed=0
+          for t in tests/installer/*.sh; do
+            echo "::group::$(basename "$t")"
+            if bash "$t"; then
+              echo "::endgroup::"
+            else
+              echo "::endgroup::"
+              echo "::error file=$t::$(basename "$t") failed"
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+  wp-plugin-tests:
+    name: dotnext-cache plugin tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Lint, version check, tests
+        # The bundled WordPress plugin is copied to every cache-enabled site,
+        # but its tests only ran by hand. Run them here in in-memory mode
+        # (the live-Redis checks skip without DOTNEXT_TEST_REDIS); they pass
+        # with no PHP extensions, so the runner's stock PHP is enough.
+        working-directory: wp-plugins/dotnext-cache
+        run: |
+          set -euo pipefail
+          php --version | head -1
+          find . -name '*.php' -print0 | xargs -0 -n1 php -l >/dev/null
+          bash bin/check-version.sh
+          failed=0
+          for t in tests/test-*.php; do
+            echo "::group::$(basename "$t")"
+            if php "$t"; then
+              echo "::endgroup::"
+            else
+              echo "::endgroup::"
+              echo "::error file=wp-plugins/dotnext-cache/$t::$(basename "$t") failed"
+              failed=1
+            fi
+          done
+          exit "$failed"
+
+  pinned-downloads:
+    name: install.sh pinned downloads published
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify pinned versions resolve to published artifacts
+        # Fails if any pinned third-party version in install.sh is AHEAD of
+        # upstream (tagged/not-yet-published) — catches the GH #670 class in the
+        # PR that bumps the pin, instead of bricking real installs.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: scripts/check-pinned-downloads.sh install.sh
+
+  demo-guard:
+    name: demo anti-leak guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      # JAB-159: the security guarantee for merging demo code to main is that a
+      # production (untagged) build physically excludes it. Assert the prod
+      # binary carries no demo_mode marker while the -tags demo build does, and
+      # run the demo write-block test under the demo tag.
+      - name: prod build excludes demo, demo build includes it
+        run: make demo-guard
+
+  ui-unit:
+    name: frontend unit tests (vitest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install deps
+        run: cd frontend && npm ci --no-audit --no-fund --prefer-offline
+      - name: eslint
+        run: cd frontend && npm run lint
+      - name: vitest
+        run: cd frontend && npm test
+      # Production build gate. vitest uses its own transform and never runs the
+      # rollup/vite production build, so a build-only break — e.g. a bumped
+      # dep that breaks `monaco-editor/…editor.worker?worker` resolution — passes
+      # vitest yet fails the real build (caught only at deploy). The Playwright
+      # job does build the SPA, but that job is slower and can be skipped under
+      # runner contention; gate the build here too so it fails fast and always.
+      - name: build (production)
+        run: cd frontend && NODE_OPTIONS=--max-old-space-size=4096 npm run build
+      # JAB-159 phase 2: the prod SPA (just built above) must not contain the
+      # demo UI; a VITE_DEMO=1 build must. `dotnext-demo-banner` is a DemoBanner
+      # string literal (CSS var + style id) that survives minification.
+      - name: demo UI stripped from prod bundle, present in demo build (JAB-159)
+        run: |
+          cd frontend
+          if grep -rq 'dotnext-demo-' dist/; then echo 'FAIL: demo UI leaked into prod bundle'; exit 1; fi
+          VITE_DEMO=1 NODE_OPTIONS=--max-old-space-size=4096 npm run build
+          if ! grep -rq 'dotnext-demo-' dist/; then echo 'FAIL: demo build missing demo UI'; exit 1; fi
+          echo 'SPA demo-gate OK: prod excludes demo UI, demo build includes it'
+
+  e2e:
+    name: Playwright E2E
+    runs-on: ubuntu-latest
+    # Serialize e2e across ALL refs — port 4173 is a host-level resource.
+    concurrency:
+      group: e2e-port-4173
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install deps
+        run: cd frontend && npm ci --no-audit --no-fund --prefer-offline
+      - name: Install Playwright Chromium
+        run: cd frontend && npx playwright install chromium
+      - name: Build SPA
+        run: cd frontend && npm run build
+      - name: Free port 4173
+        run: |
+          pgrep -a -f "vite preview" || echo "(none)"
+          pkill -9 -f "vite preview" 2>/dev/null || true
+          for i in $(seq 1 10); do
+            ss -tln | grep -q ":4173 " || break
+            sleep 1
+          done
+          if ss -tln | grep -q ":4173 "; then
+            echo "ERROR: port 4173 still in use after kill + 10s wait"
+            exit 1
+          fi
+      - name: Playwright
+        run: cd frontend && npx playwright test --project=chromium --reporter=list
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: playwright-report
+          path: |
+            frontend/test-results/
+            frontend/playwright-report/
+          retention-days: 7

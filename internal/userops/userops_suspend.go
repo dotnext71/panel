@@ -1,0 +1,232 @@
+package userops
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/dotnext-panel/dotnext/internal/ftpsync"
+	"github.com/dotnext-panel/dotnext/internal/kratosclient"
+	"github.com/dotnext-panel/dotnext/internal/models"
+)
+
+// SuspendResult / UnsuspendResult carry the domain count + best-effort,
+// step-named warnings so the REST handler maps them 1:1 to its response keys
+// (kratos_warning / domain_warning / os_warning / mail_warning) and the CLI can
+// print them.
+type SuspendResult struct {
+	AlreadySuspended bool
+	DomainsDisabled  int64
+	KratosWarning    string
+	DomainWarning    string
+	OSWarning        string
+	MailWarning      string
+}
+
+type UnsuspendResult struct {
+	AlreadyActive  bool
+	DomainsEnabled int64
+	KratosWarning  string
+	DomainWarning  string
+	OSWarning      string
+	MailWarning    string
+}
+
+// flushMailLogins clears Stalwart's HTTP login cache after a suspension
+// change. Stalwart's queryLogin refuses a mailbox whose domain's owner is
+// suspended, but webmail and JMAP logins are answered from that cache, which
+// has no expiry: without the flush a suspended user's mailboxes kept webmail.
+// On unsuspend it lets them back in at once. Returns a warning, "" on success.
+func flushMailLogins(ctx context.Context, d Deps) string {
+	if d.Agent == nil {
+		return "mail_login_cache_flush_skipped: agent unavailable"
+	}
+	fctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if _, err := d.Agent.Call(fctx, "mail.auth_cache.flush", map[string]any{}); err != nil {
+		return "mail_login_cache_flush_failed: " + err.Error()
+	}
+	return ""
+}
+
+// kratosStateWarning applies a Kratos identity state change (+ invalidate on
+// suspend) and returns a warning string, "" on success. Shared by both paths.
+func kratosStateWarning(ctx context.Context, d Deps, identityID, state string, invalidate bool) string {
+	if d.KratosClient == nil {
+		return "kratos_client_unavailable"
+	}
+	warn := ""
+	if err := d.KratosClient.SetIdentityState(ctx, identityID, state); err != nil {
+		if errors.Is(err, kratosclient.ErrIdentityNotFound) {
+			warn = "kratos_identity_not_found"
+		} else {
+			warn = "kratos_state_patch_failed: " + err.Error()
+		}
+	}
+	if invalidate {
+		d.KratosClient.InvalidateIdentity(identityID)
+	}
+	return warn
+}
+
+// Suspend applies the full suspend cascade shared by the admin REST handler
+// (POST /admin/users/:id/suspend) and the `dotnext user suspend` CLI (JAB-127):
+//
+//  1. users.suspended = 1 (+ reason) — the load-bearing login gate.
+//  2. Kratos identity -> inactive + invalidate cached whoami (best-effort).
+//  3. disable every owned domain.
+//  4. stop the tenant's Docker apps (best-effort).
+//  5. agent user.suspend — OS: drop from dotnext-sftp group + lock password.
+//  6. flush Stalwart's login cache, so the mailboxes leave webmail at once.
+//
+// Refusing to suspend an admin is the CALLER's responsibility. Steps 2-6 are
+// best-effort: a failure becomes a warning, never a hard error, because step 1
+// already denies access.
+func Suspend(ctx context.Context, d Deps, user *models.User, reason string) (SuspendResult, error) {
+	res := SuspendResult{}
+	if d.Users == nil || user == nil {
+		return res, errors.New("userops.Suspend: users repo + user required")
+	}
+	if user.Suspended {
+		res.AlreadySuspended = true
+		return res, nil
+	}
+
+	if err := d.Users.SetSuspended(ctx, user.ID, true, reason); err != nil {
+		return res, fmt.Errorf("suspend db write: %w", err)
+	}
+
+	if user.KratosIdentityID != nil && *user.KratosIdentityID != "" {
+		res.KratosWarning = kratosStateWarning(ctx, d, *user.KratosIdentityID, "inactive", true)
+	}
+
+	if d.Domains != nil {
+		if n, err := d.Domains.BulkSetEnabledByUserID(ctx, user.ID, false); err != nil {
+			res.DomainWarning = "domain_bulk_disable_failed: " + err.Error()
+		} else {
+			res.DomainsDisabled = n
+		}
+	}
+
+	if d.DockerApps != nil && d.Agent != nil {
+		if apps, aerr := d.DockerApps.ListByUserID(ctx, user.ID); aerr == nil {
+			for _, app := range apps {
+				actx, acancel := context.WithTimeout(ctx, 2*time.Minute)
+				if _, serr := d.Agent.Call(actx, "docker_app.stop", map[string]any{"slug": app.EffectiveSlug()}); serr != nil {
+					if d.Log != nil {
+						d.Log.Warn("suspend: docker_app.stop failed", "user_id", user.ID, "slug", app.EffectiveSlug(), "err", serr)
+					}
+				} else {
+					_ = d.DockerApps.UpdateStatus(actx, app.ID, models.DockerAppStatusStopped, nil)
+				}
+				acancel()
+			}
+		} else if d.Log != nil {
+			d.Log.Warn("suspend: list user docker apps failed", "user_id", user.ID, "err", aerr)
+		}
+	}
+
+	if user.Username != nil && *user.Username != "" && d.Agent != nil {
+		if _, err := d.Agent.Call(ctx, "user.suspend", map[string]any{"username": *user.Username}); err != nil {
+			res.OSWarning = "user_os_suspend_failed: " + err.Error()
+		}
+		// JAB-254: lock every FTP/SFTP subaccount alias immediately so a
+		// suspended owner's delegated credentials stop working at once,
+		// not on the next reconcile tick. The reconciler's owner-
+		// eligibility gate is the durable backstop and also handles
+		// restore-to-desired on unsuspension, so this is best-effort.
+		if _, err := d.Agent.Call(ctx, "ftpaccount.lock_tenant", map[string]any{"tenant_username": *user.Username}); err != nil {
+			if res.OSWarning == "" {
+				res.OSWarning = "ftp_alias_lock_failed: " + err.Error()
+			}
+		}
+		// AC4/AC5: re-render the sshd drop-in immediately so the suspension's
+		// eligibility clamp takes effect at once instead of waiting for the
+		// next reconcile tick (JAB-276). This is best-effort; reconciler
+		// converges if it fails.
+		ftpsync.SyncFtpHostAccess(ctx, d.Agent, d.FtpAccounts, d.Users, d.Packages, d.Log, *user.Username)
+	}
+
+	// The mail server checks the app passwords and API keys a mailbox made
+	// itself, not against the panel, so they kept working for a suspended
+	// user's mailboxes. Remove them before the login cache flush.
+	credWarning := sweepMailCredentials(ctx, d)
+	res.MailWarning = flushMailLogins(ctx, d)
+	if credWarning != "" {
+		if res.MailWarning != "" {
+			credWarning += "; " + res.MailWarning
+		}
+		res.MailWarning = credWarning
+	}
+	return res, nil
+}
+
+// sweepMailCredentials removes the mail server's app passwords and API keys
+// a mailbox may no longer use. Returns a warning, "" on success or when it is
+// not wired (the reconciler removes them on its next tick).
+func sweepMailCredentials(ctx context.Context, d Deps) string {
+	if d.MailCredentials == nil {
+		return ""
+	}
+	sctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	removed, err := d.MailCredentials.SweepMailCredentials(sctx)
+	log := d.Log
+	if log == nil {
+		log = slog.Default()
+	}
+	for _, rm := range removed {
+		log.Info("mail-credentials: removed a credential from a mail account",
+			"account", rm.Account, "type", rm.Type, "reason", rm.Reason, "door", "suspend")
+	}
+	if err != nil {
+		return "mail_credentials_sweep_failed: " + err.Error()
+	}
+	return ""
+}
+
+// Unsuspend reverses the cascade: flag off, Kratos active, domains re-enabled,
+// OS user unlocked. It does NOT restart Docker apps (matches the REST handler —
+// the operator restarts them deliberately). Best-effort on steps 2-4.
+func Unsuspend(ctx context.Context, d Deps, user *models.User) (UnsuspendResult, error) {
+	res := UnsuspendResult{}
+	if d.Users == nil || user == nil {
+		return res, errors.New("userops.Unsuspend: users repo + user required")
+	}
+	if !user.Suspended {
+		res.AlreadyActive = true
+		return res, nil
+	}
+
+	if err := d.Users.SetSuspended(ctx, user.ID, false, ""); err != nil {
+		return res, fmt.Errorf("unsuspend db write: %w", err)
+	}
+
+	if user.KratosIdentityID != nil && *user.KratosIdentityID != "" {
+		res.KratosWarning = kratosStateWarning(ctx, d, *user.KratosIdentityID, "active", false)
+	}
+
+	if d.Domains != nil {
+		if n, err := d.Domains.BulkSetEnabledByUserID(ctx, user.ID, true); err != nil {
+			res.DomainWarning = "domain_bulk_enable_failed: " + err.Error()
+		} else {
+			res.DomainsEnabled = n
+		}
+	}
+
+	if user.Username != nil && *user.Username != "" && d.Agent != nil {
+		if _, err := d.Agent.Call(ctx, "user.unsuspend", map[string]any{"username": *user.Username}); err != nil {
+			res.OSWarning = "user_os_unsuspend_failed: " + err.Error()
+		}
+		// AC4/AC5: re-render the sshd drop-in immediately so the unsuspension's
+		// eligibility expansion takes effect at once instead of waiting for the
+		// next reconcile tick (JAB-276). This is best-effort; reconciler
+		// converges if it fails.
+		ftpsync.SyncFtpHostAccess(ctx, d.Agent, d.FtpAccounts, d.Users, d.Packages, d.Log, *user.Username)
+	}
+
+	res.MailWarning = flushMailLogins(ctx, d)
+	return res, nil
+}

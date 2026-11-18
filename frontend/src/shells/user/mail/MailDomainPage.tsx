@@ -1,0 +1,203 @@
+// MailDomainPage — GH #1387 drill-down: Mail → Mail Domains → this domain →
+// accounts. Everything here is scoped to one domain (the :domainId route param,
+// resolved through the owner-scoped GET /domains/:id so a foreign id renders an
+// error, never another tenant's data). The account/domain tabs reuse the mail
+// tab components in their single-domain mode. Logs + Statistics scoping and the
+// retirement of the flat Mail page are a follow-up (PR-B).
+import { Alert, Button, Card, Skeleton, Space, Typography } from "antd";
+import { MailOutlined, PlusOutlined } from "@icons";
+import { useEffect, useState } from "react";
+import { useNavigate, useParams } from "react-router";
+
+import { useSetBreadcrumbs } from "../../../components/admin/BreadcrumbContext";
+import { useOneQuery } from "../../../hooks/useQueries";
+import { mailHostedElsewhere, type Domain } from "../../../components/domains/types";
+import { MailboxesTab } from "./tabs/MailboxesTab";
+import { GroupsTab } from "./tabs/GroupsTab";
+import { ForwardersTab } from "./tabs/ForwardersTab";
+import { SettingsTab } from "./tabs/SettingsTab";
+import { SharedFoldersTab } from "./tabs/SharedFoldersTab";
+import { SharedResourcesTab } from "./tabs/SharedResourcesTab";
+import { LogsTab } from "./tabs/LogsTab";
+import { StatisticsTab } from "./tabs/StatisticsTab";
+import { CreateMailboxWizardModal } from "./CreateMailboxWizardModal";
+
+// GH #1833: distribution lists have their own tab next to Forwarders; Groups
+// holds the Shared Workspace groups.
+const TAB_KEYS = [
+  "mailboxes",
+  "forwarders",
+  "lists",
+  "groups",
+  "shared",
+  "resources",
+  "settings",
+  "logs",
+  "statistics",
+] as const;
+type TabKey = (typeof TAB_KEYS)[number];
+const DEFAULT_TAB: TabKey = "mailboxes";
+
+// Tabs that moved: an old link or bookmark lands on the tab that holds the
+// setting now. GH #1915: the disclaimer lives on Settings. GH #1916: so does
+// the catch-all.
+const MOVED_TABS = new Map<string, TabKey>([
+  ["disclaimer", "settings"],
+  ["catchall", "settings"],
+]);
+
+// A domain whose mail is hosted elsewhere has only send-only accounts (#2491):
+// nothing arrives here, so the tabs about receiving mail don't apply. Settings
+// stays: on a mail-off domain it says to enable email first (GH #1628).
+const SEND_ONLY_TAB_KEYS: readonly TabKey[] = ["mailboxes", "settings", "logs", "statistics"];
+
+const TAB_LABELS: Record<TabKey, string> = {
+  mailboxes: "Accounts",
+  forwarders: "Forwarders",
+  lists: "Distribution lists",
+  groups: "Groups",
+  shared: "Shared Folders",
+  resources: "Shared Resources",
+  settings: "Settings",
+  logs: "Logs",
+  statistics: "Statistics",
+};
+
+export const MailDomainPage = () => {
+  const { domainId, tab } = useParams<{ domainId: string; tab?: string }>();
+  const navigate = useNavigate();
+  const [showCreateMailbox, setShowCreateMailbox] = useState(false);
+
+  const domainQ = useOneQuery<Domain>({ resource: "domains", id: domainId });
+  const sendOnly = domainQ.data ? mailHostedElsewhere(domainQ.data) : false;
+  const tabKeys: readonly TabKey[] = sendOnly ? SEND_ONLY_TAB_KEYS : TAB_KEYS;
+  const requestedKey: TabKey = (TAB_KEYS as readonly string[]).includes(tab ?? "")
+    ? (tab as TabKey)
+    : (MOVED_TABS.get(tab ?? "") ?? DEFAULT_TAB);
+  const activeKey: TabKey = tabKeys.includes(requestedKey) ? requestedKey : DEFAULT_TAB;
+
+  // Rewrite a moved tab's URL to its new home so the address bar and history
+  // match the tab shown. A tab the domain doesn't have (a send-only domain
+  // opened on Forwarders) lands on Accounts the same way.
+  useEffect(() => {
+    const moved = MOVED_TABS.get(tab ?? "");
+    if (moved) {
+      navigate(`/panel/mail-domains/${domainId}/${moved}`, { replace: true });
+    } else if (tab && activeKey !== tab && (TAB_KEYS as readonly string[]).includes(tab)) {
+      navigate(`/panel/mail-domains/${domainId}/${activeKey}`, { replace: true });
+    }
+  }, [tab, activeKey, domainId, navigate]);
+
+  // GH #1387 (johnnyq): the shell already renders ONE breadcrumb (RouteBreadcrumb,
+  // GH #455). Override it with the 3-level entity trail instead of rendering a
+  // second inline <Breadcrumb> — the drill used to show two trails with two
+  // different last crumbs (the raw :domainId vs the domain name).
+  const domainName = domainQ.data?.name;
+  useSetBreadcrumbs(
+    domainName
+      ? [
+          { title: "Dashboard", href: "/panel/dashboard" },
+          { title: "Mail Domains", href: "/panel/mail-domains" },
+          { title: domainName },
+        ]
+      : null,
+  );
+
+  const back = () => navigate("/panel/mail-domains");
+
+  if (domainQ.isLoading) {
+    return (
+      <div style={{ padding: 20 }}>
+        <Skeleton active />
+      </div>
+    );
+  }
+  if (domainQ.isError || !domainQ.data) {
+    // Owner-scoped GET /domains/:id returns 403/404 for a domain the caller does
+    // not own — surface it as an error, never a blank scoped view.
+    return (
+      <div style={{ padding: 20 }}>
+        <Alert
+          type="error"
+          showIcon
+          message="Domain not available"
+          description="This domain doesn't exist or you don't have access to it."
+          action={<Button onClick={back}>Back to Mail Domains</Button>}
+        />
+      </div>
+    );
+  }
+  const domain = domainQ.data;
+
+  const renderTab = () => {
+    switch (activeKey) {
+      case "mailboxes":
+        return <MailboxesTab domainId={domainId} />;
+      case "forwarders":
+        return <ForwardersTab domainId={domainId} />;
+      case "lists":
+        return <GroupsTab domainId={domainId} kind="distribution" />;
+      case "groups":
+        return <GroupsTab domainId={domainId} kind="resource" />;
+      case "shared":
+        return <SharedFoldersTab domainId={domainId} />;
+      case "resources":
+        return <SharedResourcesTab domainId={domainId} />;
+      case "settings":
+        return <SettingsTab domainId={domainId} />;
+      case "logs":
+        return <LogsTab domainName={domain.name} />;
+      case "statistics":
+        return <StatisticsTab domainName={domain.name} />;
+    }
+  };
+
+  return (
+    <div style={{ padding: "20px" }}>
+      <Space
+        wrap
+        align="center"
+        style={{ marginBottom: 16, width: "100%", justifyContent: "space-between" }}
+      >
+        <Typography.Title level={3} style={{ margin: 0 }}>
+          <MailOutlined /> {domain.name}
+        </Typography.Title>
+        {/* GH #1387 (johnnyq): New Mailbox belongs to the Accounts (mailboxes)
+            view only — not the Mail Domains list, and not the settings tabs. */}
+        {activeKey === "mailboxes" && (
+          <Button type="primary" icon={<PlusOutlined />} onClick={() => setShowCreateMailbox(true)}>
+            New Mailbox
+          </Button>
+        )}
+      </Space>
+
+      {sendOnly && (
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+          message="Mail for this domain is hosted elsewhere"
+          description="Accounts here can only send: they log in to SMTP to send mail, and receive no mail here."
+        />
+      )}
+
+      <Card
+        tabList={tabKeys.map((k) => ({ key: k, tab: TAB_LABELS[k] }))}
+        activeTabKey={activeKey}
+        onTabChange={(k) => navigate(`/panel/mail-domains/${domainId}/${k}`)}
+      >
+        {renderTab()}
+      </Card>
+
+      {showCreateMailbox && (
+        <CreateMailboxWizardModal
+          open={showCreateMailbox}
+          domains={[{ id: domain.id, name: domain.name, sendOnly }]}
+          lockDomain
+          onCancel={() => setShowCreateMailbox(false)}
+          onCreated={() => setShowCreateMailbox(false)}
+        />
+      )}
+    </div>
+  );
+};

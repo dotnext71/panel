@@ -1,0 +1,60 @@
+slug: rocketchat
+popularity: 68
+name: Rocket.Chat
+tags: ["Communication"]
+version: "8.9.0"
+description: |
+  Self-hosted team chat / collaboration platform — channels, DMs, voice/
+  video, file sharing, and integrations. Two services: the Rocket.Chat
+  Node.js app and a MongoDB 8.0 (single-node replica set, required by
+  Rocket.Chat). An admin account is pre-created at first boot. An install
+  from before 2026-08 has its MongoDB 6.0 database copied to MongoDB 8.0
+  once, on its next update.
+icon: icon.svg
+upstream: https://github.com/RocketChat/Rocket.Chat
+documentation: https://docs.rocket.chat/
+
+image_channel: rocketchat/rocket.chat:8.9.0@sha256:295f7b2c38fc3542024dc404f887eb2e13276b66e5854d31d86bcd069f6ce6dc
+update_mode: manual
+# The MongoDB 6.0 copy reads mongo/, so the old containers must be stopped
+# before the new ones start.
+stop_before_recreate: true
+
+resources:
+  cpu: "2.0"
+  memory: "2g"
+  pids: 800
+
+volumes:
+  - name: uploads
+    container_path: /app/uploads
+  # MongoDB 8.0's database. mongo/ is the MongoDB 6.0 one an older install
+  # used; it is copied from once and then left for a rollback.
+  - name: mongo8
+    container_path: /data/db
+  - name: mongo
+    container_path: /data/db
+  - name: mongo-upgrade
+    container_path: /upgrade
+
+ports:
+  - name: http
+    container_port: 3000
+    protocol: tcp
+    default_enabled: true
+    default_bind: loopback
+    default_reverse_proxy: true
+    health_path: /api/info
+
+env:
+  - name: ROCKETCHAT_ADMIN_USERNAME
+    value: "dotnext"
+  - name: ROCKETCHAT_ADMIN_PASSWORD
+    secret: true
+    generate: password32
+  - name: ROCKETCHAT_ADMIN_EMAIL
+    value: "admin@example.com"
+
+# Operator-supplied SMTP (GH #322): auto-injects standard SMTP_* install fields;
+# compose maps them to this app's SMTP env.
+smtp: true

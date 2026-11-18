@@ -1,0 +1,320 @@
+// UserDashboard — the tenant landing view.
+//
+// Two-column Masonry layout: account / usage on one side, four
+// recent-rows tables (domains, mailboxes, applications, databases)
+// on the other. Cards pack height-balanced like the admin shell so a
+// long table doesn't leave whitespace next to a short one.
+import { useTranslation } from "react-i18next";
+import {
+  Button,
+  Card,
+  Col,
+  Masonry,
+  Row,
+  Space,
+  Table,
+  Typography,
+} from "antd";
+import { useEffect, useState } from "react";
+import { Link } from "react-router";
+import { useQuery } from "@tanstack/react-query";
+
+import {
+  GlobalOutlined,
+  MailOutlined,
+  AppstoreOutlined,
+  DatabaseOutlined,
+} from "@icons";
+
+import { apiClient } from "../../apiClient";
+import { useListQuery } from "../../hooks/useQueries";
+import type { Mailbox } from "../../hooks/useMailboxes";
+import { getIdentity, type Identity } from "../../identity";
+import { MyProfileUsageCard } from "./MyProfileUsageCard";
+import { useServerCapabilities } from "../../hooks/useServerCapabilities";
+import { StatCard } from "../../components/StatCard";
+
+const RECENT_LIMIT = 5;
+
+const formatCount = (n: number | undefined) =>
+  n == null ? "—" : n.toLocaleString();
+
+type DomainRow = {
+  id: string;
+  name: string;
+  email_enabled?: boolean;
+  created_at?: string;
+};
+type ApplicationRow = {
+  id: string;
+  app_type?: string;
+  domain_name?: string;
+  status?: string;
+  version?: string | null;
+};
+type DatabaseRow = {
+  id: string;
+  name: string;
+  created_at?: string;
+};
+type MailboxRow = Mailbox & { domain_name: string };
+
+export function UserDashboard() {
+  const { t } = useTranslation();
+  const [me, setMe] = useState<Identity | null>(null);
+
+  useEffect(() => {
+    getIdentity().then(setMe);
+  }, []);
+
+  const recentDomains = useListQuery<DomainRow>({
+    resource: "domains",
+    params: { pageSize: RECENT_LIMIT, sort: "created_at", order: "desc" },
+  });
+  const { data: caps } = useServerCapabilities();
+  // GH #1417: with the mail module off, hide the mailbox surfaces below AND skip
+  // the fetch entirely. Default-on while caps load, matching the sidebar's mail
+  // gate; `enabled: mailEnabled` keeps a mail-off tenant from calling the endpoint.
+  const mailEnabled = caps?.mail_enabled !== false;
+  // JAB-370 Recent projection: one owner-scoped, server-paginated request for the
+  // five most-recent mailboxes across every domain the caller owns. Replaces the
+  // per-domain fan-out that capped domains at 200 — so >200 email domains silently
+  // truncated both the list and its total — and then merged/sorted/sliced in the
+  // browser. The tenant Workspace endpoint (GET /me/mailboxes) already serves this
+  // exact shape: system rows excluded in SQL, no secret columns, authoritative
+  // COUNT across all owned domains. Recent is that projection fixed to created_at
+  // DESC, page_size=5. The query key sits under the ["list","me/mailboxes"] family
+  // that invalidateMailboxLists busts, so a mailbox create/delete now refreshes the
+  // dashboard too — the old ["dashboard",…] key was outside that family and went
+  // stale until a full reload.
+  const recentMailboxesQuery = useQuery({
+    queryKey: ["list", "me/mailboxes", { recent: RECENT_LIMIT }],
+    queryFn: async () => {
+      const { data } = await apiClient.get<{ data: MailboxRow[]; total: number }>(
+        `/me/mailboxes?page=1&page_size=${RECENT_LIMIT}&sort=created_at&order=desc`,
+      );
+      return { items: data.data ?? [], total: data.total ?? 0 };
+    },
+    enabled: mailEnabled,
+  });
+  const recentMailboxes: MailboxRow[] = recentMailboxesQuery.data?.items ?? [];
+  const mailboxesLoading = recentMailboxesQuery.isLoading;
+  const mailboxTotal = recentMailboxesQuery.data?.total ?? 0;
+
+  const recentApps = useListQuery<ApplicationRow>({
+    resource: "applications",
+    params: { pageSize: RECENT_LIMIT, sort: "created_at", order: "desc" },
+  });
+  const recentDatabases = useListQuery<DatabaseRow>({
+    resource: "databases",
+    params: { pageSize: RECENT_LIMIT, sort: "created_at", order: "desc" },
+  });
+
+  const items = [
+    {
+      key: "domains",
+      data: null,
+      children: (
+        <Card
+          title={t("userdashboard.recent_domains")}
+          size="small"
+          extra={
+            <Link to="/panel/domains">
+              <Button type="primary" size="small">
+                View all
+              </Button>
+            </Link>
+          }
+        >
+          <Table<DomainRow>
+            size="small"
+            rowKey="id"
+            pagination={false}
+            loading={recentDomains.isLoading}
+            dataSource={recentDomains.items}
+            locale={{ emptyText: "No domains yet" }}
+            columns={[{ title: "Domain", dataIndex: "name", ellipsis: true }]}
+          />
+        </Card>
+      ),
+    },
+    {
+      key: "mailboxes",
+      data: null,
+      children: (
+        <Card
+          title={t("userdashboard.recent_mailboxes")}
+          size="small"
+          extra={
+            <Link to="/panel/mail/mailboxes">
+              <Button type="primary" size="small">
+                View all
+              </Button>
+            </Link>
+          }
+        >
+          <Table<MailboxRow>
+            size="small"
+            rowKey="id"
+            pagination={false}
+            loading={mailboxesLoading}
+            dataSource={recentMailboxes}
+            locale={{ emptyText: "No mailboxes yet" }}
+            columns={[
+              {
+                title: "Address",
+                dataIndex: "email",
+                ellipsis: true,
+              },
+            ]}
+          />
+        </Card>
+      ),
+    },
+    {
+      key: "apps",
+      data: null,
+      children: (
+        <Card
+          title={t("userdashboard.recent_applications")}
+          size="small"
+          extra={
+            <Link to="/panel/applications">
+              <Button type="primary" size="small">
+                View all
+              </Button>
+            </Link>
+          }
+        >
+          <Table<ApplicationRow>
+            size="small"
+            rowKey="id"
+            pagination={false}
+            loading={recentApps.isLoading}
+            dataSource={recentApps.items}
+            locale={{ emptyText: "No applications yet" }}
+            columns={[
+              {
+                title: "Domain",
+                dataIndex: "domain_name",
+                ellipsis: true,
+                render: (v: string | undefined) => v ?? "—",
+              },
+              {
+                title: "Type",
+                dataIndex: "app_type",
+                width: 110,
+                render: (v: string | undefined) => v ?? "—",
+              },
+            ]}
+          />
+        </Card>
+      ),
+    },
+    {
+      key: "databases",
+      data: null,
+      children: (
+        <Card
+          title={t("userdashboard.recent_databases")}
+          size="small"
+          extra={
+            <Link to="/panel/databases">
+              <Button type="primary" size="small">
+                View all
+              </Button>
+            </Link>
+          }
+        >
+          <Table<DatabaseRow>
+            size="small"
+            rowKey="id"
+            pagination={false}
+            loading={recentDatabases.isLoading}
+            dataSource={recentDatabases.items}
+            locale={{ emptyText: "No databases yet" }}
+            columns={[
+              { title: "Name", dataIndex: "name", ellipsis: true },
+            ]}
+          />
+        </Card>
+      ),
+    },
+  ];
+
+  return (
+    <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+      {caps?.public_ipv4 || caps?.public_ipv6 ? (
+        <Typography.Text type="secondary" style={{ fontSize: 13 }}>
+          Server IP:{" "}
+          {caps?.public_ipv4 ? (
+            <Typography.Text copyable code style={{ fontSize: 13 }}>
+              {caps.public_ipv4}
+            </Typography.Text>
+          ) : null}
+          {caps?.public_ipv6 ? (
+            <Typography.Text copyable code style={{ fontSize: 13, marginLeft: caps?.public_ipv4 ? 8 : 0 }}>
+              {caps.public_ipv6}
+            </Typography.Text>
+          ) : null}
+        </Typography.Text>
+      ) : null}
+      <Row gutter={[16, 16]}>
+        <Col xs={24} sm={12} md={6}>
+          <StatCard
+            label={t("userdashboard.domains")}
+            value={formatCount(recentDomains.total)}
+            icon={<GlobalOutlined />}
+            iconBg="rgba(6, 182, 212, 0.14)"
+            iconColor="#06B6D4"
+            to="/panel/domains"
+          />
+        </Col>
+        {mailEnabled && (
+          <Col xs={24} sm={12} md={6}>
+            <StatCard
+              label={t("userdashboard.mailboxes")}
+              value={formatCount(mailboxTotal)}
+              icon={<MailOutlined />}
+              iconBg="rgba(245, 158, 11, 0.14)"
+              iconColor="#F59E0B"
+              to="/panel/mail/mailboxes"
+            />
+          </Col>
+        )}
+        <Col xs={24} sm={12} md={6}>
+          <StatCard
+            label={t("userdashboard.applications")}
+            value={formatCount(recentApps.total)}
+            icon={<AppstoreOutlined />}
+            iconBg="rgba(56, 189, 248, 0.14)"
+            iconColor="#38BDF8"
+            to="/panel/applications"
+          />
+        </Col>
+        <Col xs={24} sm={12} md={6}>
+          <StatCard
+            label={t("userdashboard.databases")}
+            value={formatCount(recentDatabases.total)}
+            icon={<DatabaseOutlined />}
+            iconBg="rgba(16, 185, 129, 0.14)"
+            iconColor="#10B981"
+            to="/panel/databases"
+          />
+        </Col>
+      </Row>
+
+      {me && (
+        <div style={{ marginBottom: 16 }}>
+          <MyProfileUsageCard userId={me.id} />
+        </div>
+      )}
+
+      <Masonry
+        columns={{ xs: 1, sm: 1, md: 1, lg: 2 }}
+        gutter={16}
+        items={mailEnabled ? items : items.filter((it) => it.key !== "mailboxes")}
+      />
+    </Space>
+  );
+}

@@ -1,0 +1,349 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+
+	"github.com/dotnext-panel/dotnext/internal/auth"
+	"github.com/dotnext-panel/dotnext/internal/ginctx"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+)
+
+type mgGroupsFake struct {
+	repository.MailGroupRepository
+	group        *models.MailGroup
+	memberIDs    []string // current mail_group_members rows
+	memberEmails []string // their addresses
+	deliverable  []string // members that can receive mail
+
+	setMembersCalled    bool
+	addMemberCalled     bool
+	internalOnlyWritten bool
+	createdGroup        *models.MailGroup
+	createErr           error
+
+	external      []string // current outside addresses (GH #1833)
+	externalSaved bool
+}
+
+func (f *mgGroupsFake) ListExternalMembers(context.Context, string) ([]string, error) {
+	if f.external == nil {
+		return []string{}, nil
+	}
+	return f.external, nil
+}
+func (f *mgGroupsFake) SetExternalMembers(_ context.Context, _ string, addrs []string) error {
+	f.externalSaved = true
+	f.external = addrs
+	return nil
+}
+
+// mgSettingsFake serves the admin's outside-address cap; a nil row is a
+// server with no settings row yet.
+type mgSettingsFake struct {
+	repository.ServerSettingsRepository
+	row *models.ServerSettings
+}
+
+func (f *mgSettingsFake) Get(context.Context) (*models.ServerSettings, error) {
+	if f.row == nil {
+		return nil, repository.ErrNotFound
+	}
+	return f.row, nil
+}
+
+func (f *mgGroupsFake) FindByID(context.Context, string) (*models.MailGroup, error) {
+	return f.group, nil
+}
+func (f *mgGroupsFake) ListMemberEmails(context.Context, string) ([]string, error) {
+	return f.memberEmails, nil
+}
+func (f *mgGroupsFake) ListMemberMailboxIDs(context.Context, string) ([]string, error) {
+	return f.memberIDs, nil
+}
+func (f *mgGroupsFake) ListDeliverableMemberEmails(context.Context, string) ([]string, error) {
+	return f.deliverable, nil
+}
+func (f *mgGroupsFake) SetMembers(context.Context, string, []string) error {
+	f.setMembersCalled = true
+	return nil
+}
+func (f *mgGroupsFake) AddMember(context.Context, string, string) error {
+	f.addMemberCalled = true
+	return nil
+}
+func (f *mgGroupsFake) RemoveMember(context.Context, string, string) error { return nil }
+func (f *mgGroupsFake) UpdateInternalOnly(_ context.Context, _ string, v bool) error {
+	f.internalOnlyWritten = true
+	f.group.InternalOnly = v
+	return nil
+}
+func (f *mgGroupsFake) ExistsByDomainAndLocalPart(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+func (f *mgGroupsFake) Create(_ context.Context, g *models.MailGroup) error {
+	if f.createErr != nil {
+		return f.createErr
+	}
+	f.createdGroup = g
+	return nil
+}
+
+type mgMbFake struct {
+	repository.MailboxRepository
+	byID map[string]*models.Mailbox
+}
+
+func (f *mgMbFake) FindByID(_ context.Context, id string) (*models.Mailbox, error) {
+	mb, ok := f.byID[id]
+	if !ok {
+		return nil, repository.ErrNotFound
+	}
+	return mb, nil
+}
+func (f *mgMbFake) ExistsByDomainAndLocalPart(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+func (f *mgMbFake) FindByIDs(_ context.Context, ids []string) ([]models.Mailbox, error) {
+	out := make([]models.Mailbox, 0, len(ids))
+	for _, id := range ids {
+		if mb, ok := f.byID[id]; ok {
+			out = append(out, *mb)
+		}
+	}
+	return out, nil
+}
+
+// mgAgentFake records every agent command with its params.
+type mgAgentFake struct {
+	calls  []string
+	params []map[string]any
+}
+
+func (a *mgAgentFake) Call(_ context.Context, cmd string, params any) (json.RawMessage, error) {
+	a.calls = append(a.calls, cmd)
+	b, _ := json.Marshal(params)
+	var m map[string]any
+	_ = json.Unmarshal(b, &m)
+	a.params = append(a.params, m)
+	return json.RawMessage(`{"ok":true}`), nil
+}
+
+// lastParams returns the params of the last call of cmd, or nil.
+func (a *mgAgentFake) lastParams(cmd string) map[string]any {
+	for i := len(a.calls) - 1; i >= 0; i-- {
+		if a.calls[i] == cmd {
+			return a.params[i]
+		}
+	}
+	return nil
+}
+
+type mgFixture struct {
+	groups   *mgGroupsFake
+	ag       *mgAgentFake
+	dom      *srDomFake
+	settings *mgSettingsFake
+	router   *gin.Engine
+}
+
+// newMGFixture wires the mail group routes over fakes. mailboxes mb1..mbN
+// exist in the group's domain.
+func newMGFixture(t *testing.T, kind string, internalOnly bool, mailboxes int) *mgFixture {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	v1 := r.Group("/api/v1")
+	v1.Use(func(c *gin.Context) {
+		ginctx.SetClaims(c, &auth.AccessClaims{UserID: "user1", IsAdmin: false})
+		c.Next()
+	})
+	groups := &mgGroupsFake{group: &models.MailGroup{
+		ID: "grp1", DomainID: "dom1", EmailCached: "team@example.org", GroupKind: kind, InternalOnly: internalOnly,
+	}}
+	mb := &mgMbFake{byID: map[string]*models.Mailbox{}}
+	for i := 1; i <= mailboxes; i++ {
+		id := fmt.Sprintf("mb%d", i)
+		mb.byID[id] = &models.Mailbox{ID: id, DomainID: "dom1", EmailCached: fmt.Sprintf("user%d@example.org", i)}
+	}
+	dom := &srDomFake{dom: &models.Domain{ID: "dom1", UserID: "user1", Name: "example.org", EmailEnabled: true, OwnershipState: models.OwnershipState{OwnershipStatus: models.OwnershipVerified}}}
+	ag := &mgAgentFake{}
+	settings := &mgSettingsFake{}
+	RegisterMailGroupRoutes(v1, MailGroupHandlerConfig{Groups: groups, Mailboxes: mb, Domains: dom, Agent: ag, Settings: settings})
+	return &mgFixture{groups: groups, ag: ag, dom: dom, settings: settings, router: r}
+}
+
+func mailboxIDs(n int) []string {
+	out := make([]string, 0, n)
+	for i := 1; i <= n; i++ {
+		out = append(out, fmt.Sprintf("mb%d", i))
+	}
+	return out
+}
+
+// requireDistributionApply asserts a mailgroup.apply carrying the group kind
+// and the deliverable member set was dispatched — the projection that makes a
+// distribution list fan out (GH #1818) — and no memberGroupIds projection.
+func requireDistributionApply(t *testing.T, ag *mgAgentFake, wantMembers []any) {
+	t.Helper()
+	p := ag.lastParams("mailgroup.apply")
+	require.NotNil(t, p, "distribution change must re-apply the list; calls=%v", ag.calls)
+	require.Equal(t, "distribution", p["group_kind"])
+	require.Equal(t, wantMembers, p["member_emails"])
+	require.NotContains(t, ag.calls, "mailgroup.members_set", "a distribution list must not link members to a shared inbox")
+}
+
+func TestSetMembers_DistributionAppliesMemberList(t *testing.T) {
+	fx := newMGFixture(t, "distribution", false, 1)
+	fx.groups.deliverable = []string{"user1@example.org"}
+	w := do(t, fx.router, "PUT", "/api/v1/mailgroups/grp1/members", map[string]any{"mailbox_ids": []string{"mb1"}})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	requireDistributionApply(t, fx.ag, []any{"user1@example.org"})
+}
+
+func TestSetMembers_ResourceProjectsMemberGroupIds(t *testing.T) {
+	fx := newMGFixture(t, "resource", false, 1)
+	w := do(t, fx.router, "PUT", "/api/v1/mailgroups/grp1/members", map[string]any{"mailbox_ids": []string{"mb1"}})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.Contains(t, fx.ag.calls, "mailgroup.members_set", "resource group must project membership")
+}
+
+func TestAddMember_DistributionAppliesMemberList(t *testing.T) {
+	fx := newMGFixture(t, "distribution", false, 1)
+	fx.groups.deliverable = []string{"user1@example.org"}
+	w := do(t, fx.router, "POST", "/api/v1/mailgroups/grp1/members/mb1", nil)
+	require.Equal(t, http.StatusNoContent, w.Code, w.Body.String())
+	requireDistributionApply(t, fx.ag, []any{"user1@example.org"})
+}
+
+func TestRemoveMember_DistributionAppliesMemberList(t *testing.T) {
+	fx := newMGFixture(t, "distribution", false, 1)
+	fx.groups.deliverable = []string{}
+	w := do(t, fx.router, "DELETE", "/api/v1/mailgroups/grp1/members/mb1", nil)
+	require.Equal(t, http.StatusNoContent, w.Code, w.Body.String())
+	requireDistributionApply(t, fx.ag, []any{})
+}
+
+func TestRemoveMember_ResourceProjectsRemoval(t *testing.T) {
+	fx := newMGFixture(t, "resource", false, 1)
+	w := do(t, fx.router, "DELETE", "/api/v1/mailgroups/grp1/members/mb1", nil)
+	require.Equal(t, http.StatusNoContent, w.Code, w.Body.String())
+	require.Contains(t, fx.ag.calls, "mailgroup.members_set")
+}
+
+func TestCreate_DistributionSendsKind(t *testing.T) {
+	fx := newMGFixture(t, "distribution", false, 0)
+	w := do(t, fx.router, "POST", "/api/v1/domains/dom1/mailgroups", map[string]any{"name": "sales", "group_kind": "distribution"})
+	require.Equal(t, http.StatusCreated, w.Code, w.Body.String())
+	p := fx.ag.lastParams("mailgroup.apply")
+	require.NotNil(t, p)
+	require.Equal(t, "distribution", p["group_kind"])
+	require.Equal(t, "sales@example.org", p["email"])
+	require.Equal(t, []any{}, p["member_emails"])
+}
+
+// GH #1637: a mail group may not take the address of the domain directory's
+// host principal.
+func TestCreate_RefusesTheDirectoryAddress(t *testing.T) {
+	fx := newMGFixture(t, "distribution", false, 0)
+	w := do(t, fx.router, "POST", "/api/v1/domains/dom1/mailgroups", map[string]any{"name": "dotnext-directory", "group_kind": "distribution"})
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(), "invalid_name")
+	require.NotContains(t, fx.ag.calls, "mailgroup.apply")
+}
+
+// ADR-0110: postmaster@ on a tenant domain belongs to the server admin.
+func TestCreate_RefusesPostmasterOnATenantDomain(t *testing.T) {
+	fx := newMGFixture(t, "distribution", false, 0)
+	w := do(t, fx.router, "POST", "/api/v1/domains/dom1/mailgroups", map[string]any{"name": "postmaster", "group_kind": "distribution"})
+	require.Equal(t, http.StatusBadRequest, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(), "server administrator")
+	require.NotContains(t, fx.ag.calls, "mailgroup.apply")
+}
+
+// A mailbox took the address between the handler's check and the insert:
+// the database refuses the group (migration 000306).
+func TestCreate_MailboxAtTheAddressIs409(t *testing.T) {
+	fx := newMGFixture(t, "distribution", false, 0)
+	fx.groups.createErr = repository.ErrAddressInUse
+	w := do(t, fx.router, "POST", "/api/v1/domains/dom1/mailgroups", map[string]any{"name": "sales", "group_kind": "distribution"})
+	require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(), "address_taken")
+	require.NotContains(t, fx.ag.calls, "mailgroup.apply")
+}
+
+// An internal-only distribution list delivers through one Sieve redirect per
+// member and Stalwart allows 20, so the panel refuses a 21st member up front
+// instead of letting members past the limit silently receive nothing.
+func TestSetMembers_InternalOnlyDistributionOverCapRejected(t *testing.T) {
+	fx := newMGFixture(t, "distribution", true, 21)
+	w := do(t, fx.router, "PUT", "/api/v1/mailgroups/grp1/members", map[string]any{"mailbox_ids": mailboxIDs(21)})
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(), "too_many_members")
+	require.False(t, fx.groups.setMembersCalled, "over-cap member set must not be saved")
+	require.Empty(t, fx.ag.calls)
+}
+
+func TestSetMembers_InternalOnlyDistributionAtCapAllowed(t *testing.T) {
+	fx := newMGFixture(t, "distribution", true, 20)
+	w := do(t, fx.router, "PUT", "/api/v1/mailgroups/grp1/members", map[string]any{"mailbox_ids": mailboxIDs(20)})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	require.True(t, fx.groups.setMembersCalled)
+}
+
+func TestSetMembers_PlainDistributionHasNoCap(t *testing.T) {
+	fx := newMGFixture(t, "distribution", false, 25)
+	w := do(t, fx.router, "PUT", "/api/v1/mailgroups/grp1/members", map[string]any{"mailbox_ids": mailboxIDs(25)})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+}
+
+func TestAddMember_InternalOnlyDistributionOverCapRejected(t *testing.T) {
+	fx := newMGFixture(t, "distribution", true, 21)
+	fx.groups.memberIDs = mailboxIDs(20)
+	w := do(t, fx.router, "POST", "/api/v1/mailgroups/grp1/members/mb21", nil)
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code, w.Body.String())
+	require.False(t, fx.groups.addMemberCalled)
+}
+
+func TestAddMember_ExistingMemberAtCapAllowed(t *testing.T) {
+	fx := newMGFixture(t, "distribution", true, 20)
+	fx.groups.memberIDs = mailboxIDs(20)
+	w := do(t, fx.router, "POST", "/api/v1/mailgroups/grp1/members/mb3", nil)
+	require.Equal(t, http.StatusNoContent, w.Code, w.Body.String())
+}
+
+func TestUpdate_EnableInternalOnlyOverCapRejected(t *testing.T) {
+	fx := newMGFixture(t, "distribution", false, 21)
+	fx.groups.memberIDs = mailboxIDs(21)
+	w := do(t, fx.router, "PATCH", "/api/v1/mailgroups/grp1", map[string]any{"internal_only": true})
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code, w.Body.String())
+	require.False(t, fx.groups.internalOnlyWritten, "the toggle must not be saved")
+	require.Empty(t, fx.ag.calls)
+}
+
+func TestUpdate_EnableInternalOnlyDistributionReapplies(t *testing.T) {
+	fx := newMGFixture(t, "distribution", false, 2)
+	fx.groups.memberIDs = mailboxIDs(2)
+	fx.groups.deliverable = []string{"user1@example.org", "user2@example.org"}
+	w := do(t, fx.router, "PATCH", "/api/v1/mailgroups/grp1", map[string]any{"internal_only": true})
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	requireDistributionApply(t, fx.ag, []any{"user1@example.org", "user2@example.org"})
+	require.Equal(t, true, fx.ag.lastParams("mailgroup.apply")["internal_only"])
+}
+
+// GH #1816 / ADR-0170: an unproven name gets no mail group.
+func TestCreate_PendingOwnership409(t *testing.T) {
+	fx := newMGFixture(t, "distribution", false, 0)
+	fx.dom.dom.OwnershipState = models.OwnershipState{OwnershipStatus: models.OwnershipPending}
+	w := do(t, fx.router, "POST", "/api/v1/domains/dom1/mailgroups", map[string]any{"name": "sales", "group_kind": "distribution"})
+	require.Equal(t, http.StatusConflict, w.Code, w.Body.String())
+	require.Contains(t, w.Body.String(), "domain_ownership_pending")
+	require.Empty(t, fx.ag.calls, "no agent call for a pending domain")
+}

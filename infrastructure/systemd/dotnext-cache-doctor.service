@@ -1,0 +1,34 @@
+[Unit]
+Description=dotNext WordPress cache health drift auto-repair (GH #605)
+Documentation=https://github.com/dotnext71/panel
+After=dotnext-api.service dotnext-agent.service mariadb.service
+# mariadb.service is explicit, not inherited via dotnext-api.service:
+# this unit's CLI opens its own DB connection, so panel-api having
+# started proves nothing about socket readiness. Persistent=true means
+# it can fire at boot, which is exactly when mariadb may still be
+# starting (measured: 44s on a 2 GB / 2 vCPU host).
+# No Requires= — same rationale as dotnext-sso-reaper.service: a sweep that
+# runs while the panel or agent is down fails once and the next hourly run
+# picks up. After= keeps boot ordering. A fresh install starts this timer only
+# after the panel's first boot, which creates the cache_doctor_runs table the
+# sweep writes to.
+
+[Service]
+Type=oneshot
+# JAB-273: contain this all-tenant maintenance job in the resource-limited
+# dotnext-maintenance.slice (MemoryMax=50%, low CPU/IO weight) so a sweep can
+# never exhaust the box and lock the operator out of sshd; nice + idle IO keep
+# it yielding to tenants and the control plane.
+Slice=dotnext-maintenance.slice
+Nice=19
+IOSchedulingClass=idle
+# Sweeps every cache-enabled WordPress install, runs `wp dotnext-cache verify`
+# via the agent, and re-provisions (re-stamps constants, re-provisions the ACL,
+# re-verifies) any that have drifted. Idempotent: a healthy site is a no-op.
+# cache-doctor-run records the sweep as a cache_doctor_runs row (JAB-11) so the
+# result shows in the admin Cache page's history — same repair behavior as the
+# older `cache-doctor --repair`, now visible in the GUI.
+ExecStart=/usr/local/bin/dotnext-cli app cache-doctor-run --kind repair
+StandardOutput=journal
+StandardError=journal
+Restart=no

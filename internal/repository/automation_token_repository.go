@@ -1,0 +1,94 @@
+package repository
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"gorm.io/gorm"
+
+	"github.com/dotnext-panel/dotnext/internal/models"
+)
+
+// AutomationTokenRepository persists M44 HMAC-signed automation
+// tokens. List endpoints surface non-secret fields only; the verify
+// middleware uses FindByID + the row's secret_enc to recompute
+// signatures.
+type AutomationTokenRepository interface {
+	Create(ctx context.Context, t *models.AutomationToken) error
+	List(ctx context.Context) ([]models.AutomationToken, error)
+	FindByID(ctx context.Context, id string) (*models.AutomationToken, error)
+	Revoke(ctx context.Context, id string) error
+	BumpLastUsed(ctx context.Context, id, ip string) error
+	// SetWritesEnabled flips the write master switch (JAB-140). An explicit
+	// column update because GORM omits a zero-value writes_enabled on Create.
+	SetWritesEnabled(ctx context.Context, id string, enabled bool) error
+}
+
+type automationTokenRepo struct{ db *gorm.DB }
+
+func NewAutomationTokenRepository(db *gorm.DB) AutomationTokenRepository {
+	return &automationTokenRepo{db: db}
+}
+
+func (r *automationTokenRepo) Create(ctx context.Context, t *models.AutomationToken) error {
+	if t.CreatedAt.IsZero() {
+		t.CreatedAt = time.Now().UTC()
+	}
+	return r.db.WithContext(ctx).Create(t).Error
+}
+
+func (r *automationTokenRepo) List(ctx context.Context) ([]models.AutomationToken, error) {
+	var rows []models.AutomationToken
+	// Hide revoked tokens from the admin list — a revoked token is dead to the
+	// HMAC middleware (rejected on revoked_at), so it only clutters the view.
+	// The row is kept for audit/forensics; the audit log records the revoke.
+	if err := r.db.WithContext(ctx).
+		Where("revoked_at IS NULL").
+		Order("created_at DESC").
+		Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (r *automationTokenRepo) FindByID(ctx context.Context, id string) (*models.AutomationToken, error) {
+	var t models.AutomationToken
+	err := r.db.WithContext(ctx).First(&t, "id = ?", id).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &t, nil
+}
+
+func (r *automationTokenRepo) Revoke(ctx context.Context, id string) error {
+	now := time.Now().UTC()
+	return r.db.WithContext(ctx).
+		Model(&models.AutomationToken{}).
+		Where("id = ? AND revoked_at IS NULL", id).
+		Update("revoked_at", now).Error
+}
+
+func (r *automationTokenRepo) SetWritesEnabled(ctx context.Context, id string, enabled bool) error {
+	return r.db.WithContext(ctx).
+		Model(&models.AutomationToken{}).
+		Where("id = ?", id).
+		Update("writes_enabled", enabled).Error
+}
+
+// BumpLastUsed updates last_used_at + last_used_ip best-effort. Errors
+// are ignored at the call site (the middleware fires this in a
+// goroutine and never blocks the verified request on its result).
+func (r *automationTokenRepo) BumpLastUsed(ctx context.Context, id, ip string) error {
+	now := time.Now().UTC()
+	return r.db.WithContext(ctx).
+		Model(&models.AutomationToken{}).
+		Where("id = ?", id).
+		Updates(map[string]any{
+			"last_used_at": now,
+			"last_used_ip": ip,
+		}).Error
+}

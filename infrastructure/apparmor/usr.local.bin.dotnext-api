@@ -1,0 +1,359 @@
+# AppArmor profile — dotnext-api (M40.1, ADR-0086)
+#
+# panel-api binary at /usr/local/bin/dotnext-api runs as the
+# unprivileged `dotnext` user (systemd User=dotnext, Group=dotnext-sockets;
+# privileged ops are delegated to panel-agent). This matters for the
+# D-Bus rules below: an unprivileged user's `systemctl is-active` goes
+# via the system D-Bus, not root's /run/systemd/private socket. It is
+# the HTTP API surface (port 8443 via nginx upstream socket), talks to
+# MariaDB via unix socket, Redis via unix socket, and panel-agent via
+# the M25 unix socket. Reads /etc/dotnext/panel.env (DB DSN + secrets)
+# and /etc/dotnext/config.toml. Writes /var/log/dotnext-panel/.
+#
+# Default mode on first install: complain. Operator flips to enforce
+# after the 7-day soak via `dotnext apparmor flip-mature`.
+#
+# AA 4.x (Debian 13) enforces the `unix` mediation class separately
+# from `network unix`. Without explicit unix rules the daemon fails to
+# dial MariaDB / Redis / agent sockets even in complain mode.
+
+# GH #705: pin AppArmor 3.0 ABI — predates unix-socket mediation, so
+# these broken-mediation kernels (Debian 13/Ubuntu 24.04) SKIP unix
+# mediation for this profile; attaching it can't EACCES a unix connect()
+# while still confining files/caps/network. Verified on .86.
+abi <abi/3.0>,
+
+#include <tunables/global>
+
+# Profile name only — no path attach. Auto-attach by binary path would
+# also confine direct CLI invocations (dotnext update / dotnext repair /
+# dotnext apparmor flip-mature), which the operator runs as root. The
+# daemon picks up this profile via the aa-exec ExecStart wrapper in the
+# systemd unit (AppArmorProfile= silently no-ops on Debian/Ubuntu).
+#
+# flags=(attach_disconnected): the dotnext-api.service unit runs with
+# ProtectSystem=strict + PrivateTmp + ReadWritePaths=/run/mysqld, so
+# systemd bind-mounts socket dirs into a private mount namespace. Without
+# this flag AppArmor sees /run/mysqld/mysqld.sock (and redis/…) as a
+# "disconnected path" and denies connect() with a file-class name-lookup
+# failure that complain mode can't downgrade — the panel crash-loops on
+# the DB ping at boot (the #705 502 on mx). attach_disconnected reattaches
+# such paths to the namespace root so the file rules below match. Soaked
+# on mx 2026-07-05; abi/3.0 alone did NOT prevent it (class=file, not unix).
+profile dotnext-api flags=(attach_disconnected) {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+  #include <abstractions/openssl>
+  #include <abstractions/ssl_certs>
+  #include <abstractions/dbus-strict>
+
+  capability net_bind_service,
+  capability setuid,
+  capability setgid,
+  # GH #682: mac_admin REMOVED — the daemon HTTP path delegates AppArmor mode
+  # changes to panel-agent (which holds mac_admin), and `dotnext apparmor
+  # flip-mature` now calls the agent's security.apparmor.set_mode too. The panel
+  # daemon no longer needs AppArmor policy-management powers.
+  # `dotnext update` + `dotnext repair` recurse dotnext-owned trees as root,
+  # invoke chown, write under /etc/{nginx,systemd,...}, etc. The daemon
+  # HTTP path doesn't need any of these; only the operator-only CLI does.
+  capability chown,
+  capability dac_override,
+  capability dac_read_search,
+  capability fowner,
+  capability fsetid,
+  capability kill,
+
+  network inet  stream,
+  network inet6 stream,
+  network unix  stream,
+
+  # AA 4.x unix mediation — stream sockets (MariaDB, Redis, agent wire,
+  # Kratos, bulwark, crowdsec LAPI).
+  unix (create, bind, listen, accept, connect, send, receive) type=stream,
+  # AA 4.x: complain mode still enforces unix peer-label checks. Explicit
+  # peer=(label=unconfined) allows connecting to MariaDB, Redis, CrowdSec
+  # LAPI, and any other unconfined unix-socket daemon.
+  unix (connect, send, receive) type=stream peer=(label=unconfined),
+
+  /usr/local/bin/dotnext-api mr,
+  /etc/dotnext/                 r,
+  /etc/dotnext/**               r,
+  /etc/dotnext/           r,
+  /etc/dotnext/**         r,
+  /etc/apparmor/               r,
+  /etc/apparmor/**             r,
+  /etc/apparmor.d/             rw,
+  /etc/apparmor.d/**           rw,
+  /usr/share/apparmor-features/    r,
+  /usr/share/apparmor-features/**  r,
+  /var/cache/apparmor/         rw,
+  /var/cache/apparmor/**       rwk,
+  /etc/letsencrypt/live/       r,
+  /etc/letsencrypt/live/**     r,
+  /etc/letsencrypt/archive/    r,
+  /etc/letsencrypt/archive/**  r,
+
+  # Read securityfs for aa-status; flip-mature CLI execs aa-{enforce,complain}.
+  /sys/kernel/security/apparmor/    r,
+  /sys/kernel/security/apparmor/**  r,
+  # apparmor_parser writes to control files to load/replace/remove policy.
+  /sys/kernel/security/apparmor/.replace  w,
+  /sys/kernel/security/apparmor/.load     w,
+  /sys/kernel/security/apparmor/.remove   w,
+  /sys/module/apparmor/             r,
+  /sys/module/apparmor/**           r,
+
+  /usr/sbin/aa-status         rix,
+  /usr/sbin/aa-enforce        rix,
+  /usr/sbin/aa-complain       rix,
+  /usr/sbin/apparmor_parser   rix,
+  /usr/bin/journalctl         rix,
+  # panel-api's full DIRECT exec surface (exec.CommandContext): most heavy
+  # flows are delegated to the agent (its own profile); the daemon itself
+  # only shells out to these. zstd = hestia migration decompress;
+  # goaccess = web-stats (M13, websocket_logs.go); tar = backup-artifact
+  # download streams the materialized backup as a tar[.zst] (GH #462, backups.go
+  # streamBackupArtifact) — without an exec rule the download fails
+  # "fork/exec /usr/bin/tar: permission denied" under enforce.
+  # zstd (both merged-usr paths). Backup download no longer runs `tar -I zstd`
+  # (that shells out via /bin/sh to run the filter, which this profile does NOT
+  # grant — GH #462 round 3); the panel now pipes `tar` -> `zstd` itself, so both
+  # are direct execs matched here.
+  /usr/bin/zstd               rix,
+  /bin/zstd                   rix,
+  /usr/bin/goaccess           rix,
+  /usr/bin/tar                rix,
+  /bin/tar                    rix,
+  /var/log/nginx/             r,
+  /var/log/nginx/**           r,
+  /usr/share/goaccess/**      r,
+  /etc/goaccess/**            r,
+  /usr/share/GeoIP/**         r,
+  /var/lib/GeoIP/**           r,
+  /dev/tty                    rw,
+  # The aa-exec ExecStart wrapper probes `aa-exec -p dotnext-api --
+  # true` before attaching; without an exec rule for true the probe
+  # fails in enforce and the daemon silently falls back to unconfined.
+  /usr/bin/true               rix,
+  /bin/true                   rix,
+  # CrowdSec CLI — Security tab (M26/M43) shells out to cscli, which
+  # runs inline under this profile and reads tetragon/proc (below).
+  /usr/bin/cscli              rix,
+  # apt/dpkg — Updates tab (M29) update CHECK runs `apt list` in-process
+  # (apply runs in a transient unit outside this profile). Read-only.
+  /usr/bin/apt                rix,
+  /usr/bin/dpkg               rix,
+  /usr/lib/apt/**             rix,
+  /etc/apt/                   r,
+  /etc/apt/**                 r,
+  /etc/dpkg/                  r,
+  /etc/dpkg/**                r,
+  /var/lib/apt/               r,
+  /var/lib/apt/**             r,
+  /var/lib/dpkg/              r,
+  /var/lib/dpkg/**            r,
+  /var/cache/apt/             r,
+  /var/cache/apt/**           r,
+  /usr/share/dpkg/**          r,
+  # Snuffleupagus rule sets read by the PHP Defense tab (#707/#717).
+  /usr/share/dotnext/**       r,
+
+  # `dotnext update` + `dotnext repair` shell out to these. Without ix
+  # rules the CLI fails with "fork/exec ...: permission denied" once
+  # the panel profile is in enforce mode (incident 2026-05-02).
+  /usr/bin/bash               rix,
+  /bin/bash                   rix,
+  /usr/bin/sh                 rix,
+  /bin/sh                     rix,
+  /usr/bin/chmod              rix,
+  /bin/chmod                  rix,
+  /usr/bin/chown              rix,
+  /bin/chown                  rix,
+  /usr/bin/cp                 rix,
+  /bin/cp                     rix,
+  /usr/bin/mv                 rix,
+  /bin/mv                     rix,
+  /usr/bin/rm                 rix,
+  /bin/rm                     rix,
+  /usr/bin/mkdir              rix,
+  /bin/mkdir                  rix,
+  /usr/bin/ln                 rix,
+  /bin/ln                     rix,
+  /usr/bin/stat               rix,
+  /usr/bin/tail               rix,
+  /usr/bin/head               rix,
+  /usr/bin/cat                rix,
+  /usr/bin/sed                rix,
+  /usr/bin/awk                rix,
+  /usr/bin/grep               rix,
+  /usr/bin/git                rix,
+  /usr/bin/sudo               rix,
+  /bin/systemctl              rix,
+  /usr/bin/systemctl          rix,
+  /usr/sbin/nginx             rix,
+  /usr/sbin/chroot            rix,
+  /usr/sbin/debootstrap       rix,
+  /usr/bin/npm                rix,
+  /usr/bin/node               rix,
+  /usr/local/bin/go           rix,
+  /usr/bin/go                 rix,
+  /usr/local/bin/dotnext-*     rix,
+  /usr/local/bin/kratos       Px -> dotnext-kratos,
+
+  /var/lib/dotnext/       rw,
+  /var/lib/dotnext/**     rwk,
+  # GH #355: file-manager upload staging. panel-api writes the incoming
+  # upload to /var/lib/dotnext-uploads/dotnext-upload-* before the agent's
+  # files.ingest moves it into the tenant home (both units share this
+  # path — see files.go). The dir is in the unit's ReadWritePaths and is
+  # owned by the dotnext user 0750, but under enforce mode AppArmor also
+  # needs an explicit rule or the open() EACCESes ("permission denied"
+  # on every upload once the profile matures out of complain). The agent
+  # runs as root/unconfined and reads it without a rule here.
+  /var/lib/dotnext-uploads/     rw,
+  /var/lib/dotnext-uploads/**   rwk,
+  # Offline migration tarball staging. uploadTarball (POST
+  # /admin/migrations/:id/tarball) runs in the daemon and does MkdirAll
+  # + OpenFile under /var/lib/dotnext-migrations/<id>/ (admin_migrations.go).
+  # Same layer split as the upload staging above (GH #355): the dir is
+  # dotnext-owned 0750 and in ReadWritePaths, but without a profile rule
+  # the offline cPanel/HestiaCP tarball upload EACCESes once the profile
+  # is in enforce. (The migration-secrets dir is root-owned and written
+  # by the root agent, so it stays read-only here — covered by
+  # /etc/dotnext/** r above.)
+  /var/lib/dotnext-migrations/     rw,
+  /var/lib/dotnext-migrations/**   rwk,
+  # GH #1045: per-database restore staging. POST /databases/:id/restore
+  # writes the uploaded .sql dump to /var/lib/dotnext/restore/<ulid>.sql
+  # (databases.go), then the root agent's db.restore reads + unlinks it.
+  # Same layer split as the staging dirs above: ReadWritePaths covers
+  # systemd, but enforce mode needs the explicit rule or the restore
+  # 500s on the write.
+  /var/lib/dotnext/restore/        rw,
+  /var/lib/dotnext/restore/**      rwk,
+
+  # GH #462: the backup-artifact download tars the agent-materialized snapshot
+  # under /var/lib/dotnext-backups/downloads/<job>/ (backups.go streamBackupArtifact).
+  # Read-only + downloads/ only — the agent writes + cleans it, and the restic
+  # repo (/var/lib/dotnext-backups/repo, 0600 root:root) must stay off-limits.
+  # /var/lib/dotnext-backups is a SYMLINK to /var/lib/dotnext/backups; AppArmor
+  # matches the RESOLVED path, so the rule MUST use the real target (round 3 of
+  # GH #462: the symlink-path rules never matched → every read denied in
+  # enforce). Both spellings kept so it works whether or not the box symlinks.
+  /var/lib/dotnext-backups/downloads/     r,
+  /var/lib/dotnext-backups/downloads/**   r,
+  /var/lib/dotnext/backups/downloads/     r,
+  /var/lib/dotnext/backups/downloads/**   r,
+  /var/log/dotnext-panel/       rw,
+  /var/log/dotnext-panel/**     rwk,
+
+  # `dotnext update` rebuilds + reinstalls from the source tree.
+  /opt/dotnext/           rw,
+  /opt/dotnext/**         rwlk,
+  /opt/dotnext-webmail/         rw,
+  /opt/dotnext-webmail/**       rwlk,
+  /tmp/                        r,
+  /tmp/**                      rwlk,
+
+  # M25 unix-socket layout (ADR-0050).
+  # Bind own listener sockets.
+  /run/dotnext-panel/           rw,
+  /run/dotnext-panel/**         rw,
+  # Connect upstreams.
+  /run/dotnext/                 r,
+  /run/dotnext/agent.sock       rw,
+  /run/dotnext/agent-pty.sock   rw,
+  /run/dotnext-kratos/          r,
+  /run/dotnext-kratos/**        rw,
+  /run/dotnext-bulwark/         r,
+  /run/dotnext-bulwark/**       rw,
+  /run/redis/                  r,
+  /run/redis/redis.sock        rw,
+  /run/redis/dotnext.sock     rw,
+  /run/mysqld/                 r,
+  /run/mysqld/mysqld.sock      rw,
+  /var/run/mysqld/mysqld.sock  rw,
+  # CrowdSec LAPI unix socket (M26, ADR-0050 amended).
+  /run/crowdsec/               r,
+  /run/crowdsec/api.sock       rw,
+
+  # Static assets the embedded webui ships are read from /usr/local/share.
+  /usr/local/share/dotnext/**   r,
+
+  # journalctl (rix above) reads the persistent + runtime journals.
+  /etc/machine-id              r,
+  /var/log/journal/            r,
+  /var/log/journal/**          r,
+  /run/log/journal/            r,
+  /run/log/journal/**          r,
+  # cscli reads tetragon cgroup export + per-process cgroup/mountinfo.
+  /run/tetragon/**             r,
+  # cscli/systemd helpers spawned by the panel read the service's OWN
+  # cgroup limits (cpu.max, memory.max) for capacity checks. Scoped to
+  # the dotnext-api service subtree; live enforce denial observed
+  # 2026-08-01 (comm=cscli, /sys/fs/cgroup/system.slice/dotnext-api.service/cpu.max).
+  /sys/fs/cgroup/              r,
+  /sys/fs/cgroup/system.slice/ r,
+  /sys/fs/cgroup/system.slice/dotnext-api.service/   r,
+  /sys/fs/cgroup/system.slice/dotnext-api.service/** r,
+
+  /proc/                       r,
+  /proc/loadavg                r,
+  /proc/sys/net/core/somaxconn r,
+  /proc/sys/kernel/random/uuid r,
+  /proc/*/                     r,
+  /proc/*/status               r,
+  /proc/*/stat                 r,
+  /proc/*/attr/                r,
+  /proc/*/attr/current         r,
+  /proc/*/attr/apparmor/current r,
+  /proc/mounts                 r,
+  /proc/*/mounts               r,
+  /proc/*/cgroup               r,
+  /proc/*/mountinfo            r,
+  /proc/*/fd/                  r,
+  /proc/*/comm                 r,
+  # systemctl (reconciler service control + server-status) talks to
+  # systemd's private socket and reads unit files.
+  /run/systemd/private         rw,
+  # The panel runs as the unprivileged `dotnext` user. Root's systemctl
+  # uses /run/systemd/private above, but an unprivileged user's
+  # `systemctl is-active` / `is-enabled` is routed through the system
+  # D-Bus to org.freedesktop.systemd1. Without these rules the confined
+  # daemon gets "Failed to retrieve unit state: Access denied" + empty
+  # output, which the service_down monitor misreads as every unit being
+  # down (including dotnext-api itself) — a false-alarm storm.
+  dbus send    bus=system peer=(name=org.freedesktop.systemd1),
+  dbus receive bus=system peer=(name=org.freedesktop.systemd1),
+  dbus send    bus=system path=/org/freedesktop/DBus interface=org.freedesktop.DBus member={Hello,AddMatch,RemoveMatch,GetNameOwner,NameHasOwner,StartServiceByName,ListNames} peer=(name=org.freedesktop.DBus),
+  /run/systemd/                r,
+  /run/systemd/**              r,
+  /etc/systemd/                r,
+  /etc/systemd/**              r,
+  /lib/systemd/system/         r,
+  /lib/systemd/system/**       r,
+  /usr/lib/systemd/system/     r,
+  /usr/lib/systemd/system/**   r,
+
+  # Outbound TCP — OIDC, SMTP relays, ntfy / Slack / Discord / Telegram
+  # webhooks. Unrestricted at the AppArmor layer because the targets
+  # are operator-configured at runtime.
+
+  # Hard denies — defence in depth on the typical RCE blast radius.
+  deny /etc/shadow rwklx,
+  deny /etc/gshadow rwklx,
+  deny /etc/sudoers rwklx,
+  deny /etc/sudoers.d/** rwklx,
+  deny /home/** rwlkx,
+  deny /root/** rwlkx,
+  deny /var/log/audit/** rwklx,
+  deny /var/spool/cron/** rwklx,
+  deny /etc/cron.d/** wlkx,
+
+  # Site-specific rules, kept across updates: dotnext update overwrites this
+  # file but not /etc/apparmor.d/local/usr.local.bin.dotnext-api. After editing that
+  # file, reload with: apparmor_parser -r /etc/apparmor.d/usr.local.bin.dotnext-api
+  # A deny rule above still wins over an allow rule added there.
+  include if exists <local/usr.local.bin.dotnext-api>
+}

@@ -1,0 +1,268 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dotnext-panel.com/schemas/docker-app/v1",
+  "title": "DotNext Docker App catalog entry",
+  "description": "Schema for infrastructure/docker-apps/<slug>/app.yaml. See ADR-0116 for the decision rationale.",
+  "type": "object",
+  "required": [
+    "slug",
+    "name",
+    "version",
+    "description",
+    "image_channel",
+    "ports",
+    "volumes"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "slug": {
+      "type": "string",
+      "description": "Catalog slug; must match the parent directory name. URL-safe.",
+      "pattern": "^[a-z][a-z0-9-]{1,31}$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64
+    },
+    "version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 32
+    },
+    "track": {
+      "type": "string",
+      "minLength": 1,
+      "description": "GH #1956: the release track new installs get (e.g. \"28\", \"1.27\"). version must be on it (equal, or start with track + \".\"). With a track, Update never moves an install to a track it can't take in place: see update_from and held_tracks."
+    },
+    "update_from": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "GH #1956: older tracks that Update may move to this entry's track. Needs track."
+    },
+    "held_tracks": {
+      "type": "array",
+      "description": "GH #1956: older release lines, newest first, still served to the installs on them. Each keeps the entry's compose template; only the image and version label differ. Needs track.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "track",
+          "version",
+          "image_channel"
+        ],
+        "properties": {
+          "track": {
+            "type": "string",
+            "minLength": 1
+          },
+          "version": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 32
+          },
+          "image_channel": {
+            "type": "string",
+            "description": "Digest-pinned image for this track: repo:tag@sha256:<digest>.",
+            "minLength": 3
+          },
+          "update_from": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "description": "Older tracks Update may move to this held track (a step on the way to the current one)."
+          }
+        }
+      }
+    },
+    "popularity": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Catalog ordering weight; higher floats to the top of the listing. Optional, default 0."
+    },
+    "description": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "icon": {
+      "type": "string",
+      "description": "Path to icon file (relative to this app.yaml); defaults to 'icon.svg'.",
+      "default": "icon.svg"
+    },
+    "upstream": {
+      "type": "string",
+      "format": "uri"
+    },
+    "documentation": {
+      "type": "string",
+      "format": "uri"
+    },
+    "post_install_note": {
+      "type": "string",
+      "description": "Optional first-run guidance shown to the operator in the panel AFTER a successful install (e.g. Pocket ID: create the first admin at https://<domain>/setup). Plain text; the {{domain}} placeholder is substituted with the app's assigned domain at display time."
+    },
+    "image_channel": {
+      "type": "string",
+      "description": "Docker image reference. Use a stable tag (e.g. 'vaultwarden/server:latest') not a digest; the panel pins the digest at install time and tracks updates separately.",
+      "minLength": 3
+    },
+    "update_mode": {
+      "type": "string",
+      "enum": [
+        "manual",
+        "auto"
+      ],
+      "default": "manual",
+      "description": "Default update mode shown in the install drawer; operator can override."
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "cpu": {
+          "type": "string",
+          "pattern": "^[0-9]+(\\.[0-9]+)?$"
+        },
+        "memory": {
+          "type": "string",
+          "pattern": "^[0-9]+[kKmMgG]$"
+        },
+        "pids": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      }
+    },
+    "volumes": {
+      "type": "array",
+      "description": "Subdirectories created under /var/lib/dotnext/docker-apps/<slug>/ at install time, bind-mounted into the container at the catalog's chosen path.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "container_path"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{0,31}$"
+          },
+          "container_path": {
+            "type": "string",
+            "pattern": "^/[a-zA-Z0-9_./-]+$"
+          }
+        }
+      }
+    },
+    "ports": {
+      "type": "array",
+      "description": "Container ports the catalog entry can expose. Admin install drawer renders one editable row per entry. ADR-0116 Decision 5.",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "container_port",
+          "protocol",
+          "default_enabled",
+          "default_bind",
+          "default_reverse_proxy"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{0,31}$"
+          },
+          "container_port": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65535
+          },
+          "protocol": {
+            "type": "string",
+            "enum": [
+              "tcp",
+              "udp"
+            ]
+          },
+          "default_enabled": {
+            "type": "boolean"
+          },
+          "default_bind": {
+            "type": "string",
+            "enum": [
+              "loopback",
+              "public"
+            ]
+          },
+          "default_reverse_proxy": {
+            "type": "boolean"
+          },
+          "health_path": {
+            "type": "string",
+            "pattern": "^/[a-zA-Z0-9_./-]*$"
+          }
+        }
+      }
+    },
+    "env": {
+      "type": "array",
+      "description": "Environment variables exposed to the compose template. catalog declares the keys + defaults; admin install drawer can override secrets.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[A-Z][A-Z0-9_]{0,63}$"
+          },
+          "value": {
+            "type": "string"
+          },
+          "secret": {
+            "type": "boolean",
+            "default": false,
+            "description": "Mask in UI; never log; persist to .env (mode 0600) not compose.yml."
+          },
+          "generate": {
+            "type": "string",
+            "enum": [
+              "password32",
+              "password64",
+              "laravel_key",
+              "base64_32"
+            ],
+            "description": "Auto-generate at install time if value not supplied."
+          }
+        }
+      }
+    },
+    "requires_domain": {
+      "type": "boolean",
+      "description": "The app cannot start without the install's domain (its compose builds URLs from .Domain); installs without one are refused."
+    },
+    "tenant_installable": {
+      "type": "boolean",
+      "description": "M49: when true the app is tenant-installable (default false, admin-only)."
+    },
+    "tenant_caps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "M49: verified minimal capability allowlist added back after cap_drop:ALL for tenant installs."
+    }
+  }
+}

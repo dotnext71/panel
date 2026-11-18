@@ -1,0 +1,194 @@
+package main
+
+import (
+	"io"
+	"os"
+	"strconv"
+	"strings"
+	"testing"
+)
+
+func TestFilterColonFile_PasswdHidesOtherTenants(t *testing.T) {
+	tmp := t.TempDir() + "/passwd"
+	content := strings.Join([]string{
+		"root:x:0:0:root:/root:/bin/bash",
+		"www-data:x:33:33:www-data:/var/www:/usr/sbin/nologin",
+		"alice:x:1001:1001::/home/alice:/usr/local/bin/dotnext-ssh-shell",
+		"bob:x:1002:1002::/home/bob:/usr/local/bin/dotnext-ssh-shell",
+	}, "\n") + "\n"
+	if err := os.WriteFile(tmp, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := filterColonFile(tmp, func(f []string) bool {
+		if len(f) < 3 {
+			return false
+		}
+		if f[0] == "alice" {
+			return true
+		}
+		uid, err := strconv.Atoi(f[2])
+		return err == nil && uid < 1000
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if !strings.Contains(s, "root:") || !strings.Contains(s, "www-data:") {
+		t.Errorf("system users dropped: %q", s)
+	}
+	if !strings.Contains(s, "alice:") {
+		t.Errorf("connecting user missing: %q", s)
+	}
+	if strings.Contains(s, "bob:") {
+		t.Errorf("other tenant leaked: %q", s)
+	}
+}
+
+func TestBindDataFD_DeliversContentThenEOF(t *testing.T) {
+	want := []byte("alice:x:1001:1001::/home/alice:/bin/sh\n")
+	fd, f, err := bindDataFD(want)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if fd != f.Fd() {
+		t.Errorf("fd mismatch: %d vs %d", fd, f.Fd())
+	}
+	// FD_CLOEXEC must be cleared so the fd survives exec.
+	flags, _, errno := syscallFcntlGetFD(f.Fd())
+	if errno != 0 {
+		t.Fatalf("fcntl getfd: %v", errno)
+	}
+	if flags&1 != 0 { // FD_CLOEXEC == 1
+		t.Errorf("FD_CLOEXEC still set (%d) — fd would not survive exec", flags)
+	}
+	got, err := io.ReadAll(f)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != string(want) {
+		t.Errorf("read back %q, want %q", got, want)
+	}
+}
+
+func TestBuildBwrapArgv_ForwardsCommandAndIsolates(t *testing.T) {
+	// interactive
+	argv := buildBwrapArgv("alice", "/home/alice", 7, 8, "/bin/bash", false, interactiveInner("/bin/bash", nil))
+	joined := strings.Join(argv, " ")
+	for _, must := range []string{
+		"--bind /home/alice /home/alice",
+		"--unshare-all", "--share-net",
+		"--ro-bind-data 7 /etc/passwd", "--ro-bind-data 8 /etc/group",
+		"--ro-bind-try /etc/php /etc/php", // GH #277: CLI php.ini + conf.d extensions
+		"--ro-bind-try /etc/dotnext/snuffleupagus /etc/dotnext/snuffleupagus",
+		"--tmpfs /run", "--proc /proc",
+		"--ro-bind-try /run/mysqld/mysqld.sock /run/mysqld/mysqld.sock", // GH #285: shell DB access
+		"--ro-bind-try /run/redis/redis.sock /run/redis/redis.sock",     // GH #2059: CLI/cron Redis
+	} {
+		if !strings.Contains(joined, must) {
+			t.Errorf("argv missing %q in: %s", must, joined)
+		}
+	}
+	// Only the sockets: the directories around them (pid files, other
+	// sockets) stay hidden.
+	for _, dir := range []string{"/run/redis", "/run/mysqld"} {
+		for _, a := range argv {
+			if a == dir {
+				t.Errorf("argv binds the whole %s: %s", dir, joined)
+			}
+		}
+	}
+	if argv[len(argv)-2] != "/bin/bash" || argv[len(argv)-1] != "-l" {
+		t.Errorf("interactive should end in `bash -l`, got %v", argv[len(argv)-2:])
+	}
+	// command mode (scp/git/ssh host cmd)
+	argv2 := buildBwrapArgv("alice", "/home/alice", 7, 8, "/bin/bash", false, interactiveInner("/bin/bash", []string{"-c", "scp -t /home/alice"}))
+	tail := argv2[len(argv2)-3:]
+	if tail[0] != "/bin/bash" || tail[1] != "-c" || tail[2] != "scp -t /home/alice" {
+		t.Errorf("command mode should forward `-c`, got %v", tail)
+	}
+	// GH #1458: --exec mode runs the cron argv DIRECTLY inside the jail — no
+	// shell, no `-c` — so the same isolation flags wrap a python/php/node cron.
+	execInner := []string{"python3", "/home/alice/site/manage.py", "migrate"}
+	argv3 := buildBwrapArgv("alice", "/home/alice", 7, 8, "/bin/bash", false, execInner)
+	if !strings.Contains(strings.Join(argv3, " "), "--unshare-all") {
+		t.Error("exec mode must still carry the isolation flags")
+	}
+	tail3 := argv3[len(argv3)-3:]
+	if tail3[0] != "python3" || tail3[1] != "/home/alice/site/manage.py" || tail3[2] != "migrate" {
+		t.Errorf("exec mode should run the argv directly, got %v", tail3)
+	}
+	if argv3[len(argv3)-4] != "--" {
+		t.Errorf("exec argv must sit directly after bwrap `--`, got %v", argv3[len(argv3)-4:])
+	}
+}
+
+// The system log socket is in the jail only when the admin opted in
+// (ADR-0177): then PHP Defense blocks in cron and SSH PHP reach the journal.
+// Only the socket is bound, after the fresh /dev, never the journal directory.
+func TestBuildBwrapArgv_SyslogOnlyWhenOptedIn(t *testing.T) {
+	off := strings.Join(buildBwrapArgv("alice", "/home/alice", 7, 8, "/bin/bash", false, []string{"true"}), " ")
+	if strings.Contains(off, "/dev/log") || strings.Contains(off, "/run/systemd") {
+		t.Errorf("the log socket is in the jail without the opt-in: %s", off)
+	}
+	argv := buildBwrapArgv("alice", "/home/alice", 7, 8, "/bin/bash", true, []string{"true"})
+	joined := strings.Join(argv, " ")
+	if !strings.Contains(joined, "--ro-bind-try /run/systemd/journal/dev-log /dev/log") {
+		t.Fatalf("opted in, yet no log socket: %s", joined)
+	}
+	dev, sock := -1, -1
+	for i, a := range argv {
+		if a == "--dev" && dev < 0 {
+			dev = i
+		}
+		if a == "/run/systemd/journal/dev-log" {
+			sock = i
+		}
+		if a == "/run/systemd/journal" || a == "/run/systemd" {
+			t.Errorf("argv binds the directory %s: %s", a, joined)
+		}
+	}
+	if sock < dev {
+		t.Errorf("the socket bind must come after --dev /dev, or the fresh /dev hides it: %s", joined)
+	}
+}
+
+func TestSandboxSyslogOn(t *testing.T) {
+	dir := t.TempDir()
+	old := syslogFlagFile
+	t.Cleanup(func() { syslogFlagFile = old })
+
+	syslogFlagFile = dir + "/missing"
+	if sandboxSyslogOn() {
+		t.Error("no flag file, yet on")
+	}
+	syslogFlagFile = dir + "/flag"
+	for content, want := range map[string]bool{"on\n": true, "on": true, "": false, "off\n": false, "1\n": false} {
+		if err := os.WriteFile(syslogFlagFile, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if got := sandboxSyslogOn(); got != want {
+			t.Errorf("flag %q: on = %v, want %v", content, got, want)
+		}
+	}
+	syslogFlagFile = dir + "/adir"
+	if err := os.Mkdir(syslogFlagFile, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if sandboxSyslogOn() {
+		t.Error("a directory at the flag path counts as on")
+	}
+}
+
+// TestRootShellArgv guards GH #658: root's real login shell must preserve
+// sshd's invocation — a leading-dash argv0 for an interactive login, and the
+// passed args (e.g. `-c "cmd"`) for a remote command.
+func TestRootShellArgv(t *testing.T) {
+	if got := rootShellArgv("bash", []string{"-dotnext-ssh-shell"}); len(got) != 1 || got[0] != "-bash" {
+		t.Fatalf("interactive: got %v, want [-bash]", got)
+	}
+	got := rootShellArgv("bash", []string{"dotnext-ssh-shell", "-c", "id"})
+	if len(got) != 3 || got[0] != "bash" || got[1] != "-c" || got[2] != "id" {
+		t.Fatalf("command: got %v, want [bash -c id]", got)
+	}
+}

@@ -1,0 +1,106 @@
+# Cron Jobs
+
+systemd-user timers + a command allowlist.
+
+## Model
+
+A **Cron Job** is:
+
+- 5-field cron schedule (`min hour day month dow`).
+- An owner user (must have a Linux account).
+- A command from the **allowlist** (`php`, `wp`, `python`, `node`, plus a curated set per-app), or an **ordered sequence** of `wp` / `php` commands run one after another in a single job.
+- An optional name (display label).
+
+Internally each cron row becomes:
+
+- `~/.config/systemd/user/dotnext-cron-<id>.service` — the command.
+- `~/.config/systemd/user/dotnext-cron-<id>.timer` — the schedule.
+
+Both are owned by the user. `loginctl enable-linger <user>` runs at user creation so timers fire without an active session.
+
+Disabling a job stops its timer and removes both files; enabling it writes them again. Deleting a job removes them before the row. Before the November 2026 release, deleting or disabling a tenant's job left its timer running, because the removal looked in an old location (`/etc/dotnext/cron-units/<user>/`). After the update, the panel removes every `dotnext-cron-<id>` timer in an account's home that has no cron job behind it: on the first pass after the panel starts, then hourly. It skips admin accounts.
+
+## Why not crontab?
+
+systemd-user timers give:
+
+- Per-job journal logs (`journalctl --user -u dotnext-cron-<id>`).
+- `RandomizedDelaySec=` — natural jitter without operators having to add `sleep $RANDOM`.
+- No per-user `crontab -e` shell access (we don't grant interactive shell to panel users).
+
+A tenant job's output goes to the journal like any unit's. **Run now** and the job's log read it as root, limited to the job owner's entries by the journal's `_UID` field, so they work whether the journal is stored persistently or not. Before the November 2026 release they read it with `journalctl --user` run as the tenant. That sees only the tenant's own journal file, and journald keeps one per user only when the journal is stored persistently. On a server with a volatile journal (`Storage=volatile`, or `Storage=auto` with no `/var/log/journal`), Run now showed "Exit code 0" with no output and the job's log was empty, although the job had run.
+
+A tenant job's unit also sets `SyslogIdentifier=dotnext-cron-<id>`, and Run now and the log match on it, again limited to the owner's `_UID`. journald logs the last line a job writes without a trailing newline only when the job's output stream closes, after the job has exited. It can then no longer tie the line to the unit through the writer's cgroup, and it takes the unit name a stream announces only from root, so for a tenant job that line had no `_SYSTEMD_USER_UNIT`. Before the November 2026 release, a script whose output has no final newline (`echo "done<br>";`) showed nothing in Run now or the log, on any journal. A root job's last line keeps its unit field, so root jobs never had this gap. The reconciler adds the identifier to existing units within a minute of the update; a run logged before that keeps its missing line.
+
+## Command allowlist
+
+Only commands on a fixed allowlist can be scheduled. The allowlist lives in the shared validator (`/internal/cronvalidate/`) used by the REST API, the CLI (`Cron Job Intake` — the single ingest path, per CONTEXT.md) and the agent, which checks every command again before it installs or runs it. There is no setting to extend it. Alongside `php` and `wp`, the validator accepts **`python` and `node`** scripts located under the owner's home, and an **ordered sequence** of `wp`/`php` steps in one job.
+
+**Shell scripts follow the hosting package's SSH access**. A tenant job may run the account's own `.sh` script (`bash <script.sh> [args]`, `sh <script.sh> [args]`, or the script's absolute path alone, which runs with `bash`) only when the account's package has SSH enabled. The script must be an absolute path in one of the account's docroots or under its home, and no option may come before it, so `bash -c`, `-s`, `--rcfile` and `--init-file` are refused. A tenant job runs inside the account's SSH sandbox (`dotnext-ssh-shell --exec`), so a script can do nothing the account's SSH shell can't. Without SSH a script would be a way around the allowlist, so the panel refuses it with `400 validation_failed`, code `shell_needs_ssh`. An account with no package, or whose package can't be read, is treated as having no SSH.
+
+Root jobs keep the closed list: a root job never runs a shell script, whatever the admin's package allows. For an arbitrary command as root, use root's own crontab over SSH.
+
+The panel tells the agent on each `cron.apply` and `cron.run_now` whether the account's package includes SSH (`allow_shell_scripts`); the agent never honors it for a root job. When a package loses SSH, the reconciler removes the timer of each enabled job that runs a shell script within a minute, and keeps the job's row. Turning such a job on, editing it or running it is refused until the package includes SSH again; the reconciler then installs its timer again. A shell cron imported from a cPanel account still comes in disabled. Once the account's package includes SSH, the tenant can edit it to fit the rules above and turn it on.
+
+## Admin view
+
+**Admin → Cron Jobs** lists every tenant's jobs. From there an admin can create a job under any tenant (or as `root`), and toggle, run, view the log of, edit, or delete any job. Editing changes only the name, command and schedule. The owner and the run-as target stay fixed; to move a job to another tenant, delete it and create it again. An admin's edit is checked exactly like the tenant's own: the command must stay inside the **job owner's** directories, not the admin's.
+
+A `root` job is always owned by the admin who creates it. The API refuses `run_as_root` combined with another account's `user_id` (`422 run_as_root_owner_mismatch`), because a root job's command is checked against its owner's directories. A root job whose owner is not an admin, which only a raw API call could create before this check, can no longer be edited or toggled (`422 root_cron_owner_not_admin`). Delete it and create it again as an admin. Blocking edits does not stop such a job: its system timer keeps running until the job is deleted. To find such jobs, including ones whose owner no longer exists: `SELECT c.id, c.user_id FROM cron_jobs c LEFT JOIN users u ON u.id = c.user_id WHERE c.run_as_root = 1 AND (u.id IS NULL OR u.is_admin = 0);`
+
+A root job runs as root through its own system unit, `dotnext-cron-<id>.service` under `/etc/systemd/system`, so the admin needs no account on the server. **Run now**, the job's log and Last run all use that unit, and its output goes to the system journal (`journalctl -u dotnext-cron-<id>.service`). Until this was fixed, the unit wrote its output to `/var/log/dotnext/cron/root/<id>.log`, a directory nothing created. Every run failed before the command started (`status=209/STDOUT`), and Run now and the log answered 502. The reconciler rewrites an existing root unit within a minute of the panel's update. Run now and the log also refuse a root job whose owner is not an admin (`422 root_cron_owner_not_admin`), so such a job never runs as root from the panel.
+
+## System jobs
+
+**Admin → Cron Jobs → System jobs** lists the scheduled jobs DotNext itself installs on the server, apart from tenant jobs. The tab can be linked directly: `/dotnext-admin/cron?tab=system`.
+
+Each row shows what the job does, its schedule, its status, when it last ran and whether that run succeeded, and when it runs next. The status is one of these:
+
+- **Scheduled**: the job's timer is active and the job will run at the next run time.
+- **Running**: the job is running now.
+- **Disabled**: the job's timer is not active, so the job does not run. Some jobs are off on purpose. For example, panel auto-update is off until it is turned on on the Updates page, and the free-hostname check-in runs only on a server that uses a free hostname. The schedule column then reads **Not scheduled**, with the schedule the job would run on once enabled underneath.
+
+A job that is not installed on the server is not shown. The success of a run is systemd's verdict on it (`Result`), not the raw exit code, because some jobs exit with a non-zero code by design. For example, AIDE exits non-zero when it reports file changes.
+
+The last run counts every run, scheduled or started with Run now, including runs of a disabled job. systemd forgets a finished run of a job whose timer is disabled, and every job's last run after a reboot; the agent then reads the last run from systemd's own start and finish lines in the journal.
+
+The actions are:
+
+- **Run now** starts the job immediately, after a confirmation. The job runs in the background, and the list updates while it runs. A job that is already running is not started again.
+- **View log** shows the job's recent journal lines.
+- **Open Updates** and **Open Backups** go to the page that owns the job's settings. The list does not repeat those settings.
+
+Run now is not offered for three jobs:
+
+- **Operating system updates** and **Panel auto-update** run from the Updates page, which shows their progress.
+- **Single sign-on cleanup** runs every 30 seconds on its own.
+
+Nothing in this list can be turned off. The security jobs (malware signatures and scans, YARA rules, AIDE, CrowdSec, AppArmor and outbound-traffic enforcement, secret cleanup) always stay on.
+
+The server-wide backup schedules appear as rows that link to the Backups page. That page is where they are changed and run, and where their results are shown. A tenant's own backup schedules are tenant jobs and are not listed. Jobs that run inside the panel itself, such as the reconciler and notification delivery, are not listed: there is nothing to run or change on them.
+
+The list is a fixed catalog compiled into the panel and the agent (`internal/systemjobs`). A request names a job by its catalog id, never by a systemd unit. The agent refuses Run now for the three jobs above even if the panel asked. The API:
+
+| Method | Path | Notes |
+|---|---|---|
+| `GET` | `/api/v1/admin/system-jobs` | The installed jobs and the server-wide backup schedules. |
+| `POST` | `/api/v1/admin/system-jobs/{id}/run` | `202` started, `409 already_running`, `422 run_now_not_allowed`, `404 unknown_system_job` or `404 system_job_not_installed`. Rate-limited per admin, and audit-logged (`kind=system_job_run`). |
+| `GET` | `/api/v1/admin/system-jobs/{id}/log?lines=N` | The job's last `N` journal lines, 1 to 500, 200 by default. |
+
+All three endpoints are admin-only.
+
+## CLI
+
+Run these as root on the panel host: `dotnext` is the server's administration command. A hosting account that runs it gets an error saying it must run as root, and manages its own cron jobs under **Cron Jobs** in the panel instead. `dotnext-cli cron list` names each job's account in its `USER` column: the username, or the email of an admin (`--json` keeps `user_id`). `--user` takes a user id, email or username.
+
+```bash
+dotnext-cli cron list --user <id>
+dotnext-cli cron add --user <id> --schedule "0 3 * * *" --command "wp cron event run --due-now --url=https://example.com"
+dotnext-cli cron update <job-id> --schedule "*/15 * * * *"
+dotnext-cli cron delete <job-id>
+dotnext-cli cron run-now <job-id>     # ignores schedule; waits up to 4 min, a longer run keeps going
+```
+
+## Failures
+
+The panel does not send a notification when a job fails. The cron list shows each job's last exit code, and the job's log shows its output.

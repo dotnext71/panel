@@ -1,0 +1,158 @@
+// AdminCronList — admin-side cross-tenant cron view (GH#127), now a thin
+// Adapter over the shared CronJobWorkspace Module (JAB-298). It selects the
+// admin list operation, owner-aware search, the Owner sub-line, this screen's
+// column order (Enabled before the merged Last-run tag), paginated table, and
+// the admin create-as-user / edit editor (GH #1686 item 2). Toggle / run /
+// edit / delete / log / overlays all live in the Module; they authorise admins
+// server-side via fetchAndAuthorize's claims.IsAdmin bypass. A second tab,
+// System jobs (GH #1686), lists the scheduled jobs DotNext itself installs,
+// kept apart from tenant jobs; ?tab=system opens it. Laid out like Security
+// and Backups (GH #2251): the heading, then one card whose tab bar holds the
+// two lists, so the heading sits above the tabs.
+import { useTranslation } from "react-i18next";
+import { useSearchParams } from "react-router";
+import { Card, Space, Tag, Tooltip, Typography } from "antd";
+import { CalendarCheckOutlined, TeamOutlined, ToolOutlined } from "@icons";
+import dayjs from "dayjs";
+import relativeTime from "dayjs/plugin/relativeTime";
+
+import { listAdminCronJobs } from "../../../apiClient";
+import { EmptyWithCTA } from "../../../components/EmptyWithCTA";
+import { CronJobWorkspace, type CronWorkspaceAudience } from "../../../components/cron/CronJobWorkspace";
+import {
+  cronActionsColumn,
+  cronEnabledColumn,
+  type CronWorkspaceRow,
+} from "../../../components/cron/cronColumns";
+import { AdminCreateCronModal } from "./AdminCreateCronModal";
+import { AdminSystemJobs } from "./AdminSystemJobs";
+import { humanizeSchedule } from "../../../utils/cronSchedule";
+import { shortDateTime } from "../../../utils/datetime";
+
+dayjs.extend(relativeTime);
+
+const truncate = (s: string, n = 40) => (s.length <= n ? s : s.substring(0, n) + "…");
+
+export const AdminCronList = () => {
+  const { t } = useTranslation();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tab = searchParams.get("tab") === "system" ? "system" : "tenant";
+
+  // No title: the page's heading and card frame the Tenant jobs tab.
+  const audience: CronWorkspaceAudience = {
+    showCount: true,
+    query: { key: ["admin-cron-jobs"], fn: () => listAdminCronJobs() },
+    searchPlaceholder: "admincronlist.search_by_name_command_schedule_or_owner",
+    searchOwner: true,
+    pagination: { defaultPageSize: 25, showSizeChanger: true },
+    tableSize: "small",
+    renderEmpty: (openCreate) => (
+      <EmptyWithCTA
+        description={t("admincronlist.no_cron_jobs_yet")}
+        ctaLabel="Create cron job"
+        onCta={openCreate}
+      />
+    ),
+    renderEditor: ({ open, editing, onClose, onSuccess }) => (
+      <AdminCreateCronModal open={open} onClose={onClose} onSuccess={onSuccess} initial={editing} />
+    ),
+    buildColumns: (ctx) => [
+      {
+        title: "Name",
+        dataIndex: "name",
+        sorter: (a, b) => a.name.localeCompare(b.name),
+        defaultSortOrder: "ascend",
+        render: (name: string, row: CronWorkspaceRow) => (
+          <Space direction="vertical" size={0}>
+            <Typography.Text strong>{name}</Typography.Text>
+            <Tooltip title={`user_id: ${row.user_id}`}>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                {row.username || row.user_id}
+              </Typography.Text>
+            </Tooltip>
+          </Space>
+        ),
+      },
+      {
+        title: "Schedule",
+        dataIndex: "schedule",
+        sorter: (a, b) => a.schedule.localeCompare(b.schedule),
+        width: 200,
+        render: (sch: string) => (
+          <Tooltip title={sch}>
+            <Tag>{humanizeSchedule(sch)}</Tag>
+          </Tooltip>
+        ),
+      },
+      {
+        title: "Command",
+        dataIndex: "command",
+        sorter: (a, b) => a.command.localeCompare(b.command),
+        render: (cmd: string) => (
+          <Tooltip title={cmd}>
+            <Typography.Text code>{truncate(cmd)}</Typography.Text>
+          </Tooltip>
+        ),
+      },
+      cronEnabledColumn(ctx),
+      {
+        title: "Last run",
+        dataIndex: "last_run_at",
+        sorter: (a, b) =>
+          (a.last_run_at ? +new Date(a.last_run_at) : 0) - (b.last_run_at ? +new Date(b.last_run_at) : 0),
+        width: 160,
+        render: (ts: string | null, row: CronWorkspaceRow) =>
+          ts ? (
+            <Tooltip title={`${shortDateTime(ts)} · exit=${row.last_exit_code ?? "?"}${row.last_error ? "\n" + row.last_error : ""}`}>
+              <Tag color={row.last_exit_code === 0 ? "green" : row.last_exit_code === null ? "default" : "red"}>
+                {dayjs(ts).fromNow()}
+              </Tag>
+            </Tooltip>
+          ) : (
+            <Tag>never</Tag>
+          ),
+      },
+      cronActionsColumn(ctx, {
+        runLabel: "Run",
+        canEdit: true,
+        deleteConfirm: (row) => ({ title: `Delete cron job "${row.name}"?`, okText: "Delete" }),
+      }),
+    ],
+  };
+
+  return (
+    <div>
+      <Typography.Title level={3} style={{ marginTop: 0, marginBottom: 16 }}>
+        <CalendarCheckOutlined /> Cron Jobs
+      </Typography.Title>
+
+      <Card
+        // nowrap keeps two-word tabs on one line at phone width (as Notifications).
+        tabList={[
+          {
+            key: "tenant",
+            tab: (
+              <Space size={6} style={{ whiteSpace: "nowrap" }}>
+                <TeamOutlined />
+                Tenant jobs
+              </Space>
+            ),
+          },
+          {
+            key: "system",
+            tab: (
+              <Space size={6} style={{ whiteSpace: "nowrap" }}>
+                <ToolOutlined />
+                System jobs
+              </Space>
+            ),
+          },
+        ]}
+        activeTabKey={tab}
+        onTabChange={(k) => setSearchParams(k === "system" ? { tab: "system" } : {}, { replace: true })}
+      >
+        {tab === "system" ? <AdminSystemJobs /> : <CronJobWorkspace audience={audience} />}
+      </Card>
+    </div>
+  );
+};

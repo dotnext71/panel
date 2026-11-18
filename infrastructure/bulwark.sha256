@@ -1,0 +1,23 @@
+# Bulwark Webmail 1.19.1 standalone tarball SHA-256.
+# Source: https://github.com/bulwarkmail/webmail/releases/tag/1.19.1
+#   asset: bulwark-standalone-1.19.1-linux-amd64.tar.gz
+# Captured 2026-11-01 from the GitHub release artifact; matches the release's
+# own .sha256 file and the digest GitHub publishes for the asset.
+# 1.13 - 1.19.1 carry upstream security fixes in several releases (see the
+# "Security" sections of its changelog), among them sanitizing re-opened
+# drafts in 1.17.2. 1.18.0 and later work with Stalwart 0.16 and 1.0.
+# From 1.11.1 a
+# mailbox impersonation runs on an 8-hour app password Bulwark creates on the
+# mailbox, instead of carrying the Stalwart master password in the cookie.
+#
+# Bulwark ships a prebuilt "standalone" Next.js tarball (server.js +
+# node_modules + .next), so we no longer git-clone + `npm ci` +
+# `npm run build`. install_bulwark() downloads this tarball, verifies
+# the SHA below, and extracts it.
+#
+# To re-capture on a version bump (BOTH the version in install.sh AND this
+# checksum must change together — a version bump alone fails SHA verification):
+#   curl -sSL https://github.com/bulwarkmail/webmail/releases/download/<v>/bulwark-standalone-<v>-linux-amd64.tar.gz | sha256sum
+# Paste the returned 64-char hex below. install.sh `_die`s if the
+# placeholder PLACEHOLDER_CAPTURE_ON_FIRST_DEPLOY survives.
+951bb557c0cff4ee62f423ff5f0971680b19810118c5e71d061b5d732130b47e

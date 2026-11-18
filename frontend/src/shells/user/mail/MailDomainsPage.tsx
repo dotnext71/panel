@@ -1,0 +1,424 @@
+// MailDomainsPage — GH #1387. The tenant's Mail entry point: every domain they
+// own that HAS mail active, with at-a-glance info (mailbox count, storage,
+// 30-day sent/received, queue), an SSL badge, and a per-row Disable action.
+//
+// GH #1387 (johnnyq, 2026-09-01): the list shows ONLY mail-active domains (the
+// earlier "show every owned domain + a Status column + Enable action" is
+// reverted). Enabling mail on a domain is a Domains-page action; creating a
+// mailbox happens inside a domain's drill-down, not here. Disable reuses the
+// existing owner-scoped DELETE /domains/:id/email endpoint. Delete is the
+// destructive mail-only teardown (POST /domains/:id/email/purge) — it removes
+// mailboxes + mail certs + mail DNS but keeps the website + DNS zone.
+//
+// A domain whose mail is hosted elsewhere is tagged "Send-only" (#2491). One
+// with mail off is listed too once it has send-only accounts, without the mail
+// actions.
+import {
+  Alert,
+  Button,
+  Card,
+  Dropdown,
+  Empty,
+  Input,
+  Modal,
+  Space,
+  Spin,
+  Table,
+  Tag,
+  Tooltip,
+  Typography,
+  type TableColumnsType,
+} from "antd";
+import {
+  DeleteOutlined,
+  FileTextOutlined,
+  GlobalOutlined,
+  MailOutlined,
+  MoreOutlined,
+  PlusOutlined,
+  PoweroffOutlined,
+} from "@icons";
+import { useQueryClient } from "@tanstack/react-query";
+import { useState } from "react";
+import { useNavigate } from "react-router";
+import { invalidateMailInventory } from "../../../hooks/useMailboxes";
+import { useListQuery } from "../../../hooks/useQueries";
+import { humanBytes } from "../../../utils/bytes";
+import { getSSLTagColor, getSSLTagLabel } from "../../../utils/sslState";
+import { apiClient } from "../../../apiClient";
+import { feedback } from "../../../lib/feedback";
+import { useServerCapabilities } from "../../../hooks/useServerCapabilities";
+import { UserDomainDrawer } from "../domains/UserDomainDrawer";
+import { MailDNSRecordsModal } from "../../../components/mail/MailDNSRecordsModal";
+import { mailAwayContent } from "../../../components/mail/mailAwayConfirm";
+
+interface MailDomainRow {
+  id: string;
+  name: string;
+  mailbox_count: number;
+  mail_bytes: number;
+  sent_30d: number;
+  received_30d: number;
+  // Omitted by the API when the queue couldn't be read (agent unavailable) —
+  // shown as "—", never a misleading 0.
+  queue?: number | null;
+  email_enabled: boolean;
+  ssl_state?: string;
+  is_quota_suspended?: boolean;
+  // GH #1612: true when the panel does NOT host this domain's DNS (external DNS).
+  // Drives the "External DNS" tag + the "DNS records" action.
+  dns_disabled?: boolean;
+  // The domain's mail is off or with another provider, so its accounts are
+  // send-only (#2491). Tagged "Send-only". A mail-off domain is listed only
+  // for those accounts and gets no row actions: there is no mail here to
+  // disable or delete, and DotNext's mail DNS records would be wrong for it.
+  mail_hosted_elsewhere?: boolean;
+}
+
+const num = (n: number | null | undefined): string => (n ?? 0).toLocaleString();
+// nulls (unknown queue) sort last regardless of order.
+const numOrNull = (n: number | null | undefined): number =>
+  n === null || n === undefined ? -1 : n;
+
+export function MailDomainsPage() {
+  const navigate = useNavigate();
+  const qc = useQueryClient();
+  const [busyId, setBusyId] = useState<string | null>(null);
+  // Delete (mail purge) is type-to-confirm: the row being deleted + the typed
+  // domain name that must match before the destructive button enables.
+  const [deleteRow, setDeleteRow] = useState<MailDomainRow | null>(null);
+  const [confirmText, setConfirmText] = useState("");
+  // GH #1479: Create Mail Domain drawer (reuses the tenant Add-domain drawer in
+  // its mail mode — web-off, mail on, TLS/webmail/DNS-records options).
+  const [createOpen, setCreateOpen] = useState(false);
+  // GH #1479 (johnnyq): don't offer "Create Mail Domain" when mail is disabled
+  // server-wide — there's nothing to provision. Default-on while caps load, so a
+  // mail-enabled server never flashes the button away. Mirrors the sidebar gate.
+  const { data: caps } = useServerCapabilities();
+  const mailEnabled = caps?.mail_enabled !== false;
+  // DNS is "external" for a domain when the panel doesn't host its zone
+  // (dns_disabled) OR the server has no DNS module at all (GH #1612).
+  const dnsEnabled = caps?.dns_enabled !== false;
+  const isExternalDNS = (row: MailDomainRow) => !!row.dns_disabled || !dnsEnabled;
+  // GH #1612: the domain whose external-DNS records modal is open.
+  const [dnsRecordsRow, setDnsRecordsRow] = useState<MailDomainRow | null>(null);
+  const query = useListQuery<MailDomainRow>({ resource: "me/mail-domains" });
+  const rows = query.items;
+
+  // Every listed domain is mail-active, so the only mail-state action here is
+  // Disable (soft — keeps mailboxes, re-enable from the Domains page restores
+  // service). It reuses the owner-scoped DELETE /domains/:id/email endpoint.
+  const disableMail = async (row: MailDomainRow) => {
+    setBusyId(row.id);
+    try {
+      await apiClient.delete(`/domains/${row.id}/email`);
+      feedback.message.success(`Mail disabled for ${row.name}`);
+      await query.refetch();
+    } catch (err) {
+      feedback.message.error(
+        err instanceof Error ? err.message : "Could not disable mail",
+      );
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const confirmDisable = (row: MailDomainRow) => {
+    feedback.modal.confirm({
+      title: `Disable mail for ${row.name}?`,
+      // Since PR #2350 mail for the domain no longer arrives here; say so and
+      // name the mailboxes left (kept, but no new mail for them).
+      content: mailAwayContent({
+        domainLabel: row.name,
+        mailboxCount: row.mailbox_count,
+        dnsRemoved: true,
+        footer: "Turning mail back on from the Domains page restores delivery.",
+      }),
+      okText: "Disable",
+      okButtonProps: { danger: true },
+      onOk: () => disableMail(row),
+    });
+  };
+
+  // Delete = the destructive mail-only teardown (POST /domains/:id/email/purge).
+  // The server also requires confirm_domain to equal the name, so a stray call
+  // can't wipe a domain's mail.
+  const purgeMail = async (row: MailDomainRow) => {
+    setBusyId(row.id);
+    try {
+      const resp = await apiClient.post<{ warnings?: string[] }>(
+        `/domains/${row.id}/email/purge`,
+        { confirm_domain: row.name },
+      );
+      feedback.message.success(`Mail deleted for ${row.name}`);
+      (resp.data?.warnings ?? []).forEach((w) => feedback.message.warning(w));
+      // JAB-370 AC7: every user mailbox on the domain is gone (forwarders and
+      // autoresponders cascade), and email_enabled is cleared — refresh the
+      // whole mail inventory family and the domain rows, not only this list.
+      invalidateMailInventory(qc, row.id);
+      qc.invalidateQueries({ queryKey: ["list", "domains"] });
+      qc.invalidateQueries({ queryKey: ["one", "domains", row.id] });
+      qc.invalidateQueries({ queryKey: ["one", "domain-email", row.id] });
+      setDeleteRow(null);
+      setConfirmText("");
+      await query.refetch();
+    } catch (err) {
+      feedback.message.error(
+        err instanceof Error ? err.message : "Could not delete mail",
+      );
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const columns: TableColumnsType<MailDomainRow> = [
+    {
+      title: "Domain",
+      dataIndex: "name",
+      key: "name",
+      sorter: (a, b) => a.name.localeCompare(b.name),
+      defaultSortOrder: "ascend",
+      render: (name: string, row) => (
+        <Space size="small">
+          <a onClick={() => navigate(`/panel/mail-domains/${row.id}`)}>{name}</a>
+          {isExternalDNS(row) && (
+            <Tag icon={<GlobalOutlined />} color="blue">
+              External DNS
+            </Tag>
+          )}
+          {row.mail_hosted_elsewhere && (
+            <Tooltip title="Mail for this domain is hosted elsewhere. Its accounts can only send.">
+              <Tag color="orange">Send-only</Tag>
+            </Tooltip>
+          )}
+        </Space>
+      ),
+    },
+    {
+      title: "SSL",
+      dataIndex: "ssl_state",
+      key: "ssl_state",
+      sorter: (a, b) =>
+        getSSLTagLabel(a.ssl_state).localeCompare(getSSLTagLabel(b.ssl_state)),
+      render: (state?: string) => (
+        <Tag color={getSSLTagColor(state)}>{getSSLTagLabel(state)}</Tag>
+      ),
+    },
+    {
+      title: "Mailboxes",
+      dataIndex: "mailbox_count",
+      key: "mailbox_count",
+      align: "right",
+      sorter: (a, b) => a.mailbox_count - b.mailbox_count,
+      render: (n: number) => num(n),
+    },
+    {
+      title: "Mail storage",
+      dataIndex: "mail_bytes",
+      key: "mail_bytes",
+      align: "right",
+      sorter: (a, b) => a.mail_bytes - b.mail_bytes,
+      render: (n: number) => humanBytes(n),
+    },
+    {
+      title: "Sent (30d)",
+      dataIndex: "sent_30d",
+      key: "sent_30d",
+      align: "right",
+      sorter: (a, b) => a.sent_30d - b.sent_30d,
+      render: (n: number) => num(n),
+    },
+    {
+      title: "Received (30d)",
+      dataIndex: "received_30d",
+      key: "received_30d",
+      align: "right",
+      sorter: (a, b) => a.received_30d - b.received_30d,
+      render: (n: number) => num(n),
+    },
+    {
+      title: "Queue",
+      dataIndex: "queue",
+      key: "queue",
+      align: "right",
+      sorter: (a, b) => numOrNull(a.queue) - numOrNull(b.queue),
+      render: (q: number | null | undefined) =>
+        q === null || q === undefined ? "—" : num(q),
+    },
+    {
+      title: "Actions",
+      key: "actions",
+      // GH #1387 (johnnyq): collapse Disable + Delete into one "⋯" menu so the
+      // row stays compact. Disable confirms via a modal (a Popconfirm can't
+      // anchor cleanly inside a dropdown); Delete opens the type-to-confirm modal.
+      render: (_v, row) =>
+        !row.email_enabled ? null : (
+          <Dropdown
+            trigger={["click"]}
+            menu={{
+              items: [
+                // GH #1612: only when DNS is hosted externally — a panel-hosted
+                // zone publishes these records itself, so there's nothing to copy.
+                ...(isExternalDNS(row)
+                  ? [
+                      {
+                        key: "dns-records",
+                        icon: <FileTextOutlined />,
+                        label: "DNS records",
+                        onClick: () => setDnsRecordsRow(row),
+                      },
+                    ]
+                  : []),
+                {
+                  key: "disable",
+                  icon: <PoweroffOutlined />,
+                  danger: true,
+                  label: "Disable",
+                  onClick: () => confirmDisable(row),
+                },
+                {
+                  key: "delete",
+                  icon: <DeleteOutlined />,
+                  danger: true,
+                  label: "Delete",
+                  onClick: () => {
+                    setConfirmText("");
+                    setDeleteRow(row);
+                  },
+                },
+              ],
+            }}
+          >
+            <Button
+              size="small"
+              icon={<MoreOutlined />}
+              loading={busyId === row.id}
+              aria-label={`Actions for ${row.name}`}
+            />
+          </Dropdown>
+        ),
+    },
+  ];
+
+  return (
+    <div>
+      {/* GH #2251: the page opens with a heading that carries the sidebar's
+          icon, actions on its row, as on Web Domains. */}
+      <Space
+        style={{
+          marginBottom: 16,
+          width: "100%",
+          justifyContent: "space-between",
+          flexWrap: "wrap",
+          rowGap: 8,
+        }}
+      >
+        <Typography.Title level={3} style={{ margin: 0 }}>
+          <MailOutlined /> Mail Domains
+        </Typography.Title>
+        {mailEnabled ? (
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            onClick={() => setCreateOpen(true)}
+          >
+            Create Mail Domain
+          </Button>
+        ) : null}
+      </Space>
+
+      <Card>
+        <Typography.Paragraph type="secondary" style={{ marginBottom: 16 }}>
+          Domains with mail active, at a glance. Select a domain to manage its
+          accounts and add mailboxes. A domain whose mail is hosted elsewhere
+          shows here once it has send-only accounts.
+        </Typography.Paragraph>
+        {query.isLoading ? (
+          <Spin />
+        ) : rows.length === 0 ? (
+          <Empty
+            image={Empty.PRESENTED_IMAGE_SIMPLE}
+            description={
+              mailEnabled
+                ? "No domains have mail active yet. Create a mail domain here, or enable mail on an existing domain from the Domains page."
+                : "Mail is disabled on this server."
+            }
+          >
+            {mailEnabled && (
+              <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateOpen(true)}>
+                Create Mail Domain
+              </Button>
+            )}
+          </Empty>
+        ) : (
+          <Table<MailDomainRow>
+            rowKey="id"
+            dataSource={rows}
+            columns={columns}
+            pagination={false}
+            scroll={{ x: "max-content" }}
+          />
+        )}
+
+        <Modal
+          open={!!deleteRow}
+          title={deleteRow ? `Delete mail for ${deleteRow.name}?` : "Delete mail"}
+          okText="Delete mail"
+          okButtonProps={{
+            danger: true,
+            loading: busyId === deleteRow?.id,
+            disabled: !deleteRow || confirmText.trim() !== deleteRow.name,
+          }}
+          onOk={() => deleteRow && purgeMail(deleteRow)}
+          onCancel={() => setDeleteRow(null)}
+          destroyOnClose
+        >
+          <Alert
+            type="error"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message="This permanently deletes the mail service for this domain"
+            description={
+              <ul style={{ margin: "8px 0 0", paddingLeft: 18 }}>
+                <li>All mailboxes in this domain and the mail they store</li>
+                <li>The mail TLS certificate (mail, autodiscover, autoconfig)</li>
+                <li>The managed mail DNS records (MX, SPF, DKIM, autodiscover…)</li>
+              </ul>
+            }
+          />
+          <Typography.Paragraph style={{ marginBottom: 8 }}>
+            The website, its DNS zone, and its certificate are kept. Type{" "}
+            <Typography.Text code>{deleteRow?.name}</Typography.Text> to confirm.
+          </Typography.Paragraph>
+          <Input
+            autoFocus
+            placeholder={deleteRow?.name}
+            value={confirmText}
+            onChange={(e) => setConfirmText(e.target.value)}
+            onPressEnter={() => {
+              if (deleteRow && confirmText.trim() === deleteRow.name) purgeMail(deleteRow);
+            }}
+          />
+        </Modal>
+
+        <MailDNSRecordsModal
+          open={!!dnsRecordsRow}
+          domainId={dnsRecordsRow?.id}
+          domainName={dnsRecordsRow?.name}
+          onClose={() => setDnsRecordsRow(null)}
+        />
+
+        <UserDomainDrawer
+          open={createOpen}
+          mode="mail"
+          onClose={() => {
+            setCreateOpen(false);
+            // The drawer creates via the "domains" resource; this page lists
+            // "me/mail-domains", so refetch to show the new mail domain.
+            void query.refetch?.();
+          }}
+        />
+      </Card>
+    </div>
+  );
+}

@@ -1,0 +1,335 @@
+// shared_resources.go — M52 (ADR-0133) REST surface for standalone shared
+// resources (calendar / address book / file folder / mailbox) and their
+// grants. DB is truth; the reconciler converges to Stalwart host principals +
+// per-collection shareWith. Create/delete also kick the agent directly for
+// instant host provisioning (the mailgroup.apply pattern); grant changes
+// converge on the next reconcile pass.
+package api
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/dotnext-panel/dotnext/internal/agent"
+	"github.com/dotnext-panel/dotnext/internal/auth"
+	"github.com/dotnext-panel/dotnext/internal/ginctx"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+	"github.com/dotnext-panel/dotnext/internal/scandrops"
+	"github.com/dotnext-panel/dotnext/internal/sharedresourceops"
+)
+
+const sharedResourceAgentTimeout = 15 * time.Second
+
+type SharedResourceHandlerConfig struct {
+	Resources  repository.SharedResourceRepository
+	Domains    repository.DomainRepository
+	Mailboxes  repository.MailboxRepository
+	MailGroups repository.MailGroupRepository
+	Agent      agent.AgentInterface
+	// Scanners wires the GH #2503 scanner routes; nil leaves them off.
+	Scanners *scandrops.Deps
+	// ScannerRateLimit bounds turning a scanner on (it makes a login).
+	ScannerRateLimit gin.HandlerFunc
+}
+
+type sharedResourceHandler struct{ cfg SharedResourceHandlerConfig }
+
+// RegisterSharedResourceRoutes mounts the M52 endpoints:
+//
+//   - GET    /domains/:id/shared-resources       list (optional ?kind=)
+//   - POST   /domains/:id/shared-resources       create
+//   - GET    /shared-resources/:rid              detail + grants
+//   - PATCH  /shared-resources/:rid              update display name
+//   - PUT    /shared-resources/:rid/grants       replace the grant set
+//   - DELETE /shared-resources/:rid              delete (+ agent destroy)
+//   - GET|PUT|DELETE /shared-resources/:rid/scanner  a Files resource's scanner (GH #2503)
+func RegisterSharedResourceRoutes(g *gin.RouterGroup, cfg SharedResourceHandlerConfig) {
+	if cfg.Resources == nil || cfg.Domains == nil {
+		return
+	}
+	h := &sharedResourceHandler{cfg: cfg}
+	g.GET("/domains/:id/shared-resources", h.list)
+	g.POST("/domains/:id/shared-resources", h.create)
+	grp := g.Group("/shared-resources")
+	grp.GET("/:rid", h.get)
+	grp.PATCH("/:rid", h.update)
+	grp.PUT("/:rid/grants", h.setGrants)
+	grp.DELETE("/:rid", h.delete)
+	if cfg.Scanners != nil {
+		limit := cfg.ScannerRateLimit
+		if limit == nil {
+			limit = func(c *gin.Context) { c.Next() }
+		}
+		grp.GET("/:rid/scanner", h.getScanner)
+		grp.PUT("/:rid/scanner", limit, h.enableScanner)
+		grp.DELETE("/:rid/scanner", h.disableScanner)
+	}
+}
+
+// ---- request/response ----
+
+type createSharedResourceRequest struct {
+	Name        string `json:"name"` // local part of the host address
+	Kind        string `json:"kind"` // calendar|addressbook|files (mailbox refused — GH #1914)
+	DisplayName string `json:"display_name"`
+}
+
+type grantInput struct {
+	GranteeKind string `json:"grantee_kind"` // mailbox|group
+	GranteeID   string `json:"grantee_id"`
+	Rights      string `json:"rights"` // read|readwrite|admin, and readdelete on files
+}
+
+type sharedResourceWithGrants struct {
+	models.SharedResource
+	Grants []models.SharedResourceGrant `json:"grants"`
+}
+
+// ---- handlers ----
+
+func (h *sharedResourceHandler) list(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	dom, ok := h.loadDomainWithAuth(c, c.Param("id"), claims)
+	if !ok {
+		return
+	}
+	ctx := c.Request.Context()
+	var (
+		rows []models.SharedResource
+		err  error
+	)
+	if kind := c.Query("kind"); kind != "" {
+		rows, err = h.cfg.Resources.ListByDomainAndKind(ctx, dom.ID, kind)
+	} else {
+		rows, err = h.cfg.Resources.ListByDomainID(ctx, dom.ID)
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": rows, "total": len(rows)})
+}
+
+func (h *sharedResourceHandler) create(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	dom, ok := h.loadDomainWithAuth(c, c.Param("id"), claims)
+	if !ok {
+		return
+	}
+	var req createSharedResourceRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request", "detail": err.Error()})
+		return
+	}
+	// The email-enabled gate, kind allowlist, canonicalisation, duplicate-address
+	// check, trimmed display name, persist, and best-effort apply all live in
+	// sharedresourceops so the operator CLI enforces the identical policy.
+	sr, err := sharedresourceops.Create(c.Request.Context(),
+		sharedresourceops.Deps{Resources: h.cfg.Resources},
+		sharedresourceops.CreateInput{
+			Domain:      dom,
+			Kind:        req.Kind,
+			Name:        req.Name,
+			DisplayName: req.DisplayName,
+		}, h.notifyAgent)
+	if err != nil {
+		switch {
+		case errors.Is(err, sharedresourceops.ErrOwnershipPending):
+			c.JSON(http.StatusConflict, gin.H{"error": "domain_ownership_pending",
+				"detail": "prove ownership of the domain before creating shared resources"})
+		case errors.Is(err, sharedresourceops.ErrEmailNotEnabled):
+			c.JSON(http.StatusConflict, gin.H{"error": "email_not_enabled",
+				"detail": "enable email on the domain before creating shared resources"})
+		case errors.Is(err, sharedresourceops.ErrInvalidKind):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_kind",
+				"detail": "kind must be calendar, addressbook or files; for a shared mailbox, create a mail group"})
+		case errors.Is(err, sharedresourceops.ErrInvalidName):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_name", "detail": err.Error()})
+		case errors.Is(err, sharedresourceops.ErrAddressTaken):
+			c.JSON(http.StatusConflict, gin.H{"error": "address_taken"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		}
+		return
+	}
+	c.JSON(http.StatusCreated, sr)
+}
+
+func (h *sharedResourceHandler) get(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	sr, _, ok := h.loadResourceWithAuth(c, c.Param("rid"), claims)
+	if !ok {
+		return
+	}
+	grants, err := h.cfg.Resources.ListGrants(c.Request.Context(), sr.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	if grants == nil {
+		grants = []models.SharedResourceGrant{}
+	}
+	c.JSON(http.StatusOK, sharedResourceWithGrants{SharedResource: *sr, Grants: grants})
+}
+
+func (h *sharedResourceHandler) update(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	sr, _, ok := h.loadResourceWithAuth(c, c.Param("rid"), claims)
+	if !ok {
+		return
+	}
+	var req struct {
+		DisplayName *string `json:"display_name"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
+		return
+	}
+	if req.DisplayName != nil {
+		dn := strings.TrimSpace(*req.DisplayName)
+		if err := h.cfg.Resources.UpdateMeta(c.Request.Context(), sr.ID, dn); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+			return
+		}
+		// Propagate the rename to Stalwart (collection / From name). The
+		// reconciler gates apply on first-projection, so push it here.
+		if sr.EmailCached != nil && *sr.EmailCached != "" {
+			h.notifyAgent(c.Request.Context(), "sharedresource.apply", map[string]any{
+				"email": *sr.EmailCached, "display_name": dn, "kind": sr.Kind,
+			})
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (h *sharedResourceHandler) setGrants(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	sr, dom, ok := h.loadResourceWithAuth(c, c.Param("rid"), claims)
+	if !ok {
+		return
+	}
+	var req struct {
+		Grants []grantInput `json:"grants"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
+		return
+	}
+	grants := make([]models.SharedResourceGrant, 0, len(req.Grants))
+	for _, g := range req.Grants {
+		if !sharedresourceops.ValidRights(sr.Kind, g.Rights) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_rights"})
+			return
+		}
+		grants = append(grants, models.SharedResourceGrant{
+			ResourceID:  sr.ID,
+			GranteeKind: g.GranteeKind,
+			GranteeID:   g.GranteeID,
+			Rights:      g.Rights,
+		})
+	}
+	// JAB-339 AC4: validate the grantee kind + id, reject a grant to a
+	// non-existent grantee, and enforce the same-owner domain policy (the
+	// grantee must belong to the resource owner, dom.UserID) BEFORE the write —
+	// the shared owner both the REST handler and the CLI call, so they cannot
+	// drift. A dangling grantee id would otherwise persist and be silently
+	// dropped by the reconciler on every pass; an out-of-scope grantee is
+	// rejected as grantee_not_found (indistinguishable from missing).
+	grantDeps := sharedresourceops.Deps{Mailboxes: h.cfg.Mailboxes, MailGroups: h.cfg.MailGroups, Domains: h.cfg.Domains}
+	if err := sharedresourceops.ValidateGrants(c.Request.Context(), grantDeps, dom.UserID, grants); err != nil {
+		switch {
+		case errors.Is(err, sharedresourceops.ErrGranteeInvalidKind):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_grantee_kind"})
+		case errors.Is(err, sharedresourceops.ErrGranteeMissingID):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "missing_grantee_id"})
+		case errors.Is(err, sharedresourceops.ErrGranteeNotFound):
+			c.JSON(http.StatusBadRequest, gin.H{"error": "grantee_not_found"})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		}
+		return
+	}
+	if err := h.cfg.Resources.ReplaceGrants(c.Request.Context(), sr.ID, grants); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	// Convergence to Stalwart shareWith happens on the next reconcile pass.
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+func (h *sharedResourceHandler) delete(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	sr, _, ok := h.loadResourceWithAuth(c, c.Param("rid"), claims)
+	if !ok {
+		return
+	}
+	// The durable-tombstone-before-best-effort-destroy teardown lives in
+	// sharedresourceops so the operator CLI tears down identically (JAB-339
+	// AC5). A tombstone that cannot be persisted now keeps the row (500) rather
+	// than deleting it into a host principal the reconciler GC can never reach.
+	if err := sharedresourceops.Delete(c.Request.Context(),
+		sharedresourceops.Deps{Resources: h.cfg.Resources},
+		sharedresourceops.DeleteInput{Resource: sr},
+		h.notifyAgent); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"ok": true})
+}
+
+// ---- helpers ----
+
+func (h *sharedResourceHandler) notifyAgent(ctx context.Context, command string, params any) {
+	if h.cfg.Agent == nil {
+		return
+	}
+	agentCtx, cancel := context.WithTimeout(ctx, sharedResourceAgentTimeout)
+	defer cancel()
+	_, _ = h.cfg.Agent.Call(agentCtx, command, params)
+}
+
+func (h *sharedResourceHandler) loadDomainWithAuth(c *gin.Context, domainID string, claims *auth.AccessClaims) (*models.Domain, bool) {
+	dom, err := h.cfg.Domains.FindByID(c.Request.Context(), domainID)
+	if err != nil {
+		if isNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "domain_not_found"})
+			return nil, false
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return nil, false
+	}
+	if !claims.IsAdmin && dom.UserID != claims.UserID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return nil, false
+	}
+	return dom, true
+}
+
+func (h *sharedResourceHandler) loadResourceWithAuth(c *gin.Context, id string, claims *auth.AccessClaims) (*models.SharedResource, *models.Domain, bool) {
+	ctx := c.Request.Context()
+	sr, err := h.cfg.Resources.FindByID(ctx, id)
+	if err != nil {
+		if isNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "resource_not_found"})
+			return nil, nil, false
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return nil, nil, false
+	}
+	dom, err := h.cfg.Domains.FindByID(ctx, sr.DomainID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return nil, nil, false
+	}
+	if !claims.IsAdmin && dom.UserID != claims.UserID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return nil, nil, false
+	}
+	return sr, dom, true
+}

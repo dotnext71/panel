@@ -1,0 +1,165 @@
+package repository
+
+import (
+	"context"
+	"errors"
+
+	"gorm.io/gorm"
+
+	"github.com/dotnext-panel/dotnext/internal/models"
+)
+
+// DatabaseUserRepository defines data access for database users.
+type DatabaseUserRepository interface {
+	FindByID(ctx context.Context, id string) (*models.DatabaseUser, error)
+	List(ctx context.Context, opts ListOptions) ([]models.DatabaseUser, int64, error)
+	ListByUserID(ctx context.Context, userID string, opts ListOptions) ([]models.DatabaseUser, int64, error)
+	CountByUserID(ctx context.Context, userID string) (int64, error)
+	Create(ctx context.Context, du *models.DatabaseUser) error
+	// CreateWithinCap inserts du only while its owner has fewer than
+	// maxUsers database users, else ErrDatabaseUserCapExceeded. The count and
+	// the insert run in one transaction holding the owner's users row FOR
+	// UPDATE. ErrNotFound when the owner row is missing.
+	CreateWithinCap(ctx context.Context, du *models.DatabaseUser, maxUsers uint32) error
+	Delete(ctx context.Context, id string) error
+	UpdatePasswordHash(ctx context.Context, id string, hash string) error
+	// UpdateUsername renames the DB-user row in place (GH #1238 DB re-prefix).
+	UpdateUsername(ctx context.Context, id, username string) error
+	// TransferOwner repoints the DB-user row to a new tenant AND renames it onto
+	// that owner's prefix in a single UPDATE (GH #1609 reassign) — never a
+	// half-moved row. The engine-level RENAME USER is done by the agent first.
+	TransferOwner(ctx context.Context, id, newUserID, newUsername string) error
+	ExistsByUserAndUsername(ctx context.Context, userID string, username string) (bool, error)
+	// CountByEngineAndUsername counts the rows, of every panel user, that
+	// name the one engine account (engine, username). A database account is
+	// server-wide, so more than one row means more than one tenant points at
+	// it.
+	CountByEngineAndUsername(ctx context.Context, engine, username string) (int64, error)
+	// ListByEngineAndUsername returns the rows, of every panel user, that
+	// name the engine account (engine, username).
+	ListByEngineAndUsername(ctx context.Context, engine, username string) ([]models.DatabaseUser, error)
+}
+
+type databaseUserRepo struct{ db *gorm.DB }
+
+func NewDatabaseUserRepository(db *gorm.DB) DatabaseUserRepository {
+	return &databaseUserRepo{db: db}
+}
+
+func (r *databaseUserRepo) FindByID(ctx context.Context, id string) (*models.DatabaseUser, error) {
+	var du models.DatabaseUser
+	if err := r.db.WithContext(ctx).Where("id = ?", id).First(&du).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &du, nil
+}
+
+// databaseUserListCols — only the database username is free-text searchable.
+var databaseUserListCols = ListCols{
+	Search:      []string{"username"},
+	Sort:        []string{"username", "engine", "created_at"},
+	DefaultSort: "created_at",
+}
+
+func (r *databaseUserRepo) List(ctx context.Context, opts ListOptions) ([]models.DatabaseUser, int64, error) {
+	var (
+		users []models.DatabaseUser
+		total int64
+	)
+	base := r.db.WithContext(ctx).Model(&models.DatabaseUser{})
+
+	countQ := applyListOptions(base.Session(&gorm.Session{}), ListOptions{Search: opts.Search}, databaseUserListCols)
+	if err := countQ.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	if opts.Sort == "" && opts.Order == "" {
+		opts.Order = "desc"
+	}
+	q := applyListOptions(base.Session(&gorm.Session{}), opts, databaseUserListCols)
+	if err := q.Find(&users).Error; err != nil {
+		return nil, 0, err
+	}
+	return users, total, nil
+}
+
+func (r *databaseUserRepo) ListByUserID(ctx context.Context, userID string, opts ListOptions) ([]models.DatabaseUser, int64, error) {
+	var (
+		users []models.DatabaseUser
+		total int64
+	)
+	base := r.db.WithContext(ctx).Model(&models.DatabaseUser{}).Where("user_id = ?", userID)
+
+	countQ := applyListOptions(base.Session(&gorm.Session{}), ListOptions{Search: opts.Search}, databaseUserListCols)
+	if err := countQ.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	if opts.Sort == "" && opts.Order == "" {
+		opts.Order = "desc"
+	}
+	q := applyListOptions(base.Session(&gorm.Session{}), opts, databaseUserListCols)
+	if err := q.Find(&users).Error; err != nil {
+		return nil, 0, err
+	}
+	return users, total, nil
+}
+
+func (r *databaseUserRepo) CountByUserID(ctx context.Context, userID string) (int64, error) {
+	var count int64
+	if err := r.db.WithContext(ctx).Model(&models.DatabaseUser{}).Where("user_id = ?", userID).Count(&count).Error; err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (r *databaseUserRepo) Create(ctx context.Context, du *models.DatabaseUser) error {
+	return translate(r.db.WithContext(ctx).Create(du).Error)
+}
+
+// CreateWithinCap — see the interface doc and insertWithinOwnerCap.
+func (r *databaseUserRepo) CreateWithinCap(ctx context.Context, du *models.DatabaseUser, maxUsers uint32) error {
+	return insertWithinOwnerCap(ctx, r.db, du.UserID, &models.DatabaseUser{}, du, maxUsers, ErrDatabaseUserCapExceeded)
+}
+
+func (r *databaseUserRepo) Delete(ctx context.Context, id string) error {
+	return r.db.WithContext(ctx).Where("id = ?", id).Delete(&models.DatabaseUser{}).Error
+}
+
+func (r *databaseUserRepo) UpdatePasswordHash(ctx context.Context, id string, hash string) error {
+	return r.db.WithContext(ctx).Model(&models.DatabaseUser{}).Where("id = ?", id).Update("password_hash", hash).Error
+}
+
+func (r *databaseUserRepo) UpdateUsername(ctx context.Context, id, username string) error {
+	return r.db.WithContext(ctx).Model(&models.DatabaseUser{}).Where("id = ?", id).Update("username", username).Error
+}
+
+func (r *databaseUserRepo) TransferOwner(ctx context.Context, id, newUserID, newUsername string) error {
+	return r.db.WithContext(ctx).Model(&models.DatabaseUser{}).Where("id = ?", id).
+		Updates(map[string]any{"user_id": newUserID, "username": newUsername}).Error
+}
+
+func (r *databaseUserRepo) ExistsByUserAndUsername(ctx context.Context, userID string, username string) (bool, error) {
+	var count int64
+	if err := r.db.WithContext(ctx).Model(&models.DatabaseUser{}).Where("user_id = ? AND username = ?", userID, username).Count(&count).Error; err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+func (r *databaseUserRepo) CountByEngineAndUsername(ctx context.Context, engine, username string) (int64, error) {
+	var count int64
+	if err := r.db.WithContext(ctx).Model(&models.DatabaseUser{}).Where("engine = ? AND username = ?", engine, username).Count(&count).Error; err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (r *databaseUserRepo) ListByEngineAndUsername(ctx context.Context, engine, username string) ([]models.DatabaseUser, error) {
+	var rows []models.DatabaseUser
+	if err := r.db.WithContext(ctx).Where("engine = ? AND username = ?", engine, username).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	return rows, nil
+}

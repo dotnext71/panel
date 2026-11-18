@@ -1,0 +1,63 @@
+slug: forgejo
+popularity: 70
+name: Forgejo
+tags: ["Developer tools"]
+version: "17.0.1"
+# Release track (GH #1956): new installs get Forgejo 17. Update moves a 16
+# install to 17 in place (Forgejo migrates its database on start) and a 15
+# install to 16 first; a 16 install keeps the 16 image on an env or domain edit.
+track: "17"
+update_from: ["16"]
+description: |
+  Lightweight self-hosted Git forge — a community-run fork of Gitea.
+  Bundled SQLite for v1; admin can flip to compose-managed Postgres
+  post-install. Two ports: HTTP for the web UI (reverse-proxied) and
+  SSH for git-over-ssh (binds to a public IP, no nginx in the path).
+icon: icon.svg
+upstream: https://codeberg.org/forgejo/forgejo
+documentation: https://forgejo.org/docs/
+
+image_channel: codeberg.org/forgejo/forgejo:17.0.1@sha256:fcd19ff4ebc85fb098a67e8e1d0d5a84d07dd6e8a23edcfdfd5b71a6178953be
+held_tracks:
+  - track: "16"
+    version: "16.0.7"
+    image_channel: codeberg.org/forgejo/forgejo:16.0.7@sha256:c0fddfc04075e4198cc8e075fe6a1182984a5a7d5951c3a3c39b7fba2f10fbce
+    update_from: ["15"]
+volume_owner: "1000:1000"
+update_mode: manual
+
+resources:
+  cpu: "1.0"
+  memory: "512m"
+  pids: 500
+
+volumes:
+  - name: data
+    container_path: /data
+  - name: config
+    container_path: /etc/gitea
+
+ports:
+  - name: http
+    container_port: 3000
+    protocol: tcp
+    default_enabled: true
+    default_bind: loopback
+    default_reverse_proxy: true
+    health_path: /api/healthz
+  - name: ssh
+    container_port: 22
+    protocol: tcp
+    default_enabled: false
+    default_bind: public
+    default_reverse_proxy: false
+
+env:
+  - name: USER_UID
+    value: "1000"
+  - name: USER_GID
+    value: "1000"
+
+# Operator-supplied SMTP (GH #322): auto-injects standard SMTP_* install fields;
+# compose maps them to this app's SMTP env.
+smtp: true

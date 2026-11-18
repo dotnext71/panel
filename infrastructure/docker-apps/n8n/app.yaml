@@ -1,0 +1,56 @@
+slug: n8n
+popularity: 88
+name: n8n
+tags: ["Automation", "Developer tools"]
+# Release track (GH #1956): new installs and Update stay on n8n 2. n8n 3.x is
+# not stable yet: upstream's stable tag is 2.x, and every 3.x image ships
+# N8N_RELEASE_TYPE=rc. The weekly catalog-bump reports 3.x as held until it is.
+track: "2"
+version: "2.46.6"
+description: |
+  Workflow automation tool. Build, run, and share workflows that
+  connect APIs, databases, and services. Self-hosted, single
+  container, SQLite by default.
+icon: icon.svg
+upstream: https://github.com/n8n-io/n8n
+documentation: https://docs.n8n.io/
+
+image_channel: n8nio/n8n:2.46.6@sha256:8602f5dfacbe2c931eeafd010de0e68182310e9f309921e780ab69182e92b3ae
+update_mode: manual
+
+# The image runs as node (uid 1000); without volume_owner the bind-mounted
+# data dir stays owned by container-root and n8n crash-loops on
+# EACCES /home/node/.n8n/config under docker userns-remap.
+volume_owner: "1000:1000"
+
+resources:
+  cpu: "1.0"
+  # n8n 2.x does not survive startup module loading inside 512m — V8 dies
+  # with "Ineffective mark-compacts near heap limit" before first listen.
+  memory: "1024m"
+  pids: 200
+
+volumes:
+  - name: data
+    container_path: /home/node/.n8n
+
+ports:
+  - name: http
+    container_port: 5678
+    protocol: tcp
+    default_enabled: true
+    default_bind: loopback
+    default_reverse_proxy: true
+    health_path: /healthz
+
+env:
+  - name: N8N_HOST
+    value: "0.0.0.0"
+  - name: WEBHOOK_URL
+    value: ""
+  - name: GENERIC_TIMEZONE
+    value: "UTC"
+
+# Operator-supplied SMTP (GH #322): auto-injects standard SMTP_* install fields;
+# compose maps them to this app's SMTP env.
+smtp: true

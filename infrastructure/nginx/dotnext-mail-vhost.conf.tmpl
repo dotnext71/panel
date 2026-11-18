@@ -1,0 +1,257 @@
+# Per-domain webmail vhost (M6 Step 8).
+#
+# Rendered by the panel-agent's webmail.vhost_apply command, which
+# substitutes ${DOMAIN}, ${SSL_CERT_PATH}, ${SSL_KEY_PATH} and writes
+# the result to /etc/nginx/sites-available/${DOMAIN}-mail.conf, then
+# symlinks sites-enabled/${DOMAIN}-mail.conf -> there.
+#
+# SSL note: v1 reuses the main domain's cert at
+# /etc/letsencrypt/live/${DOMAIN}/fullchain.pem. That cert may not list
+# mail.${DOMAIN} as a SAN; browsers will warn until a separate cert is
+# issued (M6.1 follow-on). Self-signed fallback matches the M5 pattern
+# for domains where ACME hasn't completed yet.
+
+server {
+  ${LISTEN_443}
+  # ${EXTRA_SERVER_NAMES}: panel-primary row only — an applied custom
+  # shared mail hostname (JAB-390). Empty for every tenant row.
+  server_name mail.${DOMAIN} autoconfig.${DOMAIN} autodiscover.${DOMAIN} mta-sts.${DOMAIN} ${EXTRA_SERVER_NAMES};
+
+  ssl_certificate ${SSL_CERT_PATH};
+  ssl_certificate_key ${SSL_KEY_PATH};
+
+  # Same-origin JMAP rewrite. Bulwark's /api/config returns
+  # jmapServerUrl=https://${PANEL_MAIL_HOSTNAME} (the panel-wide setting in
+  # /etc/dotnext/bulwark.env), and Stalwart's /.well-known/jmap
+  # Session response advertises absolute URLs at the same host. The
+  # SPA then issues cross-origin preflights from mail.<tenant>, which
+  # fail because the panel hostname's cert / DNS isn't trusted from
+  # the user's browser. Rewriting the hostname to the requested $host
+  # keeps the SPA same-origin against the per-domain mail vhost it
+  # was loaded from.
+  #
+  # sub_filter_* inherit into every location below; Accept-Encoding=""
+  # is set per-location (nginx fully replaces proxy_set_header when a
+  # lower level defines any) so neither Bulwark nor Stalwart can gzip
+  # the body — sub_filter silently no-ops on gzipped payloads.
+  sub_filter_types application/json;
+  sub_filter_once off;
+  # ${PANEL_MAIL_HOSTNAME}: the applied custom shared mail hostname,
+  # else mail.<panel-hostname> (JAB-390).
+  sub_filter "${PANEL_MAIL_HOSTNAME}" $host;
+
+  # M25 Step 5: Bulwark moved off TCP 127.0.0.1:3000 onto a Unix socket
+  # at /run/dotnext-bulwark/bulwark.sock. Form D upstream — declared in
+  # /etc/nginx/sites-available/dotnext-bulwark.conf, reused here.
+  #
+  # IMPORTANT (preserved from the TCP era): we intentionally DO NOT send
+  # X-Forwarded-Proto to this upstream. Next.js's middleware-rewrite
+  # internal proxy honours X-Forwarded-Proto when constructing rewrite
+  # target URLs; with "https" and a same-process rewrite (e.g. next-intl
+  # `/` → `/en`), the target becomes `https://...` but the upstream is
+  # plain HTTP — TLS handshake error → 500. Omitting the header keeps
+  # the rewrite target on http://. Users still see HTTPS (nginx terminates
+  # it); the only cost is Bulwark not setting the Secure flag on its
+  # own cookies — acceptable since mail.<domain> never serves
+  # HTTP-plaintext (80→443 redirect below).
+  location / {
+    proxy_pass http://dotnext_bulwark/;
+    proxy_set_header Host $host;
+    # Bulwark picks a domain's branding by X-Forwarded-Host before Host
+    # (GH #2502): set it here so the browser can't name another host.
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header Accept-Encoding "";
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+  }
+
+  # Each domain's webmail branding pictures (GH #2502), kept by panel-api
+  # outside Bulwark's own directory, which a webmail upgrade replaces.
+  # Every one is a PNG panel-api encoded itself; served as nothing else.
+  location ^~ /dotnext-webmail-branding/ {
+    alias /var/lib/dotnext/webmail-branding/;
+    autoindex off;
+    types { }
+    default_type image/png;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Content-Security-Policy "default-src 'none'; sandbox" always;
+    add_header Cache-Control "public, max-age=86400" always;
+  }
+
+  # Stalwart JMAP + admin API — everything the browser needs to talk
+  # to the mailserver. Routed through Stalwart's single loopback HTTP
+  # listener on 127.0.0.1:8446.
+  location /jmap {
+    proxy_pass http://127.0.0.1:8446;
+    proxy_set_header Host $host;
+    proxy_set_header Accept-Encoding "";
+    proxy_http_version 1.1;
+    proxy_read_timeout 3600s;
+  }
+
+  location /.well-known/jmap {
+    proxy_pass http://127.0.0.1:8446;
+    proxy_set_header Host $host;
+    proxy_set_header Accept-Encoding "";
+  }
+
+  # CalDAV / CardDAV (GH #1039 follow-up). Stalwart serves the DAV
+  # collections and the RFC 6764 autodiscovery endpoints on the same
+  # loopback HTTP listener as JMAP. The _caldavs._tcp / _carddavs._tcp
+  # SRV records already point clients at mail.<domain>:443, and
+  # /.well-known/caldav|carddav 307-redirect (relative) to /dav/cal|
+  # /dav/card — so this last hop lets Thunderbird / Apple Mail discover
+  # and mount calendars + address books. Scoped to cal + card ONLY:
+  # /dav/file (WebDAV file storage) and /dav/pal (principals) are
+  # deliberately NOT exposed on the mail vhost.
+  location = /.well-known/caldav {
+    proxy_pass http://127.0.0.1:8446;
+    proxy_set_header Host $host;
+    proxy_set_header Accept-Encoding "";
+  }
+  location = /.well-known/carddav {
+    proxy_pass http://127.0.0.1:8446;
+    proxy_set_header Host $host;
+    proxy_set_header Accept-Encoding "";
+  }
+  location /dav/cal {
+    proxy_pass http://127.0.0.1:8446;
+    proxy_set_header Host $host;
+    proxy_set_header Accept-Encoding "";
+    proxy_http_version 1.1;
+    proxy_read_timeout 3600s;
+    client_max_body_size 50m;
+  }
+  location /dav/card {
+    proxy_pass http://127.0.0.1:8446;
+    proxy_set_header Host $host;
+    proxy_set_header Accept-Encoding "";
+    proxy_http_version 1.1;
+    proxy_read_timeout 3600s;
+    client_max_body_size 50m;
+  }
+
+  # NOTE: /api/* is deliberately NOT proxied to Stalwart. Bulwark owns
+  # every /api/* path (its own /api/auth/session, /api/health, etc.)
+  # and proxies Stalwart admin calls internally via STALWART_API_URL=
+  # http://127.0.0.1:8446 set in bulwark.env. Routing /api → 8446 at
+  # the nginx layer hijacks Bulwark's own endpoints and breaks login
+  # (the POST body is Next.js JSON, Stalwart rejects it).
+
+  # Block access to autodiscover helper paths so a misconfigured client
+  # doesn't leak probes to Bulwark. Stalwart serves its own JMAP
+  # discovery at /.well-known/jmap above.
+  # Webmail SSO landing (M6 Step 8 Phase B). panel-api owns
+  # /sso/webmail and sets the Bulwark session cookie on the response so
+  # the 303 redirect lands the user logged in. We proxy through here
+  # (rather than redirecting to the panel hostname) because the cookie
+  # has to be set under mail.<domain>.
+  #
+  # M25 Step 4: panel-api now listens on a Unix socket. The
+  # `dotnext_panel_api` upstream is declared once in
+  # /etc/nginx/sites-available/dotnext-api.conf (Form D — same upstream
+  # name reused across server blocks). proxy_ssl_verify is gone because
+  # there's no TLS hop here anymore — nginx does the only TLS termination.
+  location = /sso/webmail {
+    proxy_pass http://dotnext_panel_api/sso/webmail;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_http_version 1.1;
+  }
+
+  # Mail-client autoconfiguration (GH #1039). panel-api renders the config
+  # documents from the domain's mail settings (mail.<domain>, IMAPS 993 /
+  # SMTPS 465). Host is forwarded so panel-api derives the domain from
+  # autoconfig.<domain> / autodiscover.<domain>. These paths used to 404
+  # (autodiscover) or fall through `location /` to Bulwark webmail (autoconfig).
+  #
+  #   Thunderbird / Mozilla: GET  /mail/config-v1.1.xml
+  #                          GET  /.well-known/autoconfig/mail/config-v1.1.xml
+  #   Outlook / Exchange:    POST /autodiscover/autodiscover.xml (+ capitalised)
+  location = /mail/config-v1.1.xml {
+    proxy_pass http://dotnext_panel_api;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_http_version 1.1;
+  }
+  location = /.well-known/autoconfig/mail/config-v1.1.xml {
+    proxy_pass http://dotnext_panel_api/mail/config-v1.1.xml;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_http_version 1.1;
+  }
+  location = /autodiscover/autodiscover.xml {
+    proxy_pass http://dotnext_panel_api;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_http_version 1.1;
+  }
+  location = /Autodiscover/Autodiscover.xml {
+    proxy_pass http://dotnext_panel_api;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_http_version 1.1;
+  }
+}
+
+# HTTP → HTTPS redirect for mail.<domain>. The ACME location must
+# be a location block, not server-level `return 301`, because nginx
+# evaluates server-scoped redirects in SERVER_REWRITE phase BEFORE
+# FIND_CONFIG locates the location — so a server-level redirect
+# bypasses the ^~ ACME match entirely. Webroot is the apex domain's
+# DocRoot to match what panel-api/internal/reconciler.IssueDomainCert
+# passes as -w, so cert renewal for the SAN set [<domain>,
+# www.<domain>, mail.<domain>, autoconfig.<domain>] all hits the
+# same writable directory. Incident 2026-04-26: dotnext.site cert
+# stuck because mail.dotnext.site:80 redirected to https → 404.
+#
+# The agent renders three forms of this block: with a docroot (this
+# form); the panel's own domain, which serves /var/www/dotnext-api-acme
+# alone (GH #268); and a domain without a site, which serves
+# /var/www/dotnext-acme alone (GH #2082). A domain with mail but no
+# webmail keeps the :443 server above without the webmail app: no
+# Bulwark `location /` (it answers 404) and no /sso/webmail, while JMAP,
+# CalDAV/CardDAV and autoconfig/autodiscover stay. With no certificate to
+# serve on :443, it gets this :80 block alone, so its mail certificate
+# can still be issued (GH #2082).
+server {
+  ${LISTEN_80}
+  server_name mail.${DOMAIN} autoconfig.${DOMAIN} autodiscover.${DOMAIN} mta-sts.${DOMAIN} ${EXTRA_SERVER_NAMES};
+
+  # Serves two webroots in priority order so BOTH the regular
+  # per-domain cert (-w docroot) and the M6.6 per-domain mail cert
+  # (-w /var/www/dotnext-acme) can validate mail.<domain> over :80.
+  # GH #132: the mail cert 404'd here because only the docroot was
+  # served, parking the cert in dns_missing/failed and leaving
+  # Stalwart on its self-signed default on :465.
+  location ^~ /.well-known/acme-challenge/ {
+    default_type "text/plain";
+    root /var/www/dotnext-acme;
+    try_files $uri @acme_docroot;
+  }
+
+  location @acme_docroot {
+    default_type "text/plain";
+    root ${ACME_WEBROOT};
+    try_files $uri =404;
+  }
+
+  location / {
+    return 301 https://$host$request_uri;
+  }
+}

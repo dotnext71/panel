@@ -1,0 +1,207 @@
+// ServicesSummaryCard — compact Service / Status / Action table for the
+// Server Status top section. Action column is a row of icon-only
+// Buttons each wrapped in a Tooltip explaining the verb. Self-destruct
+// panel-critical units (dotnext-panel, dotnext-agent, dotnext-kratos,
+// mariadb, nginx, redis-server) hide Stop+Disable —
+// those requests are 403'd at the API anyway. Destructive verbs
+// (stop/disable/restart) show a confirm Modal first.
+import { useState } from "react";
+import { Card, Modal, Table } from "antd";
+import { feedback } from "../../../lib/feedback"; // GH #970: themed toasts
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+
+import {
+  PauseCircleOutlined,
+  PlayCircleOutlined,
+  PoweroffOutlined,
+  ReloadOutlined,
+  SettingOutlined,
+  SyncOutlined,
+} from "@icons";
+import { RowActions } from "../../../components/RowActions";
+
+import { apiClient } from "../../../apiClient";
+import { useServerCapabilities } from "../../../hooks/useServerCapabilities";
+import type { ServiceDetail } from "../../../hooks/useServerStatus";
+import { isRunConfigured, prettyName, statusTag, visibleServicesFor } from "./serviceHelpers";
+
+interface Props {
+  services: ServiceDetail[];
+}
+
+const reloadCapable = new Set([
+  "nginx.service",
+  "pdns.service",
+  "pdns-recursor.service",
+]);
+
+// Panel-critical units: stopping/disabling any of these from the UI would make
+// the panel inaccessible (GH #746). Kept in sync with panelSelfDestructUnits in
+// panel-api/internal/api/admin_services.go. nginx is the reverse proxy (stop ->
+// 502); redis-server is a hard dotnext-panel dependency (stop -> the panel dies);
+// dotnext-kratos is the identity provider every login/session flows through.
+const selfDestructUnits = new Set([
+  "dotnext-api.service",
+  "dotnext-agent.service",
+  "dotnext-kratos.service",
+  "mariadb.service",
+  "nginx.service",
+  "redis-server.service",
+]);
+
+// Units whose restart interrupts the panel itself: nginx proxies every panel
+// request, and dotnext-panel Requires= dotnext-agent and redis-server, so
+// restarting either restarts the panel. The API schedules these restarts a
+// moment out so its response is not cut off (GH #1992), and the panel is then
+// unreachable for a few seconds. Kept in sync with restartDeferredUnits in
+// panel-api/internal/api/admin_services.go.
+const restartInterruptsPanel = new Set([
+  "nginx.service",
+  "dotnext-api.service",
+  "dotnext-agent.service",
+  "redis-server.service",
+]);
+
+// How long after a scheduled restart to refetch the status: past the restart
+// delay and the few seconds the panel is down.
+const scheduledRefetchMs = 8000;
+
+type Action = "restart" | "reload" | "start" | "stop" | "enable" | "disable";
+
+const destructiveActions = new Set<Action>(["stop", "disable", "restart"]);
+
+export function ServicesSummaryCard({ services }: Props) {
+  const qc = useQueryClient();
+  const { data: caps } = useServerCapabilities();
+  const visibleServices = visibleServicesFor(services, caps);
+  const [pending, setPending] = useState<{ unit: string; action: Action } | null>(null);
+
+  const ctl = useMutation({
+    mutationFn: async ({ unit, action }: { unit: string; action: Action }) => {
+      const name = unit.replace(/\.service$/, "");
+      const res = await apiClient.post<{ scheduled?: boolean }>(
+        `/admin/services/${encodeURIComponent(name)}/${action}`,
+      );
+      return res?.data;
+    },
+    onSuccess: (data, { unit }) => {
+      if (data?.scheduled) {
+        // The restart runs a moment after this response; refetching now
+        // would land in the outage window.
+        feedback.message.info(
+          `${prettyName(unit)} is restarting — the panel will be unreachable for a few seconds.`,
+        );
+        setTimeout(() => qc.invalidateQueries({ queryKey: ["admin", "server-status"] }), scheduledRefetchMs);
+        return;
+      }
+      qc.invalidateQueries({ queryKey: ["admin", "server-status"] });
+      feedback.message.success("Done");
+    },
+    onError: (e: unknown) => {
+      feedback.message.error(e instanceof Error ? e.message : "Service action failed");
+    },
+  });
+
+  const runAction = (unit: string, action: Action) => {
+    if (destructiveActions.has(action)) {
+      setPending({ unit, action });
+      return;
+    }
+    ctl.mutate({ unit, action });
+  };
+
+  const confirmPending = () => {
+    if (!pending) return;
+    ctl.mutate(pending);
+    setPending(null);
+  };
+
+  return (
+    <>
+      <Card title={<><SettingOutlined /> Services</>} size="small">
+        <Table<ServiceDetail>
+          rowKey="unit"
+          size="small"
+          dataSource={visibleServices}
+          pagination={false}
+          scroll={{ x: "max-content" }}
+          showHeader={false}
+          columns={[
+            {
+              title: "Service",
+              dataIndex: "unit",
+              render: (u: string) => prettyName(u),
+            },
+            {
+              title: "Status",
+              dataIndex: "active",
+              width: 120,
+              render: (_: string, r: ServiceDetail) => statusTag(r),
+            },
+            {
+              title: "Actions",
+              width: 200,
+              align: "right" as const,
+              render: (_: unknown, r: ServiceDetail) => (
+                <ServiceActions service={r} onAction={runAction} />
+              ),
+            },
+          ]}
+        />
+      </Card>
+      <Modal
+        open={!!pending}
+        title={pending ? `${capitalize(pending.action)} ${prettyName(pending.unit)}?` : ""}
+        okText={pending ? capitalize(pending.action) : "OK"}
+        okButtonProps={{ danger: true }}
+        onOk={confirmPending}
+        onCancel={() => setPending(null)}
+      >
+        {pending?.action === "stop" && (
+          <p>This will halt the unit. Dependent panel features may stop working until you start it again.</p>
+        )}
+        {pending?.action === "disable" && (
+          <p>This will prevent the unit from starting at boot. Combine with Stop if you also want it down right now.</p>
+        )}
+        {pending?.action === "restart" && !restartInterruptsPanel.has(pending.unit) && (
+          <p>Restart causes a brief drop in service. Continue?</p>
+        )}
+        {pending?.action === "restart" && restartInterruptsPanel.has(pending.unit) && (
+          <p>
+            Restart causes a brief drop in service, and restarting {prettyName(pending.unit)} also interrupts the
+            panel itself — the panel will be unreachable for a few seconds. Continue?
+          </p>
+        )}
+      </Modal>
+    </>
+  );
+}
+
+interface ServiceActionsProps {
+  service: ServiceDetail;
+  onAction: (unit: string, action: Action) => void;
+}
+
+function ServiceActions({ service, onAction }: ServiceActionsProps) {
+  const isDown = service.active === "inactive" || service.active === "failed";
+  const isReload = reloadCapable.has(service.unit);
+  const isSelfDestruct = selfDestructUnits.has(service.unit);
+  const isEnabled = isRunConfigured(service.unit_file_state);
+
+  return (
+    <RowActions
+      actions={[
+        { key: "start", label: "Start", icon: <PlayCircleOutlined />, hidden: !isDown, onClick: () => onAction(service.unit, "start"), tooltip: "Start" },
+        { key: "restart", label: "Restart", icon: <SyncOutlined />, hidden: isDown, onClick: () => onAction(service.unit, "restart"), tooltip: "Restart" },
+        { key: "reload", label: "Reload", icon: <ReloadOutlined />, hidden: isDown || !isReload, onClick: () => onAction(service.unit, "reload"), tooltip: "Reload" },
+        { key: "stop", label: "Stop", icon: <PauseCircleOutlined />, danger: true, hidden: isDown || isSelfDestruct, onClick: () => onAction(service.unit, "stop"), tooltip: "Stop" },
+        { key: "enable", label: "Enable at boot", icon: <PoweroffOutlined />, hidden: isEnabled, onClick: () => onAction(service.unit, "enable"), tooltip: "Enable at boot" },
+        { key: "disable", label: "Disable at boot", icon: <PoweroffOutlined />, danger: true, hidden: !isEnabled || isSelfDestruct, onClick: () => onAction(service.unit, "disable"), tooltip: "Disable at boot" },
+      ]}
+    />
+  );
+}
+
+function capitalize(s: string): string {
+  return s.charAt(0).toUpperCase() + s.slice(1);
+}

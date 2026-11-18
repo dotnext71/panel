@@ -1,0 +1,169 @@
+package panelcmd
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"text/tabwriter"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/dotnext-panel/dotnext/internal/appseccfg"
+	"github.com/dotnext-panel/dotnext/internal/appsecops"
+	"github.com/dotnext-panel/dotnext/internal/ids"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+)
+
+// appsec_exclusion_cmd.go — JAB-227.
+//
+// Operator-managed CRS false-positive exclusions. The built-in set in
+// internal/appseccfg covers what dotnext ships knowing about; this covers what
+// only the operator can see — a customer's webhook whose message bodies read as
+// RFI, a plugin route that trips libinjection on ordinary content.
+//
+// Before this, the options were hand-editing a file on the box (and knowing that
+// only ctl:ruleRemoveById has any effect, since the target-scoped forms are
+// silent no-ops) or leaving the customer blocked.
+
+func crsExclRepo() repository.CRSRuleExclusionRepository {
+	return repository.NewCRSRuleExclusionRepository(sharedDB)
+}
+
+func newAppSecExclusionCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "exclusion",
+		Short: "Manage operator CRS false-positive exclusions",
+		Long: "Exclude a specific CRS rule, or a CrowdSec virtual patch, for a specific host + path.\n\n" +
+			"Scope is mandatory. The only removal construct that works in CrowdSec's engine\n" +
+			"drops the rule for the whole matched request, so every exclusion must name both\n" +
+			"a host and a URI prefix — there is no whole-host or whole-server form.\n\n" +
+			"A CRS rule is named by its id (942100). A virtual patch or generic AppSec rule\n" +
+			"is named by its name (crowdsecurity/vpatch-CVE-2025-29927); its path prefix is\n" +
+			"matched against the decoded path, without the query string.\n\n" +
+			"Find the rule to exclude with: dotnext appsec explain, or cscli alerts list\n" +
+			"(a virtual patch's alert is named after it).",
+	}
+	cmd.AddCommand(newAppSecExclusionAddCmd(), newAppSecExclusionListCmd(), newAppSecExclusionRmCmd())
+	return cmd
+}
+
+func newAppSecExclusionAddCmd() *cobra.Command {
+	var host, uriPrefix, ruleID, note string
+	cmd := &cobra.Command{
+		Use:     "add",
+		Short:   "Add an exclusion (host + path + rule are all required)",
+		PreRunE: requireDB,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := context.WithTimeout(cmd.Context(), 15*time.Second)
+			defer cancel()
+
+			// Stored as the panel stores it (GH #1649), so a duplicate check
+			// compares like with like.
+			e := appseccfg.NormalizeExclusion(appseccfg.Exclusion{Host: host, URIPrefix: uriPrefix, RuleID: ruleID, Note: note})
+			if err := appseccfg.ValidateExclusion(e); err != nil {
+				return err
+			}
+			host, uriPrefix, ruleID = e.Host, e.URIPrefix, e.RuleID
+			row := &models.CRSRuleExclusion{
+				ID: ids.NewULID(), Host: e.Host, URIPrefix: e.URIPrefix, RuleID: e.RuleID, Note: e.Note,
+			}
+			if err := crsExclRepo().Create(ctx, row); err != nil {
+				return fmt.Errorf("save exclusion: %w", err)
+			}
+			cliAuditOK(ctx, "appsec.exclusion_add", "crs_rule_exclusion", row.ID, nil)
+			if jsonOutput {
+				return printJSON(map[string]any{"id": row.ID, "host": host, "uri_prefix": uriPrefix, "rule_id": ruleID})
+			}
+			fmt.Fprintf(cmd.OutOrStdout(),
+				"added %s — rule %s excluded for %s%s\n"+
+					"  apply with: dotnext appsec render-config --reconcile --reload\n",
+				row.ID, ruleID, host, uriPrefix)
+			return nil
+		},
+	}
+	cmd.Flags().StringVar(&host, "host", "", "hostname the exclusion applies to (required)")
+	cmd.Flags().StringVar(&uriPrefix, "uri-prefix", "", "URI prefix the exclusion applies to, e.g. /wp-json/x/ (required)")
+	cmd.Flags().StringVar(&ruleID, "rule", "", "CRS rule ID or AppSec rule name to exclude, e.g. 942100 or crowdsecurity/vpatch-CVE-2025-29927 (required)")
+	cmd.Flags().StringVar(&note, "note", "", "why this exclusion exists")
+	_ = cmd.MarkFlagRequired("host")
+	_ = cmd.MarkFlagRequired("uri-prefix")
+	_ = cmd.MarkFlagRequired("rule")
+	return cmd
+}
+
+func newAppSecExclusionListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:     "list",
+		Short:   "List operator CRS exclusions",
+		Args:    cobra.NoArgs,
+		PreRunE: requireDB,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := context.WithTimeout(cmd.Context(), 15*time.Second)
+			defer cancel()
+			return listAppSecExclusions(ctx, appsecops.Deps{Exclusions: crsExclRepo()}, cmd.OutOrStdout(), jsonOutput)
+		},
+	}
+}
+
+// listAppSecExclusions prints the stored exclusions the way the panel's API
+// lists them: a row an app install carries (Flarum, Nextcloud) names that
+// install and its app. Such a row is put back by the install's next sync, so
+// removing it by hand does not last.
+func listAppSecExclusions(ctx context.Context, d appsecops.Deps, out io.Writer, asJSON bool) error {
+	rows, err := appsecops.ListExclusions(ctx, d)
+	if err != nil {
+		return fmt.Errorf("list exclusions: %w", err)
+	}
+	if asJSON {
+		b, err := json.MarshalIndent(map[string]any{"exclusions": rows, "total": len(rows)}, "", "  ")
+		if err != nil {
+			return fmt.Errorf("json encode: %w", err)
+		}
+		_, err = fmt.Fprintln(out, string(b))
+		return err
+	}
+	if len(rows) == 0 {
+		fmt.Fprintln(out, "No operator CRS exclusions.")
+		return nil
+	}
+	w := tabwriter.NewWriter(out, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(w, "ID\tHOST\tURI PREFIX\tRULE\tMANAGED BY\tNOTE")
+	for _, r := range rows {
+		managedBy := "-"
+		if r.ManagedApp != "" {
+			managedBy = r.ManagedApp + " install " + r.ManagedInstallID
+		}
+		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\n", r.ID, r.Host, r.URIPrefix, r.RuleID, managedBy, r.Note)
+	}
+	return w.Flush()
+}
+
+func newAppSecExclusionRmCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:     "rm <id>",
+		Short:   "Remove an exclusion by id",
+		Args:    cobra.ExactArgs(1),
+		PreRunE: requireDB,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := context.WithTimeout(cmd.Context(), 15*time.Second)
+			defer cancel()
+			if err := crsExclRepo().DeleteByID(ctx, args[0]); err != nil {
+				if errors.Is(err, repository.ErrNotFound) {
+					return fmt.Errorf("no exclusion with id %q — nothing to remove (see `dotnext appsec exclusion list`)", args[0])
+				}
+				return fmt.Errorf("delete exclusion: %w", err)
+			}
+			cliAuditOK(ctx, "appsec.exclusion_rm", "crs_rule_exclusion", args[0], nil)
+			if jsonOutput {
+				return printJSON(map[string]any{"id": args[0], "deleted": true})
+			}
+			fmt.Fprintf(cmd.OutOrStdout(),
+				"removed %s\n  apply with: dotnext appsec render-config --reconcile --reload\n", args[0])
+			return nil
+		},
+	}
+}

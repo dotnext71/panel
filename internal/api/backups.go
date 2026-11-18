@@ -1,0 +1,3413 @@
+// M30 Step 8 — REST endpoints for account_backup. System routes live
+// in system_backups.go (Step 12). User-shell self-backup endpoints
+// land in user_backups.go (Step 9).
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/dotnext-panel/dotnext/internal/agent"
+	internalbackup "github.com/dotnext-panel/dotnext/internal/backup"
+	"github.com/dotnext-panel/dotnext/internal/backupmetadata"
+	"github.com/dotnext-panel/dotnext/internal/backupwrapperhelpers"
+	"github.com/dotnext-panel/dotnext/internal/dbops"
+	"github.com/dotnext-panel/dotnext/internal/ginctx"
+	"github.com/dotnext-panel/dotnext/internal/ids"
+	"github.com/dotnext-panel/dotnext/internal/kratosclient"
+	"github.com/dotnext-panel/dotnext/internal/middleware"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/notifications"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+	"github.com/dotnext-panel/dotnext/internal/ssokey"
+)
+
+// BackupHandlerConfig is the dependency bundle for both /admin and /me
+// backup routes. RestoreStaging is the local path the agent restores
+// stages into; download materializes from there.
+type BackupHandlerConfig struct {
+	Agent        agent.AgentInterface
+	Jobs         repository.BackupJobRepository
+	Destinations repository.BackupDestinationRepository
+	Users        repository.UserRepository
+	// Packages backs create-from-manifest (GH #1408): when a restore-from-
+	// upload targets a user that doesn't exist yet, the account is created via
+	// userops.Create with the admin-chosen package. Optional: nil disables the
+	// create path (the restore then 404s "create the user first").
+	Packages       repository.PackageRepository
+	Databases      repository.DatabaseRepository
+	DatabaseUsers  repository.DatabaseUserRepository
+	DatabaseGrants repository.DatabaseUserGrantRepository
+	Domains        repository.DomainRepository
+	Mailboxes      repository.MailboxRepository
+	AppInstalls    repository.ApplicationInstallRepository
+	// DockerApps resolves the account's docker app slugs so the backup
+	// covers their data trees (GH #954). Optional: nil means no slugs and
+	// the docker stage records "no docker apps".
+	DockerApps repository.DockerAppRepository
+
+	// Schema-v2 metadata producers — every nullable repo here is queried
+	// when building the per-user metadata bundle so disaster recovery
+	// can rebuild full panel state. Each is optional; missing repos
+	// log + skip the corresponding section.
+	SSLCerts       repository.SSLCertificateRepository
+	PHPPools       repository.PHPPoolRepository
+	PHPPoolIni     repository.PHPPoolIniOverrideRepository
+	Forwarders     repository.EmailForwarderRepository
+	Autoresponders repository.EmailAutoresponderRepository
+	MailboxShares  repository.MailboxShareRepository
+	TrustedSenders repository.MailboxTrustedSenderRepository
+	DNSSECKeys     repository.DNSSECKeyRepository
+	DNSZones       repository.DNSZoneRepository
+	DNSRecords     repository.DNSRecordRepository
+	SSHKeys        repository.SSHKeyRepository
+	CronJobs       repository.CronJobRepository
+	FtpAccounts    repository.FtpAccountRepository
+	LimitOverrides repository.UserLimitOverrideRepository
+	EgressPolicies repository.UserEgressPolicyRepository
+	EgressRequests repository.UserEgressRequestRepository
+
+	// M30.2.x — sso key for unsealing per-destination restic
+	// passwords before the agent dispatch. Optional; when nil the
+	// password helper falls back to the legacy shared file at
+	// /etc/dotnext/restic-repo.password (back-compat for
+	// destinations that haven't been rotated yet).
+	SSOKey *ssokey.Key
+
+	// KratosClient lets the account-restore finalizer reinstate the
+	// restored user's login identity (JAB-312), mirroring the CLI restore.
+	// Optional: when nil the panel rows are still rebuilt; only the login
+	// credential is left for a recovery link.
+	KratosClient *kratosclient.Client
+
+	// WebDomainAliases and ServerSettings feed the name guards a restored
+	// domain goes through (GH #1898). A restore that brings back domains
+	// refuses them when either is nil, rather than skip a guard.
+	WebDomainAliases repository.WebDomainAliasRepository
+	ServerSettings   repository.ServerSettingsRepository
+	// WebmailBranding lets a backup carry each domain's webmail branding and
+	// a restore bring it back (GH #2502).
+	WebmailBranding repository.DomainWebmailBrandingRepository
+	// Scheduler, optional, has the reconciler create a restored domain's DNS
+	// zone at once so the restore can add the backup's DNS records to it
+	// (GH #1993); nil waits for the periodic pass.
+	Scheduler DomainScheduler
+
+	// MailAddresses clears a restored mailbox's address from Stalwart's
+	// registry before the mailbox is stored. A restore refuses its
+	// mailboxes when it is nil.
+	MailAddresses MailAddressReleaser
+	// UploadedBackups keeps account backups uploaded from another server
+	// (GH #1993). Optional: nil leaves the /admin/uploaded-backups routes out.
+	UploadedBackups repository.UploadedBackupRepository
+
+	Log             *slog.Logger
+	StrictRateLimit gin.HandlerFunc
+}
+
+const backupCallTimeout = 10 * time.Second
+
+// restoreJobTimeout bounds a BACKGROUND restore job (GH #1044). Restores
+// used to run synchronously inside the HTTP request, which stacked three
+// unrelated ceilings on top of the real work: the UI client's 15 s axios
+// timeout, nginx's 300 s proxy_read_timeout, and this constant — so a
+// 500 MB Postgres restore died on whichever tripped first while the agent
+// kept restoring anyway. The restore is now a tracked job (the row the
+// jobs list already shows) and this is the only bound left: generous
+// because a large pg_restore plus mailbox imports legitimately runs long,
+// finite because an agent hang must still seal the row. The finalizer
+// seals rows this goroutine never finishes (panel restart mid-restore).
+const restoreJobTimeout = 60 * time.Minute
+
+// RegisterBackupRoutes mounts the admin-scoped backup endpoints under
+// /admin/users/:id/backups + /admin/backups/:job_id. The user-shell
+// /me/backups routes live in RegisterUserBackupRoutes.
+func RegisterBackupRoutes(rg *gin.RouterGroup, cfg BackupHandlerConfig) {
+	if cfg.Jobs == nil {
+		panic("api.RegisterBackupRoutes: cfg.Jobs is nil")
+	}
+	if cfg.Users == nil {
+		panic("api.RegisterBackupRoutes: cfg.Users is nil")
+	}
+	h := &backupHandler{cfg: cfg}
+
+	admin := rg.Group("/admin", middleware.RequireAdmin())
+	admin.POST("/users/:id/backups", h.createForUser)
+	admin.GET("/users/:id/backups", h.listForUser)
+	admin.GET("/backups", h.listAll)
+	admin.GET("/backups/:job_id", h.get)
+	admin.DELETE("/backups/:job_id", h.delete)
+	admin.GET("/backups/:job_id/status", h.status)
+	admin.GET("/backups/:job_id/download", h.download)
+	// GH #1408: background prepare so the Download button isn't dead during the
+	// restic materialize.
+	admin.POST("/backups/:job_id/download/prepare", h.downloadPrepare)
+	admin.GET("/backups/:job_id/download/prepare-status", h.downloadPrepareStatus)
+	admin.POST("/backups/:job_id/cancel", h.cancel)
+	admin.GET("/backups/:job_id/logs", h.logs)
+	admin.POST("/backups/restore", h.restore)
+	// GH #1408: restore from an uploaded backup archive (DR / migration).
+	admin.POST("/backups/restore-upload", h.restoreUploadChunk)
+	admin.POST("/backups/restore-upload/inspect", h.restoreUploadInspect)
+	admin.POST("/backups/restore-upload/apply", h.restoreUploadApply)
+	admin.GET("/backups/restore-upload/status", h.restoreUploadStatus)
+	// GH #1993: keep an uploaded backup on this server, listed in Backups.
+	if cfg.UploadedBackups != nil {
+		h.registerUploadedBackupRoutes(admin)
+	}
+	admin.GET("/backup-runs", h.listRuns)
+	admin.GET("/backup-runs/:run_id/jobs", h.listRunJobs)
+	admin.DELETE("/backup-runs/:run_id/jobs", h.deleteRunJobs)
+	admin.POST("/system/backups", h.systemCreate)
+	admin.GET("/system/backups", h.systemList)
+	// GH #1408: package a Full Server backup run into one downloadable container.
+	admin.POST("/system/full-backup/:run_id/package", h.fullBackupPackage)
+	admin.GET("/system/full-backup/:run_id/package-status", h.fullBackupPackageStatus)
+	admin.GET("/system/full-backup/:run_id/download", h.fullBackupDownload)
+	// GH #1408 phase 2: restore from an uploaded full-server container.
+	admin.POST("/system/full-restore-upload/inspect", h.fullRestoreInspect)
+	admin.POST("/system/full-restore-upload/apply", h.fullRestoreApply)
+	admin.GET("/system/full-restore-upload/status", h.fullRestoreStatus)
+	admin.POST("/system/backups/:job_id/cancel", h.systemCancel)
+	admin.GET("/system/backups/:job_id/logs", h.logs)
+}
+
+// backupsPagination reads the page size and offset for a backups list. The
+// repo convention is ?page_size= (see parseListOptions); every UI caller sends
+// it. Older clients may still send ?limit=, so fall back to it when page_size
+// is absent. A missing/invalid/<1 size falls back to defaultLimit; an over-max
+// size clamps DOWN to maxLimit, never resets to the default (GH #1796). page<1
+// or invalid becomes 1. Returns (limit, offset).
+func backupsPagination(c *gin.Context, defaultLimit, maxLimit int) (int, int) {
+	page, _ := strconv.Atoi(c.DefaultQuery("page", "1"))
+	if page < 1 {
+		page = 1
+	}
+	sizeParam := c.Query("page_size")
+	if sizeParam == "" {
+		sizeParam = c.Query("limit")
+	}
+	limit, _ := strconv.Atoi(sizeParam)
+	if limit < 1 {
+		limit = defaultLimit
+	}
+	if limit > maxLimit {
+		limit = maxLimit
+	}
+	return limit, (page - 1) * limit
+}
+
+func (h *backupHandler) listRuns(c *gin.Context) {
+	limit, offset := backupsPagination(c, 25, 1000)
+	runs, total, err := h.cfg.Jobs.ListRuns(c.Request.Context(), limit, offset)
+	if err != nil {
+		h.cfg.logErr("list backup runs", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_list"})
+		return
+	}
+	manual, manualTotal, err := h.cfg.Jobs.ListManual(c.Request.Context(), limit, offset)
+	if err != nil {
+		h.cfg.logErr("list manual backups", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_list_manual"})
+		return
+	}
+	page := offset/maxInt(limit, 1) + 1
+	c.JSON(http.StatusOK, gin.H{
+		"data":         runs,
+		"manual":       manual,
+		"manual_total": manualTotal,
+		"total":        total,
+		"page":         page,
+		"page_size":    limit,
+	})
+}
+
+func (h *backupHandler) listRunJobs(c *gin.Context) {
+	runID := c.Param("run_id")
+	jobs, err := h.cfg.Jobs.ListByRun(c.Request.Context(), runID)
+	if err != nil {
+		h.cfg.logErr("list run jobs", err, "run_id", runID)
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_list"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": jobs})
+}
+
+type systemBackupRequest struct {
+	IncludeAccounts bool   `json:"include_accounts"`
+	DestinationID   string `json:"destination_id,omitempty"`
+	// Compression is the restic level ("" = auto / "off" / "max", the GH #294
+	// whitelist) for this System / Full Server run (GH #1646). It rides the
+	// system.backup call for the system job and is stamped on every fanned-out
+	// account job so the dispatcher carries it to each account's backup.create.
+	Compression string `json:"compression,omitempty"`
+}
+
+// fanOutFullServerAccounts enqueues a queued account_backup job for every
+// non-admin user, sharing the given run_id + destination, so the backup
+// dispatcher backs up each account as part of a Full Server run (GH #502).
+// Best-effort: a per-user create failure is logged and skipped, never aborting
+// the run. Content is "full" (home + databases + mailboxes) per account.
+func (h *backupHandler) fanOutFullServerAccounts(ctx context.Context, destID, runID, compression string) {
+	if h.cfg.Users == nil || h.cfg.Jobs == nil {
+		return
+	}
+	notAdmin := false
+	users, _, err := h.cfg.Users.List(ctx, repository.ListOptions{Limit: 10000, IsAdmin: &notAdmin})
+	if err != nil {
+		h.cfg.logErr("full-server fan-out: list users", err)
+		return
+	}
+	for i := range users {
+		u := &users[i]
+		dID, rID := destID, runID
+		acct := &models.BackupJob{
+			ID:            ids.NewULID(),
+			UserID:        u.ID,
+			DestinationID: &dID,
+			RunID:         &rID,
+			Kind:          models.BackupJobKindAccountBackup,
+			Content:       models.BackupContentFull,
+			Compression:   compression,
+			CreatedAt:     time.Now().UTC(),
+			Status:        models.BackupJobStatusQueued,
+		}
+		if err := h.cfg.Jobs.Create(ctx, acct); err != nil {
+			h.cfg.logErr("full-server fan-out: create account job", err)
+		}
+	}
+}
+
+func (h *backupHandler) systemCreate(c *gin.Context) {
+	var req systemBackupRequest
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		// An empty body means the defaults; a malformed one is refused.
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_json"})
+		return
+	}
+	if !validBackupCompression(req.Compression) {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_option", "detail": "compression must be off/auto/max"})
+		return
+	}
+	dest, derr := h.resolveDest(c, req.DestinationID)
+	if derr != nil {
+		return
+	}
+	release, ok := claimBackupSubmit(c, h.cfg.Jobs, h.cfg.logErr, "system", models.BackupJobKindSystemBackup,
+		"backup_in_progress", "a system backup is already queued or running")
+	if !ok {
+		return
+	}
+	defer release()
+	destID := dest.ID
+	runID := ids.NewULID()
+	job := &models.BackupJob{
+		ID:            ids.NewULID(),
+		UserID:        "system",
+		DestinationID: &destID,
+		RunID:         &runID,
+		Kind:          models.BackupJobKindSystemBackup,
+		Compression:   req.Compression,
+		CreatedAt:     time.Now().UTC(),
+		Status:        models.BackupJobStatusQueued,
+	}
+	if err := h.cfg.Jobs.Create(c.Request.Context(), job); err != nil {
+		h.cfg.logErr("create system backup", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_create"})
+		return
+	}
+	// GH #502: a Full Server backup (include_accounts) is the system backup
+	// PLUS a per-account backup for every hosting user, all sharing this run_id
+	// + destination so the repo holds the account snapshots restoreAccounts
+	// walks on a full restore. The agent's system.backup only covers system
+	// state; this account fan-out was missing, so "Full Server" previously
+	// backed up System only. The queued account jobs run via the dispatcher.
+	if req.IncludeAccounts {
+		h.fanOutFullServerAccounts(c.Request.Context(), destID, runID, req.Compression)
+	}
+	if h.cfg.Agent != nil {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), backupCallTimeout)
+		defer cancel()
+		params := map[string]any{
+			"job_id":           job.ID,
+			"include_accounts": req.IncludeAccounts,
+			"compression":      req.Compression,
+		}
+		for k, v := range destWireParams(dest) {
+			params[k] = v
+		}
+		if _, err := h.cfg.Agent.Call(ctx, "system.backup", params); err != nil {
+			_ = h.cfg.Jobs.MarkFinished(c.Request.Context(), job.ID, models.BackupJobStatusFailed,
+				"", "", 0, 0, nil, nil, err.Error())
+			c.JSON(http.StatusBadGateway, gin.H{"status": "error", "error": "agent_call_failed"})
+			return
+		}
+		_ = h.cfg.Jobs.MarkStarted(c.Request.Context(), job.ID)
+	}
+	c.JSON(http.StatusCreated, gin.H{"status": "ok", "job_id": job.ID})
+}
+
+func (h *backupHandler) systemList(c *gin.Context) {
+	limit, offset := backupsPagination(c, 25, 100)
+	rows, total, err := h.cfg.Jobs.ListAll(c.Request.Context(), limit, offset)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_list"})
+		return
+	}
+	// Filter to system_backup kind only.
+	out := make([]models.BackupJob, 0, len(rows))
+	for _, r := range rows {
+		if r.Kind == models.BackupJobKindSystemBackup {
+			out = append(out, r)
+		}
+	}
+	page := offset/maxInt(limit, 1) + 1
+	c.JSON(http.StatusOK, gin.H{
+		"data": out, "total": total, "page": page, "page_size": limit,
+	})
+}
+
+func (h *backupHandler) systemCancel(c *gin.Context) {
+	h.cancelJob(c, "system.backup_cancel")
+}
+
+type backupHandler struct{ cfg BackupHandlerConfig }
+
+// resolveDest looks up the destination row (or auto-picks the only
+// enabled one when destID is empty + exactly one exists), writes a
+// 4xx + nil on miss, returns the row + nil on success.
+func (h *backupHandler) resolveDest(c *gin.Context, destID string) (*models.BackupDestination, error) {
+	if h.cfg.Destinations == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "destinations_repo_unavailable"})
+		return nil, errors.New("destinations repo unavailable")
+	}
+	if destID == "" {
+		// No destination supplied — fall back to the single enabled
+		// destination if exactly one exists, else 400.
+		all, err := h.cfg.Destinations.ListEnabled(c.Request.Context())
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_list_destinations"})
+			return nil, err
+		}
+		if len(all) != 1 {
+			c.JSON(http.StatusBadRequest, gin.H{
+				"status": "error",
+				"error":  "destination_id_required",
+				"detail": "destination_id required when more than one destination exists",
+			})
+			return nil, errors.New("destination_id required")
+		}
+		return &all[0], nil
+	}
+	d, err := h.cfg.Destinations.Get(c.Request.Context(), destID)
+	if err != nil || d == nil {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "destination_not_found"})
+		return nil, errors.New("destination not found")
+	}
+	if !d.Enabled {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "destination_disabled"})
+		return nil, errors.New("destination disabled")
+	}
+	return d, nil
+}
+
+// materializeDestParams resolves the restic repo params for a backup job's
+// download from the job's recorded destination. Returns nil when the job has
+// no destination (a truly-local backup) so the agent keeps its local default.
+// Without this the download always opened the local repo and 404'd remote
+// backups with "no snapshots for job" (GH #462).
+func materializeDestParams(ctx context.Context, dests repository.BackupDestinationRepository, job *models.BackupJob) map[string]any {
+	_, params := materializeDest(ctx, dests, job)
+	return params
+}
+
+// materializeDest is materializeDestParams plus the destination row itself,
+// which the caller needs to bridge a per-destination restic password
+// (M30.2.x) into the download. Without that password the agent cannot open a
+// rotated destination's repo, so the download fails even though the backup
+// is fine.
+func materializeDest(ctx context.Context, dests repository.BackupDestinationRepository, job *models.BackupJob) (*models.BackupDestination, map[string]any) {
+	if dests == nil || job.DestinationID == nil || *job.DestinationID == "" {
+		return nil, nil
+	}
+	d, err := dests.Get(ctx, *job.DestinationID)
+	if err != nil || d == nil {
+		return nil, nil
+	}
+	return d, destWireParams(d)
+}
+
+// destWireParams projects a destination into the JSON keys the agent
+// backup commands accept. Mirror of backupscheduler.destWireParams;
+// kept duplicated to avoid the api → backupscheduler import cycle.
+func destWireParams(d *models.BackupDestination) map[string]any {
+	// nil = a legacy job row with no destination — the agent falls back to
+	// its default local repo, which is exactly where such a backup lives.
+	if d == nil {
+		return nil
+	}
+	out := map[string]any{
+		"repo_url":         d.URL,
+		"destination_kind": d.Kind,
+		"sftp":             backupwrapperhelpers.SFTPWireParams(d),
+	}
+	if d.CredentialsRef != nil {
+		out["credentials_ref"] = *d.CredentialsRef
+	}
+	if d.Kind == models.BackupDestinationKindSFTP {
+		if s := d.ExtraOptionsTyped().SFTP; s != nil {
+			out["sftp"] = map[string]any{
+				"host":     s.Host,
+				"user":     s.User,
+				"port":     s.Port,
+				"path":     s.Path,
+				"auth":     s.Auth,
+				"key_path": s.KeyPath,
+			}
+		}
+	}
+	return out
+}
+
+type createBackupRequest struct {
+	DestinationID string   `json:"destination_id,omitempty"`
+	Databases     []string `json:"databases,omitempty"`
+	Mailboxes     []string `json:"mailboxes,omitempty"`
+	// GH #294 options. Content: ""/"full" | "files" | "database" | "folders".
+	// Folders: home subpaths (content=folders). Compression: ""|"off"|"auto"|"max".
+	Content     string   `json:"content,omitempty"`
+	Folders     []string `json:"folders,omitempty"`
+	Compression string   `json:"compression,omitempty"`
+}
+
+// validBackupContent / validBackupCompression whitelist the GH #294 options so a
+// bad value can't reach the agent (restic has only off/auto/max — never gzip/xz).
+func validBackupContent(c string) bool { return models.ValidBackupContent(c) }
+
+// normalizeBackupContent maps the empty request default to "full" so the
+// job row records what the run actually captured (GH #454): the content
+// column drives the Type shown in the backup list. Previously the create
+// left Content unset -> GORM applied the column default 'full' -> every
+// account backup showed as "Account Backup" regardless of files/db choice.
+func normalizeBackupContent(c string) string {
+	if c == "" {
+		return models.BackupContentFull
+	}
+	return c
+}
+
+func validBackupCompression(c string) bool {
+	switch c {
+	case "", "off", "auto", "max":
+		return true
+	}
+	return false
+}
+
+// applyBackupContent zeroes the db/mail selections a content mode excludes:
+// "files"/"folders" -> home only; "database" -> dbs only; else (full) unchanged.
+func applyBackupContent(content string, dbs, mbs, pgDbs []string) ([]string, []string, []string) {
+	return models.ApplyBackupContent(content, dbs, mbs, pgDbs)
+}
+
+func (h *backupHandler) createForUser(c *gin.Context) {
+	userID := c.Param("id")
+	user, err := h.cfg.Users.FindByID(c.Request.Context(), userID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "user_not_found"})
+		return
+	}
+	var req createBackupRequest
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		// An empty body means the defaults; a malformed one is refused.
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_json"})
+		return
+	}
+	if !validBackupContent(req.Content) || !validBackupCompression(req.Compression) {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_option", "detail": "content must be full/files/database/folders; compression must be off/auto/max"})
+		return
+	}
+	dest, derr := h.resolveDest(c, req.DestinationID)
+	if derr != nil {
+		return
+	}
+	release, ok := claimBackupSubmit(c, h.cfg.Jobs, h.cfg.logErr, user.ID, models.BackupJobKindAccountBackup,
+		"backup_in_progress", "a backup of this account is already queued or running")
+	if !ok {
+		return
+	}
+	defer release()
+	destID := dest.ID
+	job := &models.BackupJob{
+		ID:            ids.NewULID(),
+		UserID:        user.ID,
+		DestinationID: &destID,
+		Kind:          models.BackupJobKindAccountBackup,
+		Content:       normalizeBackupContent(req.Content),
+		SystemdUnit:   "",
+		CreatedAt:     time.Now().UTC(),
+		Status:        models.BackupJobStatusQueued,
+	}
+	if err := h.cfg.Jobs.Create(c.Request.Context(), job); err != nil {
+		h.cfg.logErr("create backup job", err, "user_id", user.ID)
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_create"})
+		return
+	}
+
+	if h.cfg.Agent != nil {
+		// Resolve the account's full content selection once (JAB-324): the
+		// same producer the tenant path and scheduler use, with one
+		// lookup-failure classification — a partial result that is logged,
+		// never a silent empty the agent would skip as "the account owns none".
+		sel, warns := backupmetadata.SelectAll(c.Request.Context(), h.cfg.metadataDeps(), user.ID, user.IsAdmin)
+		backupmetadata.LogWarnings(h.cfg.Log, warns)
+		// Fall back to "every database / mailbox the user owns" when the
+		// operator submits empty arrays — that's what the admin "Create
+		// backup" button does. Empty arrays leaving DBs and mail untouched
+		// would silently produce home-only backups.
+		dbs := req.Databases
+		if len(dbs) == 0 {
+			dbs = sel.MariaDB
+		}
+		mbs := req.Mailboxes
+		if len(mbs) == 0 {
+			mbs = sel.Mailboxes
+		}
+		// M37: mariadb and postgres stay in parallel wire fields so the
+		// agent dispatches the right dump tool per engine.
+		pgDbs := sel.Postgres
+		dbs, mbs, pgDbs = applyBackupContent(req.Content, dbs, mbs, pgDbs)
+		params := map[string]any{
+			"job_id":             job.ID,
+			"user_id":            user.ID,
+			"username":           user.Username,
+			"email":              user.Email,
+			"is_admin":           user.IsAdmin,
+			"databases":          dbs,
+			"databases_postgres": pgDbs,
+			"mailboxes":          mbs,
+			"docker_apps":        sel.DockerApps,
+			"content":            req.Content,
+			"folders":            req.Folders,
+			"compression":        req.Compression,
+			"metadata":           h.cfg.buildAccountMetadata(c.Request.Context(), user),
+		}
+		for k, v := range destWireParams(dest) {
+			params[k] = v
+		}
+		ctx, cancel := context.WithTimeout(c.Request.Context(), backupCallTimeout)
+		defer cancel()
+		// JAB-302: backup.create is ASYNC — the agent spawns the backup
+		// goroutine and returns immediately. So this dispatch must NOT unlink
+		// the per-destination password tempfile when the Call returns: the
+		// background restic/borg run still needs it to authenticate to the
+		// destination. Use the async variant (like the scheduler); the agent's
+		// backup.create goroutine owns the tempfile's lifetime and removes it
+		// when the job finishes (backup_create.go: defer removePasswordTempFile).
+		// The old sync WithDestPasswordFile raced its cleanup_temp against the
+		// live backup — the exact bug the agent comment records as "used to".
+		callErr := backupwrapperhelpers.WithDestPasswordFileAsync(ctx, dest, h.cfg.Agent, h.cfg.SSOKey,
+			func(passwordFile string) error {
+				if passwordFile != "" {
+					params["password_file"] = passwordFile
+				}
+				_, err := h.cfg.Agent.Call(ctx, "backup.create", params)
+				return err
+			})
+		if err := callErr; err != nil {
+			// Mark failed so the UI surfaces the issue right away.
+			_ = h.cfg.Jobs.MarkFinished(c.Request.Context(), job.ID, models.BackupJobStatusFailed,
+				"", "", 0, 0, nil, nil, err.Error())
+			respondAgentErrStatus(c, "agent_call_failed", err)
+			return
+		}
+		_ = h.cfg.Jobs.MarkStarted(c.Request.Context(), job.ID)
+	}
+
+	c.JSON(http.StatusCreated, gin.H{
+		"status":       "ok",
+		"job_id":       job.ID,
+		"systemd_unit": "dotnext-backup-" + job.ID + ".service",
+	})
+}
+
+func (h *backupHandler) listForUser(c *gin.Context) {
+	userID := c.Param("id")
+	limit, offset := backupsPagination(c, 50, 200)
+	rows, total, err := h.cfg.Jobs.ListForUser(c.Request.Context(), userID, limit, offset)
+	if err != nil {
+		h.cfg.logErr("list backups for user", err, "user_id", userID)
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_list"})
+		return
+	}
+	page := offset/maxInt(limit, 1) + 1
+	c.JSON(http.StatusOK, gin.H{
+		"data": rows, "total": total, "page": page, "page_size": limit,
+	})
+}
+
+func (h *backupHandler) listAll(c *gin.Context) {
+	limit, offset := backupsPagination(c, 50, 200)
+	ctx := c.Request.Context()
+	var rows []models.BackupJob
+	var total int64
+	var err error
+	// Admin owner-scope via ?user_id (#483).
+	if uid := c.Query("user_id"); uid != "" {
+		if !ids.IsValidULID(uid) {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid user_id"})
+			return
+		}
+		rows, total, err = h.cfg.Jobs.ListForUser(ctx, uid, limit, offset)
+	} else {
+		rows, total, err = h.cfg.Jobs.ListAll(ctx, limit, offset)
+	}
+	if err != nil {
+		h.cfg.logErr("list backups", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_list"})
+		return
+	}
+	page := offset/maxInt(limit, 1) + 1
+	c.JSON(http.StatusOK, gin.H{
+		"data": rows, "total": total, "page": page, "page_size": limit,
+	})
+}
+
+// delete removes a backup run: the agent forgets+prunes the run's restic
+// snapshots first, then the DB job row is dropped. forget-then-delete (like the
+// docker-app delete) so a failed forget leaves the row for retry rather than
+// orphaning snapshots (GH #294).
+func (h *backupHandler) delete(c *gin.Context) {
+	jobID := c.Param("job_id")
+	job, err := h.cfg.Jobs.Get(c.Request.Context(), jobID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "not_found"})
+		return
+	}
+	// GH #1044: a restore job owns no restic snapshot, so there is nothing to
+	// forget — skip straight to dropping the row. Calling backup.forget for it
+	// would ask the agent to prune a snapshot that never existed.
+	if h.cfg.Agent != nil && !isRestoreKind(job.Kind) {
+		if err := h.forgetBackup(c, job); err != nil {
+			return // forgetBackup wrote the response; leave the row
+		}
+	}
+	if err := h.cfg.Jobs.Delete(c.Request.Context(), jobID); err != nil {
+		h.cfg.logErr("delete backup job", err, "job_id", jobID)
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_delete"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// forgetBackup asks the agent to forget+prune the run's snapshots from its
+// destination repo. Returns a non-nil error (response already written) on
+// hard failure. Thin response-writing wrapper around forgetBackupErr so the
+// bulk run-jobs delete (GH #502) can reuse the same forget logic per job
+// without fighting over the response writer.
+func (h *backupHandler) forgetBackup(c *gin.Context, job *models.BackupJob) error {
+	if err := h.forgetBackupErr(c.Request.Context(), job); err != nil {
+		status, body := translateAgentError(err)
+		c.JSON(status, body)
+		return err
+	}
+	return nil
+}
+
+// forgetBackupErr resolves the job's destination for repo URL + creds (a job
+// with no destination, or a since-deleted one, falls back to the default
+// local repo) and asks the agent to forget+prune the job's snapshots.
+func (h *backupHandler) forgetBackupErr(reqCtx context.Context, job *models.BackupJob) error {
+	return forgetJobSnapshots(reqCtx, h.cfg.Agent, h.cfg.Destinations, h.cfg.SSOKey, job)
+}
+
+// forgetJobSnapshots asks the agent to forget+prune a backup job's snapshots
+// from the repository the job wrote to: its destination's repo, credentials
+// and restic password. Named by job alone, the agent looks in its default
+// local repo, so a backup on any other destination is not found there and its
+// data stays behind once the caller deletes the row. A job without a
+// destination (pre-ADR-0080), or whose destination was deleted, uses the
+// default repo. A destination that cannot be read is an error, so the caller
+// keeps the row.
+func forgetJobSnapshots(reqCtx context.Context, ag agent.AgentInterface, dests repository.BackupDestinationRepository, ssoKey *ssokey.Key, job *models.BackupJob) error {
+	ctx, cancel := context.WithTimeout(reqCtx, backupCallTimeout)
+	defer cancel()
+	params := map[string]any{"job_id": job.ID, "user_id": job.UserID, "kind": job.Kind}
+	var dest *models.BackupDestination
+	if job.DestinationID != nil && *job.DestinationID != "" && dests != nil {
+		d, derr := dests.Get(ctx, *job.DestinationID)
+		switch {
+		case errors.Is(derr, repository.ErrNotFound):
+		case derr != nil:
+			return fmt.Errorf("load backup destination %s: %w", *job.DestinationID, derr)
+		case d != nil:
+			dest = d
+			for k, v := range destWireParams(dest) {
+				params[k] = v
+			}
+		}
+	}
+	call := func(passwordFile string) error {
+		if passwordFile != "" {
+			params["password_file"] = passwordFile
+		}
+		_, err := ag.Call(ctx, "backup.forget", params)
+		return err
+	}
+	if dest != nil {
+		return backupwrapperhelpers.WithDestPasswordFile(ctx, dest, ag, ssoKey, call)
+	}
+	return call("")
+}
+
+// deleteRunJobs removes EVERY deletable job of a backup run behind one
+// confirmation (GH #502): a Full Server run holds a job per account, and
+// deleting hundreds of jobs one dialog at a time is not an operation, it
+// is a punishment. Per-job semantics match the single delete exactly —
+// forget-then-delete, so a failed forget leaves that row for retry.
+// Running/pending jobs are skipped (cancel them first); the response
+// reports deleted / skipped_running / failed so partial outcomes are
+// visible instead of silently half-done.
+func (h *backupHandler) deleteRunJobs(c *gin.Context) {
+	runID := c.Param("run_id")
+	jobs, err := h.cfg.Jobs.ListByRun(c.Request.Context(), runID)
+	if err != nil {
+		h.cfg.logErr("bulk delete: list run jobs", err, "run_id", runID)
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_list"})
+		return
+	}
+	if len(jobs) == 0 {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "not_found"})
+		return
+	}
+	deleted, skippedRunning, failed := 0, 0, 0
+	for i := range jobs {
+		job := &jobs[i]
+		switch job.Status {
+		case models.BackupJobStatusRunning, models.BackupJobStatusQueued:
+			skippedRunning++
+			continue
+		}
+		if h.cfg.Agent != nil {
+			if ferr := h.forgetBackupErr(c.Request.Context(), job); ferr != nil {
+				h.cfg.logErr("bulk delete: forget failed", ferr, "job_id", job.ID)
+				failed++
+				continue
+			}
+		}
+		if derr := h.cfg.Jobs.Delete(c.Request.Context(), job.ID); derr != nil {
+			h.cfg.logErr("bulk delete: db delete failed", derr, "job_id", job.ID)
+			failed++
+			continue
+		}
+		deleted++
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"status":          "ok",
+		"deleted":         deleted,
+		"skipped_running": skippedRunning,
+		"failed":          failed,
+	})
+}
+
+func (h *backupHandler) get(c *gin.Context) {
+	job, err := h.cfg.Jobs.Get(c.Request.Context(), c.Param("job_id"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "not_found"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"data": job})
+}
+
+func (h *backupHandler) status(c *gin.Context) {
+	jobID := c.Param("job_id")
+	if h.cfg.Agent == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "agent_unavailable"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), backupCallTimeout)
+	defer cancel()
+	raw, err := h.cfg.Agent.Call(ctx, "backup.status", map[string]string{"job_id": jobID})
+	if err != nil {
+		respondAgentErrStatus(c, "agent_call_failed", err)
+		return
+	}
+	var resp any
+	_ = json.Unmarshal(raw, &resp)
+	c.JSON(http.StatusOK, gin.H{"data": resp})
+}
+
+func (h *backupHandler) cancel(c *gin.Context) {
+	h.cancelJob(c, "backup.cancel")
+}
+
+// agentCancelReply is backup.cancel's reply (panel-agent
+// commands/backup_create.go backupCancelResult). Stopped is a pointer: an
+// agent from before GH #2245 answered {"cancel":"noop_v1"} and stopped
+// nothing, which must not read as "nothing was running".
+type agentCancelReply struct {
+	JobID    string `json:"job_id"`
+	Stopped  *bool  `json:"stopped"`
+	JobState string `json:"job_state"`
+}
+
+// cancelledByAdminText is the error_text of a job an admin cancelled.
+const cancelledByAdminText = "cancelled by an administrator"
+
+// cancelledByOwnerText is the error_text of a job its account's owner
+// cancelled from the tenant panel.
+const cancelledByOwnerText = "cancelled by the account owner"
+
+// backupCancelTimeout bounds the agent's backup.cancel call. The agent waits
+// up to CancelGrace+2s for the job to stop before answering, so the call
+// allows a little more, and stays under the server's 30s WriteTimeout.
+var backupCancelTimeout = internalbackup.CancelGrace + 5*time.Second
+
+// cancelJob stops a queued or running backup and records it cancelled
+// (GH #2245). Cancel used to only ask the agent, whose backup.cancel was a
+// no-op, and answer ok: the backup ran on and its row stayed "running".
+func (h *backupHandler) cancelJob(c *gin.Context, rpc string) {
+	if h.cfg.Agent == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "agent_unavailable"})
+		return
+	}
+	if h.cfg.Jobs == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "jobs_repo_unavailable"})
+		return
+	}
+	job, err := h.cfg.Jobs.Get(c.Request.Context(), c.Param("job_id"))
+	if errors.Is(err, repository.ErrNotFound) {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "not_found"})
+		return
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_get_job"})
+		return
+	}
+	cancelBackupJob(c, h.cfg.Agent, h.cfg.Jobs, job, rpc, cancelledByAdminText)
+}
+
+// cancelBackupJob is the cancel shared by the admin and tenant routes, once
+// the caller has loaded the job and checked it may cancel it.
+func cancelBackupJob(c *gin.Context, ag agent.AgentInterface, jobs repository.BackupJobRepository, job *models.BackupJob, rpc, cancelledText string) {
+	reqCtx := c.Request.Context()
+	if isRestoreKind(job.Kind) {
+		c.JSON(http.StatusConflict, gin.H{"status": "error", "error": "not_cancellable",
+			"detail": "A restore can't be cancelled."})
+		return
+	}
+	if job.Status != models.BackupJobStatusQueued && job.Status != models.BackupJobStatusRunning {
+		c.JSON(http.StatusConflict, gin.H{"status": "error", "error": "job_not_active",
+			"detail": "This backup has already finished (" + job.Status + ")."})
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(reqCtx, backupCancelTimeout)
+	defer cancel()
+	var reply agentCancelReply
+	raw, callErr := ag.Call(ctx, rpc, map[string]string{"job_id": job.ID})
+	if callErr == nil {
+		callErr = json.Unmarshal(raw, &reply)
+	}
+	// A queued job is not on the agent yet, so the row alone decides. A
+	// running one is sealed only once the agent says nothing runs any more.
+	// The panel's own agent failing answers 500, not 502: Cloudflare would
+	// replace a 502's body, and the user needs this one (GH #2077).
+	if job.Status == models.BackupJobStatusRunning {
+		if callErr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "agent_call_failed",
+				"detail": "Couldn't reach the agent to stop this backup. Try again in a moment."})
+			return
+		}
+		if reply.Stopped == nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "agent_cannot_cancel",
+				"detail": "The agent on this server is too old to stop a backup. Update the panel and try again."})
+			return
+		}
+	}
+	// It finished before the cancel reached it, or on its own while the agent
+	// waited for it to stop; the finalizer records how.
+	if callErr == nil && reply.Stopped != nil &&
+		(reply.JobState == "succeeded" || reply.JobState == "failed") {
+		c.JSON(http.StatusConflict, gin.H{"status": "error", "error": "job_already_finished",
+			"detail": "This backup finished before it could be cancelled."})
+		return
+	}
+	// The agent answers once the job has stopped. One still stopping when it
+	// gave up waiting keeps its row as it is: calling it cancelled now would
+	// let a delete run into the job's slot. The finalizer seals it when the
+	// agent reports it cancelled.
+	if callErr == nil && reply.Stopped != nil && *reply.Stopped && reply.JobState == "running" {
+		c.JSON(http.StatusAccepted, gin.H{"status": "ok", "data": gin.H{"job_id": job.ID, "status": "cancelling"}})
+		return
+	}
+	sealed, err := jobs.MarkCancelledIfActive(reqCtx, job.ID, cancelledText)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_update_job"})
+		return
+	}
+	if !sealed {
+		c.JSON(http.StatusConflict, gin.H{"status": "error", "error": "job_already_finished",
+			"detail": "This backup finished before it could be cancelled."})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "data": gin.H{"job_id": job.ID, "status": models.BackupJobStatusCancelled}})
+}
+
+// logs proxies journalctl tail of the transient unit
+// (dotnext-backup-<id>.service or dotnext-system-backup-<id>.service)
+// via the agent. Same handler covers both kinds — agent picks the
+// unit name from the job kind in the DB row.
+func (h *backupHandler) logs(c *gin.Context) {
+	jobID := c.Param("job_id")
+	job, err := h.cfg.Jobs.Get(c.Request.Context(), jobID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "not_found"})
+		return
+	}
+	// GH #1044: a restore never writes the agent's per-job backup log file — its
+	// result (applied/skipped/warnings for selective, stages for full) lives on
+	// the job row. Render that as the log body instead of asking the agent for a
+	// file that is always "no log available". Before the agent check so the Logs
+	// action works even when the agent is momentarily unavailable.
+	if isRestoreKind(job.Kind) {
+		c.JSON(http.StatusOK, gin.H{"data": gin.H{"log_text": formatRestoreLog(job)}})
+		return
+	}
+	if h.cfg.Agent == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "agent_unavailable"})
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+	raw, err := h.cfg.Agent.Call(ctx, "backup.logs", map[string]any{
+		"job_id": job.ID,
+		"kind":   job.Kind,
+	})
+	if err != nil {
+		respondAgentErrStatus(c, "agent_call_failed", err)
+		return
+	}
+	var resp any
+	_ = json.Unmarshal(raw, &resp)
+	c.JSON(http.StatusOK, gin.H{"data": resp})
+}
+
+func (h *backupHandler) download(c *gin.Context) {
+	job, err := h.cfg.Jobs.Get(c.Request.Context(), c.Param("job_id"))
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "no_completed_snapshot"})
+		return
+	}
+	dest, destParams := materializeDest(c.Request.Context(), h.cfg.Destinations, job)
+	// Bridge the destination's own restic password (M30.2.x) for the
+	// materialize call; without it a rotated destination's snapshot cannot
+	// be opened and the download fails. No-op for legacy/local jobs.
+	_ = backupwrapperhelpers.WithOptionalDestPassword(c.Request.Context(), dest, h.cfg.Agent, h.cfg.SSOKey,
+		func(passwordFile string) error {
+			if passwordFile != "" {
+				if destParams == nil {
+					destParams = map[string]any{}
+				}
+				destParams["password_file"] = passwordFile
+			}
+			streamBackupArtifact(c, h.cfg.Agent, job, backupDownloadBase(job, backupJobOwnerName(c.Request.Context(), h.cfg.Users, job)), destParams, h.cfg.logErr)
+			return nil
+		})
+}
+
+// backupJobOwnerName is the name a backup download is filed under (GH #2089):
+// "system" for a system backup or restore, else the account's username. ""
+// when the account is gone or has no username, so the caller falls back to
+// the job ID.
+func backupJobOwnerName(ctx context.Context, users repository.UserRepository, job *models.BackupJob) string {
+	if job.Kind == models.BackupJobKindSystemBackup || job.Kind == models.BackupJobKindSystemRestore {
+		return "system"
+	}
+	if users == nil {
+		return ""
+	}
+	u, err := users.FindByID(ctx, job.UserID)
+	if err != nil || u == nil || u.Username == nil {
+		return ""
+	}
+	return *u.Username
+}
+
+// backupDownloadBase names a backup download without its extension (GH #2089):
+// backup_<owner>[_<content>]_<YYYY-MM-DD>_<HHMM>, the time in UTC. A folder of
+// downloads used to be a list of job IDs. Content is named only when it isn't
+// a full backup. Every part is reduced to [A-Za-z0-9_-] (contentDisposition
+// adds its own escaping on top), and an empty owner falls back to the job ID.
+func backupDownloadBase(job *models.BackupJob, owner string) string {
+	safe := func(s string) string {
+		var b strings.Builder
+		for _, r := range s {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' {
+				b.WriteRune(r)
+			}
+		}
+		return b.String()
+	}
+	who := safe(owner)
+	if who == "" {
+		who = safe(job.ID)
+	}
+	parts := []string{"backup", who}
+	if content := safe(job.Content); content != "" && content != models.BackupContentFull {
+		parts = append(parts, content)
+	}
+	parts = append(parts, job.CreatedAt.UTC().Format("2006-01-02_1504"))
+	return strings.Join(parts, "_")
+}
+
+// streamBackupArtifact materializes a SUCCEEDED backup job's restic snapshot
+// via the agent and streams it to the client as a tar.zst attachment. Shared
+// by the admin (/backups/:job_id/download) and tenant (/me/backups/:id/download
+// — GH #266) handlers; the CALLER must load the job and authorize the request
+// (admin vs owner) before calling this. baseName is the download's file name
+// without its extension (backupDownloadBase); "" falls back to the job ID.
+//
+// panel-api runs as the dotnext user and can read neither
+// /etc/dotnext/restic-repo.password nor /var/lib/dotnext-backups/repo (both
+// 0600/0700 root:root), so the restic restore is dispatched to the agent, which
+// materializes the snapshot under /var/lib/dotnext-backups/downloads/<job_id>/ as
+// root:dotnext 0750 for the tar to read without elevated privileges.
+func streamBackupArtifact(c *gin.Context, ag agent.AgentInterface, job *models.BackupJob, baseName string, destParams map[string]any, logErr func(string, error, ...any)) {
+	// A `partial` backup still produced a valid manifest snapshot (one
+	// non-critical stage failed but the rest, incl. the manifest, were
+	// captured) — the operator must be able to download it (GH #502): the
+	// system leg of a Full Server backup is commonly `partial` yet its
+	// snapshot is real. The SnapshotID guard below is the true gate; queued/
+	// running/failed/cancelled have no snapshot and 404 here.
+	if job.Status != models.BackupJobStatusSucceeded && job.Status != models.BackupJobStatusPartial {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "no_completed_snapshot"})
+		return
+	}
+	if job.SnapshotID == "" {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"status": "error", "error": "no_snapshot_id"})
+		return
+	}
+	if ag == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "agent_unavailable"})
+		return
+	}
+	// Backup downloads stream multi-GB archives, and the restic materialize can
+	// take minutes — both far exceed the server's 30s WriteTimeout, which would
+	// sever the connection mid-stream. GH #462: the download stalled at ~1.15 GB,
+	// i.e. exactly 30s of throughput. Clear this request's write deadline so the
+	// stream runs to completion (nginx already allows an hour via
+	// proxy_send/read_timeout 3600s). Best-effort: a writer that doesn't support
+	// deadlines just keeps the default.
+	_ = http.NewResponseController(c.Writer).SetWriteDeadline(time.Time{})
+
+	// The materialized dir is cleaned up once the stream ends — whether we
+	// restored it inline below or a GH #1408 prepare-job warmed it first.
+	defer func() {
+		cleanCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		_, _ = ag.Call(cleanCtx, "backup.materialize_cleanup", map[string]string{"job_id": job.ID})
+	}()
+
+	// GH #1408: reuse a prepare-job's already-restored dir so the download
+	// doesn't re-run the minutes-long restic materialize (which is what made the
+	// Download button look dead). Falls back to an inline materialize otherwise.
+	matPath := consumePreparedDir(job.ID)
+	if matPath == "" {
+		matCtx, matCancel := context.WithTimeout(c.Request.Context(), 30*time.Minute)
+		defer matCancel()
+		// The snapshot lives in the job's DESTINATION repo. Forward repo_url +
+		// credentials so the agent opens that repo, not the local default at
+		// /var/lib/dotnext-backups/repo (which has no snapshots and 404s with
+		// "no snapshots for job" — GH #462). destParams is nil for a truly-local
+		// backup, in which case the agent keeps its local default.
+		params := map[string]any{
+			"job_id":      job.ID,
+			"snapshot_id": job.SnapshotID,
+		}
+		for k, v := range destParams {
+			params[k] = v
+		}
+		raw, err := ag.Call(matCtx, "backup.materialize", params)
+		if err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"status": "error", "error": "restic_restore_failed", "detail": err.Error(),
+			})
+			return
+		}
+		var mat struct {
+			Path string `json:"path"`
+		}
+		if err := json.Unmarshal(raw, &mat); err != nil || mat.Path == "" {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "agent_reply_parse"})
+			return
+		}
+		matPath = mat.Path
+	}
+
+	// GH #462: choose the compressor by what's actually installed. A box that
+	// lacks the zstd binary (installed before zstd became a dependency, then
+	// only ever `dotnext update`d) falls back to an uncompressed tar so the
+	// download always works.
+	useZstd := false
+	if _, lerr := exec.LookPath("zstd"); lerr == nil {
+		useZstd = true
+	}
+	if baseName == "" {
+		baseName = job.ID
+	}
+	filename := baseName + ".tar"
+	contentType := "application/x-tar"
+
+	// GH #462 round 3: build the archive as a Go pipeline (tar -> zstd), NOT
+	// `tar -I zstd` / `tar --zstd`. Those run the compressor through /bin/sh,
+	// which the panel's AppArmor profile deliberately does not grant (no shell),
+	// so under enforce the download died with "zstd: Cannot exec". Two direct
+	// execs stay on the profile's tar + zstd allowlist and never touch a shell.
+	tarCmd := exec.CommandContext(c.Request.Context(), "tar", "-cf", "-",
+		"-C", filepath.Dir(matPath), filepath.Base(matPath))
+	var tarErr, zstdErr bytes.Buffer
+	tarCmd.Stderr = &tarErr
+
+	streamCmd := tarCmd // the process whose stdout is streamed to the client
+	if useZstd {
+		filename = baseName + ".tar.zst"
+		contentType = "application/zstd"
+		zstdCmd := exec.CommandContext(c.Request.Context(), "zstd", "-c", "-")
+		zstdCmd.Stderr = &zstdErr
+		tarOut, perr := tarCmd.StdoutPipe()
+		if perr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "tar_pipe", "detail": perr.Error()})
+			return
+		}
+		zstdCmd.Stdin = tarOut
+		streamCmd = zstdCmd
+	}
+	stdout, perr := streamCmd.StdoutPipe()
+	if perr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "tar_pipe", "detail": perr.Error()})
+		return
+	}
+	// Start tar first so its stdout is flowing before zstd reads it.
+	if serr := tarCmd.Start(); serr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "tar_start", "detail": serr.Error()})
+		return
+	}
+	if useZstd {
+		if serr := streamCmd.Start(); serr != nil {
+			_ = tarCmd.Process.Kill()
+			_ = tarCmd.Wait()
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "zstd_start", "detail": serr.Error()})
+			return
+		}
+	}
+	// GH #462: read the first chunk BEFORE sending the download headers. If tar
+	// produces no output (missing binary, unreadable materialized path,
+	// permission denied), return a real JSON error instead of committing the
+	// browser to a silent 0-byte download + "Network Failed".
+	head := make([]byte, 64*1024)
+	n, rerr := io.ReadFull(stdout, head)
+	if n == 0 {
+		_ = streamCmd.Wait()
+		if useZstd {
+			_ = tarCmd.Wait()
+		}
+		detail := strings.TrimSpace(tarErr.String() + " " + zstdErr.String())
+		logErr("tar download produced no output", rerr, "job_id", job.ID, "stderr", detail)
+		c.JSON(http.StatusInternalServerError, gin.H{
+			"status": "error", "error": "archive_empty",
+			"detail": "could not build the download archive: " + detail,
+		})
+		return
+	}
+	c.Header("Content-Type", contentType)
+	c.Header("Content-Disposition", contentDisposition("attachment", filename))
+	if _, werr := c.Writer.Write(head[:n]); werr != nil {
+		logErr("tar download write head", werr, "job_id", job.ID)
+	}
+	if rerr == nil { // more than the first chunk remains
+		_, _ = io.Copy(c.Writer, stdout)
+	}
+	if werr := streamCmd.Wait(); werr != nil {
+		logErr("archive download", werr, "job_id", job.ID, "stderr", strings.TrimSpace(tarErr.String()+" "+zstdErr.String()))
+	}
+	if useZstd {
+		if werr := tarCmd.Wait(); werr != nil {
+			logErr("archive download (tar)", werr, "job_id", job.ID, "stderr", strings.TrimSpace(tarErr.String()))
+		}
+	}
+}
+
+type restoreRequest struct {
+	ManifestSnapshotID string `json:"manifest_snapshot_id"`
+	TargetUserID       string `json:"target_user_id"`
+	Overwrite          bool   `json:"overwrite"`
+	// DestinationID resolves the restic repo URL + credentials for the
+	// agent. Without it the agent defaults to the local repo at
+	// /var/lib/dotnext-backups/repo, which silently 404s on snapshot
+	// lookup whenever the original backup landed on a remote dest.
+	DestinationID string `json:"destination_id,omitempty"`
+}
+
+func (h *backupHandler) restore(c *gin.Context) {
+	var req restoreRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_json"})
+		return
+	}
+	if req.ManifestSnapshotID == "" || req.TargetUserID == "" {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"status": "error", "error": "manifest_snapshot_id_and_target_user_id_required"})
+		return
+	}
+	if h.cfg.Agent == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "agent_unavailable"})
+		return
+	}
+
+	// Resolve destination → repo_url + credentials (and SFTP block when
+	// applicable). Empty destination_id falls back to the single-enabled
+	// dest auto-pick already implemented for create flows; if the host
+	// has many destinations and none was supplied resolveDest 422s.
+	dest, derr := h.resolveDest(c, req.DestinationID)
+	if derr != nil {
+		return
+	}
+
+	// Resolve target user → username so the agent's apply step can
+	// chown home + scope mariadb loads. The system user must already
+	// exist on this host (cross-host restore is out of scope for v1).
+	targetUser, uerr := h.cfg.Users.FindByID(c.Request.Context(), req.TargetUserID)
+	if uerr != nil || targetUser == nil {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "target_user_not_found"})
+		return
+	}
+
+	release, ok := claimBackupSubmit(c, h.cfg.Jobs, h.cfg.logErr, req.TargetUserID, models.BackupJobKindAccountRestore,
+		"restore_in_progress", "a restore into this account is already queued or running")
+	if !ok {
+		return
+	}
+	defer release()
+	destID := dest.ID
+	// GH #1044: inherit the SOURCE backup's content so restoring a
+	// database-only backup reads "Database Restore", not a generic "Account
+	// Restore". A missing source (snapshot deleted, or a cross-host snapshot)
+	// falls back to "full".
+	restoreContent := models.BackupContentFull
+	if src, serr := h.cfg.Jobs.FindBySnapshotID(c.Request.Context(), req.ManifestSnapshotID); serr == nil && src != nil && src.Content != "" {
+		restoreContent = models.NormalizeBackupContent(src.Content)
+	}
+	job := &models.BackupJob{
+		ID:            ids.NewULID(),
+		UserID:        req.TargetUserID,
+		DestinationID: &destID,
+		Kind:          models.BackupJobKindAccountRestore,
+		Content:       restoreContent,
+		CreatedAt:     time.Now().UTC(),
+		Status:        models.BackupJobStatusQueued,
+	}
+	if err := h.cfg.Jobs.Create(c.Request.Context(), job); err != nil {
+		h.cfg.logErr("create restore job", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_create"})
+		return
+	}
+	// GH #1044: the restore runs as a BACKGROUND job. It used to run
+	// synchronously inside this request, which chained three unrelated
+	// ceilings onto the real work (UI 15 s axios timeout, nginx 300 s
+	// proxy_read_timeout, the old 10 m server cap) — a large Postgres
+	// restore blew whichever tripped first, the client reported
+	// "timeout", and the agent kept restoring regardless. The job row
+	// the jobs list already shows IS the tracking surface; the HTTP
+	// response only confirms the job was queued.
+	//
+	// Every context inside the goroutine is fresh — the request context
+	// dies when this handler returns, and a status write on a dead
+	// context is a silent no-op (the createCloneAndKickAgent lesson).
+	_ = h.cfg.Jobs.MarkStarted(c.Request.Context(), job.ID)
+	params := map[string]any{
+		"job_id":               job.ID,
+		"manifest_snapshot_id": req.ManifestSnapshotID,
+		"target_user_id":       req.TargetUserID,
+		"target_username":      targetUser.Username,
+		"overwrite":            req.Overwrite,
+	}
+	for k, v := range destWireParams(dest) {
+		params[k] = v
+	}
+	go h.runAccountRestoreJob(job.ID, dest, params)
+	c.JSON(http.StatusAccepted, gin.H{"status": "queued", "job_id": job.ID})
+}
+
+// runAccountRestoreJob executes one admin account restore to completion and
+// seals the job row. Runs detached from any HTTP request (GH #1044); the
+// finalizer seals the row if this goroutine dies with it (panel restart).
+func (h *backupHandler) runAccountRestoreJob(jobID string, dest *models.BackupDestination, params map[string]any) {
+	ctx, cancel := context.WithTimeout(context.Background(), restoreJobTimeout)
+	defer cancel()
+	seal := func(status, errText string, raw json.RawMessage) {
+		sctx, scancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer scancel()
+		_ = h.cfg.Jobs.MarkFinished(sctx, jobID, status, "", "", 0, 0, raw, nil, errText)
+	}
+
+	var raw json.RawMessage
+	err := backupwrapperhelpers.WithDestPasswordFile(ctx, dest, h.cfg.Agent, h.cfg.SSOKey,
+		func(passwordFile string) error {
+			if passwordFile != "" {
+				params["password_file"] = passwordFile
+			}
+			var callErr error
+			raw, callErr = h.cfg.Agent.Call(ctx, "backup.restore", params)
+			return callErr
+		})
+	if err != nil {
+		h.cfg.logErr("account restore job failed", err, "job_id", jobID)
+		seal(models.BackupJobStatusFailed, err.Error(), nil)
+		return
+	}
+	// Parse the agent's restore result so the job row reflects what
+	// actually happened (succeeded / partial / failed based on stages).
+	var result struct {
+		JobID  string `json:"job_id"`
+		Stages []struct {
+			Name   string `json:"name"`
+			Status string `json:"status"`
+			Error  string `json:"error,omitempty"`
+		} `json:"stages"`
+		// Metadata is the raw metadata.json the agent pulled from the
+		// snapshot's meta stage — the bundle the finalizer applies to
+		// rebuild panel DB rows (JAB-312). Empty on old snapshots.
+		Metadata json.RawMessage `json:"metadata,omitempty"`
+		// RestoredPostgresDBs are the PostgreSQL databases the restore
+		// loaded (GH #1993).
+		RestoredPostgresDBs []string `json:"restored_postgres_databases"`
+	}
+	finalStatus := models.BackupJobStatusSucceeded
+	finalErr := ""
+	if uerr := json.Unmarshal(raw, &result); uerr == nil {
+		failed := 0
+		for _, s := range result.Stages {
+			if s.Status == "failed" {
+				failed++
+				if finalErr == "" {
+					finalErr = fmt.Sprintf("%s: %s", s.Name, s.Error)
+				}
+			}
+		}
+		switch {
+		case failed > 0 && failed < len(result.Stages):
+			finalStatus = models.BackupJobStatusPartial
+		case failed > 0:
+			finalStatus = models.BackupJobStatusFailed
+		}
+	}
+
+	// JAB-312: apply the returned panel-metadata bundle so a UI/HTTP restore
+	// rebuilds the panel DB rows (domains, mailboxes, forwarders, applications,
+	// SSH keys, cron jobs, …) — not just host files + DB dumps. Before this only
+	// the CLI applied it, so UI restores left the panel with no record of the
+	// restored account. Skipped when the host restore itself failed (nothing
+	// consistent to rebuild) and for old snapshots that carry no bundle. A
+	// metadata-apply failure must not leave the job reporting a clean success.
+	if finalStatus != models.BackupJobStatusFailed {
+		// GH #1993: an account deleted and created again here has a new id;
+		// its snapshot names the old one.
+		targetID, _ := params["target_user_id"].(string)
+		targetName := ""
+		switch v := params["target_username"].(type) {
+		case string:
+			targetName = v
+		case *string: // as restore() passes it
+			if v != nil {
+				targetName = *v
+			}
+		}
+		meta, rerr := retargetRecreatedAccount(result.Metadata, targetID, targetName)
+		if rerr != nil {
+			meta = result.Metadata
+		}
+		errs := h.applyRestoreMetadata(ctx, meta, nil)
+		// GH #1993: the restored PostgreSQL databases' users get their access
+		// again, and the first takes over the restored objects.
+		pgErrs, _ := h.regrantRestoredPostgres(ctx, targetID, result.RestoredPostgresDBs)
+		if errs = append(errs, pgErrs...); len(errs) > 0 {
+			if finalStatus == models.BackupJobStatusSucceeded {
+				finalStatus = models.BackupJobStatusPartial
+			}
+			if finalErr == "" {
+				finalErr = "metadata apply: " + strings.Join(errs, "; ")
+			}
+			h.cfg.logErr("account restore metadata apply had errors", errors.New(strings.Join(errs, "; ")), "job_id", jobID)
+		}
+		// GH #1993: the domains' custom DNS records, once their zones exist.
+		if acct := metadataUserID(meta); acct != "" {
+			if _, dnsWarnings := RestoreBundleDNS(ctx, h.restoreDNSDeps(false), meta, acct); len(dnsWarnings) > 0 {
+				if finalStatus == models.BackupJobStatusSucceeded {
+					finalStatus = models.BackupJobStatusPartial
+				}
+				if finalErr == "" {
+					finalErr = strings.Join(dnsWarnings, "; ")
+				}
+				h.cfg.logErr("account restore dns records had warnings", errors.New(strings.Join(dnsWarnings, "; ")), "job_id", jobID)
+			}
+		}
+	}
+	seal(finalStatus, finalErr, raw)
+}
+
+// retargetRecreatedAccount points a snapshot's metadata bundle at the account
+// it is restored into when that is the same account created again here: the
+// same username under a new id (GH #1993). Without it the rebuild tries to
+// create the account under its old id, the username clashes, and none of the
+// panel rows come back. A bundle of another account is left as it is.
+func retargetRecreatedAccount(metaRaw json.RawMessage, targetID, targetUsername string) (json.RawMessage, error) {
+	if len(metaRaw) == 0 || targetID == "" || targetUsername == "" {
+		return metaRaw, nil
+	}
+	var m struct {
+		User struct {
+			ID       string  `json:"id"`
+			Username *string `json:"username"`
+		} `json:"user"`
+	}
+	if err := json.Unmarshal(metaRaw, &m); err != nil {
+		return metaRaw, nil // Apply reports the bundle it can't parse
+	}
+	if m.User.ID == targetID || m.User.Username == nil || *m.User.Username != targetUsername {
+		return metaRaw, nil
+	}
+	return remapMetadataUserID(metaRaw, targetID)
+}
+
+// applyRestoreMetadata rebuilds the panel DB rows from the metadata bundle the
+// agent returned with a restore (JAB-312), mirroring the CLI restore
+// (account_restore_cmd.go applyPanelMetadata). Returns the apply errors (empty
+// on a clean apply). An empty bundle — old snapshots (schema_version=1) — is a
+// no-op, the documented fallback. Restored cron ROWS regain their systemd
+// timers on the next reconciler tick (internal/reconciler/cron_reconcile.go),
+// the same convergence model the rest of restored state follows.
+// uploaded is set for a bundle that came from an uploaded file rather than one
+// of this server's own backup destinations (see backupmetadata.Deps.Untrusted)
+// and names what the agent restored from it; nil for an own-destination one.
+func (h *backupHandler) applyRestoreMetadata(ctx context.Context, metaRaw json.RawMessage, uploaded *uploadedData) []string {
+	if len(metaRaw) == 0 {
+		return nil
+	}
+	var meta internalbackup.AccountMetadata
+	if err := json.Unmarshal(metaRaw, &meta); err != nil {
+		return []string{"parse metadata bundle: " + err.Error()}
+	}
+	r := backupmetadata.Apply(ctx, &meta, h.restoreMetadataDeps(uploaded))
+	return r.Errors
+}
+
+// restoreMetadataDeps is what applyRestoreMetadata's rebuild runs with;
+// uploaded as there.
+func (h *backupHandler) restoreMetadataDeps(uploaded *uploadedData) backupmetadata.Deps {
+	source := RestoreFromOwnBackup
+	if uploaded != nil {
+		source = RestoreFromUpload
+	}
+	deps := backupmetadata.Deps{
+		Users:          h.cfg.Users,
+		Domains:        h.cfg.Domains,
+		Databases:      h.cfg.Databases,
+		DatabaseUsers:  h.cfg.DatabaseUsers,
+		DatabaseGrants: h.cfg.DatabaseGrants,
+		AppInstalls:    h.cfg.AppInstalls,
+		DockerApps:     h.cfg.DockerApps,
+		SSLCerts:       h.cfg.SSLCerts,
+		PHPPools:       h.cfg.PHPPools,
+		PHPPoolIni:     h.cfg.PHPPoolIni,
+		SSHKeys:        h.cfg.SSHKeys,
+		CronJobs:       h.cfg.CronJobs,
+		FtpAccounts:    h.cfg.FtpAccounts,
+		Mailboxes:      h.cfg.Mailboxes,
+		Forwarders:     h.cfg.Forwarders,
+		Autoresponders: h.cfg.Autoresponders,
+		MailboxShares:  h.cfg.MailboxShares,
+		TrustedSenders: h.cfg.TrustedSenders,
+		DNSZones:       h.cfg.DNSZones,
+		DNSRecords:     h.cfg.DNSRecords,
+		KratosClient:   h.cfg.KratosClient,
+		Packages:       h.cfg.Packages, // a pool from an uploaded file keeps to the package cap (GH #1993)
+		Agent:          h.cfg.Agent,    // push restored forwarders to Stalwart (GH #1795)
+		// GH #1898: a restored domain passes the create-time checks.
+		CheckDomain: RestoreDomainCheck(h.cfg.Domains, h.cfg.WebDomainAliases, h.cfg.ServerSettings, h.cfg.Domains, source),
+		Untrusted:   source == RestoreFromUpload,
+		// A backup from this server's own destinations brings its
+		// certificates back; an uploaded file's only when the admin chose
+		// to keep them (GH #1993, JAB-54).
+		RestoreCertificates: uploaded == nil || uploaded.keepCertificates,
+		// Both doors restore the domains' DNS records once Apply is done
+		// (RestoreBundleDNS), unless the upload leaves them out.
+		RestoresDNS: uploaded == nil || !uploaded.skipDNS,
+
+		// GH #1993: a restored web domain alias passes the alias page's checks.
+		WebDomainAliases: h.cfg.WebDomainAliases,
+		CheckAlias:       RestoreAliasCheck(h.cfg.Domains, h.cfg.WebDomainAliases, h.cfg.ServerSettings),
+		// GH #2502: each domain's webmail branding.
+		WebmailBranding: h.cfg.WebmailBranding,
+	}
+	if uploaded != nil {
+		deps.RestoredDatabases = stringSet(uploaded.databases)
+		deps.RestoredDockerSlugs = stringSet(uploaded.dockerSlugs)
+		deps.KeepExisting = uploaded.keepExisting
+		// Left nil when the agent didn't name them: the file then grants
+		// access to no database.
+		if uploaded.archiveMariaDBs != nil {
+			deps.ArchiveMariaDBs = stringSet(uploaded.archiveMariaDBs)
+		}
+		if uploaded.archivePostgresDBs != nil {
+			deps.ArchivePostgresDBs = stringSet(uploaded.archivePostgresDBs)
+		}
+		deps.OverwriteRows = uploaded.overwriteRows
+		deps.SkipMail, deps.SkipPostgres = uploaded.skipMail, uploaded.skipPostgres
+		deps.FtpPasswordsStaged = stringSet(uploaded.ftpPasswordsStaged)
+		deps.AccountCreated = uploaded.accountCreated
+	}
+	if h.cfg.Mailboxes != nil {
+		deps.MailboxSettings = restoreMailboxSettings{mailboxes: h.cfg.Mailboxes, agent: h.cfg.Agent}
+	}
+	if h.cfg.Scheduler != nil {
+		deps.ScheduleDomain = h.cfg.Scheduler.Schedule
+	}
+	if h.cfg.MailAddresses != nil {
+		deps.MailAddresses = h.cfg.MailAddresses
+	}
+	return deps
+}
+
+// --- helpers + sentinel below ---
+
+// stringSet returns the set of xs.
+func stringSet(xs []string) map[string]bool {
+	m := make(map[string]bool, len(xs))
+	for _, x := range xs {
+		m[x] = true
+	}
+	return m
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func (cfg BackupHandlerConfig) logErr(msg string, err error, kv ...any) {
+	if cfg.Log == nil {
+		return
+	}
+	args := append([]any{"err", err}, kv...)
+	cfg.Log.Warn(msg, args...)
+}
+
+func (cfg MeBackupsHandlerConfig) logErr(msg string, err error, kv ...any) {
+	if cfg.Log == nil {
+		return
+	}
+	args := append([]any{"err", err}, kv...)
+	cfg.Log.Warn(msg, args...)
+}
+
+// metadataDeps bundles the repos the two backupmetadata producers read —
+// Build (schema-v2 account metadata) and SelectAll (backup content selection,
+// JAB-324). Building it once means the two producers can never drift on which
+// repos they see, and the admin / tenant / scheduler adapters share one
+// content-selection code path instead of three divergent copies.
+func (cfg BackupHandlerConfig) metadataDeps() backupmetadata.Deps {
+	return backupmetadata.Deps{
+		Databases: cfg.Databases, DatabaseUsers: cfg.DatabaseUsers, DatabaseGrants: cfg.DatabaseGrants,
+		Domains: cfg.Domains, Mailboxes: cfg.Mailboxes, AppInstalls: cfg.AppInstalls, DockerApps: cfg.DockerApps,
+		SSLCerts: cfg.SSLCerts, PHPPools: cfg.PHPPools, PHPPoolIni: cfg.PHPPoolIni,
+		Forwarders: cfg.Forwarders, Autoresponders: cfg.Autoresponders, MailboxShares: cfg.MailboxShares,
+		TrustedSenders: cfg.TrustedSenders,
+		DNSSECKeys:     cfg.DNSSECKeys, DNSZones: cfg.DNSZones, DNSRecords: cfg.DNSRecords, SSHKeys: cfg.SSHKeys, CronJobs: cfg.CronJobs, FtpAccounts: cfg.FtpAccounts,
+		LimitOverrides: cfg.LimitOverrides, EgressPolicies: cfg.EgressPolicies, EgressRequests: cfg.EgressRequests,
+		WebDomainAliases: cfg.WebDomainAliases,
+		WebmailBranding:  cfg.WebmailBranding,
+		Log:              cfg.Log,
+	}
+}
+
+// buildAccountMetadata delegates to the shared producer in
+// panel-api/internal/backupmetadata so the admin and user-shell
+// handlers stay in lockstep with the scheduler on schema changes.
+func (cfg BackupHandlerConfig) buildAccountMetadata(ctx context.Context, user *models.User) *internalbackup.AccountMetadata {
+	return backupmetadata.Build(ctx, user, cfg.metadataDeps())
+}
+
+// MeBackupsHandlerConfig wires the user-shell endpoints. Auth check
+// uses ginctx.Claims to scope the request to the caller's own user_id.
+type MeBackupsHandlerConfig struct {
+	Agent          agent.AgentInterface
+	Jobs           repository.BackupJobRepository
+	Destinations   repository.BackupDestinationRepository
+	Users          repository.UserRepository
+	Databases      repository.DatabaseRepository
+	DatabaseUsers  repository.DatabaseUserRepository
+	DatabaseGrants repository.DatabaseUserGrantRepository
+	Domains        repository.DomainRepository
+	Mailboxes      repository.MailboxRepository
+	AppInstalls    repository.ApplicationInstallRepository
+	// DockerApps — see the note on BackupHandlerConfig.DockerApps. The
+	// tenant's own backup must cover their docker apps too, or a
+	// self-service restore comes back without them.
+	DockerApps repository.DockerAppRepository
+
+	SSLCerts       repository.SSLCertificateRepository
+	PHPPools       repository.PHPPoolRepository
+	PHPPoolIni     repository.PHPPoolIniOverrideRepository
+	Forwarders     repository.EmailForwarderRepository
+	Autoresponders repository.EmailAutoresponderRepository
+	MailboxShares  repository.MailboxShareRepository
+	TrustedSenders repository.MailboxTrustedSenderRepository
+	DNSSECKeys     repository.DNSSECKeyRepository
+	DNSZones       repository.DNSZoneRepository
+	DNSRecords     repository.DNSRecordRepository
+	SSHKeys        repository.SSHKeyRepository
+	CronJobs       repository.CronJobRepository
+	FtpAccounts    repository.FtpAccountRepository
+	LimitOverrides repository.UserLimitOverrideRepository
+	EgressPolicies repository.UserEgressPolicyRepository
+	EgressRequests repository.UserEgressRequestRepository
+	// WebDomainAliases lets the tenant's backup carry its domains' aliases
+	// (GH #1993).
+	WebDomainAliases repository.WebDomainAliasRepository
+	// WebmailBranding lets it carry their webmail branding (GH #2502).
+	WebmailBranding repository.DomainWebmailBrandingRepository
+	// Packages resolves the caller's hosting-package backup limits (GH #454).
+	// REQUIRED — RegisterMeBackupRoutes panics if nil, and the create gate fails
+	// CLOSED (denies) rather than skipping when the entitlement can't be resolved.
+	Packages repository.PackageRepository
+
+	// Notify publishes the backup.limit.reached event to the tenant + admins when
+	// the retention cap is hit (GH #454). Optional — nil just skips the notice.
+	Notify *notifications.Queue
+
+	// Schedules + Settings power the tenant scheduled-backup card (GH #454
+	// Step 4): the tenant owns content/destination/on-off within their package
+	// limits, the admin owns the cron TIME (server_settings.tenant_backup_cron).
+	// Both are OPTIONAL — the /me/backup-schedule routes mount only when both
+	// are non-nil, so a deployment without them simply lacks tenant scheduling.
+	Schedules repository.BackupScheduleRepository
+	Settings  repository.ServerSettingsRepository
+
+	// SSOKey unseals a destination's per-row restic password (M30.2.x) so a
+	// tenant download can open a rotated destination's repo. Optional: nil
+	// falls back to the agent's shared password file.
+	SSOKey *ssokey.Key
+
+	Log *slog.Logger
+}
+
+// metadataDeps bundles the repos the two backupmetadata producers read for the
+// tenant self-shell path — Build (schema-v2 metadata) and SelectAll (backup
+// content selection, JAB-324) — so the tenant path uses the exact same
+// selection code (and the same non-silent lookup-failure classification) as the
+// admin handler and the scheduler.
+func (cfg MeBackupsHandlerConfig) metadataDeps() backupmetadata.Deps {
+	return backupmetadata.Deps{
+		Databases: cfg.Databases, DatabaseUsers: cfg.DatabaseUsers, DatabaseGrants: cfg.DatabaseGrants,
+		Domains: cfg.Domains, Mailboxes: cfg.Mailboxes, AppInstalls: cfg.AppInstalls, DockerApps: cfg.DockerApps,
+		SSLCerts: cfg.SSLCerts, PHPPools: cfg.PHPPools, PHPPoolIni: cfg.PHPPoolIni,
+		Forwarders: cfg.Forwarders, Autoresponders: cfg.Autoresponders, MailboxShares: cfg.MailboxShares,
+		TrustedSenders: cfg.TrustedSenders,
+		DNSSECKeys:     cfg.DNSSECKeys, DNSZones: cfg.DNSZones, DNSRecords: cfg.DNSRecords, SSHKeys: cfg.SSHKeys, CronJobs: cfg.CronJobs, FtpAccounts: cfg.FtpAccounts,
+		LimitOverrides: cfg.LimitOverrides, EgressPolicies: cfg.EgressPolicies, EgressRequests: cfg.EgressRequests,
+		WebDomainAliases: cfg.WebDomainAliases,
+		WebmailBranding:  cfg.WebmailBranding,
+		Log:              cfg.Log,
+	}
+}
+
+// buildAccountMetadata projects MeBackupsHandlerConfig into the shared
+// metadataDeps consumer. Same schema-v2 producer as BackupHandlerConfig.
+func (cfg MeBackupsHandlerConfig) buildAccountMetadata(ctx context.Context, user *models.User) *internalbackup.AccountMetadata {
+	return backupmetadata.Build(ctx, user, cfg.metadataDeps())
+}
+
+// RegisterMeBackupRoutes mounts the user-shell self-backup endpoints
+// under /me/backups. Route registers off the v1 group; auth comes from
+// the Kratos session middleware already on `rg`.
+func RegisterMeBackupRoutes(rg *gin.RouterGroup, cfg MeBackupsHandlerConfig) {
+	if cfg.Jobs == nil || cfg.Users == nil || cfg.Packages == nil {
+		panic("api.RegisterMeBackupRoutes: nil dep")
+	}
+	h := &meBackupHandler{cfg: cfg}
+	g := rg.Group("/me/backups")
+	g.POST("", h.create)
+	g.GET("", h.list)
+	g.GET("/:id/download", h.download)
+	// GH #1408: background prepare (owner-scoped) so the Download button isn't
+	// dead during the restic materialize.
+	g.POST("/:id/download/prepare", h.downloadPrepare)
+	g.GET("/:id/download/prepare-status", h.downloadPrepareStatus)
+	// GH #1408: tenant self-service Restore-from-Upload (own account, untrusted
+	// tar → owned-DB/domain allowlists enforced by the agent).
+	g.POST("/restore-upload", h.restoreUploadChunk)
+	g.POST("/restore-upload/inspect", h.restoreUploadInspect)
+	g.POST("/restore-upload/apply", h.restoreUploadApply)
+	g.GET("/restore-upload/status", h.restoreUploadStatus)
+	g.DELETE("/:id", h.delete)
+	// GH #2245: the owner can cancel a queued or running backup of their
+	// account, as an admin can.
+	g.POST("/:id/cancel", h.cancel)
+	g.GET("/:id/manifest", h.manifest)
+	g.POST("/:id/restore", h.restoreSelective)
+	g.GET("/destinations", h.destinations)
+	// GH #454: tenant-editable backup exclusions (~/.backupignore). Owner-scoped
+	// via the session user; layered onto the global exclude list at backup time.
+	g.GET("/exclusions", h.getExclusions)
+	g.PUT("/exclusions", h.putExclusions)
+	// Tenant scheduled-backup card (GH #454 Step 4). Mounted only when the
+	// schedule repo + server settings (the admin-owned cron time) are wired.
+	if cfg.Schedules != nil && cfg.Settings != nil {
+		rg.GET("/me/backup-schedule", h.getSchedule)
+		rg.PUT("/me/backup-schedule", h.putSchedule)
+		// GH #454 7B: tenant multi-schedule surface (window-governed). Owner-
+		// scoped CRUD — every mutation re-verifies row.user_id == the session
+		// user, 404 on mismatch (no cross-tenant leak). Cap enforced from the
+		// hosting package's max_backup_schedules.
+		rg.GET("/me/backup-schedules", h.listSchedules)
+		rg.POST("/me/backup-schedules", h.createSchedule)
+		rg.PUT("/me/backup-schedules/:id", h.updateSchedule)
+		rg.DELETE("/me/backup-schedules/:id", h.deleteSchedule)
+	}
+}
+
+// meDestView is the SAFE tenant-facing projection of a backup destination
+// (GH #454): id/name/kind only. It deliberately omits URL, credentials_ref,
+// and extra_options (bucket names, SFTP hosts) so a tenant picker never leaks
+// the admin's infrastructure details.
+type meDestView struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Kind string `json:"kind"`
+}
+
+// destinations lists the backup destinations the caller may target — those
+// whose kind is in the caller's hosting-package allow-list (GH #454). Admins
+// see every enabled destination. allow_local flags whether the plain local
+// default (no destination row) is permitted, so the UI can offer it. Fails
+// closed: a non-admin whose package can't be resolved sees nothing.
+func (h *meBackupHandler) destinations(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"status": "error", "error": "unauthenticated"})
+		return
+	}
+	user, err := h.cfg.Users.FindByID(c.Request.Context(), claims.UserID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "user_not_found"})
+		return
+	}
+	var pkg *models.HostingPackage
+	if !user.IsAdmin {
+		if h.cfg.Packages == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "backup_gating_unavailable"})
+			return
+		}
+		if user.PackageID != nil {
+			pkg, _ = h.cfg.Packages.FindByID(c.Request.Context(), *user.PackageID)
+		}
+	}
+	allowKind := func(kind string) bool {
+		if user.IsAdmin {
+			return true
+		}
+		return pkg != nil && pkg.AllowsBackupKind(kind)
+	}
+	out := make([]meDestView, 0)
+	if h.cfg.Destinations != nil {
+		all, lerr := h.cfg.Destinations.ListEnabled(c.Request.Context())
+		if lerr == nil {
+			for _, d := range all {
+				if allowKind(d.Kind) {
+					out = append(out, meDestView{ID: d.ID, Name: d.Name, Kind: d.Kind})
+				}
+			}
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"data":        out,
+		"allow_local": allowKind(models.BackupDestinationKindLocal),
+	})
+}
+
+type meBackupHandler struct{ cfg MeBackupsHandlerConfig }
+
+// cancel stops a queued or running backup of the caller's own account,
+// including one from an admin schedule: the same rows their Delete reaches.
+// A system backup or restore is the server's, so it is not found here.
+func (h *meBackupHandler) cancel(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"status": "error", "error": "unauthenticated"})
+		return
+	}
+	if h.cfg.Agent == nil || h.cfg.Jobs == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "agent_unavailable"})
+		return
+	}
+	job, err := h.cfg.Jobs.Get(c.Request.Context(), c.Param("id"))
+	if err != nil && !errors.Is(err, repository.ErrNotFound) {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_get_job"})
+		return
+	}
+	if err != nil || job.UserID != claims.UserID ||
+		job.Kind == models.BackupJobKindSystemBackup || job.Kind == models.BackupJobKindSystemRestore {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "not_found"})
+		return
+	}
+	cancelBackupJob(c, h.cfg.Agent, h.cfg.Jobs, job, "backup.cancel", cancelledByOwnerText)
+}
+
+// delete forgets the caller's own backup run (default local repo — me-backups
+// never use a destination) then drops the job row (GH #294).
+func (h *meBackupHandler) delete(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"status": "error", "error": "unauthenticated"})
+		return
+	}
+	jobID := c.Param("id")
+	job, err := h.cfg.Jobs.Get(c.Request.Context(), jobID)
+	if err != nil || job.UserID != claims.UserID {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "not_found"})
+		return
+	}
+	// GH #1044: a restore job owns no restic snapshot — skip the forget and just
+	// drop the row (forgetting would prune a snapshot that never existed).
+	if h.cfg.Agent != nil && !isRestoreKind(job.Kind) {
+		if err := forgetJobSnapshots(c.Request.Context(), h.cfg.Agent, h.cfg.Destinations, h.cfg.SSOKey, job); err != nil {
+			status, body := translateAgentError(err)
+			c.JSON(status, body)
+			return // leave the row for retry
+		}
+	}
+	if err := h.cfg.Jobs.Delete(c.Request.Context(), jobID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_delete"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// backupIgnoreFilename is the per-account, tenant-editable restic exclude list
+// at the home root. Mirrors panel-agent commands.BackupIgnoreFile; kept as a
+// local literal to avoid importing the agent package (GH #454).
+const backupIgnoreFilename = ".backupignore"
+
+// maxBackupExclusionsBytes caps the .backupignore the tenant may save. A pattern
+// list is tiny; the agent's home backup ignores the file above 256 KiB anyway.
+const maxBackupExclusionsBytes = 64 * 1024
+
+// backupExclusionsFileNotFound reports whether an agent files.read error is just
+// "the file isn't there yet" (the common case for an account that never set
+// exclusions) — files.read collapses ENOENT into a generic CodeInternal
+// "failed to open file: … no such file or directory", so match on the message.
+func backupExclusionsFileNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	m := strings.ToLower(err.Error())
+	return strings.Contains(m, "no such file") ||
+		strings.Contains(m, "does not exist") ||
+		strings.Contains(m, "enoent")
+}
+
+// getExclusions returns the caller's own ~/.backupignore contents (empty when
+// the file doesn't exist yet). Owner-scoped: the username is resolved from the
+// session user, never the request, so a tenant can only ever read their own file.
+func (h *meBackupHandler) getExclusions(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"status": "error", "error": "unauthenticated"})
+		return
+	}
+	user, err := h.cfg.Users.FindByID(c.Request.Context(), claims.UserID)
+	if err != nil || user == nil || user.Username == nil || *user.Username == "" {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "user_not_found"})
+		return
+	}
+	if h.cfg.Agent == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "agent_unavailable"})
+		return
+	}
+	path := filepath.Join("/home", *user.Username, backupIgnoreFilename)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), backupCallTimeout)
+	defer cancel()
+	raw, err := h.cfg.Agent.Call(ctx, "files.read", map[string]any{
+		"user_id":  claims.UserID,
+		"username": *user.Username,
+		"path":     path,
+	})
+	if err != nil {
+		if backupExclusionsFileNotFound(err) {
+			c.JSON(http.StatusOK, gin.H{"status": "ok", "patterns": ""})
+			return
+		}
+		status, body := translateAgentError(err)
+		c.JSON(status, body)
+		return
+	}
+	var r struct {
+		Content  string `json:"content"`
+		IsBinary bool   `json:"is_binary"`
+	}
+	_ = json.Unmarshal(raw, &r)
+	if r.IsBinary {
+		// A binary .backupignore is nonsense; surface empty so the editor can
+		// replace it rather than rendering garbage.
+		c.JSON(http.StatusOK, gin.H{"status": "ok", "patterns": ""})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok", "patterns": r.Content})
+}
+
+// putExclusions overwrites the caller's own ~/.backupignore with the supplied
+// restic exclude patterns (owner-scoped, session-derived username). An empty
+// body clears the list (writes an empty file). The home backup layers this on
+// top of the global exclude list (GH #454).
+func (h *meBackupHandler) putExclusions(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"status": "error", "error": "unauthenticated"})
+		return
+	}
+	user, err := h.cfg.Users.FindByID(c.Request.Context(), claims.UserID)
+	if err != nil || user == nil || user.Username == nil || *user.Username == "" {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "user_not_found"})
+		return
+	}
+	if h.cfg.Agent == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "agent_unavailable"})
+		return
+	}
+	var body struct {
+		Patterns string `json:"patterns"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_body"})
+		return
+	}
+	if len(body.Patterns) > maxBackupExclusionsBytes {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "too_large", "detail": "exclude list exceeds 64 KiB"})
+		return
+	}
+	path := filepath.Join("/home", *user.Username, backupIgnoreFilename)
+	ctx, cancel := context.WithTimeout(c.Request.Context(), backupCallTimeout)
+	defer cancel()
+	if _, err := h.cfg.Agent.Call(ctx, "files.write", map[string]any{
+		"user_id":  claims.UserID,
+		"username": *user.Username,
+		"path":     path,
+		"content":  body.Patterns,
+		"mode":     "overwrite",
+	}); err != nil {
+		status, respBody := translateAgentError(err)
+		c.JSON(status, respBody)
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func (h *meBackupHandler) create(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"status": "error", "error": "unauthenticated"})
+		return
+	}
+	user, err := h.cfg.Users.FindByID(c.Request.Context(), claims.UserID)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "user_not_found"})
+		return
+	}
+	// GH #454: gate tenant self-backups on the hosting-package limit. Admins are
+	// exempt (unlimited, they use the admin backup surface). A non-admin tenant
+	// needs a package with max_backups > 0, and must be under that retention cap.
+	// This gate FAILS CLOSED: any inability to resolve the limit (missing package
+	// repo, package load error, no package) denies the backup — a limit gate must
+	// never silently allow an ungated tenant backup on a misconfiguration.
+	var pkg *models.HostingPackage
+	if !user.IsAdmin {
+		if h.cfg.Packages == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "backup_gating_unavailable", "detail": "backup entitlement cannot be resolved right now"})
+			return
+		}
+		if user.PackageID == nil {
+			c.JSON(http.StatusForbidden, gin.H{"status": "error", "error": "backups_not_included", "detail": "your hosting plan does not include self-service backups"})
+			return
+		}
+		var perr error
+		pkg, perr = h.cfg.Packages.FindByID(c.Request.Context(), *user.PackageID)
+		if perr != nil || pkg == nil {
+			// Fail closed: cannot confirm the entitlement -> deny.
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "backup_gating_unavailable", "detail": "backup entitlement cannot be resolved right now"})
+			return
+		}
+		if !pkg.BackupsEnabled() {
+			c.JSON(http.StatusForbidden, gin.H{"status": "error", "error": "backups_not_included", "detail": "your hosting plan does not include self-service backups"})
+			return
+		}
+		// Retention cap. On a count error, fail closed (deny) rather than risk
+		// letting a tenant exceed max_backups. RETAINED backups only —
+		// failed/cancelled attempts and restores never consume the cap
+		// (GH #1045: counting every row ever locked tenants out of both
+		// manual and scheduled backups once early failures piled up).
+		total, terr := h.cfg.Jobs.CountRetainedForUser(c.Request.Context(), user.ID)
+		if terr != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "backup_gating_unavailable", "detail": "backup count cannot be resolved right now"})
+			return
+		}
+		if total >= int64(pkg.MaxBackups) {
+			// Retention policy (GH #454): the admin picks reject (default, safe) or
+			// prune. Prune auto-forgets the tenant's OLDEST OWNED backup(s) to make
+			// room; if it can't free enough (e.g. only running jobs remain) it falls
+			// back to reject. Either way, the tenant + admins are notified.
+			if pkg.BackupRetentionPrunes() && h.pruneOldestOwned(c.Request.Context(), user, int(pkg.MaxBackups)) {
+				h.notifyBackupLimit(c.Request.Context(), user, "prune", pkg.MaxBackups)
+			} else {
+				h.notifyBackupLimit(c.Request.Context(), user, "reject", pkg.MaxBackups)
+				c.JSON(http.StatusForbidden, gin.H{"status": "error", "error": "backup_limit_reached", "detail": fmt.Sprintf("your plan allows %d backups; delete an old one before creating another", pkg.MaxBackups)})
+				return
+			}
+		}
+	}
+	var req createBackupRequest // content/folders/compression + optional destination_id
+	if err := c.ShouldBindJSON(&req); err != nil && !errors.Is(err, io.EOF) {
+		// An empty body means the defaults; a malformed one is refused.
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_json"})
+		return
+	}
+	if !validBackupContent(req.Content) || !validBackupCompression(req.Compression) {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_option", "detail": "content must be full/files/database/folders; compression must be off/auto/max"})
+		return
+	}
+	// GH #454: resolve + gate the backup destination. The package's allowed
+	// destination kinds gate which destinations a tenant may target, INCLUDING
+	// the implicit "local" default (a tenant whose plan doesn't allow "local"
+	// must pick an allowed remote). Admins are unrestricted.
+	var dest *models.BackupDestination
+	destKind := models.BackupDestinationKindLocal
+	if strings.TrimSpace(req.DestinationID) != "" {
+		if h.cfg.Destinations == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "destination_lookup_unavailable"})
+			return
+		}
+		d, derr := h.cfg.Destinations.Get(c.Request.Context(), strings.TrimSpace(req.DestinationID))
+		if derr != nil || d == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "unknown_destination", "detail": "no such backup destination"})
+			return
+		}
+		if !d.Enabled {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "destination_disabled", "detail": "that backup destination is disabled"})
+			return
+		}
+		dest = d
+		destKind = d.Kind
+	}
+	if !user.IsAdmin && (pkg == nil || !pkg.AllowsBackupKind(destKind)) {
+		c.JSON(http.StatusForbidden, gin.H{"status": "error", "error": "destination_not_allowed", "detail": fmt.Sprintf("your hosting plan does not allow the %q backup destination", destKind)})
+		return
+	}
+	release, ok := claimBackupSubmit(c, h.cfg.Jobs, h.cfg.logErr, user.ID, models.BackupJobKindAccountBackup,
+		"backup_in_progress", "a backup of your account is already queued or running")
+	if !ok {
+		return
+	}
+	defer release()
+	job := &models.BackupJob{
+		ID:        ids.NewULID(),
+		UserID:    user.ID,
+		Kind:      models.BackupJobKindAccountBackup,
+		Content:   normalizeBackupContent(req.Content),
+		CreatedAt: time.Now().UTC(),
+		Status:    models.BackupJobStatusQueued,
+	}
+	if dest != nil {
+		did := dest.ID
+		job.DestinationID = &did
+	}
+	if err := h.cfg.Jobs.Create(c.Request.Context(), job); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_create"})
+		return
+	}
+	if h.cfg.Agent != nil {
+		ctx, cancel := context.WithTimeout(c.Request.Context(), backupCallTimeout)
+		defer cancel()
+		// Resolve the tenant's full content selection through the shared
+		// producer (JAB-324). This path previously used a copy that swallowed
+		// lookup failures silently — a transient DB-list error dropped the
+		// tenant's databases from their own backup with no trace. Now the
+		// failure is a logged Warning and whatever resolved is still backed up.
+		sel, warns := backupmetadata.SelectAll(c.Request.Context(), h.cfg.metadataDeps(), user.ID, user.IsAdmin)
+		backupmetadata.LogWarnings(h.cfg.Log, warns)
+		dbs, mbs, pgDbs := applyBackupContent(req.Content, sel.MariaDB, sel.Mailboxes, sel.Postgres)
+		params := map[string]any{
+			"job_id":             job.ID,
+			"user_id":            user.ID,
+			"username":           user.Username,
+			"email":              user.Email,
+			"is_admin":           user.IsAdmin,
+			"databases":          dbs,
+			"databases_postgres": pgDbs,
+			"mailboxes":          mbs,
+			"docker_apps":        sel.DockerApps,
+			"content":            req.Content,
+			"folders":            req.Folders,
+			"compression":        req.Compression,
+			"metadata":           h.cfg.buildAccountMetadata(c.Request.Context(), user),
+		}
+		// Route to the chosen destination (GH #454). destWireParams supplies
+		// repo_url + credentials_ref + destination_kind (+ sftp); absent = the
+		// agent's local repo default, unchanged.
+		if dest != nil {
+			for k, v := range destWireParams(dest) {
+				params[k] = v
+			}
+		}
+		if _, err := h.cfg.Agent.Call(ctx, "backup.create", params); err != nil {
+			_ = h.cfg.Jobs.MarkFinished(c.Request.Context(), job.ID, models.BackupJobStatusFailed,
+				"", "", 0, 0, nil, nil, err.Error())
+			c.JSON(http.StatusBadGateway, gin.H{"status": "error", "error": "agent_call_failed"})
+			return
+		}
+		_ = h.cfg.Jobs.MarkStarted(c.Request.Context(), job.ID)
+	}
+	c.JSON(http.StatusCreated, gin.H{"status": "ok", "job_id": job.ID})
+}
+
+// meScheduleView is the tenant's own scheduled-backup state plus the
+// admin-owned knobs the card needs to render (GH #454 Step 4). CronExpr and the
+// firing times are READ-ONLY to the tenant (the admin owns the timing via
+// server_settings.tenant_backup_cron); ScheduledBackupsEnabled + MaxBackups
+// come from the hosting package and cap what the tenant may set.
+type meScheduleView struct {
+	Exists                  bool     `json:"exists"`
+	Enabled                 bool     `json:"enabled"`
+	Content                 string   `json:"content"`
+	DestinationID           string   `json:"destination_id,omitempty"`
+	KeepDaily               *int     `json:"keep_daily,omitempty"`
+	KeepWeekly              *int     `json:"keep_weekly,omitempty"`
+	KeepMonthly             *int     `json:"keep_monthly,omitempty"`
+	KeepWithinDays          *int     `json:"keep_within_days,omitempty"`
+	CronExpr                string   `json:"cron_expr"`
+	NextFirings             []string `json:"next_firings,omitempty"`
+	ScheduledBackupsEnabled bool     `json:"scheduled_backups_enabled"`
+	MaxBackups              uint32   `json:"max_backups"`
+	// KeepWithinDaysMax is the most days to keep the plan's backup limit
+	// holds at the admin's cron (GH #2300).
+	KeepWithinDaysMax int `json:"keep_within_days_max"`
+}
+
+// meScheduleGate resolves the caller + hosting package for the tenant
+// scheduled-backup endpoints, failing CLOSED exactly like the on-demand create
+// gate: any inability to resolve the package entitlement denies (it writes the
+// error and returns ok=false). Admins pass with a nil package — they manage
+// schedules through the admin surface, so PUT still denies them (nil package
+// fails the scheduled_backups_enabled check), while GET renders a disabled card.
+func (h *meBackupHandler) meScheduleGate(c *gin.Context) (*models.User, *models.HostingPackage, bool) {
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"status": "error", "error": "unauthenticated"})
+		return nil, nil, false
+	}
+	user, err := h.cfg.Users.FindByID(c.Request.Context(), claims.UserID)
+	if err != nil || user == nil {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "user_not_found"})
+		return nil, nil, false
+	}
+	if user.IsAdmin {
+		return user, nil, true
+	}
+	if h.cfg.Packages == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "backup_gating_unavailable"})
+		return nil, nil, false
+	}
+	if user.PackageID == nil {
+		c.JSON(http.StatusForbidden, gin.H{"status": "error", "error": "backups_not_included", "detail": "your hosting plan does not include self-service backups"})
+		return nil, nil, false
+	}
+	pkg, perr := h.cfg.Packages.FindByID(c.Request.Context(), *user.PackageID)
+	if perr != nil || pkg == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "backup_gating_unavailable"})
+		return nil, nil, false
+	}
+	return user, pkg, true
+}
+
+// findMeSchedule returns the caller's OWN account_backup schedule, or nil. A
+// tenant-owned schedule is marked by a non-null user_id == the tenant (admin
+// schedules always leave user_id NULL and target users via the join table), so
+// ListForUser(userID) returns only the tenant's own rows — a tenant can never
+// reach an admin-created fan-out schedule through this path.
+func (h *meBackupHandler) findMeSchedule(ctx context.Context, userID string) *models.BackupSchedule {
+	rows, err := h.cfg.Schedules.ListForUser(ctx, userID)
+	if err != nil {
+		return nil
+	}
+	for i := range rows {
+		if rows[i].Kind == models.BackupScheduleKindAccount {
+			return &rows[i]
+		}
+	}
+	return nil
+}
+
+func (h *meBackupHandler) getSchedule(c *gin.Context) {
+	user, pkg, ok := h.meScheduleGate(c)
+	if !ok {
+		return
+	}
+	settings, serr := h.cfg.Settings.Get(c.Request.Context())
+	if serr != nil || settings == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "settings_unavailable"})
+		return
+	}
+	view := meScheduleView{
+		Content:  models.BackupContentFull,
+		CronExpr: settings.TenantBackupCron,
+	}
+	if pkg != nil {
+		view.ScheduledBackupsEnabled = pkg.BackupsEnabled() && pkg.ScheduledBackupsEnabled
+		view.MaxBackups = pkg.MaxBackups
+		if runs, rerr := internalbackup.CronRunsPerWeek(settings.TenantBackupCron, time.Now().UTC()); rerr == nil {
+			view.KeepWithinDaysMax = internalbackup.MaxKeepWithinDays(pkg.MaxBackups, runs)
+		}
+	}
+	if fires, ferr := internalbackup.PreviewFires(settings.TenantBackupCron, time.Now().UTC(), 3); ferr == nil {
+		for _, f := range fires {
+			view.NextFirings = append(view.NextFirings, f.Format(time.RFC3339))
+		}
+	}
+	if sched := h.findMeSchedule(c.Request.Context(), user.ID); sched != nil {
+		view.Exists = true
+		view.Enabled = sched.Enabled
+		view.Content = models.NormalizeBackupContent(sched.Content)
+		view.KeepDaily, view.KeepWeekly, view.KeepMonthly = sched.KeepDaily, sched.KeepWeekly, sched.KeepMonthly
+		view.KeepWithinDays = sched.KeepWithinDays
+		// A value above what the plan holds now (migration 342 copied the
+		// older keep_daily as is) shows as the limit, which the next save
+		// stores.
+		if m := view.KeepWithinDaysMax; m > 0 && view.KeepWithinDays != nil && *view.KeepWithinDays > m {
+			view.KeepWithinDays = &m
+		}
+		if dests, derr := h.cfg.Schedules.GetDestinations(c.Request.Context(), sched.ID); derr == nil && len(dests) > 0 {
+			view.DestinationID = dests[0].ID
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"data": view})
+}
+
+// meScheduleRequest is the tenant-editable schedule payload. cron_expr is NOT a
+// field — the tenant can never set the timing; it is always forced from the
+// admin-owned server_settings.tenant_backup_cron.
+type meScheduleRequest struct {
+	Enabled        bool   `json:"enabled"`
+	Content        string `json:"content"`
+	DestinationID  string `json:"destination_id"`
+	KeepDaily      *int   `json:"keep_daily"`
+	KeepWeekly     *int   `json:"keep_weekly"`
+	KeepMonthly    *int   `json:"keep_monthly"`
+	KeepWithinDays *int   `json:"keep_within_days"`
+}
+
+func (h *meBackupHandler) putSchedule(c *gin.Context) {
+	user, pkg, ok := h.meScheduleGate(c)
+	if !ok {
+		return
+	}
+	// Admins and plans without scheduled backups cannot use the tenant card.
+	if pkg == nil || !pkg.BackupsEnabled() || !pkg.ScheduledBackupsEnabled {
+		c.JSON(http.StatusForbidden, gin.H{"status": "error", "error": "scheduled_backups_not_enabled", "detail": "your hosting plan does not allow scheduled backups"})
+		return
+	}
+	var req meScheduleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_body", "detail": err.Error()})
+		return
+	}
+	if !validBackupContent(req.Content) {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_option", "detail": "content must be full/files/database/folders"})
+		return
+	}
+	content := models.NormalizeBackupContent(req.Content)
+	// A schedule with no destination is inert (the fan-out skips it), so an
+	// enabled schedule MUST carry an allowed, enabled destination. When disabled
+	// the tenant may still save their content/destination choice for later.
+	destID := strings.TrimSpace(req.DestinationID)
+	if destID != "" {
+		if h.cfg.Destinations == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "destination_lookup_unavailable"})
+			return
+		}
+		d, derr := h.cfg.Destinations.Get(c.Request.Context(), destID)
+		if derr != nil || d == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "unknown_destination", "detail": "no such backup destination"})
+			return
+		}
+		if !d.Enabled {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "destination_disabled", "detail": "that backup destination is disabled"})
+			return
+		}
+		if !pkg.AllowsBackupKind(d.Kind) {
+			c.JSON(http.StatusForbidden, gin.H{"status": "error", "error": "destination_not_allowed", "detail": fmt.Sprintf("your hosting plan does not allow the %q backup destination", d.Kind)})
+			return
+		}
+	}
+	if req.Enabled && destID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "destination_required", "detail": "pick a backup destination to enable scheduled backups"})
+		return
+	}
+	// Retention: no keep_* may exceed the package's max_backups cap.
+	maxKeep := int(pkg.MaxBackups)
+	clamp := func(v *int) *int {
+		if v == nil {
+			return nil
+		}
+		n := *v
+		if n < 0 {
+			n = 0
+		}
+		if n > maxKeep {
+			n = maxKeep
+		}
+		return &n
+	}
+	keepDaily, keepWeekly, keepMonthly := clamp(req.KeepDaily), clamp(req.KeepWeekly), clamp(req.KeepMonthly)
+	// cron_expr is ALWAYS the admin-owned time — never anything from the body.
+	settings, serr := h.cfg.Settings.Get(c.Request.Context())
+	if serr != nil || settings == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "settings_unavailable"})
+		return
+	}
+	next, ferr := internalbackup.NextFire(settings.TenantBackupCron, time.Now().UTC())
+	if ferr != nil {
+		// A misconfigured admin cron shouldn't 500 the tenant; surface it.
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "schedule_time_invalid", "detail": "the scheduled-backup time set by your host is invalid; contact support"})
+		return
+	}
+	// Days to keep: as many as the plan's backup limit holds at the admin's
+	// cron (GH #2300).
+	runs, _ := internalbackup.CronRunsPerWeek(settings.TenantBackupCron, time.Now().UTC())
+	keepWithin := clampKeepWithinDays(req.KeepWithinDays, pkg.MaxBackups, runs)
+	uid := user.ID
+	// Scope the fan-out to THIS tenant only (an empty user list would fan out to
+	// every non-admin user at tick time — never for a tenant-owned schedule), and
+	// link the chosen destination (none when disabling). Both sets are handed to
+	// the atomic primitive below so the row and its links commit together.
+	users := []string{uid}
+	dests := []string{}
+	if destID != "" {
+		dests = append(dests, destID)
+	}
+	sched := h.findMeSchedule(c.Request.Context(), user.ID)
+	if sched == nil {
+		sched = &models.BackupSchedule{
+			ID:     ids.NewULID(),
+			Kind:   models.BackupScheduleKindAccount,
+			UserID: &uid,
+		}
+		sched.CronExpr = settings.TenantBackupCron
+		sched.Content = content
+		sched.Enabled = req.Enabled
+		sched.KeepDaily, sched.KeepWeekly, sched.KeepMonthly = keepDaily, keepWeekly, keepMonthly
+		sched.KeepWithinDays = keepWithin
+		sched.NextRunAt = &next
+		// One transaction: the row plus the user and destination links commit
+		// together, or the whole create rolls back. The previous three sequential
+		// writes (Create + ReplaceUsers + ReplaceDestinations) could leave a runnable
+		// row with no or partial links if the second or third write failed (JAB-307).
+		// Same atomic primitive the admin, CLI, and multi-schedule tenant paths use.
+		if err := h.cfg.Schedules.CreateWithMemberships(c.Request.Context(), sched, dests, users); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_create"})
+			return
+		}
+	} else {
+		sched.UserID = &uid
+		sched.CronExpr = settings.TenantBackupCron
+		sched.Content = content
+		sched.Enabled = req.Enabled
+		sched.KeepDaily, sched.KeepWeekly, sched.KeepMonthly = keepDaily, keepWeekly, keepMonthly
+		sched.KeepWithinDays = keepWithin
+		sched.NextRunAt = &next
+		// One transaction: the field changes plus both membership sets commit
+		// together, or the whole update rolls back. UpdateWithMemberships writes the
+		// same column set the old Update did (cron_expr, content, enabled, keep_*,
+		// next_run_at, user_id), so field persistence is unchanged — it only wraps
+		// the two membership replacements into the same transaction (JAB-307).
+		if err := h.cfg.Schedules.UpdateWithMemberships(c.Request.Context(), sched, &dests, &users); err != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_update"})
+			return
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// ---- GH #454 7B: tenant multi-schedule surface (window-governed) ----
+
+// meScheduleRow is one tenant-owned schedule in the multi-schedule list. The
+// firing times are read-only (the scheduler owns them); the tenant edits
+// content/cadence/destination/retention/on-off.
+type meScheduleRow struct {
+	ID             string  `json:"id"`
+	Enabled        bool    `json:"enabled"`
+	Content        string  `json:"content"`
+	Cadence        string  `json:"cadence"`
+	DestinationID  string  `json:"destination_id,omitempty"`
+	KeepDaily      *int    `json:"keep_daily,omitempty"`
+	KeepWeekly     *int    `json:"keep_weekly,omitempty"`
+	KeepMonthly    *int    `json:"keep_monthly,omitempty"`
+	KeepWithinDays *int    `json:"keep_within_days,omitempty"`
+	NextRunAt      *string `json:"next_run_at,omitempty"`
+	LastRunAt      *string `json:"last_run_at,omitempty"`
+}
+
+// meSchedulesView is the multi-schedule list payload: the tenant's own rows plus
+// the read-only caps + admin window the UI renders around them.
+type meSchedulesView struct {
+	Schedules               []meScheduleRow `json:"schedules"`
+	MaxBackupSchedules      int             `json:"max_backup_schedules"`
+	MaxBackups              uint32          `json:"max_backups"`
+	ScheduledBackupsEnabled bool            `json:"scheduled_backups_enabled"`
+	MultiEnabled            bool            `json:"multi_enabled"`
+	WindowStart             string          `json:"window_start"`
+	WindowEnd               string          `json:"window_end"`
+	// WindowEnforced (GH #1097): whether the admin window actually restricts
+	// tenant schedules. When false the window_start/end are informational only
+	// and the tenant's schedules run on their chosen interval.
+	WindowEnforced bool `json:"window_enforced"`
+}
+
+// meScheduleUpsertRequest is the tenant-editable multi-schedule payload. Cadence
+// is a fixed allow-list (NOT free cron) so a tenant can never pick a stampede
+// minute; the admin owns the window the cadence fires inside.
+type meScheduleUpsertRequest struct {
+	Enabled        bool   `json:"enabled"`
+	Content        string `json:"content"`
+	Cadence        string `json:"cadence"`
+	DestinationID  string `json:"destination_id"`
+	KeepDaily      *int   `json:"keep_daily"`
+	KeepWeekly     *int   `json:"keep_weekly"`
+	KeepMonthly    *int   `json:"keep_monthly"`
+	KeepWithinDays *int   `json:"keep_within_days"`
+}
+
+// ownedTenantSchedules returns the caller's OWN account_backup schedules.
+// ListForUser filters by the user_id column, which tenant-owned schedules always
+// set (admin fan-out schedules leave it NULL), so this can never surface another
+// tenant's or an admin's schedule.
+func (h *meBackupHandler) ownedTenantSchedules(ctx context.Context, userID string) []models.BackupSchedule {
+	rows, err := h.cfg.Schedules.ListForUser(ctx, userID)
+	if err != nil {
+		return nil
+	}
+	out := rows[:0]
+	for i := range rows {
+		if rows[i].Kind == models.BackupScheduleKindAccount {
+			out = append(out, rows[i])
+		}
+	}
+	return out
+}
+
+// findOwnedSchedule resolves one schedule by id, but only if it belongs to the
+// caller (kind=account_backup AND user_id == caller). Returns nil otherwise so
+// every caller can 404 without leaking whether the id exists for another tenant.
+func (h *meBackupHandler) findOwnedSchedule(ctx context.Context, userID, id string) *models.BackupSchedule {
+	s, err := h.cfg.Schedules.Get(ctx, id)
+	if err != nil || s == nil {
+		return nil
+	}
+	if s.Kind != models.BackupScheduleKindAccount || s.UserID == nil || *s.UserID != userID {
+		return nil
+	}
+	return s
+}
+
+// tenantWindow returns the window used to compute a tenant schedule's next run.
+// GH #1097: the window is opt-in — off by default it returns a whole-day
+// (ungated) window so a new/edited schedule fires on its plain interval, exactly
+// as the scheduler does. Only when the admin enables enforcement does it narrow
+// to the configured window. A missing settings row also stays ungated.
+func (h *meBackupHandler) tenantWindow(ctx context.Context) internalbackup.TenantWindow {
+	settings, err := h.cfg.Settings.Get(ctx)
+	if err != nil || settings == nil {
+		return internalbackup.TenantWindow{} // whole-day / ungated
+	}
+	return internalbackup.EffectiveTenantWindow(settings.TenantBackupWindowEnforce, settings.TenantBackupWindowStart, settings.TenantBackupWindowEnd)
+}
+
+func (h *meBackupHandler) listSchedules(c *gin.Context) {
+	user, pkg, ok := h.meScheduleGate(c)
+	if !ok {
+		return
+	}
+	settings, serr := h.cfg.Settings.Get(c.Request.Context())
+	if serr != nil || settings == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "settings_unavailable"})
+		return
+	}
+	view := meSchedulesView{
+		Schedules:          []meScheduleRow{},
+		MaxBackupSchedules: 1,
+		WindowStart:        settings.TenantBackupWindowStart,
+		WindowEnd:          settings.TenantBackupWindowEnd,
+		WindowEnforced:     settings.TenantBackupWindowEnforce,
+	}
+	if pkg != nil {
+		view.ScheduledBackupsEnabled = pkg.BackupsEnabled() && pkg.ScheduledBackupsEnabled
+		view.MaxBackups = pkg.MaxBackups
+		view.MaxBackupSchedules = pkg.MaxBackupSchedulesOrDefault()
+		view.MultiEnabled = pkg.TenantMultiScheduleEnabled()
+	}
+	for _, s := range h.ownedTenantSchedules(c.Request.Context(), user.ID) {
+		row := meScheduleRow{
+			ID:             s.ID,
+			Enabled:        s.Enabled,
+			Content:        models.NormalizeBackupContent(s.Content),
+			Cadence:        s.Cadence,
+			KeepDaily:      s.KeepDaily,
+			KeepWeekly:     s.KeepWeekly,
+			KeepMonthly:    s.KeepMonthly,
+			KeepWithinDays: s.KeepWithinDays,
+		}
+		if pkg != nil {
+			row.KeepWithinDays = shownKeepWithinDays(s, pkg.MaxBackups)
+		}
+		if s.NextRunAt != nil {
+			v := s.NextRunAt.Format(time.RFC3339)
+			row.NextRunAt = &v
+		}
+		if s.LastRunAt != nil {
+			v := s.LastRunAt.Format(time.RFC3339)
+			row.LastRunAt = &v
+		}
+		if dests, derr := h.cfg.Schedules.GetDestinations(c.Request.Context(), s.ID); derr == nil && len(dests) > 0 {
+			row.DestinationID = dests[0].ID
+		}
+		view.Schedules = append(view.Schedules, row)
+	}
+	c.JSON(http.StatusOK, gin.H{"data": view})
+}
+
+// validateScheduleUpsert checks the shared body rules for create + update and,
+// on success, returns the normalized content + clamped keep_* + the destination
+// list to link. On failure it writes the error response and returns ok=false.
+func (h *meBackupHandler) validateScheduleUpsert(c *gin.Context, pkg *models.HostingPackage, req meScheduleUpsertRequest) (content string, keepDaily, keepWeekly, keepMonthly, keepWithin *int, dests []string, ok bool) {
+	if !internalbackup.ValidCadence(req.Cadence) {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_cadence", "detail": "cadence must be hourly/every_6h/every_12h/daily/weekly"})
+		return
+	}
+	if !validBackupContent(req.Content) {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_option", "detail": "content must be full/files/database/folders"})
+		return
+	}
+	content = models.NormalizeBackupContent(req.Content)
+	destID := strings.TrimSpace(req.DestinationID)
+	if destID != "" {
+		if h.cfg.Destinations == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "destination_lookup_unavailable"})
+			return
+		}
+		d, derr := h.cfg.Destinations.Get(c.Request.Context(), destID)
+		if derr != nil || d == nil {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "unknown_destination", "detail": "no such backup destination"})
+			return
+		}
+		if !d.Enabled {
+			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "destination_disabled", "detail": "that backup destination is disabled"})
+			return
+		}
+		if !pkg.AllowsBackupKind(d.Kind) {
+			c.JSON(http.StatusForbidden, gin.H{"status": "error", "error": "destination_not_allowed", "detail": fmt.Sprintf("your hosting plan does not allow the %q backup destination", d.Kind)})
+			return
+		}
+		dests = []string{destID}
+	}
+	if req.Enabled && destID == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "destination_required", "detail": "pick a backup destination to enable a scheduled backup"})
+		return
+	}
+	maxKeep := int(pkg.MaxBackups)
+	clamp := func(v *int) *int {
+		if v == nil {
+			return nil
+		}
+		n := *v
+		if n < 0 {
+			n = 0
+		}
+		if n > maxKeep {
+			n = maxKeep
+		}
+		return &n
+	}
+	keepDaily, keepWeekly, keepMonthly = clamp(req.KeepDaily), clamp(req.KeepWeekly), clamp(req.KeepMonthly)
+	keepWithin = clampKeepWithinDays(req.KeepWithinDays, pkg.MaxBackups, internalbackup.CadenceRunsPerWeek(req.Cadence))
+	ok = true
+	return
+}
+
+// clampKeepWithinDays bounds an account's days to keep (GH #2300): 0 (no
+// rule) up to the most days whose backups fit in the plan's backup limit at
+// runsPerWeek, and at least 1 of those.
+func clampKeepWithinDays(v *int, maxBackups uint32, runsPerWeek int) *int {
+	if v == nil {
+		return nil
+	}
+	n := *v
+	if n < 0 {
+		n = 0
+	}
+	if m := internalbackup.MaxKeepWithinDays(maxBackups, runsPerWeek); n > m {
+		n = m
+	}
+	return &n
+}
+
+// shownKeepWithinDays is the days to keep an account sees for one of its
+// schedules: a value above what the plan's backup limit holds at the
+// schedule's frequency (migration 342 copied the older keep_daily as is)
+// shows as that limit, which the next save stores.
+func shownKeepWithinDays(s models.BackupSchedule, maxBackups uint32) *int {
+	runs := internalbackup.CadenceRunsPerWeek(s.Cadence)
+	if s.Cadence == "" {
+		if n, err := internalbackup.CronRunsPerWeek(s.CronExpr, time.Now().UTC()); err == nil {
+			runs = n
+		}
+	}
+	return clampKeepWithinDays(s.KeepWithinDays, maxBackups, runs)
+}
+
+func (h *meBackupHandler) createSchedule(c *gin.Context) {
+	user, pkg, ok := h.meScheduleGate(c)
+	if !ok {
+		return
+	}
+	if pkg == nil || !pkg.BackupsEnabled() || !pkg.ScheduledBackupsEnabled {
+		c.JSON(http.StatusForbidden, gin.H{"status": "error", "error": "scheduled_backups_not_enabled", "detail": "your hosting plan does not allow scheduled backups"})
+		return
+	}
+	// Cap enforcement: refuse the N+1th schedule (GH #454 7B). Counts the
+	// caller's OWN account_backup rows only.
+	existing := h.ownedTenantSchedules(c.Request.Context(), user.ID)
+	if len(existing) >= pkg.MaxBackupSchedulesOrDefault() {
+		c.JSON(http.StatusForbidden, gin.H{"status": "error", "error": "schedule_limit_reached", "detail": fmt.Sprintf("your hosting plan allows at most %d backup schedules", pkg.MaxBackupSchedulesOrDefault())})
+		return
+	}
+	var req meScheduleUpsertRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_body", "detail": err.Error()})
+		return
+	}
+	content, keepDaily, keepWeekly, keepMonthly, keepWithin, dests, vok := h.validateScheduleUpsert(c, pkg, req)
+	if !vok {
+		return
+	}
+	uid := user.ID
+	id := ids.NewULID()
+	next := internalbackup.NextTenantRun(time.Now().UTC(), req.Cadence, h.tenantWindow(c.Request.Context()), id)
+	sched := &models.BackupSchedule{
+		ID:             id,
+		Kind:           models.BackupScheduleKindAccount,
+		UserID:         &uid,
+		Cadence:        req.Cadence,
+		Content:        content,
+		Enabled:        req.Enabled,
+		KeepDaily:      keepDaily,
+		KeepWeekly:     keepWeekly,
+		KeepMonthly:    keepMonthly,
+		KeepWithinDays: keepWithin,
+		NextRunAt:      &next,
+	}
+	// One transaction: the row and both membership sets commit together, or the
+	// whole create rolls back. The previous three sequential writes could leave a
+	// row with no or partial user/destination links if the second or third write
+	// failed (JAB-307). Same atomic repository primitive the admin and CLI paths
+	// use; the tenant surface keeps its own shape (Cadence/Content), so it calls
+	// the primitive directly rather than through the admin lifecycle leaf.
+	if err := h.cfg.Schedules.CreateWithMemberships(c.Request.Context(), sched, dests, []string{uid}); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_create"})
+		return
+	}
+	c.JSON(http.StatusCreated, gin.H{"status": "ok", "id": id})
+}
+
+func (h *meBackupHandler) updateSchedule(c *gin.Context) {
+	user, pkg, ok := h.meScheduleGate(c)
+	if !ok {
+		return
+	}
+	if pkg == nil || !pkg.BackupsEnabled() || !pkg.ScheduledBackupsEnabled {
+		c.JSON(http.StatusForbidden, gin.H{"status": "error", "error": "scheduled_backups_not_enabled", "detail": "your hosting plan does not allow scheduled backups"})
+		return
+	}
+	id := c.Param("id")
+	sched := h.findOwnedSchedule(c.Request.Context(), user.ID, id)
+	if sched == nil {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "schedule_not_found"})
+		return
+	}
+	var req meScheduleUpsertRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_body", "detail": err.Error()})
+		return
+	}
+	content, keepDaily, keepWeekly, keepMonthly, keepWithin, dests, vok := h.validateScheduleUpsert(c, pkg, req)
+	if !vok {
+		return
+	}
+	uid := user.ID
+	// GH #2300: an edit that keeps the cadence keeps the schedule's run times, as
+	// the admin edit does (GH #2246). A run time that passed while the schedule
+	// was off moves to the next of its times, so turning it on doesn't start a
+	// backup at once. A new cadence times it again from now.
+	now := time.Now().UTC()
+	w := h.tenantWindow(c.Request.Context())
+	var next time.Time
+	switch {
+	case req.Cadence != sched.Cadence || sched.NextRunAt == nil:
+		next = internalbackup.NextTenantRun(now, req.Cadence, w, sched.ID)
+	case !sched.Enabled && !sched.NextRunAt.After(now):
+		next = internalbackup.NextTenantRunAfter(*sched.NextRunAt, now, req.Cadence, w, sched.ID)
+	default:
+		next = *sched.NextRunAt
+	}
+	sched.UserID = &uid
+	sched.Cadence = req.Cadence
+	sched.Content = content
+	sched.Enabled = req.Enabled
+	sched.KeepDaily, sched.KeepWeekly, sched.KeepMonthly = keepDaily, keepWeekly, keepMonthly
+	sched.KeepWithinDays = keepWithin
+	sched.NextRunAt = &next
+	// One transaction: the field changes and both membership sets commit together,
+	// or the whole update rolls back. The previous three sequential writes could
+	// leave the row on a new cadence while the destination or user set was only
+	// half-replaced (JAB-307). UpdateWithMemberships writes the same column set the
+	// old Update did, so field persistence is unchanged — it only wraps the two
+	// membership replacements into the same transaction. Same atomic repository
+	// primitive the admin and CLI paths use; called directly (not the admin
+	// lifecycle leaf) because the tenant surface keeps its own shape (Cadence/Content).
+	users := []string{uid}
+	if err := h.cfg.Schedules.UpdateWithMemberships(c.Request.Context(), sched, &dests, &users); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_update"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+func (h *meBackupHandler) deleteSchedule(c *gin.Context) {
+	user, _, ok := h.meScheduleGate(c)
+	if !ok {
+		return
+	}
+	id := c.Param("id")
+	// Ownership check BEFORE delete: a non-owner (or admin targeting a tenant
+	// row through this path) gets 404, never a cross-tenant delete.
+	if sched := h.findOwnedSchedule(c.Request.Context(), user.ID, id); sched == nil {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "schedule_not_found"})
+		return
+	}
+	if err := h.cfg.Schedules.Delete(c.Request.Context(), id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_delete"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// pruneOldestOwned auto-forgets the caller's OLDEST owned account_backup(s)
+// until they are under maxBackups, for the "prune" retention policy (GH #454).
+// Owner-scoped: OldestAccountBackupForUser filters by user_id, so a tenant can
+// only ever prune their OWN backups. Returns true once under the cap; false if
+// it can't free enough (e.g. only running/restore jobs remain) -> caller falls
+// back to reject. It counts what the limit counts (CountRetainedForUser):
+// counting every row, failed attempts included, kept the total over the limit
+// while it deleted every backup the account had. A backup whose forget fails
+// keeps its row and the caller rejects: deleting the row would leave the data
+// in its repository, uncounted and never removed.
+func (h *meBackupHandler) pruneOldestOwned(ctx context.Context, user *models.User, maxBackups int) bool {
+	for i := 0; i < 1000; i++ { // bounded so an odd repo state can't spin forever
+		total, err := h.cfg.Jobs.CountRetainedForUser(ctx, user.ID)
+		if err != nil {
+			return false
+		}
+		if total < int64(maxBackups) {
+			return true
+		}
+		oldest, oerr := h.cfg.Jobs.OldestAccountBackupForUser(ctx, user.ID)
+		if oerr != nil || oldest == nil {
+			return false
+		}
+		if h.cfg.Agent != nil {
+			if ferr := forgetJobSnapshots(ctx, h.cfg.Agent, h.cfg.Destinations, h.cfg.SSOKey, oldest); ferr != nil {
+				return false
+			}
+		}
+		if derr := h.cfg.Jobs.Delete(ctx, oldest.ID); derr != nil {
+			return false
+		}
+	}
+	return false
+}
+
+// notifyBackupLimit fires the backup.limit.reached event to the tenant's own
+// inbox (UserID set) AND broadcasts it to every admin bell (UserID empty), with
+// bodies tailored to the outcome ("reject" blocked / "prune" auto-removed).
+// Best-effort — a notify failure never blocks the backup path (GH #454).
+func (h *meBackupHandler) notifyBackupLimit(ctx context.Context, user *models.User, outcome string, limit uint32) {
+	if h.cfg.Notify == nil {
+		return
+	}
+	who := user.ID
+	if user.Username != nil && *user.Username != "" {
+		who = *user.Username
+	}
+	var tenantBody, adminBody string
+	if outcome == "prune" {
+		tenantBody = fmt.Sprintf("You reached your plan's backup limit (%d). Your oldest backup was automatically removed to make room for the new one.", limit)
+		adminBody = fmt.Sprintf("Tenant %s reached their backup limit (%d); the oldest backup was auto-pruned per the package retention policy.", who, limit)
+	} else {
+		tenantBody = fmt.Sprintf("You reached your plan's backup limit (%d). Delete an old backup before creating another, or ask your host to raise the limit.", limit)
+		adminBody = fmt.Sprintf("Tenant %s reached their backup limit (%d); the new backup was blocked (reject policy).", who, limit)
+	}
+	nctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, _ = h.cfg.Notify.Publish(nctx, notifications.Envelope{
+		EventKind: "backup.limit.reached", Severity: "warning",
+		Title: "Backup limit reached", Body: tenantBody, UserID: user.ID,
+	})
+	_, _ = h.cfg.Notify.Publish(nctx, notifications.Envelope{
+		EventKind: "backup.limit.reached", Severity: "warning",
+		Title: "Tenant backup limit reached", Body: adminBody,
+	})
+}
+
+func (h *meBackupHandler) list(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"status": "error", "error": "unauthenticated"})
+		return
+	}
+	limit, offset := backupsPagination(c, 25, 100)
+	rows, total, err := h.cfg.Jobs.ListForUser(c.Request.Context(), claims.UserID, limit, offset)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_list"})
+		return
+	}
+	page := offset/maxInt(limit, 1) + 1
+	c.JSON(http.StatusOK, gin.H{
+		"data": rows, "total": total, "page": page, "page_size": limit,
+	})
+}
+
+type meRestoreSelectiveRequest struct {
+	Databases  []string `json:"databases"`
+	Home       bool     `json:"home"`
+	Mailboxes  []string `json:"mailboxes"`
+	DNSDomains []string `json:"dns_domains"`
+	// Domains restores only these domains' docroots (~/domains/<domain>) from the
+	// home stage — the per-domain alternative to a full home restore (GH #1359).
+	Domains []string `json:"domains"`
+	// DeleteExtra makes each restored domain folder hold exactly what the
+	// backup holds: files added since the backup are deleted (GH #2303).
+	DeleteExtra bool `json:"delete_extra"`
+	Overwrite   bool `json:"overwrite"`
+}
+
+// restoreSelective restores a chosen subset of the caller's OWN backup
+// (databases only, GH #267 Wave 2). DESTRUCTIVE + fail-closed: nothing is
+// written unless overwrite=true, target_username is server-derived (never from
+// the body), and each requested DB must be both in the backup AND currently
+// owned by the caller. Home/mail/DNS are out of v1 (see the blueprint).
+func (h *meBackupHandler) restoreSelective(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"status": "error", "error": "unauthenticated"})
+		return
+	}
+	job, err := h.cfg.Jobs.Get(c.Request.Context(), c.Param("id"))
+	if err != nil || job.UserID != claims.UserID {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "not_found"})
+		return
+	}
+	if job.Status != models.BackupJobStatusSucceeded {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "no_completed_snapshot"})
+		return
+	}
+	if job.SnapshotID == "" {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"status": "error", "error": "no_snapshot_id"})
+		return
+	}
+	if h.cfg.Agent == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "agent_unavailable"})
+		return
+	}
+
+	var req meRestoreSelectiveRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"status": "error", "error": "validation_failed", "detail": err.Error()})
+		return
+	}
+	if len(req.Databases) == 0 && !req.Home && len(req.DNSDomains) == 0 && len(req.Mailboxes) == 0 && len(req.Domains) == 0 {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"status": "error", "error": "nothing_selected",
+			"detail": "select at least one database, mailbox, home, domain, and/or dns domain"})
+		return
+	}
+
+	// Server-derive the target username from the caller — NEVER trust a body.
+	owner, oerr := h.cfg.Users.FindByID(c.Request.Context(), claims.UserID)
+	if oerr != nil || owner == nil || owner.Username == nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "owner_lookup_failed"})
+		return
+	}
+
+	// Every requested DB must be CURRENTLY owned by the caller — fail-closed.
+	// (The agent additionally restores only DBs present in the manifest.)
+	owned := map[string]bool{}
+	if h.cfg.Databases != nil {
+		dbs, _, derr := h.cfg.Databases.ListByUserID(c.Request.Context(), claims.UserID, repository.ListOptions{Limit: 10000})
+		if derr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_list_failed"})
+			return
+		}
+		for _, d := range dbs {
+			owned[d.Name] = true
+		}
+	}
+	for _, name := range req.Databases {
+		if !owned[name] {
+			c.JSON(http.StatusForbidden, gin.H{"status": "error", "error": "database_not_owned",
+				"detail": "you do not own a database named " + name})
+			return
+		}
+	}
+
+	// DNS domains + domain docroots + mailboxes must all be currently owned by
+	// the caller (name -> id map). Fail-closed.
+	ownedDomains := map[string]string{}
+	if (len(req.DNSDomains) > 0 || len(req.Mailboxes) > 0 || len(req.Domains) > 0) && h.cfg.Domains != nil {
+		doms, _, derr := h.cfg.Domains.ListByUserID(c.Request.Context(), claims.UserID, repository.ListOptions{Limit: 10000})
+		if derr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "domain_list_failed"})
+			return
+		}
+		for _, d := range doms {
+			ownedDomains[d.Name] = d.ID
+		}
+		for _, n := range req.DNSDomains {
+			if _, ok := ownedDomains[n]; !ok {
+				c.JSON(http.StatusForbidden, gin.H{"status": "error", "error": "domain_not_owned",
+					"detail": "you do not own a domain named " + n})
+				return
+			}
+		}
+		for _, n := range req.Domains {
+			if _, ok := ownedDomains[n]; !ok {
+				c.JSON(http.StatusForbidden, gin.H{"status": "error", "error": "domain_not_owned",
+					"detail": "you do not own a domain named " + n})
+				return
+			}
+		}
+		for _, mb := range req.Mailboxes {
+			at := strings.LastIndex(mb, "@")
+			if at <= 0 {
+				c.JSON(http.StatusUnprocessableEntity, gin.H{"status": "error", "error": "invalid_mailbox", "detail": mb})
+				return
+			}
+			if _, ok := ownedDomains[mb[at+1:]]; !ok {
+				c.JSON(http.StatusForbidden, gin.H{"status": "error", "error": "mailbox_not_owned",
+					"detail": "you do not own the domain for mailbox " + mb})
+				return
+			}
+		}
+	}
+
+	release, ok := claimBackupSubmit(c, h.cfg.Jobs, h.cfg.logErr, claims.UserID, models.BackupJobKindAccountRestore,
+		"restore_in_progress", "a restore into your account is already queued or running")
+	if !ok {
+		return
+	}
+	defer release()
+	// Track the restore as its own job so the jobs list + notifications cover it.
+	restoreJob := &models.BackupJob{
+		ID:     ids.NewULID(),
+		UserID: claims.UserID,
+		Kind:   models.BackupJobKindAccountRestore,
+		// GH #1044: record what this restore actually touches so the list reads
+		// "Database Restore" (etc.) rather than the generic "Account Restore".
+		Content:   restoreContentFromSelective(req.Databases, req.Mailboxes, req.DNSDomains, req.Domains, req.Home),
+		CreatedAt: time.Now().UTC(),
+		Status:    models.BackupJobStatusQueued,
+	}
+	if err := h.cfg.Jobs.Create(c.Request.Context(), restoreJob); err != nil {
+		h.cfg.logErr("create selective restore job", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_create"})
+		return
+	}
+	_ = h.cfg.Jobs.MarkStarted(c.Request.Context(), restoreJob.ID)
+
+	// GH #1044: run the restore as a BACKGROUND job — see the admin
+	// handler for the full reasoning (three stacked HTTP-lifetime
+	// ceilings killed any restore that outlived the shortest one, while
+	// the agent finished the work anyway). The result the drawer used to
+	// read from this response is persisted onto the job row
+	// (warnings_json) instead, and the drawer polls the job.
+	// The snapshot lives in the SOURCE backup's destination repo, not the
+	// agent's legacy default. Resolve it here and hand it to the runner —
+	// without this every restore from a per-destination backup failed with
+	// "failed to find snapshot" against /var/lib/dotnext-backups/repo (found
+	// live while E2E-testing the async flow; the synchronous version had
+	// the same omission all along).
+	var restoreDest *models.BackupDestination
+	if job.DestinationID != nil && *job.DestinationID != "" && h.cfg.Destinations != nil {
+		if d, derr := h.cfg.Destinations.Get(c.Request.Context(), *job.DestinationID); derr == nil {
+			restoreDest = d
+		} else {
+			h.cfg.logErr("selective restore: destination lookup failed", derr, "dest_id", *job.DestinationID)
+		}
+	}
+	go h.runSelectiveRestoreJob(restoreJob.ID, job.SnapshotID, *owner.Username, owner.ID, req, ownedDomains, restoreDest)
+	c.JSON(http.StatusAccepted, gin.H{"status": "queued", "job_id": restoreJob.ID})
+}
+
+// selectiveRestoreOutcome is what the tenant restore drawer renders. It is
+// stored verbatim in backup_jobs.warnings_json when the job seals so the
+// result survives the (now-async) HTTP exchange (GH #1044).
+type selectiveRestoreOutcome struct {
+	Applied  []string `json:"applied"`
+	Skipped  []string `json:"skipped"`
+	Warnings []string `json:"warnings"`
+}
+
+// runSelectiveRestoreJob executes one tenant selective restore to
+// completion and seals the job row with the outcome. Detached from the
+// request; every context is fresh (a status write on the dead request
+// context would be a silent no-op).
+func (h *meBackupHandler) runSelectiveRestoreJob(jobID, manifestSnap, username, userID string, req meRestoreSelectiveRequest, ownedDomains map[string]string, dest *models.BackupDestination) {
+	ctx, cancel := context.WithTimeout(context.Background(), restoreJobTimeout)
+	defer cancel()
+	seal := func(status, errText string, out selectiveRestoreOutcome) {
+		sctx, scancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer scancel()
+		outJSON, _ := json.Marshal(out)
+		_ = h.cfg.Jobs.MarkFinished(sctx, jobID, status, "", "", 0, 0, nil, outJSON, errText)
+	}
+
+	out := selectiveRestoreOutcome{Applied: []string{}, Skipped: []string{}, Warnings: []string{}}
+
+	// Databases + home go to the agent (host-side). Only dispatch when one is
+	// requested — the agent rejects an empty db+home set.
+	if len(req.Databases) > 0 || req.Home || len(req.Mailboxes) > 0 || len(req.Domains) > 0 {
+		params := map[string]any{
+			"job_id":               jobID,
+			"manifest_snapshot_id": manifestSnap,
+			"target_username":      username,
+			"databases":            req.Databases,
+			"mailboxes":            req.Mailboxes,
+			"home":                 req.Home,
+			"domains":              req.Domains,
+			"delete_extra":         req.DeleteExtra,
+			"overwrite":            req.Overwrite,
+		}
+		// Point the agent at the repo the snapshot actually lives in, and
+		// unseal the per-destination restic password for it (M30.2.x) —
+		// same contract as every backup.create/backup.restore dispatch.
+		for k, v := range destWireParams(dest) {
+			params[k] = v
+		}
+		var raw json.RawMessage
+		aerr := backupwrapperhelpers.WithOptionalDestPassword(ctx, dest, h.cfg.Agent, h.cfg.SSOKey,
+			func(passwordFile string) error {
+				if passwordFile != "" {
+					params["password_file"] = passwordFile
+				}
+				var callErr error
+				raw, callErr = h.cfg.Agent.Call(ctx, "backup.restore_selective", params)
+				return callErr
+			})
+		if aerr != nil {
+			// Agent errors carry restic/host internals — log, don't echo
+			// (JAB-114). The drawer sees the generic failure via the row.
+			h.cfg.logErr("selective restore job failed", aerr, "job_id", jobID)
+			out.Warnings = append(out.Warnings, "restore failed — the panel log has the detail")
+			seal(models.BackupJobStatusFailed, "restore_failed", out)
+			return
+		}
+		var ar struct {
+			selectiveRestoreOutcome
+			RestoredPostgresDBs []string `json:"restored_postgres_databases"`
+		}
+		_ = json.Unmarshal(raw, &ar)
+		out.Applied = append(out.Applied, ar.Applied...)
+		out.Skipped = append(out.Skipped, ar.Skipped...)
+		out.Warnings = append(out.Warnings, ar.Warnings...)
+		// GH #1993: the restored PostgreSQL databases' users get their access
+		// again, and the first takes over the restored objects.
+		pgErrs, pgNotes := dbops.RegrantRestoredPostgres(ctx, h.cfg.Agent, h.cfg.Databases, h.cfg.DatabaseGrants, h.cfg.DatabaseUsers, userID, ar.RestoredPostgresDBs)
+		out.Warnings = append(append(out.Warnings, pgErrs...), pgNotes...)
+	}
+
+	// DNS records are panel-side DB rows — restore them here (owner-scoped),
+	// reading the captured records out of the backup metadata via the agent.
+	if len(req.DNSDomains) > 0 {
+		if !req.Overwrite {
+			for _, n := range req.DNSDomains {
+				out.Skipped = append(out.Skipped, "dns:"+n)
+			}
+			out.Warnings = append(out.Warnings, "overwrite=false: DNS not applied. Restoring DNS replaces this domain's custom records; re-send with overwrite=true.")
+		} else {
+			da, dw := h.restoreDNSRecords(ctx, manifestSnap, req.DNSDomains, ownedDomains, dest)
+			out.Applied = append(out.Applied, da...)
+			out.Warnings = append(out.Warnings, dw...)
+		}
+	}
+
+	seal(models.BackupJobStatusSucceeded, "", out)
+}
+
+// restoreDNSRecords reads the captured user DNS records from the backup metadata
+// (via the agent) and re-inserts them into each domain's zone, replacing the
+// existing NON-managed records. Owner-scoping is enforced by ownedDomains (the
+// caller's name->id map); managed records are left untouched (they re-derive).
+func (h *meBackupHandler) restoreDNSRecords(ctx context.Context, manifestSnap string, domains []string, ownedDomains map[string]string, dest *models.BackupDestination) ([]string, []string) {
+	var applied, warnings []string
+	if h.cfg.DNSZones == nil || h.cfg.DNSRecords == nil {
+		return nil, []string{"dns: not configured on this panel"}
+	}
+	// GH #1044: read from the SOURCE backup's destination repo, not the
+	// legacy default — same fix as the manifest and selective paths.
+	params := map[string]any{
+		"manifest_snapshot_id": manifestSnap,
+		"domain_names":         domains,
+	}
+	for k, v := range destWireParams(dest) {
+		params[k] = v
+	}
+	var raw json.RawMessage
+	err := backupwrapperhelpers.WithOptionalDestPassword(ctx, dest, h.cfg.Agent, h.cfg.SSOKey,
+		func(passwordFile string) error {
+			if passwordFile != "" {
+				params["password_file"] = passwordFile
+			}
+			var callErr error
+			raw, callErr = h.cfg.Agent.Call(ctx, "backup.dns_read", params)
+			return callErr
+		})
+	if err != nil {
+		return nil, []string{"dns: read from backup failed"}
+	}
+	var rd struct {
+		Domains []struct {
+			Name       string `json:"name"`
+			DNSRecords []struct {
+				Name      string `json:"name"`
+				Type      string `json:"type"`
+				Content   string `json:"content"`
+				TTL       int    `json:"ttl"`
+				Priority  int    `json:"priority"`
+				IsEnabled bool   `json:"is_enabled"`
+			} `json:"dns_records"`
+		} `json:"domains"`
+	}
+	if uerr := json.Unmarshal(raw, &rd); uerr != nil {
+		return nil, []string{"dns: parse backup metadata failed"}
+	}
+	have := map[string]bool{}
+	for _, d := range rd.Domains {
+		have[d.Name] = true
+		domID, ok := ownedDomains[d.Name]
+		if !ok {
+			continue // not owned (already validated, defensive)
+		}
+		zone, zerr := h.cfg.DNSZones.FindByDomainID(ctx, domID)
+		if zerr != nil || zone == nil {
+			warnings = append(warnings, "dns "+d.Name+": no DNS zone — skipped")
+			continue
+		}
+		// Replace the zone's existing user records.
+		if existing, lerr := h.cfg.DNSRecords.ListByZoneID(ctx, zone.ID); lerr == nil {
+			for _, e := range existing {
+				if !e.Managed {
+					_ = h.cfg.DNSRecords.Delete(ctx, e.ID)
+				}
+			}
+		}
+		n := 0
+		for _, rec := range d.DNSRecords {
+			if cerr := h.cfg.DNSRecords.Create(ctx, &models.DNSRecord{
+				ID: ids.NewULID(), ZoneID: zone.ID,
+				Name: rec.Name, Type: rec.Type, Content: rec.Content,
+				TTL: rec.TTL, Priority: rec.Priority,
+				Managed: false, IsEnabled: rec.IsEnabled,
+			}); cerr == nil {
+				n++
+			}
+		}
+		applied = append(applied, fmt.Sprintf("dns → %s (%d records; reconciler re-publishes)", d.Name, n))
+	}
+	for _, n := range domains {
+		if !have[n] {
+			warnings = append(warnings, "dns "+n+": no custom records captured in this backup (older backup, or none) — skipped")
+		}
+	}
+	return applied, warnings
+}
+
+// manifest returns the backup's stage/item preview (GH #267 Wave 1) so the
+// tenant restore UI can show what's inside one of the caller's own backups
+// WITHOUT materializing it. Read-only; owner-scoped (cross-user → 404).
+func (h *meBackupHandler) manifest(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"status": "error", "error": "unauthenticated"})
+		return
+	}
+	job, err := h.cfg.Jobs.Get(c.Request.Context(), c.Param("id"))
+	if err != nil || job.UserID != claims.UserID {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "not_found"})
+		return
+	}
+	if job.Status != models.BackupJobStatusSucceeded {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "no_completed_snapshot"})
+		return
+	}
+	if job.SnapshotID == "" {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"status": "error", "error": "no_snapshot_id"})
+		return
+	}
+	if h.cfg.Agent == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "agent_unavailable"})
+		return
+	}
+	// GH #1044: the manifest lives in the SOURCE backup's destination repo.
+	// Without repo_url the agent read the legacy default repo, restic
+	// retried against a snapshot that was never there, and the restore
+	// drawer 502'd for every per-destination backup.
+	var dest *models.BackupDestination
+	if job.DestinationID != nil && *job.DestinationID != "" && h.cfg.Destinations != nil {
+		if d, derr := h.cfg.Destinations.Get(c.Request.Context(), *job.DestinationID); derr == nil {
+			dest = d
+		}
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), 30*time.Second)
+	defer cancel()
+	params := map[string]any{"manifest_snapshot_id": job.SnapshotID}
+	for k, v := range destWireParams(dest) {
+		params[k] = v
+	}
+	var raw json.RawMessage
+	err = backupwrapperhelpers.WithOptionalDestPassword(ctx, dest, h.cfg.Agent, h.cfg.SSOKey,
+		func(passwordFile string) error {
+			if passwordFile != "" {
+				params["password_file"] = passwordFile
+			}
+			var callErr error
+			raw, callErr = h.cfg.Agent.Call(ctx, "backup.manifest_read", params)
+			return callErr
+		})
+	if err != nil {
+		// Agent errors carry restic/host internals — log, never echo
+		// (JAB-114; the old response leaked err.Error() to the tenant).
+		respondAgentErr(c, "manifest_read_failed", err)
+		return
+	}
+	// Pass the agent's {kind,user_id,username,stages[]} through, with its
+	// domain lists narrowed to the domains the caller owns now (GH #2303): a
+	// restore of a domain the account no longer has is refused.
+	owned := map[string]string{}
+	if h.cfg.Domains != nil {
+		doms, _, derr := h.cfg.Domains.ListByUserID(c.Request.Context(), claims.UserID, repository.ListOptions{Limit: 10000})
+		if derr != nil {
+			h.cfg.logErr("manifest: list owned domains", derr)
+			c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "domain_list_failed"})
+			return
+		}
+		for _, d := range doms {
+			owned[d.Name] = d.ID
+		}
+	}
+	c.Data(http.StatusOK, "application/json", filterManifestDomains(raw, owned))
+}
+
+// filterManifestDomains keeps, in the manifest's "domains" and "dns_domains"
+// lists, only the names in owned, and passes everything else through. A reply
+// that isn't a JSON object goes back unchanged.
+func filterManifestDomains(raw json.RawMessage, owned map[string]string) json.RawMessage {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return raw
+	}
+	for _, key := range []string{"domains", "dns_domains"} {
+		v, ok := m[key]
+		if !ok {
+			continue
+		}
+		var names []string
+		if err := json.Unmarshal(v, &names); err != nil {
+			delete(m, key)
+			continue
+		}
+		kept := make([]string, 0, len(names))
+		for _, n := range names {
+			if _, ok := owned[n]; ok {
+				kept = append(kept, n)
+			}
+		}
+		m[key], _ = json.Marshal(kept)
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+func (h *meBackupHandler) download(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"status": "error", "error": "unauthenticated"})
+		return
+	}
+	job, err := h.cfg.Jobs.Get(c.Request.Context(), c.Param("id"))
+	// Cross-user attempt → 404 not 403, matches plan Step 9 spec.
+	if err != nil || job.UserID != claims.UserID {
+		c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "not_found"})
+		return
+	}
+	// GH #266: actually materialize + stream the tar.zst (the v1 stub
+	// returned job metadata as JSON, so the browser's <a href> download
+	// got a JSON blob, never a file). Same agent-materialize path as the
+	// admin handler, scoped to the caller's own job by the check above.
+	dest, destParams := materializeDest(c.Request.Context(), h.cfg.Destinations, job)
+	// Bridge the destination's own restic password (M30.2.x) for the
+	// materialize call; without it a rotated destination's snapshot cannot
+	// be opened and the download fails. No-op for legacy/local jobs.
+	_ = backupwrapperhelpers.WithOptionalDestPassword(c.Request.Context(), dest, h.cfg.Agent, h.cfg.SSOKey,
+		func(passwordFile string) error {
+			if passwordFile != "" {
+				if destParams == nil {
+					destParams = map[string]any{}
+				}
+				destParams["password_file"] = passwordFile
+			}
+			streamBackupArtifact(c, h.cfg.Agent, job, backupDownloadBase(job, backupJobOwnerName(c.Request.Context(), h.cfg.Users, job)), destParams, h.cfg.logErr)
+			return nil
+		})
+}

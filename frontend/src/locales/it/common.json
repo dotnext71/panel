@@ -1,0 +1,674 @@
+{
+  "nav": {
+    "admin": {
+      "dashboard": "Dashboard",
+      "dashboard_desc": "Panoramica del server e statistiche rapide",
+      "users": "Utenti",
+      "users_desc": "Gestisci gli utenti del pannello, le sessioni e l'impersonificazione",
+      "domains": "Domini web",
+      "domains_desc": "Tutti i domini web di tutti gli utenti",
+      "mail": "Posta",
+      "mail_desc": "Caselle di posta, inoltri e webmail",
+      "packages": "Pacchetti di hosting",
+      "packages_desc": "Piani di hosting e limiti",
+      "ssl": "Gestore SSL",
+      "ssl_desc": "Certificati SSL ed emissione",
+      "applications": "Applicazioni",
+      "applications_desc": "Installazione di applicazioni con un clic (WordPress e altro)",
+      "docker-apps": "App Docker",
+      "docker-apps_desc": "Catalogo di app Docker",
+      "settings": "Impostazioni del server",
+      "settings_desc": "Impostazioni globali del server e moduli opzionali",
+      "server-status": "Stato del server",
+      "server-status_desc": "Servizi, risorse e integrità in tempo reale",
+      "cache": "Cache",
+      "cache_desc": "Strumenti di cache di Redis e WordPress",
+      "security": "Sicurezza",
+      "security_desc": "CrowdSec, scansione malware e firewall",
+      "backups": "Backup",
+      "backups_desc": "Destinazioni e pianificazioni dei backup",
+      "php-pools": "Gestore PHP",
+      "php-pools_desc": "Versioni di PHP e pool FPM",
+      "dns": "Zone DNS",
+      "dns_desc": "Zone DNS autoritative e record",
+      "ips": "Indirizzi IP",
+      "ips_desc": "Indirizzi IP gestiti del server",
+      "notifications": "Notifiche",
+      "notifications_desc": "Avvisi e canali di notifica",
+      "updates": "Aggiornamenti",
+      "updates_desc": "Aggiornamenti del pannello e dei pacchetti di sistema",
+      "automation": "Accesso API del server",
+      "automation_desc": "Token API globali del server e ambiti per le automazioni",
+      "api-tokens": "Token API personali",
+      "api-tokens_desc": "Chiavi API REST",
+      "migrations": "Migrazioni",
+      "migrations_desc": "Importa account da cPanel, HestiaCP o DirectAdmin",
+      "terminal": "Terminale",
+      "terminal_desc": "Terminale web verso il server",
+      "logs": "Log e statistiche",
+      "logs_desc": "Log di accesso e di errore oltre alle statistiche",
+      "cron": "Cron",
+      "cron_desc": "Processi Cron pianificati",
+      "support": "Assistenza",
+      "support_desc": "Diagnostica e contatto con l'assistenza"
+    },
+    "user": {
+      "dashboard": "Dashboard",
+      "domains": "Domini web",
+      "mail": "Posta",
+      "applications": "Applicazioni",
+      "python-apps": "App Python",
+      "docker-apps": "App Docker",
+      "databases": "Database",
+      "disk-usage": "Utilizzo del disco",
+      "files": "File",
+      "logs": "Log e statistiche",
+      "ssh-keys": "Chiavi SSH",
+      "api-tokens": "Token API personali",
+      "dns": "DNS",
+      "ssl": "Gestore SSL",
+      "php-settings": "Impostazioni PHP",
+      "cron": "Cron",
+      "backups": "Backup/Ripristino",
+      "group": {
+        "hosting": "Hosting",
+        "services": "Servizi",
+        "tools": "Strumenti",
+        "account": "Account"
+      }
+    }
+  },
+  "login": {
+    "flowError": "Impossibile avviare la procedura di accesso. Verifica che il servizio di identità sia in esecuzione e ricarica la pagina.",
+    "hostnameWarningTitle": "Accedi usando il nome host, non l'IP",
+    "hostnameWarningDescription": "Il provider di identità è associato al nome host del pannello, quindi l'accesso tramite l'indirizzo IP del server non funzionerà. Apri il pannello tramite il suo nome host (l'URL mostrato dopo l'installazione) e riprova.",
+    "hostnameWarningOpenLink": "Apri il pannello su {{hostname}}",
+    "noCredentialMethod": "Al momento non è configurato alcun metodo di credenziali per il tuo account. Contatta un amministratore.",
+    "fieldRequired": "Obbligatorio",
+    "identifierHint": "Usa il tuo nome utente, non la tua email.",
+    "totpHint": "Inserisci il codice a 6 cifre della tua app di autenticazione.",
+    "backupCodeHint": "Inserisci uno dei tuoi codici di backup.",
+    "webauthnHint": "Usa la tua chiave di sicurezza per accedere.",
+    "submitVerify": "Verifica",
+    "submitSignIn": "Accedi"
+  },
+  "menu": {
+    "profile": "Profilo",
+    "language": "Lingua",
+    "sign_out": "Esci"
+  },
+  "dashboard": {
+    "stats": {
+      "users": "Utenti totali",
+      "domains": "Domini web attivi",
+      "mailboxes": "Caselle di posta"
+    },
+    "health": {
+      "healthy": "Integro",
+      "critical": "{{count}} critico",
+      "warning_one": "{{count}} avviso",
+      "warning_many": "{{count}} avvisi",
+      "warning_other": "{{count}} avvisi"
+    },
+    "server_ip": "IP del server:",
+    "summary": "Riepilogo generale. Per metriche in tempo reale, servizi, rete e processi, vedi Stato del server.",
+    "view_server_status": "Visualizza stato del server →",
+    "view_all": "Visualizza tutto",
+    "recent_users": "Utenti recenti",
+    "recent_domains": "Domini web recenti",
+    "recent_apps": "Applicazioni recenti",
+    "packages": "Pacchetti di hosting",
+    "empty": {
+      "users": "Ancora nessun utente",
+      "domains": "Ancora nessun dominio web",
+      "apps": "Ancora nessuna applicazione",
+      "packages": "Ancora nessun pacchetto"
+    },
+    "col": {
+      "username": "Nome utente",
+      "role": "Ruolo",
+      "domain": "Dominio",
+      "name": "Nome",
+      "type": "Tipo",
+      "ssh": "SSH"
+    },
+    "role": {
+      "admin": "Amministratore",
+      "user": "Utente"
+    },
+    "ssh": {
+      "on": "attivo",
+      "off": "disattivato"
+    },
+    "alert": {
+      "title_one": "{{count}} problema critico sull'host",
+      "title_many": "{{count}} problemi critici sull'host",
+      "title_other": "{{count}} problemi critici sull'host",
+      "action": "Apri Stato del server per approfondire →"
+    }
+  },
+  "users": {
+    "actions": {
+      "login_as": "Accedi come utente",
+      "edit": "Modifica",
+      "reset_password": "Reimposta password",
+      "suspend": "Sospendi",
+      "unsuspend": "Riattiva",
+      "delete": "Elimina"
+    },
+    "filter": {
+      "active": "Attivo",
+      "suspended": "Sospeso"
+    },
+    "empty": {
+      "users": "Ancora nessun utente"
+    },
+    "cta": {
+      "create_user": "Crea utente"
+    },
+    "col": {
+      "username": "Nome utente",
+      "name": "Nome",
+      "package": "Pacchetto",
+      "created": "Creato",
+      "disk_usage": "Utilizzo disco",
+      "actions": "Azioni"
+    },
+    "suspended": "Sospeso",
+    "tab": {
+      "users": "Utenti",
+      "admins": "Amministratori",
+      "sessions": "Sessioni"
+    }
+  },
+  "adminapplicationlist": {
+    "actions": "Azioni",
+    "created": "Creato",
+    "domain": "Dominio",
+    "owner": "Proprietario",
+    "status": "Stato",
+    "version": "Versione"
+  },
+  "adminauditlist": {
+    "action": "Azione",
+    "result": "Risultato",
+    "target": "Destinazione"
+  },
+  "adminautomationtokenspage": {
+    "actions": "Azioni",
+    "created": "Creato",
+    "last_used": "Ultimo utilizzo",
+    "name": "Nome",
+    "status": "Stato"
+  },
+  "backuplogstab": {
+    "status": "Stato",
+    "user_id": "ID utente"
+  },
+  "createbackupdrawer": {
+    "content": "Contenuto",
+    "create_backup": "Crea backup",
+    "destination": "Destinazione",
+    "type": "Tipo",
+    "user": "Utente"
+  },
+  "destinationstab": {
+    "actions": "Azioni",
+    "enabled": "Abilitato",
+    "name": "Nome"
+  },
+  "schedulestab": {
+    "actions": "Azioni",
+    "enabled": "Abilitato",
+    "last_run": "Ultima esecuzione",
+    "next_run": "Prossima esecuzione",
+    "users": "Utenti"
+  },
+  "fleetcachedoctor": {
+    "refresh": "Aggiorna",
+    "repair": "Ripara"
+  },
+  "admincreatecronmodal": {
+    "name": "Nome",
+    "schedule": "Pianificazione"
+  },
+  "admincronlist": {
+    "no_cron_jobs_yet": "Ancora nessun cron job"
+  },
+  "databaseuserdrawer": {
+    "username": "Nome utente"
+  },
+  "databaseuserslist": {
+    "actions": "Azioni",
+    "created": "Creato",
+    "user": "Utente"
+  },
+  "databasecreate": {
+    "name": "Nome"
+  },
+  "databaselist": {
+    "actions": "Azioni",
+    "created": "Creato",
+    "database": "Database",
+    "no_databases_yet": "Ancora nessun database",
+    "user_id": "ID utente"
+  },
+  "dnszonesoverviewpage": {
+    "actions": "Azioni",
+    "domain_name": "Nome dominio",
+    "expiration": "Scadenza",
+    "owner": "Proprietario"
+  },
+  "admindockerappspage": {
+    "running": "In esecuzione",
+    "stopped": "Arrestato"
+  },
+  "backupsdrawer": {
+    "backups": "Backup",
+    "restore": "Ripristina"
+  },
+  "editdrawer": {
+    "domain": "Dominio",
+    "memory": "Memoria",
+    "select_a_domain": "Seleziona un dominio"
+  },
+  "envsection": {
+    "copy": "Copia",
+    "regenerate": "Rigenera"
+  },
+  "installdrawer": {
+    "domain": "Dominio",
+    "memory": "Memoria",
+    "select_a_domain": "Seleziona un dominio"
+  },
+  "maintenancetab": {
+    "containers": "Container",
+    "disk_usage": "Utilizzo disco",
+    "images": "Immagini",
+    "volumes": "Volumi"
+  },
+  "domaincreate": {
+    "name": "Nome",
+    "select_a_user": "Seleziona un utente",
+    "user": "Utente"
+  },
+  "domaindirectoryprivacysection": {
+    "delete": "Elimina",
+    "password": "Password",
+    "path": "Percorso",
+    "user": "Utente",
+    "username": "Nome utente"
+  },
+  "domainedit": {
+    "name": "Nome"
+  },
+  "domainemailsection": {
+    "copy_value": "Copia valore"
+  },
+  "domainipaclsection": {
+    "action": "Azione",
+    "comment": "Commento",
+    "delete": "Elimina",
+    "priority": "Priorità"
+  },
+  "domainlist": {
+    "actions": "Azioni",
+    "domain": "Dominio",
+    "no_domains_yet": "Ancora nessun dominio web",
+    "status": "Stato",
+    "user": "Utente"
+  },
+  "domainmailboxessection": {
+    "create": "Crea",
+    "create_mailbox": "Crea casella di posta",
+    "domain": "Dominio",
+    "password": "Password"
+  },
+  "domainsslsection": {
+    "install": "Installa"
+  },
+  "adminiplist": {
+    "actions": "Azioni",
+    "address": "Indirizzo",
+    "default": "Predefinito",
+    "label": "Etichetta",
+    "status": "Stato"
+  },
+  "adminmailpage": {
+    "new_password": "Nuova password",
+    "set_password": "Imposta password"
+  },
+  "mailthrottlespage": {
+    "enabled": "Abilitato",
+    "scope": "Ambito"
+  },
+  "adminmigrationdetailpage": {
+    "ended": "Terminato",
+    "error": "Errore",
+    "last_error": "Ultimo errore",
+    "started": "Avviato"
+  },
+  "adminmigrationspage": {
+    "ended": "Terminato",
+    "source": "Origine",
+    "started": "Avviato",
+    "state": "Stato"
+  },
+  "createmigrationwizard": {
+    "review": "Rivedi"
+  },
+  "channelstab": {
+    "actions": "Azioni",
+    "enabled": "Abilitato",
+    "kind": "Tipo",
+    "name": "Nome"
+  },
+  "dlqtab": {
+    "clear": "Svuota"
+  },
+  "eventstab": {
+    "description": "Descrizione",
+    "enabled": "Abilitato",
+    "event": "Evento",
+    "severity": "Gravità"
+  },
+  "historytab": {
+    "clear": "Svuota",
+    "event": "Evento",
+    "read": "Leggi",
+    "severity": "Gravità",
+    "show_details": "Mostra dettagli",
+    "time": "Ora",
+    "title": "Titolo"
+  },
+  "packagecreate": {
+    "name": "Nome"
+  },
+  "packageedit": {
+    "name": "Nome"
+  },
+  "packagelist": {
+    "actions": "Azioni",
+    "created": "Creato",
+    "domains": "Domini",
+    "email": "Email",
+    "name": "Nome"
+  },
+  "phpextensionstab": {
+    "action": "Azione",
+    "installed": "Installato",
+    "status": "Stato"
+  },
+  "versionstab": {
+    "actions": "Azioni",
+    "default": "Predefinito",
+    "status": "Stato"
+  },
+  "phppooledit": {
+    "kind": "Tipo",
+    "value": "Valore"
+  },
+  "adminsecurityaide": {
+    "category": "Categoria",
+    "last_check": "Ultimo controllo",
+    "rebuild": "Ricostruisci"
+  },
+  "adminsecurityapparmor": {
+    "flip": "Inverti",
+    "mode": "Modalità"
+  },
+  "adminsecuritycrowdsec": {
+    "apply": "Applica",
+    "cancel": "Annulla",
+    "description": "Descrizione",
+    "duration": "Durata",
+    "enabled": "Abilitato",
+    "events": "Eventi",
+    "provider": "Provider",
+    "reason": "Motivo",
+    "remove": "Rimuovi",
+    "scope": "Ambito",
+    "source": "Origine",
+    "started": "Avviato",
+    "type": "Tipo",
+    "value": "Valore"
+  },
+  "adminsecurityegress": {
+    "actions": "Azioni",
+    "comment": "Commento",
+    "port": "Porta",
+    "reason": "Motivo",
+    "state": "Stato",
+    "user": "Utente"
+  },
+  "adminsecuritymalware": {
+    "filename": "Nome file",
+    "settings": "Impostazioni"
+  },
+  "adminsecuritysnuffleupagus": {
+    "action": "Azione",
+    "disable": "Disabilita"
+  },
+  "adminsecurityufw": {
+    "action": "Azione",
+    "cancel": "Annulla",
+    "continue": "Continua",
+    "delete": "Elimina",
+    "port": "Porta",
+    "status": "Stato"
+  },
+  "crowdsectestipcard": {
+    "unban": "Sblocca"
+  },
+  "egressmaturepromotion": {
+    "promote": "Promuovi"
+  },
+  "accountskeletoncard": {
+    "add": "Aggiungi",
+    "path": "Percorso"
+  },
+  "databaseadminsections": {
+    "actions": "Azioni",
+    "apply": "Applica",
+    "host": "Host",
+    "kill": "Termina",
+    "state": "Stato",
+    "time": "Ora",
+    "user": "Utente"
+  },
+  "nspawnimagescard": {
+    "version": "Versione"
+  },
+  "pagetemplatescard": {
+    "cancel": "Annulla",
+    "save": "Salva"
+  },
+  "panelsslcard": {
+    "hostname": "Nome host"
+  },
+  "stalwartwebadmincard": {
+    "done": "Fatto"
+  },
+  "webmailtogglecard": {
+    "webmail": "Webmail"
+  },
+  "dnsorphanrepaircard": {
+    "cancel": "Cancel",
+    "delete_all_orphan_records": "Delete all orphan records?",
+    "delete_permanently": "Delete permanently",
+    "no_orphan_records_found": "No orphan PowerDNS records found.",
+    "this_is_irreversible_it_removes_the_pdns_rows": "This is irreversible — it removes the orphaned PowerDNS rows (records, DNSSEC keys, metadata) and purges the pdns caches for the affected names. Scan first and review the list."
+  },
+  "domainrepaircard": {
+    "cancel": "Annulla",
+    "select_a_user": "Seleziona un utente"
+  },
+  "repaircard": {
+    "cancel": "Annulla",
+    "run": "Esegui"
+  },
+  "userreset2faaction": {
+    "reset": "Reimposta"
+  },
+  "userresetpasswordaction": {
+    "done": "Fatto",
+    "reset": "Reimposta"
+  },
+  "myprofile": {
+    "email": "Email",
+    "full_name": "Nome completo",
+    "member_since": "Membro dal",
+    "role": "Ruolo",
+    "security": "Sicurezza",
+    "user_id": "ID utente",
+    "username": "Nome utente"
+  },
+  "myprofilebackupcard": {
+    "destination": "Destinazione"
+  },
+  "myprofileschedulecard": {
+    "destination": "Destinazione"
+  },
+  "userdashboard": {
+    "databases": "Database",
+    "domains": "Domini web",
+    "mailboxes": "Caselle di posta"
+  },
+  "accountactivity": {
+    "result": "Risultato",
+    "target": "Destinazione"
+  },
+  "userapitokenspage": {
+    "create": "Crea",
+    "name": "Nome"
+  },
+  "cloneapplicationmodal": {
+    "select_a_domain": "Seleziona un dominio"
+  },
+  "installapplicationmodal": {
+    "copy": "Copia",
+    "domain": "Dominio",
+    "no_domains_yet": "Ancora nessun dominio",
+    "select_a_domain": "Seleziona un dominio"
+  },
+  "userapplicationlist": {
+    "actions": "Azioni",
+    "created": "Creato",
+    "domain": "Dominio",
+    "failed": "Non riuscito",
+    "in_progress": "In corso",
+    "ready": "Pronto"
+  },
+  "createcronmodal": {
+    "name": "Nome",
+    "schedule": "Pianificazione"
+  },
+  "quicksetupmodal": {
+    "copy": "Copia"
+  },
+  "userdatabasedrawer": {
+    "create_database": "Crea database",
+    "name": "Nome"
+  },
+  "userdatabaselist": {
+    "actions": "Azioni",
+    "created": "Creato",
+    "database": "Database",
+    "size": "Dimensione"
+  },
+  "userdnszonesoverviewpage": {
+    "actions": "Azioni",
+    "domain_name": "Nome dominio",
+    "expiration": "Scadenza"
+  },
+  "userdockerappspage": {
+    "running": "In esecuzione",
+    "stopped": "Arrestato"
+  },
+  "userdomaindrawer": {
+    "add_domain": "Aggiungi dominio",
+    "domain_name": "Nome dominio",
+    "document_root": "Radice del documento",
+    "document_root_hint": "Da dove vengono serviti i file di questo dominio. Lascia vuoto per il percorso predefinito. Deve restare all'interno della cartella di questo dominio."
+  },
+  "userdomainlist": {
+    "actions": "Azioni",
+    "domain": "Dominio",
+    "status": "Stato"
+  },
+  "filemanagerpage": {
+    "apply": "Applica",
+    "create": "Crea",
+    "move": "Sposta",
+    "rename": "Rinomina",
+    "save": "Salva"
+  },
+  "autoreplymodal": {
+    "save": "Salva"
+  },
+  "createmailboxwizardmodal": {
+    "create_mailbox": "Crea casella di posta",
+    "display_name": "Nome visualizzato",
+    "domain": "Dominio",
+    "email_address": "Indirizzo email",
+    "password": "Password",
+    "select_a_domain": "Seleziona un dominio"
+  },
+  "catchalltab": {
+    "domain": "Dominio",
+    "save": "Salva"
+  },
+  "disclaimertab": {
+    "edit": "Modifica",
+    "save": "Salva"
+  },
+  "forwarderstab": {
+    "add_forwarder": "Aggiungi inoltro",
+    "create": "Crea",
+    "remove": "Rimuovi",
+    "type": "Tipo"
+  },
+  "mailboxestab": {
+    "new_password": "Nuova password",
+    "no_mailboxes_yet": "Ancora nessuna casella",
+    "set_password": "Imposta password"
+  },
+  "sharedfolderstab": {
+    "remove": "Rimuovi",
+    "share": "Condividi"
+  },
+  "userphpsettingspage": {
+    "domain": "Dominio",
+    "select_a_domain": "Seleziona un dominio"
+  },
+  "pythonappspage": {
+    "create": "Crea",
+    "domain": "Dominio",
+    "name": "Nome",
+    "select_a_domain": "Seleziona un dominio",
+    "status": "Stato",
+    "type": "Tipo"
+  },
+  "usersshkeyspage": {
+    "add_ssh_key": "Aggiungi chiave SSH",
+    "name": "Nome",
+    "public_key": "Chiave pubblica",
+    "yes": "Sì"
+  },
+  "domainnginxoptionsmodal": {
+    "save": "Salva"
+  },
+  "notificationbell": {
+    "clear": "Svuota",
+    "notifications": "Notifiche"
+  },
+  "sslmanagertable": {
+    "status": "Stato",
+    "yes": "Sì"
+  },
+  "settings": {
+    "hostname": "Nome host",
+    "select_timezone": "Seleziona fuso orario",
+    "timezone": "Fuso orario"
+  }
+}

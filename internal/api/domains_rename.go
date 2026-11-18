@@ -1,0 +1,234 @@
+package api
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/dotnext-panel/dotnext/internal/domainops"
+	"github.com/dotnext-panel/dotnext/internal/ginctx"
+	"github.com/dotnext-panel/dotnext/internal/userops"
+)
+
+type renameDomainRequest struct {
+	Name string `json:"name" binding:"required"`
+}
+
+// rename renames an existing domain in place (GH #1579). Owner-scoped: a tenant
+// may rename their own domain, an admin any. Experimental. Mail is CARRIED to the
+// new name (the Stalwart registry domain is renamed in place, so mailboxes,
+// stored messages, and DKIM follow) and the per-domain mail cert is re-queued for
+// mail.<new>. A WordPress install's stored site URL IS rewritten to the new name
+// (best-effort); any install that could not be rewritten comes back in the
+// response `warnings` (surfaced by the UI). Other apps' internal config is
+// unchanged. The heavy lifting (gate, tombstone the old name, rename the row,
+// move + re-own the docroot, carry mail, rewrite app URLs, re-render) lives in
+// the shared userops.RenameDomain so any future CLI reuses it.
+func (h *domainHandler) rename(c *gin.Context) {
+	ctx := c.Request.Context()
+	domain, err := h.cfg.Domains.FindByID(ctx, c.Param("id"))
+	if err != nil {
+		if isNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthenticated"})
+		return
+	}
+	if !claims.IsAdmin && domain.UserID != claims.UserID {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
+
+	var req renameDomainRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_request"})
+		return
+	}
+	// Same normalize + RFC-shape validation the create source of truth runs, so
+	// a rename can never produce a name create would have rejected.
+	newName := normalizeDomainName(req.Name)
+	if verr := validateDomainName(newName); verr != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_name", "message": verr.Error()})
+		return
+	}
+	// GH #1625: a rename assigns a new domains.name too, so it must run the same
+	// cross-tenant hijack guard create does — the new name must not claim a
+	// server_name already held by another domain's web-domain alias. (The
+	// domain's own aliases survive the rename; they are keyed by domain_id.)
+	if hit, clash, cerr := AliasCollision(ctx, h.cfg.WebDomainAliases, newName); cerr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "db_alias_lookup", "message": "could not verify the domain name against existing aliases"})
+		return
+	} else if clash {
+		c.JSON(http.StatusConflict, gin.H{"error": "domain_conflicts_alias", "message": "the name " + hit + " is already used as an alias of another domain"})
+		return
+	}
+	// JAB-390: never the panel's custom mail hostname or a parent zone of it,
+	// whoever renames. Fail CLOSED on a lookup error.
+	if clash, cerr := MailHostnameCollision(ctx, h.cfg.ServerSettings, newName); cerr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "db_mail_hostname_lookup", "message": "could not verify the domain name against the panel mail hostname"})
+		return
+	} else if clash {
+		c.JSON(http.StatusConflict, gin.H{"error": "domain_conflicts_mail_hostname", "message": "the name conflicts with the panel's hostname or mail hostname"})
+		return
+	}
+	// GH #1789: an in-place rename to a subdomain of (or a parent over) another
+	// tenant's domain is the same cross-tenant DNS hijack the create path guards
+	// — rename foo.com → evil.example.com. Owner stays the domain's current owner;
+	// admins bypass (trusted delegation). Fail CLOSED on a lookup error.
+	if !claims.IsAdmin {
+		// Generic detail on purpose — see the create path (GH #1789): naming the
+		// conflicting domain would leak another tenant's zone/subdomain existence.
+		if _, clash, cerr := CrossTenantSuffixCollision(ctx, h.cfg.Domains, newName, domain.UserID); cerr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "db_suffix_lookup", "message": "could not verify the domain name against existing domains"})
+			return
+		} else if clash {
+			c.JSON(http.StatusConflict, gin.H{"error": "domain_conflicts_tenant", "message": "the name conflicts with a domain owned by another account"})
+			return
+		}
+	}
+
+	// GH #1816 / ADR-0170 section 5: the new name gets the create-time
+	// ownership decision. An unproven name is written pending BEFORE the row
+	// is renamed, so no reconcile pass ever sees the new name carrying the old
+	// name's proof; a failed rename restores the old name's state.
+	var finder domainops.AncestorFinder
+	if h.cfg.Domains != nil {
+		finder = h.cfg.Domains
+	}
+	dec, derr := domainops.PlanRenameOwnership(ctx, domainops.OwnershipDeps{
+		Domains: finder, Policy: ownershipPolicy(h.cfg.DomainOwnership),
+	}, domain, newName, claims.IsAdmin)
+	if errors.Is(derr, domainops.ErrRenameUnprovenMail) {
+		c.JSON(http.StatusConflict, gin.H{"error": "rename_requires_proven_name",
+			"message": "this domain's mail would move to " + newName + ", which is not proven yet — ask an administrator, or add " + newName + " as a new domain and prove it first"})
+		return
+	} else if derr != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	wasVerified := domain.Verified()
+	oldMethod, oldToken := domain.OwnershipMethod, domain.OwnershipToken
+	restoreOwnership := func() {}
+	if !dec.Verified {
+		if h.cfg.DomainOwnership == nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "ownership_unavailable", "message": "the new name needs an ownership proof, which is not available on this panel"})
+			return
+		}
+		token, terr := domainops.NewOwnershipToken()
+		if terr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+			return
+		}
+		now := time.Now().UTC()
+		if _, perr := h.cfg.DomainOwnership.MarkDomainPending(ctx, domain.ID, token, now, false, true); perr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+			return
+		}
+		if wasVerified {
+			restoreOwnership = func() {
+				if _, rerr := h.cfg.DomainOwnership.MarkDomainVerified(context.WithoutCancel(ctx), domain.ID, oldMethod, token, time.Now().UTC()); rerr != nil {
+					slog.Error("rename: restoring the ownership state after a failed rename", "domain_id", domain.ID, "err", rerr)
+				}
+			}
+		}
+	}
+
+	// *reconciler.Reconciler satisfies RenameReconciler, but pass it as a truly
+	// nil interface when unwired so RenameDomain's nil check holds (a typed-nil
+	// pointer in an interface is not == nil).
+	var rec userops.RenameReconciler
+	if h.cfg.Reconciler != nil {
+		rec = h.cfg.Reconciler
+	}
+
+	warnings, err := userops.RenameDomain(ctx, userops.Deps{
+		Domains:         h.cfg.Domains,
+		DomainTeardowns: h.cfg.DomainTeardowns,
+		Users:           h.cfg.Users,
+		Agent:           h.cfg.Agent,
+		// DNSZones + SSLCerts let the rename re-key the zone + reissue the web
+		// cert for the new name; MailCerts re-queues the per-domain mail cert for
+		// mail.<new>; AppInstalls lets it rewrite a WordPress install's stored site
+		// URL. Mail data is carried by the mail.domain.rename agent verb (via
+		// h.cfg.Agent), so no mailbox repo is needed here.
+		DNSZones:    h.cfg.DNSZones,
+		SSLCerts:    h.cfg.SSLCerts,
+		MailCerts:   h.cfg.MailCerts,
+		AppInstalls: h.cfg.AppInstalls,
+		// FtpAccounts backs the refusal when an FTP/SFTP subaccount is homed
+		// under the docroot being moved (its jail/chroot is not moved here).
+		FtpAccounts: h.cfg.FtpAccounts,
+		// DMARC / TLSRPT move the domain's aggregate report history onto the new
+		// name so those dashboards are not orphaned.
+		DMARC:  h.cfg.DMARCAggregate,
+		TLSRPT: h.cfg.TLSRPTAggregate,
+		// Forwarders rewrites alias forwarder targets to the new name.
+		Forwarders: h.cfg.Forwarders,
+		// Settings gates the mail-carry verb on ServerSettings.MailEnabled so a
+		// rename on a server without the mail module installed skips the Stalwart
+		// call instead of failing on the absent admin token (GH #1579).
+		Settings: h.cfg.ServerSettings,
+		Log:      slog.Default(),
+	}, rec, domain, newName)
+	if err != nil {
+		restoreOwnership()
+		var re *userops.RenameError
+		if errors.As(err, &re) {
+			c.JSON(renameHTTPStatus(re.Code), gin.H{"error": re.Code, "message": re.Message})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+
+	// A pending domain renamed to a name the decision proves (an admin rename,
+	// or a verified parent of the owner's) is verified now.
+	if dec.Verified && !wasVerified && h.cfg.DomainOwnership != nil {
+		if _, verr := h.cfg.DomainOwnership.MarkDomainVerified(ctx, domain.ID, dec.Method, oldToken, time.Now().UTC()); verr != nil {
+			slog.Error("rename: recording the new name's ownership", "domain_id", domain.ID, "err", verr)
+		}
+		if h.cfg.Reconciler != nil {
+			h.cfg.Reconciler.Schedule(domain.ID)
+		}
+	}
+
+	// warnings carries any best-effort app-URL rewrite that did not complete —
+	// the rename itself succeeded. Always an array (never null) so the client
+	// can render it uniformly.
+	if warnings == nil {
+		warnings = []string{}
+	}
+	c.JSON(http.StatusOK, gin.H{"id": domain.ID, "name": domain.Name, "doc_root": domain.DocRoot, "warnings": warnings})
+}
+
+// renameHTTPStatus maps a RenameError code to an HTTP status. Gate/validation
+// reasons are 4xx; an infrastructure failure while carrying out the rename
+// (moving files, or persisting the row) is 5xx and re-runnable — the file move
+// and the row rename are ordered so a retry finishes cleanly.
+func renameHTTPStatus(code string) int {
+	switch code {
+	case "invalid_name", "noop", "custom_docroot", "ambiguous_docroot":
+		return http.StatusBadRequest
+	case "mail_domain_conflict", "panel_primary", "web_disabled", "rename_requires_proven_name",
+		"ssl_custom_cert", "name_taken", "owner_unprovisioned", "owner_unresolved",
+		"ftp_subaccounts":
+		return http.StatusConflict
+	case "not_found":
+		return http.StatusNotFound
+	case "unavailable", "ftp_check_failed":
+		return http.StatusServiceUnavailable
+	default: // persist_failed, move_failed, lookup_failed
+		return http.StatusInternalServerError
+	}
+}

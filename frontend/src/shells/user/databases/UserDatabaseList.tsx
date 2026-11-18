@@ -1,0 +1,438 @@
+// UserDatabaseList — tenant view of their databases with Quick Setup
+// + Open-in-phpMyAdmin + Delete. phpMyAdmin SSO is wired through the
+// apiClient helper; a blank tab is opened synchronously to dodge
+// popup blockers while the SSO call runs.
+// GH #1045: per-database Backup/Restore actions (download a one-shot
+// dump; restore from an uploaded .sql file) for both MariaDB (mariadb-dump
+// / mysql) and PostgreSQL (pg_dump / privilege-scoped psql loader).
+import { useTranslation } from "react-i18next";
+import { useRef, useState, type ChangeEvent } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { Button, Card, Space, Table, Typography } from "antd";
+import { feedback } from "../../../lib/feedback"; // GH #970: themed toasts
+import { openSsoTab, sendSsoTab } from "../../../lib/ssoTab";
+import { getIdentity } from "../../../identity";
+import {
+  DatabaseOutlined,
+  LinkOutlined,
+  DeleteOutlined,
+  PlusSquareOutlined,
+  ThunderboltOutlined,
+  DownloadOutlined,
+  UploadOutlined,
+} from "@icons";
+import { sorterToParams } from "../../../utils/tableSorter";
+
+import {
+  downloadDatabaseBackup,
+  restoreDatabaseUploadAuto,
+  ssoAdminer,
+  ssoPhpMyAdmin,
+} from "../../../apiClient";
+import { EngineTag } from "../../../components/EngineTag";
+import { RowActions } from "../../../components/RowActions";
+import { columnSearchProps } from "../../../components/columnSearch";
+import { SearchableTableStringQ } from "../../../components/SearchableTable";
+import { useDeleteMutation } from "../../../hooks/useQueries";
+import { useTableURL } from "../../../hooks/useTableURL";
+import { QuickSetupModal } from "./QuickSetupModal";
+import { UserDatabaseDrawer } from "./UserDatabaseDrawer";
+import {
+  RestoreProgressModal,
+  type RestoreProgress,
+} from "./RestoreProgressModal";
+import { Timestamp } from "../../../components/Timestamp";
+
+export type Database = {
+  id: string;
+  user_id: string;
+  name: string;
+  engine: "mariadb" | "postgres";
+  charset?: string;
+  collation?: string;
+  created_at: string;
+  updated_at: string;
+  size_bytes?: number;
+};
+
+const formatBytes = (bytes: number | undefined): string => {
+  if (bytes === undefined || bytes === 0) return "0 B";
+
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let size = bytes;
+  let unitIndex = 0;
+
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex++;
+  }
+
+  if (unitIndex === 0) {
+    return `${Math.floor(size)} B`;
+  }
+  return `${size.toFixed(1)} ${units[unitIndex]}`;
+};
+
+export const UserDatabaseList = () => {
+  const { t } = useTranslation();
+  const qc = useQueryClient();
+  const query = useTableURL<Database>({
+    resource: "databases",
+    defaultSort: "name",
+    defaultOrder: "asc",
+  });
+  const deleteMutation = useDeleteMutation({ resource: "databases" });
+
+  const [loadingAdminerId, setLoadingAdminerId] = useState<string | null>(null);
+  const [loadingPhpMyAdminId, setLoadingPhpMyAdminId] = useState<string | null>(
+    null,
+  );
+  const [loadingBackupId, setLoadingBackupId] = useState<string | null>(null);
+  const [restoringId, setRestoringId] = useState<string | null>(null);
+  // GH #1044: drives the upload+restore progress modal for "Restore from file".
+  const [restoreProgress, setRestoreProgress] = useState<RestoreProgress | null>(
+    null,
+  );
+  const [quickSetupOpen, setQuickSetupOpen] = useState(false);
+  const [createDrawerOpen, setCreateDrawerOpen] = useState(false);
+  // Hidden file input for "Restore from file" — the row action only
+  // records which database is the target and clicks this input; the
+  // upload happens in its onChange. Kept as a ref (not state) because
+  // the target row is only needed between the click and the change
+  // event, never for rendering.
+  const restoreInputRef = useRef<HTMLInputElement | null>(null);
+  const restoreTargetRef = useRef<Database | null>(null);
+
+  const handleTableChange: React.ComponentProps<
+    typeof Table<Database>
+  >["onChange"] = (pagination, _filters, sorter) => {
+    const { sort, order } = sorterToParams<Database>(sorter);
+    query.setParams({
+      page: pagination.current ?? 1,
+      pageSize: pagination.pageSize ?? 20,
+      sort,
+      order,
+    });
+  };
+
+  // openConsole opens phpMyAdmin or Adminer in a new tab through lib/ssoTab:
+  // the blank tab opens with the click and is cut off from the panel before
+  // the one-time link is minted; a blocked tab mints nothing.
+  const openConsole = async (
+    row: Database,
+    label: string,
+    mint: (databaseId: string) => Promise<{ redirect_url: string }>,
+    setLoadingId: (id: string | null) => void,
+  ) => {
+    const tab = openSsoTab(
+      `Browser blocked the ${label} tab — allow popups for this site and click again.`,
+    );
+    if (!tab) return;
+    try {
+      setLoadingId(row.id);
+      const response = await mint(row.id);
+      if (!sendSsoTab(tab, response.redirect_url)) {
+        feedback.message.error(`Could not open ${label}`);
+      }
+    } catch (error) {
+      tab.close();
+      const errorMsg =
+        error instanceof Error ? error.message : `Could not open ${label}`;
+      feedback.message.error(`Could not open ${label}: ${errorMsg}`);
+    } finally {
+      setLoadingId(null);
+    }
+  };
+
+  const handleOpenPhpMyAdmin = (row: Database) =>
+    openConsole(row, "phpMyAdmin", ssoPhpMyAdmin, setLoadingPhpMyAdminId);
+
+  const handleOpenAdminer = (row: Database) =>
+    openConsole(row, "Adminer", ssoAdminer, setLoadingAdminerId);
+
+  const handleDownloadBackup = async (row: Database) => {
+    try {
+      setLoadingBackupId(row.id);
+      const { blob, filename } = await downloadDatabaseBackup(row.id);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (error) {
+      const errorMsg =
+        error instanceof Error ? error.message : "Backup failed";
+      feedback.message.error(`Backup failed: ${errorMsg}`);
+    } finally {
+      setLoadingBackupId(null);
+    }
+  };
+
+  const handlePickRestore = (row: Database) => {
+    restoreTargetRef.current = row;
+    restoreInputRef.current?.click();
+  };
+
+  const handleRestoreFile = async (
+    e: ChangeEvent<HTMLInputElement>,
+  ) => {
+    const file = e.target.files?.[0];
+    // Reset the input value so picking the same file twice in a row
+    // still fires onChange the second time.
+    e.target.value = "";
+    const row = restoreTargetRef.current;
+    if (!file || !row) return;
+    // GH #1044: fail fast + clearly when the dump is over the configured cap,
+    // instead of a slow upload that 413s at the app, nginx, or Cloudflare. The
+    // cap mirrors the File Manager's server_settings.upload_max_size_mb.
+    const id = await getIdentity().catch(() => null);
+    const capMb = id?.uploadMaxSizeMb && id.uploadMaxSizeMb > 0 ? id.uploadMaxSizeMb : 1024;
+    if (file.size > capMb * 1024 * 1024) {
+      feedback.message.error(
+        `"${file.name}" is ${Math.ceil(file.size / (1024 * 1024))} MB — over the ${capMb} MB restore cap ` +
+          `(raise it in Server Settings → Uploads). A larger upload may also be blocked upstream by nginx ` +
+          `(Server Settings → Nginx) or Cloudflare.`,
+      );
+      return;
+    }
+    // GH #1044: show a File-Manager-style progress modal instead of a blind
+    // wait. The upload leg reports real progress/speed/ETA; the restore leg is
+    // indeterminate (the server emits no further events once the body is up).
+    setRestoringId(row.id);
+    setRestoreProgress({
+      dbName: row.name,
+      fileName: file.name,
+      fileSize: file.size,
+      phase: "uploading",
+      loaded: 0,
+    });
+    try {
+      await restoreDatabaseUploadAuto(row.id, file, (pr) => {
+        setRestoreProgress((prev) =>
+          prev
+            ? {
+                ...prev,
+                // Once the body is fully sent, flip to the restoring leg.
+                phase: pr.frac >= 1 ? "restoring" : "uploading",
+                loaded: pr.loaded,
+                rate: pr.rate,
+                estimated: pr.estimated,
+              }
+            : prev,
+        );
+      });
+      setRestoreProgress((prev) =>
+        prev ? { ...prev, phase: "success" } : prev,
+      );
+      // Size changed — refresh the listing.
+      qc.invalidateQueries({ queryKey: ["list", "databases"] });
+    } catch (error) {
+      const errorMsg =
+        error instanceof Error ? error.message : "Restore failed";
+      setRestoreProgress((prev) =>
+        prev ? { ...prev, phase: "error", errorMessage: errorMsg } : prev,
+      );
+    } finally {
+      setRestoringId(null);
+    }
+  };
+
+  return (
+    <div>
+      <input
+        ref={restoreInputRef}
+        type="file"
+        accept=".sql"
+        style={{ display: "none" }}
+        onChange={(e) => {
+          void handleRestoreFile(e);
+        }}
+      />
+      <Space
+        style={{
+          marginBottom: 16,
+          width: "100%",
+          justifyContent: "space-between",
+          flexWrap: "wrap",
+          rowGap: 8,
+        }}
+      >
+        <Typography.Title level={3} style={{ margin: 0 }}>
+          <DatabaseOutlined /> Databases
+        </Typography.Title>
+        <Space wrap>
+          <Button
+            icon={<ThunderboltOutlined />}
+            onClick={() => setQuickSetupOpen(true)}
+          >
+            Quick Setup
+          </Button>
+          <Button
+            type="primary"
+            icon={<PlusSquareOutlined />}
+            onClick={() => setCreateDrawerOpen(true)}
+          >
+            Create Database
+          </Button>
+        </Space>
+      </Space>
+
+      <QuickSetupModal
+        open={quickSetupOpen}
+        onClose={() => setQuickSetupOpen(false)}
+        onSuccess={() =>
+          qc.invalidateQueries({ queryKey: ["list", "databases"] })
+        }
+      />
+
+      <UserDatabaseDrawer
+        open={createDrawerOpen}
+        onClose={() => setCreateDrawerOpen(false)}
+      />
+
+      <RestoreProgressModal
+        progress={restoreProgress}
+        onClose={() => setRestoreProgress(null)}
+      />
+
+      <Card>
+        <SearchableTableStringQ<Database>
+          rowKey="id"
+          loading={query.isLoading}
+          dataSource={query.items}
+          initialSearch={query.params.q}
+          searchPlaceholder="Search by database name"
+          onSearchChange={(q) => query.setParams({ q, page: 1 })}
+          pagination={{
+            current: query.params.page,
+            pageSize: query.params.pageSize,
+            total: query.total,
+          }}
+          onChange={handleTableChange}
+        >
+          <Table.Column<Database>
+            dataIndex="name"
+            title={t("userdatabaselist.database")}
+            key="name"
+            sorter
+            defaultSortOrder="ascend"
+            {...columnSearchProps<Database>({
+              placeholder: "Search by database name",
+              currentQ: query.params.q,
+              onSearch: (v) => query.setParams({ q: v, page: 1 }),
+            })}
+          />
+          <Table.Column<Database>
+            dataIndex="engine"
+            title={t("userdatabaselist.engine")}
+            width={140}
+            render={(engine: string) => <EngineTag engine={engine} />}
+          />
+          <Table.Column<Database>
+            dataIndex="size_bytes"
+            title={t("userdatabaselist.size")}
+            key="size_bytes"
+            sorter={{ multiple: 3 }}
+            render={(size_bytes?: number) => formatBytes(size_bytes)}
+          />
+          <Table.Column<Database>
+            dataIndex="charset"
+            title={t("userdatabaselist.charset")}
+            render={(charset?: string) => charset || "-"}
+          />
+          <Table.Column<Database>
+            dataIndex="created_at"
+            title={t("userdatabaselist.created")}
+            key="created_at"
+            sorter
+            render={(date: string) => <Timestamp value={date} />}
+          />
+          <Table.Column<Database>
+            title={t("userdatabaselist.actions")}
+            dataIndex="actions"
+            render={(_, r) => {
+              const isPostgres = r.engine === "postgres";
+              const isLoading = loadingPhpMyAdminId === r.id;
+              const isAdminerLoading = loadingAdminerId === r.id;
+
+              const pmaAction = {
+                key: "pma",
+                label: "Open in phpMyAdmin",
+                icon: <LinkOutlined />,
+                onClick: () => handleOpenPhpMyAdmin(r),
+                disabled: isPostgres || isLoading,
+                loading: isLoading,
+                tooltip: isPostgres ? "phpMyAdmin supports MySQL/MariaDB only" : undefined,
+              };
+              const adminerAction = {
+                key: "adminer",
+                label: "Open in Adminer",
+                icon: <LinkOutlined />,
+                onClick: () => handleOpenAdminer(r),
+                disabled: isAdminerLoading,
+                loading: isAdminerLoading,
+              };
+              // GH #1045 — per-database backup/restore for both engines.
+              // Download uses mariadb-dump / pg_dump; restore loads the uploaded
+              // dump through a db-scoped, unprivileged account (MariaDB shadow
+              // user, or the Postgres scoped shadow role over scram) so tenant
+              // SQL can never exceed its own database.
+              const backupAction = {
+                key: "backup",
+                label: "Download backup",
+                icon: <DownloadOutlined />,
+                onClick: () => void handleDownloadBackup(r),
+                disabled: loadingBackupId === r.id,
+                loading: loadingBackupId === r.id,
+              };
+              const restoreAction = {
+                key: "restore",
+                label: "Restore from file",
+                icon: <UploadOutlined />,
+                onClick: () => handlePickRestore(r),
+                disabled: restoringId === r.id,
+                loading: restoringId === r.id,
+                confirm: {
+                  title: `Restore into "${r.name}"?`,
+                  // Postgres restore resets the whole database (drop + rebuild
+                  // from the dump); MariaDB overwrites the dump's own tables.
+                  description: isPostgres
+                    ? "This REPLACES the entire database — all current data in it is dropped and rebuilt from the uploaded dump."
+                    : "The uploaded dump runs against this database — existing tables with the same names are overwritten.",
+                  okText: "Choose .sql file",
+                },
+              };
+              // Adminer is the native admin tool for Postgres (phpMyAdmin
+              // is MariaDB-only and shows disabled), so lead with it there;
+              // MariaDB keeps phpMyAdmin first. (GH #1005)
+              const dbTools = isPostgres
+                ? [adminerAction, pmaAction]
+                : [pmaAction, adminerAction];
+
+              return (
+                <RowActions
+                  actions={[
+                    ...dbTools,
+                    backupAction,
+                    restoreAction,
+                    {
+                      key: "delete",
+                      label: "Delete",
+                      icon: <DeleteOutlined />,
+                      danger: true,
+                      onClick: () => { void deleteMutation.mutateAsync({ id: r.id }); },
+                      confirm: { title: `Delete database "${r.name}"?`, okText: "Delete" },
+                    },
+                  ]}
+                />
+              );
+            }}
+          />
+        </SearchableTableStringQ>
+      </Card>
+    </div>
+  );
+};

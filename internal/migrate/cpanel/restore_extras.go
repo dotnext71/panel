@@ -1,0 +1,1108 @@
+// restore_extras.go — M35.8 P2/P5 "everything else" writers.
+//
+// Covered:
+//   * Catch-all addresses    (cpanel: <home>/etc/<dom>/aliases line "*: target")
+//   * Subdomains             (cpanel: SUB_DOMAINS=<sub.dom>,<sub.dom>,... in cp/<user>)
+//
+// Recorded-as-warning (no agent endpoint yet — operator follow-up):
+//   * External forwarders    (M6.5 forwarders schema needs MailboxID; cpanel
+//                             aliases can target external mail; not 1:1)
+//   * Per-mailbox autoresponders (need post-mailbox-create id lookup)
+//   * Sieve filters
+//   * Per-domain custom SSL certs (LE auto-issue picks up once nginx vhost
+//                                  exists; warning records source cert path)
+//   * Per-domain PHP version  (needs per-domain pool create — deferred)
+//   * FTP accounts            (deprecated in favour of SFTP keys)
+
+package cpanel
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/dotnext-panel/dotnext/internal/agent"
+	"github.com/dotnext-panel/dotnext/internal/forwarderops"
+	"github.com/dotnext-panel/dotnext/internal/ids"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/redirects"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+)
+
+// ExtrasResult is the per-area counter set returned from ImportExtras.
+// Counters are summed into the parent restore manifest by the caller.
+type ExtrasResult struct {
+	CatchallsSet           int      // domains where catchall_target was written
+	SubdomainsDetected     int      // JAB-220: subdomains found on the source (created + skipped)
+	SubdomainsCreated      int      // panel domain rows added for those subdomains
+	ForwardersCreated      int      // mail forwarder rows added (M6.5)
+	ForwardersOrphaned     int      // alias lines whose local mailbox isn't in panel
+	AutorespondersCreated  int      // vacation auto-replies restored (M6.5)
+	AutorespondersOrphaned int      // .autorespond entries whose mailbox isn't in panel
+	PHPVersionApplied      string   // first version applied at user-pool level (legacy)
+	PHPVersionsDetected    string   // JAB-218: source spread, e.g. "7.4x3,8.1x1" ("none" if the source recorded nothing)
+	PHPPoolsCreated        int      // distinct (user, version) FPM pools created (M35.8 P6)
+	PHPDomainsBound        int      // domains whose php_pool_id was set to a per-version pool
+	FTPAccountsObserved    int      // cpanel ftp accounts seen on source (record-only)
+	DKIMKeysPreserved      int      // legacy DKIM keys copied to sidecar storage
+	FiltersImported        int      // per-mailbox Sieve/cpanel inbox rules
+	Skipped                []string // human-readable reasons (mirrors other restore writers)
+}
+
+// ImportExtras walks the parsed cpmove + reads cpanel meta files for
+// the bits that don't have a dedicated restore_*.go writer yet.
+// All operations are idempotent on rerun.
+func ImportExtras(
+	ctx context.Context,
+	domainsRepo repository.DomainRepository,
+	mailboxesRepo repository.MailboxRepository,
+	forwardersRepo repository.EmailForwarderRepository,
+	autoRespondersRepo repository.EmailAutoresponderRepository,
+	filtersRepo repository.EmailFilterRepository,
+	poolsRepo repository.PHPPoolRepository,
+	agentCli agent.AgentInterface,
+	parsed *ParsedTarball,
+	targetUserID, targetUsername string,
+	preserveMailRouting bool,
+) (*ExtrasResult, error) {
+	if parsed == nil {
+		return nil, fmt.Errorf("ImportExtras: parsed nil")
+	}
+	res := &ExtrasResult{}
+
+	// Discover the userdata file. PeekAccountMeta already searched
+	// the same candidates; reuse its discovery to find the cpanel-
+	// owner's primary-userdata file (cp/<user>) — that's where
+	// SUB_DOMAINS lives.
+	userdataPath := findUserdataFile(parsed.ExtractDir, parsed.SourceUser)
+
+	// ---- P5: subdomains ----
+	{
+		subs := detectSubDomains(parsed, userdataPath)
+		res.SubdomainsDetected = len(subs)
+		// A subdomain that backs an addon domain served the addon's site on
+		// cPanel; its files now go to the addon's docroot, so it is created
+		// as a 301 to the addon instead of a blank page (addon_domains.go).
+		addons, addonWarnings := AddonDomainsBySubdomain(parsed)
+		res.Skipped = append(res.Skipped, addonWarnings...)
+		for _, n := range subs {
+			if n == "" {
+				continue
+			}
+			if _, err := domainsRepo.FindByName(ctx, n); err == nil {
+				res.Skipped = append(res.Skipped, "subdomain_skip:already_exists:"+n)
+				continue
+			}
+			domainID := ids.NewULID()
+			// dotnext convention — and, more to the point, exactly where
+			// ImportHomeSplit rsynced this subdomain's files. The previous
+			// /home/<user>/public_html/<sub> mirrored the cpanel source layout,
+			// so even a subdomain that got created would have pointed its vhost
+			// at an empty directory (JAB-220). parsed.DocRoots wins when the
+			// source resolved a path itself, matching ImportDomains' docRootFor.
+			docRoot := filepath.Join("/home", targetUsername, "domains", n, "public_html")
+			if parsed.DocRoots != nil {
+				if override, ok := parsed.DocRoots[n]; ok && override != "" {
+					docRoot = override
+				}
+			}
+			now := time.Now()
+			d := &models.Domain{
+				ID:            domainID,
+				UserID:        targetUserID,
+				Name:          n,
+				DocRoot:       docRoot,
+				IsEnabled:     true,
+				IndexPriority: "html_first",
+				GhostState:    "unchecked",
+				CreatedAt:     now,
+				UpdatedAt:     now,
+			}
+			createParams := map[string]any{
+				"domain_id":      domainID,
+				"domain":         n,
+				"username":       targetUsername,
+				"doc_root":       docRoot,
+				"index_priority": "html_first",
+			}
+			if addon := addons[n]; addon != "" {
+				// Set on the row at create (a later Update's column allowlist
+				// could drop it) and rendered into the vhost now, rather than
+				// serving an empty docroot until the reconciler's next pass.
+				to, typ := "https://"+addon+"/", "301"
+				d.RedirectAllTo, d.RedirectAllType = &to, &typ
+				createParams["redirect_directives"] = redirects.Compile(d)
+				res.Skipped = append(res.Skipped, fmt.Sprintf(
+					"subdomain_redirect:%s → %s (backing subdomain of cPanel addon domain %s)", n, to, addon))
+			}
+			if _, err := agentCli.Call(ctx, "domain.create", createParams); err != nil {
+				res.Skipped = append(res.Skipped, fmt.Sprintf("subdomain_skip:agent_create:%s:%v", n, err))
+				continue
+			}
+			if err := markMigratedOwnership(d, now); err != nil {
+				res.Skipped = append(res.Skipped, fmt.Sprintf("subdomain_skip:ownership_token:%s:%v", n, err))
+				continue
+			}
+			if err := domainsRepo.Create(ctx, d); err != nil {
+				res.Skipped = append(res.Skipped, fmt.Sprintf("subdomain_skip:db_create:%s:%v", n, err))
+				continue
+			}
+			res.SubdomainsCreated++
+		}
+	}
+
+	// ---- P2: catch-all from <homedir>/etc/<dom>/aliases ----
+	// Format: lines like `address: target` or `*: target` (where
+	// asterisk = the catch-all). We only consume the catch-all row;
+	// forwarder rows are recorded as warnings (M6.5 schema needs a
+	// MailboxID which we'd have to invent here).
+	//
+	// Imported forwarders only reach Stalwart via forwarder.apply; the DB row
+	// alone does nothing (GH #1795 follow-up). Collect the mailboxes whose
+	// forwarders were created enabled and converge them after the walk.
+	convergeFwds := map[string]string{}
+	if parsed.HomeDir != "" {
+		etcDir := filepath.Join(parsed.HomeDir, "etc")
+		if doms, derr := os.ReadDir(etcDir); derr == nil {
+			for _, d := range doms {
+				if !d.IsDir() || strings.HasPrefix(d.Name(), ".") {
+					continue
+				}
+				domName := d.Name()
+				aliasFile := filepath.Join(etcDir, domName, "aliases")
+				ct, fwds, sk := parseAliases(aliasFile)
+				if ct != "" {
+					dom, err := domainsRepo.FindByName(ctx, domName)
+					if err != nil {
+						res.Skipped = append(res.Skipped, fmt.Sprintf("catchall_skip:domain_missing:%s", domName))
+					} else if !preserveMailRouting {
+						// JAB-46: don't auto-route unknown-address mail to an
+						// imported catch-all (attacker-controllable if the source
+						// was compromised). Quarantine — leave the catch-all unset;
+						// the operator re-applies it in the Mail tab if trusted.
+						res.Skipped = append(res.Skipped, fmt.Sprintf("catchall_quarantined:%s→%s", domName, ct))
+					} else if uErr := domainsRepo.UpdateCatchallTarget(ctx, dom.ID, &ct); uErr != nil {
+						res.Skipped = append(res.Skipped, fmt.Sprintf("catchall_skip:db_update:%s:%v", domName, uErr))
+					} else {
+						res.CatchallsSet++
+					}
+				}
+				// Forwarder rows — M6.5 EmailForwarder needs both
+				// MailboxID + DomainID. Look up by `<local>@<dom>` to
+				// find the source mailbox; skip the line when no
+				// matching panel mailbox exists (cpanel allows forwards
+				// without a local mailbox, dotnext doesn't).
+				// A source whose target set includes its own address uses the
+				// cpanel "keep a local copy" idiom (forward out AND deliver
+				// locally). Map that to KeepCopy on the source's external rows;
+				// the self entry itself is not a forward destination.
+				keepCopyLocal := map[string]bool{}
+				for _, f := range fwds {
+					if strings.EqualFold(f.Target, f.Local+"@"+domName) {
+						keepCopyLocal[f.Local] = true
+					}
+				}
+				for _, f := range fwds {
+					if mailboxesRepo == nil || forwardersRepo == nil {
+						res.Skipped = append(res.Skipped, "forwarders_skip:repos_unwired")
+						break
+					}
+					local := f.Local
+					target := f.Target
+					if local == "" || target == "" {
+						continue
+					}
+					srcEmail := local + "@" + domName
+					if strings.EqualFold(target, srcEmail) {
+						// keep-copy marker, folded into keepCopyLocal above.
+						continue
+					}
+					mb, mErr := mailboxesRepo.FindByEmail(ctx, srcEmail)
+					if mErr != nil || mb == nil {
+						res.ForwardersOrphaned++
+						res.Skipped = append(res.Skipped, fmt.Sprintf("forwarder_orphan:%s→%s (no local mailbox)", srcEmail, target))
+						continue
+					}
+					fwd := &models.EmailForwarder{
+						ID:        ids.NewULID(),
+						MailboxID: &mb.ID,
+						DomainID:  mb.DomainID,
+						Type:      "external",
+						// local_part stays NULL for type='external' — the source is
+						// the mailbox (MailboxID), matching api.create and the model.
+						// Setting it non-NULL wrongly consumes the uq_alias_local
+						// (domain_id, local_part) slot, which the migration reserves
+						// for aliases: two external forwards off the same source local
+						// (or a later same-local alias) then collide and get dropped.
+						Target:    target,
+						KeepCopy:  keepCopyLocal[local],
+						Enabled:   preserveMailRouting, // JAB-46: inert unless opted in
+						ManagedBy: "m35",
+					}
+					if cErr := forwardersRepo.Create(ctx, fwd); cErr != nil {
+						res.Skipped = append(res.Skipped, fmt.Sprintf("forwarder_skip:create:%s→%s:%v", srcEmail, target, cErr))
+						continue
+					}
+					res.ForwardersCreated++
+					if fwd.Enabled {
+						// Enabled (preserveMailRouting). Needs a Stalwart Sieve push,
+						// keyed on the MAILBOX's own canonical address (what
+						// accountIDByEmail resolves), not the alias source line.
+						email := mb.EmailCached
+						if email == "" {
+							email = srcEmail
+						}
+						convergeFwds[mb.ID] = email
+					}
+				}
+				res.Skipped = append(res.Skipped, sk...)
+			}
+		}
+	}
+
+	// Push the imported enabled forwarders to Stalwart. Best-effort: the DB row
+	// is authoritative, so a transient agent failure is recorded and the operator
+	// re-saves the forwarder to retry (GH #1795 follow-up). Converge is nil-safe
+	// (nil agent/repo → no-op), so no guard is needed here.
+	for mbID, email := range convergeFwds {
+		// Pass the autoresponder repo so a mailbox imported with BOTH a forward
+		// and an autoresponder gets the full composite immediately, not
+		// forwards-only until the reconcile sweep catches it. Converge is
+		// nil-safe, and the sweep still re-asserts drift later (GH #1795).
+		if cErr := forwarderops.Converge(ctx, agentCli, forwardersRepo, autoRespondersRepo, mbID, email); cErr != nil {
+			res.Skipped = append(res.Skipped, fmt.Sprintf("forwarder_converge:%s:%v", email, cErr))
+		}
+	}
+
+	// ---- P4: per-domain PHP version ----
+	// cpanel writes per-domain `<dom>.php-fpm.yaml` with `phpversion:
+	// ea-php82`. Schema migration 000129 allows multiple FPM pools
+	// per user (one per version) so each domain can keep its source
+	// version. For each distinct version: ensure (user, version)
+	// pool exists via php.pool.apply, then bind every domain in
+	// that group to that pool via SetPHPPoolID.
+	if agentCli != nil && poolsRepo != nil && domainsRepo != nil {
+		byVersion := detectPHPVersionsPerDomain(parsed)
+		// JAB-218: record the source spread BEFORE any binding, so the summary
+		// distinguishes "the source ran one PHP version" from "we detected
+		// nothing and every domain silently inherited the box default" — the
+		// two used to look identical (`php_version=`), which is how 39 PHP-7.4
+		// sites landed on 8.4 without anyone noticing until they 500'd.
+		res.PHPVersionsDetected = summarisePHPVersionSpread(byVersion)
+		if len(byVersion) == 0 {
+			res.Skipped = append(res.Skipped,
+				"php_version_detect:source recorded no per-domain PHP version — every domain will run the box default")
+		}
+		seenVersions := map[string]string{} // version → pool_id
+		for version, doms := range byVersion {
+			if version == "" {
+				continue
+			}
+			// Look up or insert the (user, version) pool DB row first.
+			// Agent's php.pool.apply only writes FPM config; the panel
+			// row is the source of truth domains.SetPHPPoolID references.
+			pool, lookupErr := poolsRepo.FindByUserAndVersion(ctx, targetUserID, version)
+			if lookupErr != nil && !errors.Is(lookupErr, repository.ErrNotFound) {
+				res.Skipped = append(res.Skipped, fmt.Sprintf("php_pool_lookup_skip:%s:%v", version, lookupErr))
+				continue
+			}
+			if pool == nil {
+				now := time.Now().UTC()
+				pool = &models.PHPPool{
+					ID:                        ids.NewULID(),
+					UserID:                    targetUserID,
+					PHPVersion:                version,
+					PmMode:                    "ondemand",
+					PmMaxChildren:             20,
+					ProcessIdleTimeoutSeconds: 60,
+					Status:                    "pending",
+					CreatedAt:                 now,
+					UpdatedAt:                 now,
+				}
+				if cErr := poolsRepo.Create(ctx, pool); cErr != nil {
+					res.Skipped = append(res.Skipped, fmt.Sprintf("php_pool_create_skip:%s:%v", version, cErr))
+					continue
+				}
+			}
+			// Ensure the source PHP version — and its required extensions,
+			// notably php<v>-mysql — is actually installed before applying the
+			// pool. php.pool.apply only writes FPM config and hard-fails if the
+			// version dir is absent; and even a present version can lack mysqli,
+			// which 500s every migrated site's mysqli_connect() (GH #531).
+			// php.version.install is idempotent and backfills missing exts, so a
+			// migrated Hestia/cPanel domain on e.g. 8.2 gets a complete runtime
+			// even when the box shipped only the default version. Non-fatal:
+			// pool.apply below still reports a clear error if the version is
+			// genuinely uninstallable.
+			if _, err := agentCli.Call(ctx, "php.version.install", map[string]any{
+				"version": version,
+			}); err != nil {
+				res.Skipped = append(res.Skipped, fmt.Sprintf("php_version_install_skip:%s:%v", version, err))
+			}
+			// Ensure FPM pool exists at OS level. Send the pool row's tuning
+			// as the source of truth. The agent validates pm_mode,
+			// pm_max_children, and process_idle_timeout_seconds (and, for a
+			// dynamic row, the pm_start/min-spare/max-spare sizing) and rejects
+			// the call if any is missing or invalid. The old map sent only
+			// pm_max_children, so the agent rejected every importer pool with
+			// "invalid pm_mode" and the domain silently fell back to the box
+			// default PHP version (JAB-404). The periodic reconciler converges
+			// the rest (tenant ini overrides, package exec opt-out) on its next
+			// tick, so this only needs the sizing the validator requires.
+			//
+			// Resolve the pool's slug exactly the way phppoolops.ReconcileViaAgent
+			// does (GH #329): the user's earliest pool is the default (slug ==
+			// username, version-independent /run/php/dotnext-<user> socket); every
+			// other version gets a versioned slug on its own socket. Sending an
+			// empty (default) slug for every version — as this call used to,
+			// harmlessly, because it always failed pm_mode validation first —
+			// becomes actively wrong now that it succeeds: the default slug's
+			// glob-delete removes dotnext-<user>.conf from every OTHER version dir
+			// (clobbering a pre-existing box-default pool) and its socket is
+			// shared, so two imported versions would collide on one socket.
+			// Matching the reconciler keeps the importer's apply
+			// convergence-consistent; additive = !isDefault mirrors it too.
+			isDefault := true
+			if list, lerr := poolsRepo.ListByUserID(ctx, targetUserID); lerr == nil && len(list) > 0 {
+				isDefault = list[0].ID == pool.ID
+			}
+			slug := models.PoolSlug(targetUsername, version, isDefault)
+			if _, err := agentCli.Call(ctx, "php.pool.apply", map[string]any{
+				"username":                     targetUsername,
+				"slug":                         slug,
+				"php_version":                  version,
+				"pm_mode":                      pool.PmMode,
+				"pm_max_children":              pool.PmMaxChildren,
+				"process_idle_timeout_seconds": pool.ProcessIdleTimeoutSeconds,
+				"pm_start_servers":             pool.PmStartServers,
+				"pm_min_spare_servers":         pool.PmMinSpareServers,
+				"pm_max_spare_servers":         pool.PmMaxSpareServers,
+				"additive":                     !isDefault, // GH #329: default pool non-additive; versioned pools keep siblings
+			}); err != nil {
+				res.Skipped = append(res.Skipped, fmt.Sprintf("php_pool_apply_skip:%s:%v", version, err))
+				continue
+			}
+			res.PHPPoolsCreated++
+			seenVersions[version] = pool.ID
+			if res.PHPVersionApplied == "" {
+				res.PHPVersionApplied = version
+			}
+			// Bind every domain that runs this version.
+			for _, dom := range doms {
+				d, dErr := domainsRepo.FindByName(ctx, dom)
+				if dErr != nil || d == nil {
+					res.Skipped = append(res.Skipped, fmt.Sprintf("php_bind_skip:%s:no_domain_row", dom))
+					continue
+				}
+				if sErr := domainsRepo.SetPHPPoolID(ctx, d.ID, &pool.ID); sErr != nil {
+					res.Skipped = append(res.Skipped, fmt.Sprintf("php_bind_skip:%s:%v", dom, sErr))
+					continue
+				}
+				res.PHPDomainsBound++
+			}
+		}
+		_ = seenVersions // future: clean up orphan pools
+	}
+
+	// ---- P3.5: DKIM key preserve ----
+	// cpanel writes per-domain RSA DKIM private keys under
+	//   cpmove-<user>/domainkeys/<domain>   (newer)
+	//   <homedir>/etc/<domain>/dkim_keys.priv (legacy)
+	// dotnext rotates to Ed25519 + selector "dotnext" on email-enable,
+	// so signature continuity isn't preserved automatically. We
+	// copy the source key into a sidecar path the operator can wire
+	// into Stalwart for verifying pre-migration mail (DNS at the
+	// source selector must stay published or be re-published).
+	if agentCli != nil {
+		for _, root := range []string{
+			filepath.Join(parsed.ExtractDir, "cpmove-"+parsed.SourceUser, "domainkeys"),
+			filepath.Join(parsed.ExtractDir, "domainkeys"),
+		} {
+			entries, derr := os.ReadDir(root)
+			if derr != nil {
+				continue
+			}
+			for _, e := range entries {
+				if e.IsDir() {
+					continue
+				}
+				dom := e.Name()
+				if !strings.Contains(dom, ".") {
+					continue
+				}
+				keyBytes, rerr := os.ReadFile(filepath.Join(root, dom))
+				if rerr != nil || len(keyBytes) == 0 {
+					continue
+				}
+				if _, callErr := agentCli.Call(ctx, "dkim.import", map[string]any{
+					"domain":    dom,
+					"selector":  "default", // cpanel's per-domain selector
+					"algorithm": "rsa",
+					"key_pem":   string(keyBytes),
+				}); callErr != nil {
+					res.Skipped = append(res.Skipped, fmt.Sprintf("dkim_skip:%s:%v", dom, callErr))
+					continue
+				}
+				res.DKIMKeysPreserved++
+			}
+			if res.DKIMKeysPreserved > 0 {
+				break
+			}
+		}
+	}
+
+	// ---- P6: FTP accounts (record-only) ----
+	if parsed.HomeDir != "" {
+		if files, derr := os.ReadDir(filepath.Join(parsed.HomeDir, "etc")); derr == nil {
+			for _, f := range files {
+				if !f.IsDir() {
+					continue
+				}
+				ftpPasswd := filepath.Join(parsed.HomeDir, "etc", f.Name(), "passwd")
+				if n := countNonCommentLines(ftpPasswd); n > 0 {
+					res.FTPAccountsObserved += n
+					res.Skipped = append(res.Skipped, fmt.Sprintf("ftp_observed:%s count=%d (FTP deprecated — re-issue via SFTP keys)", f.Name(), n))
+				}
+			}
+		}
+	}
+
+	// ---- P1: per-mailbox Sieve filters ----
+	// cpanel layout:
+	//   <homedir>/etc/<dom>/<local>/filter.yaml   (per-mailbox)
+	//   <homedir>/etc/<dom>/managefilters/*.filter (global per-domain)
+	// We pick up the per-mailbox file + store as cpanel_raw (Sieve
+	// conversion is post-restore operator work).
+	if parsed.HomeDir != "" && filtersRepo != nil && mailboxesRepo != nil {
+		etcDir := filepath.Join(parsed.HomeDir, "etc")
+		if doms, derr := os.ReadDir(etcDir); derr == nil {
+			for _, d := range doms {
+				if !d.IsDir() || strings.HasPrefix(d.Name(), ".") {
+					continue
+				}
+				domName := d.Name()
+				users, uerr := os.ReadDir(filepath.Join(etcDir, domName))
+				if uerr != nil {
+					continue
+				}
+				for _, u := range users {
+					if !u.IsDir() {
+						continue
+					}
+					local := u.Name()
+					filterPath := filepath.Join(etcDir, domName, local, "filter.yaml")
+					b, rerr := os.ReadFile(filterPath)
+					if rerr != nil || len(b) == 0 {
+						continue
+					}
+					addr := local + "@" + domName
+					mb, mErr := mailboxesRepo.FindByEmail(ctx, addr)
+					if mErr != nil || mb == nil {
+						res.Skipped = append(res.Skipped, fmt.Sprintf("filter_orphan:%s (no local mailbox)", addr))
+						continue
+					}
+					raw := string(b)
+					f := &models.EmailFilter{
+						ID:        ids.NewULID(),
+						MailboxID: mb.ID,
+						Name:      "cpanel-import",
+						CpanelRaw: &raw,
+						Enabled:   preserveMailRouting, // JAB-46: inert unless opted in
+						ManagedBy: "m35",
+					}
+					if cErr := filtersRepo.Create(ctx, f); cErr != nil {
+						res.Skipped = append(res.Skipped, fmt.Sprintf("filter_skip:%s:%v", addr, cErr))
+						continue
+					}
+					res.FiltersImported++
+				}
+			}
+		}
+	}
+
+	// ---- P2.5: per-mailbox autoresponders ----
+	// cpanel layout: <homedir>/.autorespond/<address>.{conf,yaml}
+	if parsed.HomeDir != "" && autoRespondersRepo != nil && mailboxesRepo != nil {
+		respDir := filepath.Join(parsed.HomeDir, ".autorespond")
+		if files, derr := os.ReadDir(respDir); derr == nil {
+			for _, f := range files {
+				if f.IsDir() {
+					continue
+				}
+				name := f.Name()
+				// strip .conf / .yaml — leaving the address
+				addr := strings.TrimSuffix(strings.TrimSuffix(name, ".conf"), ".yaml")
+				if !strings.Contains(addr, "@") {
+					continue
+				}
+				mb, mErr := mailboxesRepo.FindByEmail(ctx, addr)
+				if mErr != nil || mb == nil {
+					res.AutorespondersOrphaned++
+					res.Skipped = append(res.Skipped, fmt.Sprintf("autoresponder_orphan:%s (no local mailbox)", addr))
+					continue
+				}
+				ar := parseAutoresponder(filepath.Join(respDir, name), mb.ID)
+				if ar == nil {
+					res.Skipped = append(res.Skipped, fmt.Sprintf("autoresponder_skip:%s parse failed", addr))
+					continue
+				}
+				ar.Enabled = preserveMailRouting // JAB-46: inert unless opted in
+				if uErr := autoRespondersRepo.Update(ctx, ar); uErr != nil {
+					res.Skipped = append(res.Skipped, fmt.Sprintf("autoresponder_skip:db:%s:%v", addr, uErr))
+					continue
+				}
+				res.AutorespondersCreated++
+			}
+		}
+	}
+
+	// GH #327: HestiaCP e-mail aliases live at mail/<domain>/conf/aliases, NOT
+	// cpanel's <home>/etc/<dom>/aliases — so they never imported. Scan + attach
+	// each alias to its target mailbox.
+	scanHestiaAliases(ctx, forwardersRepo, mailboxesRepo, domainsRepo, parsed, preserveMailRouting, res)
+
+	return res, nil
+}
+
+// scanHestiaAliases imports HestiaCP e-mail aliases. Hestia writes them to
+// mail/<domain>/conf/aliases as `alias@domain:account@domain` lines (one per
+// alias), coupling an alias address to a real local account. dotnext models an
+// alias as a type='alias' EmailForwarder OWNED BY the target mailbox — the alias
+// is an extra local_part that delivers to that mailbox. Mirroring the panel's
+// create path (GH #280), Target stores the alias's OWN address so one mailbox
+// can hold many aliases without colliding on uq_external_forward(mailbox_id,
+// type,target). No-op for cpanel/DA (no mail/<dom>/conf/aliases). Idempotent: a
+// unique-index conflict on re-run is counted as skipped, not fatal.
+func scanHestiaAliases(
+	ctx context.Context,
+	forwardersRepo repository.EmailForwarderRepository,
+	mailboxesRepo repository.MailboxRepository,
+	domainsRepo repository.DomainRepository,
+	parsed *ParsedTarball,
+	preserveMailRouting bool,
+	res *ExtrasResult,
+) {
+	if forwardersRepo == nil || mailboxesRepo == nil {
+		return
+	}
+	mailRoot := filepath.Join(parsed.ExtractDir, "mail")
+	doms, err := os.ReadDir(mailRoot)
+	if err != nil {
+		return
+	}
+	for _, d := range doms {
+		if !d.IsDir() {
+			continue
+		}
+		domName := d.Name()
+		body, rErr := os.ReadFile(filepath.Join(mailRoot, domName, "conf", "aliases"))
+		if rErr != nil {
+			continue // no aliases file for this domain — not an error
+		}
+		dom, dErr := domainsRepo.FindByName(ctx, domName)
+		if dErr != nil || dom == nil {
+			res.Skipped = append(res.Skipped, "hestia_alias_skip:domain_missing:"+domName)
+			continue
+		}
+		for _, line := range strings.Split(string(body), "\n") {
+			line = strings.TrimSpace(line)
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+			// `alias@domain:account@domain`
+			colon := strings.Index(line, ":")
+			if colon < 1 {
+				res.Skipped = append(res.Skipped, "hestia_alias_malformed:"+line)
+				continue
+			}
+			aliasAddr := strings.TrimSpace(line[:colon])
+			acctAddr := strings.TrimSpace(line[colon+1:])
+			aliasLocal := aliasAddr
+			if at := strings.LastIndex(aliasAddr, "@"); at > 0 {
+				aliasLocal = aliasAddr[:at]
+			}
+			if aliasLocal == "" || acctAddr == "" {
+				continue
+			}
+			// The alias delivers to the target account: attach it to that
+			// mailbox. If the account isn't a panel mailbox, it's orphaned.
+			mb, mErr := mailboxesRepo.FindByEmail(ctx, acctAddr)
+			if mErr != nil || mb == nil {
+				res.ForwardersOrphaned++
+				res.Skipped = append(res.Skipped, fmt.Sprintf("hestia_alias_orphan:%s→%s (no local mailbox)", aliasAddr, acctAddr))
+				continue
+			}
+			lp := aliasLocal
+			f := &models.EmailForwarder{
+				ID:        ids.NewULID(),
+				MailboxID: &mb.ID,
+				DomainID:  dom.ID,
+				Type:      "alias",
+				LocalPart: &lp,
+				Target:    aliasLocal + "@" + domName, // alias's own address (GH #280 uniqueness)
+				Enabled:   preserveMailRouting,        // JAB-46: inert unless opted in
+				ManagedBy: "gh327-hestia",
+			}
+			if cErr := forwardersRepo.Create(ctx, f); cErr != nil {
+				res.Skipped = append(res.Skipped, fmt.Sprintf("hestia_alias_skip:%s:%v", aliasAddr, cErr))
+				continue
+			}
+			res.ForwardersCreated++
+		}
+	}
+}
+
+// parseAutoresponder reads a cpanel .autorespond/<addr>.{conf,yaml}
+// file + builds an EmailAutoresponder row. Both formats share the
+// same "Header: value" / blank line / body shape; YAML adds quoting
+// which we strip.
+func parseAutoresponder(path, mailboxID string) *models.EmailAutoresponder {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	parts := strings.SplitN(string(raw), "\n\n", 2)
+	headerBlock := parts[0]
+	var bodyPart string
+	if len(parts) == 2 {
+		bodyPart = parts[1]
+	}
+	var subject string
+	for _, line := range strings.Split(headerBlock, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		i := strings.Index(line, ":")
+		if i <= 0 {
+			continue
+		}
+		k := strings.TrimSpace(line[:i])
+		v := strings.Trim(strings.TrimSpace(line[i+1:]), `"'`)
+		if strings.EqualFold(k, "subject") {
+			subject = v
+		}
+	}
+	body := strings.TrimSpace(bodyPart)
+	if body == "" && subject == "" {
+		return nil
+	}
+	ar := &models.EmailAutoresponder{
+		MailboxID: mailboxID,
+		Enabled:   true,
+		ManagedBy: "m35",
+	}
+	if subject != "" {
+		ar.Subject = &subject
+	}
+	if body != "" {
+		ar.TextBody = &body
+	}
+	return ar
+}
+
+// aliasForward is one forwarder row out of an aliases file:
+// `<local>@<domain>: <target>` → Local="<local>", Target="<target>".
+type aliasForward struct {
+	Local  string
+	Target string
+}
+
+// parseAliases reads a cpanel-style aliases file. Returns
+// (catchAllTarget, forwarderRows, perLineWarnings).
+func parseAliases(path string) (string, []aliasForward, []string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", nil, nil
+	}
+	defer f.Close()
+
+	var catchAll string
+	var forwards []aliasForward
+	var warnings []string
+
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		// Skip cpanel meta-lines that begin with `:` (e.g. ":fail:").
+		if strings.HasPrefix(line, ":") {
+			continue
+		}
+		i := strings.Index(line, ":")
+		if i <= 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:i])
+		val := strings.Trim(strings.TrimSpace(line[i+1:]), `"'`)
+		if key == "*" {
+			catchAll = val
+			continue
+		}
+		// `key` may be `local` or `local@domain`. Normalise to local.
+		if at := strings.IndexByte(key, '@'); at > 0 {
+			key = key[:at]
+		}
+		// A cpanel valias line can list several comma-separated targets:
+		//   sales: a@x.org, b@y.org
+		// Emit one forward per target so each becomes its own external row
+		// (uq_external_forward keys on target). A single combined string would
+		// otherwise be persisted as one malformed Sieve `redirect`.
+		for _, tgt := range strings.Split(val, ",") {
+			tgt = strings.Trim(strings.TrimSpace(tgt), `"'`)
+			if tgt == "" {
+				continue
+			}
+			// Skip exim pipe / `:fail:`-style directives (operator-specific);
+			// dotnext only models plain address redirects.
+			if strings.HasPrefix(tgt, "|") || strings.HasPrefix(tgt, ":") {
+				warnings = append(warnings, fmt.Sprintf("exim_directive:%s:%s", key, tgt))
+				continue
+			}
+			forwards = append(forwards, aliasForward{Local: key, Target: tgt})
+		}
+	}
+	if err := sc.Err(); err != nil {
+		warnings = append(warnings, fmt.Sprintf("aliases_scan_err:%s:%v", path, err))
+	}
+	return catchAll, forwards, warnings
+}
+
+// userdataRoots returns the candidate locations of the source's userdata dir
+// inside an extracted cpmove tree, in probe order. Shared so every reader looks
+// in the same places.
+func userdataRoots(parsed *ParsedTarball) []string {
+	return []string{
+		filepath.Join(parsed.ExtractDir, "cpmove-"+parsed.SourceUser, "userdata"),
+		filepath.Join(parsed.ExtractDir, "userdata"),
+		filepath.Join(parsed.ExtractDir, "cp", parsed.SourceUser, "userdata"),
+	}
+}
+
+// detectSubDomains returns the account's subdomains, lower-cased and
+// de-duplicated.
+//
+// Read from `<userdata>/main`, which is cpanel's own manifest:
+//
+//	addon_domains: {}
+//	main_domain: example-d.co.il
+//	parked_domains: []
+//	sub_domains:
+//	  - staging.example-d.co.il
+//
+// An earlier revision read a `SUB_DOMAINS=` key out of the `cp/<user>` file
+// instead. That key does not exist — checked against a live cpanel account,
+// whose user file carries DNS/DNS1/DNS2… and no SUB_DOMAINS at all — so the
+// subdomain pass found nothing on every migration ever run, and the summary's
+// `subdomains=0` was indistinguishable from an account that genuinely had none
+// (JAB-220).
+//
+// Subdomains matter here specifically because ImportDomains cannot see them:
+// it builds its list from zone files, and a cpanel subdomain has no zone of its
+// own — it is a record inside the parent's zone. So the files get restored, the
+// php-ini sanitizer walks them, and nothing ever serves them.
+//
+// The legacy key is still honoured as a fallback in case some cpanel build does
+// emit it.
+func detectSubDomains(parsed *ParsedTarball, userdataPath string) []string {
+	seen := map[string]bool{}
+	var out []string
+	add := func(raw string) {
+		n := strings.ToLower(strings.TrimSpace(raw))
+		n = strings.Trim(n, `"'`)
+		if n == "" || seen[n] {
+			return
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+
+	for _, root := range userdataRoots(parsed) {
+		for _, name := range parseYAMLStringList(filepath.Join(root, "main"), "sub_domains") {
+			add(name)
+		}
+		if len(out) > 0 {
+			break
+		}
+	}
+	// Legacy fallback.
+	if len(out) == 0 && userdataPath != "" {
+		for _, name := range splitCpanelList(extractKV(userdataPath, "SUB_DOMAINS")) {
+			add(name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// parseYAMLStringList pulls a simple `key:` block-sequence out of a cpanel
+// manifest:
+//
+//	sub_domains:
+//	  - one.example.com
+//	  - two.example.com
+//
+// Hand-rolled rather than pulling in a YAML dependency: these manifests are
+// machine-written by cpanel and only ever use this one flat shape. An inline
+// empty list (`sub_domains: []`) yields nothing, which is the correct answer.
+func parseYAMLStringList(path, key string) []string {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var out []string
+	inBlock := false
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		trimmed := strings.TrimSpace(line)
+		if !inBlock {
+			// cpanel writes "sub_domains:" and sometimes "sub_domains: " —
+			// anything with a value on the same line is not a block sequence.
+			if strings.HasPrefix(trimmed, key+":") &&
+				strings.TrimSpace(strings.TrimPrefix(trimmed, key+":")) == "" {
+				inBlock = true
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "- ") {
+			out = append(out, strings.TrimSpace(strings.TrimPrefix(trimmed, "- ")))
+			continue
+		}
+		if trimmed == "" {
+			continue // blank lines inside the block are harmless
+		}
+		break // a new key ends the sequence
+	}
+	return out
+}
+
+// userdataNonDomainFiles are the fixed-name entries cpanel keeps in the
+// userdata dir alongside the per-domain files.
+var userdataNonDomainFiles = map[string]bool{
+	"main": true, "cache": true, "scope": true, "nobody": true,
+}
+
+// userdataSidecarSuffixes are the per-domain sidecars that sit next to the
+// plain userdata file. None of them carries phpversion.
+var userdataSidecarSuffixes = []string{
+	".php-fpm.yaml", ".php-fpm.cache", ".cache", ".json", ".db", ".yaml",
+}
+
+// isPlainDomainUserdata reports whether name is cpanel's plain per-domain
+// userdata file — the one that actually carries `phpversion`.
+//
+// _SSL is excluded because it duplicates the http vhost's settings; counting
+// both would double every domain in the version tally.
+func isPlainDomainUserdata(name string) bool {
+	if name == "" || userdataNonDomainFiles[name] || strings.HasSuffix(name, "_SSL") {
+		return false
+	}
+	for _, suf := range userdataSidecarSuffixes {
+		if strings.HasSuffix(name, suf) {
+			return false
+		}
+	}
+	return true
+}
+
+// scanUserdataPHPVersions walks the source userdata dir and returns
+// version → [domain…] for every per-domain PHP version it can read.
+//
+// It reads the PLAIN `<userdata>/<domain>` file. An earlier revision scanned
+// `<domain>.php-fpm.yaml` instead, which never carries the key: cpanel puts
+// only pool tuning there —
+//
+//	_is_present: 1
+//	pm_max_children: 5
+//	pm_max_requests: 20
+//	pm_process_idle_timeout: 10
+//
+// Measured on a live source box: 0 of 143 .php-fpm.yaml files contained
+// `phpversion`, while 141 plain userdata files did. So detection always came
+// back empty, every migrated domain silently inherited the destination's
+// default PHP, and the restore summary reported the tell nobody read:
+// `php_pools=0 php_domains_bound=0 php_version=` (JAB-218).
+//
+// The .php-fpm.yaml probe is kept as a fallback rather than deleted — it costs
+// one stat per domain and covers any cpanel build that does write the key
+// there — but the plain file is now the primary source.
+func scanUserdataPHPVersions(parsed *ParsedTarball) map[string][]string {
+	roots := userdataRoots(parsed)
+	// An addon site's userdata file is named after its backing subdomain; the
+	// version belongs to the addon, which is the site (see addon_domains.go).
+	addons, _ := AddonDomainsBySubdomain(parsed)
+	out := map[string][]string{}
+	for _, root := range roots {
+		entries, err := os.ReadDir(root)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() || !isPlainDomainUserdata(e.Name()) {
+				continue
+			}
+			domain := e.Name()
+			ver := normalisePHPVersion(extractKV(filepath.Join(root, domain), "phpversion"))
+			if ver == "" {
+				// Legacy fallback: some builds may carry it in the sidecar.
+				ver = normalisePHPVersion(extractKV(
+					filepath.Join(root, domain+".php-fpm.yaml"), "phpversion"))
+			}
+			if ver == "" {
+				continue
+			}
+			out[ver] = append(out[ver], SiteDomain(addons, domain))
+		}
+		if len(out) > 0 {
+			break
+		}
+	}
+	// Deterministic domain order per version so reruns and tests agree.
+	for v := range out {
+		sort.Strings(out[v])
+	}
+	return out
+}
+
+// summarisePHPVersionSpread renders the detected version distribution for the
+// restore summary, e.g. "7.4x39,8.1x82,8.3x29". Returns "none" for an empty
+// map, which is the case the operator most needs to see.
+func summarisePHPVersionSpread(byVersion map[string][]string) string {
+	if len(byVersion) == 0 {
+		return "none"
+	}
+	vers := make([]string, 0, len(byVersion))
+	for v := range byVersion {
+		vers = append(vers, v)
+	}
+	sort.Strings(vers)
+	parts := make([]string, 0, len(vers))
+	for _, v := range vers {
+		parts = append(parts, fmt.Sprintf("%sx%d", v, len(byVersion[v])))
+	}
+	return strings.Join(parts, ",")
+}
+
+// detectPHPVersionsPerDomain returns version → [domain1, domain2…]
+// — every distinct PHP version in the source userdata dir with the
+// list of domains using it. Used by the per-domain pool-bind path
+// in ImportExtras.
+func detectPHPVersionsPerDomain(parsed *ParsedTarball) map[string][]string {
+	return scanUserdataPHPVersions(parsed)
+}
+
+// detectPHPVersion returns (primaryVersion, otherVersions) across the source's
+// per-domain userdata files. "primary" = the most-frequent version; the rest
+// are reported so the operator can see the spread. Empty string when the source
+// records no PHP version at all.
+//
+// Shares scanUserdataPHPVersions with the per-domain path so both read the same
+// file — see the note there for why the plain userdata file, not the
+// .php-fpm.yaml sidecar, is the one that carries `phpversion` (JAB-218).
+func detectPHPVersion(parsed *ParsedTarball) (string, []string) {
+	byVersion := scanUserdataPHPVersions(parsed)
+	if len(byVersion) == 0 {
+		return "", nil
+	}
+	// Most-frequent wins; ties pick lexicographically lower so reruns
+	// are deterministic.
+	primary := ""
+	bestCount := 0
+	for v, doms := range byVersion {
+		c := len(doms)
+		if c > bestCount || (c == bestCount && (primary == "" || v < primary)) {
+			primary = v
+			bestCount = c
+		}
+	}
+	var others []string
+	for v := range byVersion {
+		if v != primary {
+			others = append(others, v)
+		}
+	}
+	sort.Strings(others)
+	return primary, others
+}
+
+// normalisePHPVersion maps cpanel's "ea-php82" / "ea-php-rpm-7.4" /
+// raw "8.2" strings to dotnext's "<major>.<minor>" form so
+// php.pool.apply accepts them. Empty string on unparseable input.
+func normalisePHPVersion(raw string) string {
+	raw = strings.TrimSpace(raw)
+	raw = strings.TrimPrefix(raw, "ea-php")
+	raw = strings.TrimPrefix(raw, "ea-")
+	raw = strings.TrimPrefix(raw, "php-")
+	raw = strings.TrimPrefix(raw, "php")
+	raw = strings.TrimPrefix(raw, "-rpm-")
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	// "82" → "8.2"; already-dotted "8.2" passes through.
+	if !strings.Contains(raw, ".") && len(raw) == 2 {
+		return string(raw[0]) + "." + string(raw[1])
+	}
+	return raw
+}
+
+// countNonCommentLines tallies non-blank, non-#-prefixed lines in
+// a file. Used for FTP-account counting where the source's
+// /etc/<dom>/passwd is a colon-separated user list.
+func countNonCommentLines(path string) int {
+	f, err := os.Open(path)
+	if err != nil {
+		return 0
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	n := 0
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// findUserdataFile probes the same locations PeekAccountMeta uses
+// for the cp/<user> file. Returns the first hit or "".
+func findUserdataFile(extractDir, sourceUser string) string {
+	candidates := []string{
+		filepath.Join(extractDir, "cpmove-"+sourceUser, "cp", sourceUser),
+		filepath.Join(extractDir, "cp", sourceUser),
+	}
+	for _, c := range candidates {
+		if info, err := os.Stat(c); err == nil && !info.IsDir() {
+			return c
+		}
+	}
+	return ""
+}
+
+// splitCpanelList splits comma-separated lists out of cpanel's
+// `KEY=v1,v2,v3` userdata lines. Tolerant of stray whitespace.
+func splitCpanelList(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts
+}

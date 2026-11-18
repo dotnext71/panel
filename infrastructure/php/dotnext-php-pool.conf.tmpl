@@ -1,0 +1,110 @@
+; Rendered by panel-agent's php.pool.apply command.
+; DO NOT EDIT by hand — regenerated from DB by dotnext-api reconciler.
+; Source template: infrastructure/php/dotnext-php-pool.conf.tmpl
+[{{.PoolName}}]
+user = {{.User}}
+group = {{.Group}}
+listen = {{.SocketPath}}
+listen.owner = {{.User}}
+listen.group = {{.User}}
+listen.mode = 0660
+pm = {{.PmMode}}
+pm.max_children = {{.PmMaxChildren}}
+pm.process_idle_timeout = {{.ProcessIdleTimeoutSeconds}}s
+{{- if eq .PmMode "dynamic" }}
+; Dynamic-mode sizing (GH #339). FPM requires these for pm=dynamic and
+; enforces min_spare <= start <= max_spare <= max_children; the API validates
+; the same before writing, so FPM never fails to start on a bad combo.
+pm.start_servers = {{.PmStartServers}}
+pm.min_spare_servers = {{.PmMinSpareServers}}
+pm.max_spare_servers = {{.PmMaxSpareServers}}
+{{- end }}
+{{- if gt .PmMaxRequests 0 }}
+; Recycle a worker after this many requests to bound memory leaks (0 = never).
+pm.max_requests = {{.PmMaxRequests}}
+{{- end }}
+{{- if gt .RequestTerminateTimeoutSeconds 0 }}
+; Kill a request stuck longer than this (0 = no limit).
+request_terminate_timeout = {{.RequestTerminateTimeoutSeconds}}s
+{{- end }}
+{{- if gt .SlowlogTimeoutSeconds 0 }}
+; Slow log (GH #1332). Dump a PHP backtrace of any request slower than this to
+; the tenant-owned slow log. Path is agent-derived from the slug; the master
+; runs as the tenant so it can write under /home/<user>/logs.
+request_slowlog_timeout = {{.SlowlogTimeoutSeconds}}s
+slowlog = {{.SlowlogPath}}
+{{- end }}
+chdir = /home/{{.User}}
+security.limit_extensions = .php
+; Jailbreak defense (ADR-0023 decision 12). open_basedir is hard-coded
+; and NOT in the user-facing ini-override allowlist; users cannot
+; loosen it. Without this, a user could symlink shell.jpg to a .php
+; file outside their docroot and bypass security.limit_extensions.
+; The MariaDB socket is whitelisted so apps using DB host "localhost"
+; (the WordPress/PHP default — MySQL treats localhost as a UNIX-socket
+; connection, not TCP) can reach it. Without it open_basedir blocks the
+; socket and only 127.0.0.1 (TCP) works (GH#112). The socket file is
+; root/mysql-owned and not user-writable, so it adds no jailbreak surface.
+; /run/dotnext-wp-purge is the WP->nginx cache-purge spool (GH #611/#619,
+; JAB-199): the dotnext-cache plugin drops purge requests there for the
+; agent's spool watcher. Without it in open_basedir the plugin's is_dir()
+; guard trips the restriction on every wp-admin request and concludes
+; "not a DotNext host" -- every content-edit purge of the micro-cache was
+; a silent no-op fleet-wide. Spool dir only; the watcher validates every
+; request, so this adds no jailbreak surface.
+php_admin_value[open_basedir] = /home/{{.User}}:/run/mysqld/mysqld.sock:/tmp:/var/tmp:/run/dotnext-wp-purge
+; Tenant command-exec lockdown (GH #401). Tenants are SFTP-only, so PHP is
+; their exec vector; without this a tenant shell_exec/proc_open runs arbitrary
+; commands as their uid from any web request. php_admin_value (not overridable)
+; and in the agent's forbiddenDirectives set, exactly like open_basedir. Blocks
+; process-spawning only — curl/file_get_contents stay enabled (WordPress HTTP
+; API needs them); outbound SSRF/metadata is handled at the egress layer.
+; The value is spec-driven (agent: defaultDisableFunctions). GH #402: an admin
+; may opt a package out, making DisableFunctions empty -> no line emitted.
+{{- if .DisableFunctions }}
+php_admin_value[disable_functions] = {{ .DisableFunctions }}
+{{- end }}
+; No OPcache sizing here (GH #2466). The master allocates OPcache's shared
+; memory and file table at startup, before it reads this pool, so a
+; php_admin_value for them changes nothing. The size comes from the
+; server-wide 15-dotnext-opcache.ini (install.sh, sized to the host's RAM);
+; a pool's own override goes into its dotnext-ext ini, written by the agent.
+; PHP mail() path (JAB-230). install.sh purges every traditional MTA
+; (Stalwart owns :25), so /usr/sbin/sendmail does not exist — without this
+; line mail()/wp_mail() fails on every site. The shim runs as the tenant
+; uid, picks the panel-provisioned relay credential for the message's From
+; domain, and submits to Stalwart on 127.0.0.1:587 with the envelope sender
+; forced to that identity. php_admin_value: the path is not tenant-tunable.
+php_admin_value[sendmail_path] = /usr/local/libexec/dotnext/dotnext-sendmail -t -i
+; Session upload progress off (CVE-2026-115560, php.net advisory 2026-10-23).
+; With it on, a script that switches session.serialize_handler at runtime
+; before session_start() opens a memory-corruption path to running native
+; code in the worker, which disable_functions and open_basedir do not limit.
+; php.net advises turning it off until the fixed PHP release; it only feeds
+; upload progress bars, which few apps use. php_admin_flag, so .user.ini and
+; ini_set cannot turn it back on; not in the agent's adminFlagAllowlist.
+php_admin_flag[session.upload_progress.enabled] = off
+; Shared-hosting PHP defaults (GH #253). php_value (not php_admin_value) so a
+; per-domain override below takes precedence; these apply only when the domain
+; sets nothing. Stock PHP defaults (128M / 2M / 8M / 1000) are too small for
+; most apps.
+php_value[memory_limit] = 512M
+php_value[upload_max_filesize] = 512M
+php_value[post_max_size] = 512M
+php_value[max_execution_time] = 300
+php_value[max_input_time] = 300
+php_value[max_input_vars] = 10000
+php_value[max_file_uploads] = 100
+; PHP warnings go to a file, never FastCGI stderr: nginx reads stderr into the
+; response-header buffer, and a page with many warnings returns 502 "upstream
+; sent too big header". Each vhost pins its own <domain>.php-error.log in
+; PHP_VALUE; this is the fallback. php_value, so .user.ini and ini_set (e.g.
+; WP_DEBUG_LOG) can still pick another file. php.pool.apply makes ~/logs and
+; rotates the files as the tenant (panel-agent php_error_log.go).
+php_value[error_log] = /home/{{.User}}/logs/php-error.log
+{{- range .AdminValues }}
+php_admin_value[{{.Name}}] = {{.Value}}
+{{- end }}
+{{- range .AdminFlags }}
+php_admin_flag[{{.Name}}] = {{.Value}}
+{{- end }}

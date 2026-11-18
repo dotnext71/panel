@@ -1,0 +1,138 @@
+package api
+
+import (
+	"github.com/dotnext-panel/dotnext/internal/agent"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+	"github.com/dotnext-panel/dotnext/internal/scandrops"
+	"github.com/dotnext-panel/dotnext/internal/sendasops"
+	"github.com/gin-gonic/gin"
+)
+
+// M65RouteDeps holds every repository + client any M6.5 feature needs.
+// One struct for all sub-routes so parallel feature steps don't collide
+// on the registration signature.
+type M65RouteDeps struct {
+	Agent           agent.AgentInterface
+	Domains         repository.DomainRepository
+	Mailboxes       repository.MailboxRepository
+	MailGroups      repository.MailGroupRepository
+	Autoresponders  repository.EmailAutoresponderRepository
+	Forwarders      repository.EmailForwarderRepository
+	MailboxShares   repository.MailboxShareRepository
+	SharedResources repository.SharedResourceRepository
+	SendDelegations repository.MailboxSendDelegationRepository
+	SendAs          *sendasops.Syncer
+	TrustedSenders  repository.MailboxTrustedSenderRepository
+	// Addresses: see MailboxForwarderHandlerConfig.Addresses.
+	Addresses MailAddressReleaser
+	// Scanners / ScannerRateLimit: see SharedResourceHandlerConfig (GH #2503).
+	Scanners         *scandrops.Deps
+	ScannerRateLimit gin.HandlerFunc
+}
+
+// RegisterM65Routes registers all M6.5 email feature routes.
+// Called once from app.go; each sub-registration lives in its own Wave file,
+// preventing file collisions. Enables parallel Wave B/C development (ADR-0051).
+func RegisterM65Routes(g *gin.RouterGroup, deps M65RouteDeps) {
+	registerForwarderRoutes(g, deps)
+	registerAutoresponderRoutes(g, deps)
+	registerCatchAllRoutes(g, deps)
+	registerDisclaimerRoutes(g, deps)
+	registerSharedFolderRoutes(g, deps)
+	registerMailLogRoutes(g, deps)
+	registerSharedResourceRoutes(g, deps)
+	registerSendAsRoutes(g, deps)
+	registerTrustedSenderRoutes(g, deps)
+}
+
+// GH #347: send-as delegation.
+func registerSendAsRoutes(g *gin.RouterGroup, deps M65RouteDeps) {
+	RegisterMailboxSendAsRoutes(g, MailboxSendAsHandlerConfig{
+		Mailboxes:       deps.Mailboxes,
+		Domains:         deps.Domains,
+		SendDelegations: deps.SendDelegations,
+		Agent:           deps.Agent,
+		Sync:            deps.SendAs,
+	})
+}
+
+// GH #2017: the senders a mailbox trusts.
+func registerTrustedSenderRoutes(g *gin.RouterGroup, deps M65RouteDeps) {
+	RegisterMailboxTrustedSenderRoutes(g, MailboxTrustedSenderHandlerConfig{
+		Mailboxes:      deps.Mailboxes,
+		Domains:        deps.Domains,
+		TrustedSenders: deps.TrustedSenders,
+		Agent:          deps.Agent,
+	})
+}
+
+// Wave B: forwarders.
+func registerForwarderRoutes(g *gin.RouterGroup, deps M65RouteDeps) {
+	RegisterMailboxForwarderRoutes(g, MailboxForwarderHandlerConfig{
+		Mailboxes:      deps.Mailboxes,
+		Domains:        deps.Domains,
+		Forwarders:     deps.Forwarders,
+		Autoresponders: deps.Autoresponders,
+		Agent:          deps.Agent,
+		Addresses:      deps.Addresses,
+	})
+}
+
+// Wave B: autoresponders.
+func registerAutoresponderRoutes(g *gin.RouterGroup, deps M65RouteDeps) {
+	RegisterMailboxAutoresponderRoutes(g, MailboxAutoresponderHandlerConfig{
+		Mailboxes:      deps.Mailboxes,
+		Domains:        deps.Domains,
+		Autoresponders: deps.Autoresponders,
+		Forwarders:     deps.Forwarders,
+		Agent:          deps.Agent,
+	})
+}
+
+// Wave B: catch-all.
+func registerCatchAllRoutes(g *gin.RouterGroup, deps M65RouteDeps) {
+	RegisterDomainCatchallRoutes(g, DomainCatchallHandlerConfig{
+		Agent:   deps.Agent,
+		Domains: deps.Domains,
+	})
+}
+
+// Wave C: disclaimer.
+func registerDisclaimerRoutes(g *gin.RouterGroup, deps M65RouteDeps) {
+	RegisterDomainDisclaimerRoutes(g, DomainDisclaimerHandlerConfig{
+		Domains: deps.Domains,
+		Agent:   deps.Agent,
+	})
+}
+
+// Wave B: shared folders.
+func registerSharedFolderRoutes(g *gin.RouterGroup, deps M65RouteDeps) {
+	RegisterMailboxShareRoutes(g, MailboxShareHandlerConfig{
+		Mailboxes:     deps.Mailboxes,
+		Domains:       deps.Domains,
+		MailboxShares: deps.MailboxShares,
+		Agent:         deps.Agent,
+	})
+}
+
+// Wave C: mail logs.
+func registerMailLogRoutes(g *gin.RouterGroup, deps M65RouteDeps) {
+	RegisterMailLogsRoutes(g, MailLogsHandlerConfig{
+		Domains: deps.Domains,
+		Agent:   deps.Agent,
+	})
+}
+
+// M52 (ADR-0133): standalone shared resources + grants.
+func registerSharedResourceRoutes(g *gin.RouterGroup, deps M65RouteDeps) {
+	RegisterSharedResourceRoutes(g, SharedResourceHandlerConfig{
+		Resources:  deps.SharedResources,
+		Domains:    deps.Domains,
+		Mailboxes:  deps.Mailboxes,
+		MailGroups: deps.MailGroups,
+		Agent:      deps.Agent,
+
+		Scanners:         deps.Scanners,
+		ScannerRateLimit: deps.ScannerRateLimit,
+	})
+}

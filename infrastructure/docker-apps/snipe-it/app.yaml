@@ -1,0 +1,48 @@
+slug: snipe-it
+name: Snipe-IT
+tags: ["IT", "Inventory", "Assets"]
+version: "8.8.3"
+description: |
+  Free, open-source IT asset management. Track hardware, licenses,
+  accessories, and consumables. Laravel app container + bundled MariaDB.
+icon: icon.webp
+upstream: https://github.com/snipe/snipe-it
+documentation: https://snipe-it.readme.io/docs
+
+image_channel: snipe/snipe-it:v8.8.3@sha256:eb6d78c1bdae46d15177b149fcc14d7cd795d9f6c17e53dc4d87e04da9653218
+update_mode: manual
+
+resources:
+  cpu: "1.5"
+  memory: "768m"
+  pids: 300
+
+volumes:
+  - name: data
+    container_path: /var/lib/snipeit
+  - name: db
+    container_path: /var/lib/mysql
+
+ports:
+  - name: http
+    container_port: 80
+    protocol: tcp
+    default_enabled: true
+    default_bind: loopback
+    default_reverse_proxy: true
+    health_path: /
+
+env:
+  - name: APP_KEY
+    secret: true
+    generate: laravel_key
+  - name: DB_PASSWORD
+    secret: true
+    generate: password32
+  - name: MYSQL_ROOT_PASSWORD
+    secret: true
+    generate: password32
+
+# Operator-supplied SMTP (GH #322): auto-injects standard SMTP_* install fields;
+# compose maps them to this app's SMTP env.
+smtp: true

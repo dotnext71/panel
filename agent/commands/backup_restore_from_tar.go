@@ -1,0 +1,561 @@
+package commands
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/dotnext-panel/dotnext/agentwire"
+	"github.com/dotnext-panel/dotnext/internal/backup"
+)
+
+// backup.restore_from_tar — GH #1408. Restore an account from a re-UPLOADED
+// backup archive (the .tar the admin downloaded earlier), instead of a restic
+// snapshot. This is the DR / cross-server-migration path: reinstall a box,
+// upload a user's backup, restore.
+//
+// The uploaded tar is untrusted, so it is extracted through safeExtractZstdTar
+// (allowlist: regular/dir/in-tree-symlink; no ../ absolute hardlink device;
+// bomb-bounded). The extracted tree has the SAME per-stage layout a restic
+// restore produces (materialize built the downloaded tar from those very
+// snapshots), so once staged it reuses the exact same applyAccountRestore path
+// as backup.restore — home rsync + chown, per-DB mariadb load. mail is not
+// auto-applied (same as backup.restore).
+//
+// v1 scope (see GH #1408): admin-only, one tar = one account, target user must
+// already exist (the panel enforces this). Component selection gates which
+// manifest stages are applied.
+
+const restoreUploadsRoot = "/var/lib/dotnext-uploads"
+
+type backupRestoreFromTarParams struct {
+	JobID          string `json:"job_id"`
+	TarPath        string `json:"tar_path"`
+	TargetUsername string `json:"target_username"`
+	// Components names the manifest stages to apply (e.g. "home","db","dns").
+	// Empty = apply every stage present (a full account restore).
+	Components []string `json:"components,omitempty"`
+	// SkipComponents names stages not to apply even when Components selects
+	// them (or is empty). The panel's upload restore skips "mail" in its
+	// first pass and restores mail once it rebuilt the account's domains
+	// (GH #1993).
+	SkipComponents []string `json:"skip_components,omitempty"`
+	// ApplyStaged=false stages the extracted tree without touching the live
+	// system (recon), mirroring backup.restore.
+	ApplyStaged *bool `json:"apply_staged,omitempty"`
+	// GH #1408 tenant self-restore: when Mode=="tenant" the uploaded tar is
+	// untrusted, so the panel supplies the caller's OWNED resources and the
+	// agent skips anything else. AllowedDBNames / AllowedMailDomains: nil =
+	// unrestricted (admin); non-nil (even empty) = enforce. Mode=="tenant"
+	// REQUIRES both lists (fail-closed) and additionally drops docker.
+	Mode               string   `json:"mode,omitempty"`
+	AllowedDBNames     []string `json:"allowed_db_names,omitempty"`
+	AllowedMailDomains []string `json:"allowed_mail_domains,omitempty"`
+	// GH #1993 admin restore from an uploaded file (Mode=="upload"): the panel
+	// supplies the target's own databases, domains and docker apps
+	// (AllowedDBNames, AllowedMailDomains, OwnedDockerSlugs) and the databases
+	// and docker apps everyone else owns. All five are REQUIRED in that mode
+	// (fail-closed); see restoreModeUpload.
+	ForeignDBNames     []string `json:"foreign_db_names,omitempty"`
+	OwnedDockerSlugs   []string `json:"owned_docker_slugs,omitempty"`
+	ForeignDockerSlugs []string `json:"foreign_docker_slugs,omitempty"`
+	// KeepExisting (GH #1993): add only what isn't on this server yet; see
+	// restoreEnforcement.KeepExisting. False (or absent) replaces.
+	KeepExisting bool `json:"keep_existing,omitempty"`
+	// SkipPostgres (GH #1993): restore no PostgreSQL database; see
+	// restoreEnforcement.SkipPostgres.
+	SkipPostgres bool `json:"skip_postgres,omitempty"`
+	// FTPPasswords (GH #1993): stage the file's FTP subaccount passwords
+	// (stageUploadedFtpPasswords). The panel sets it only for an account the
+	// restore created. Upload mode only.
+	FTPPasswords bool `json:"ftp_passwords,omitempty"`
+}
+
+// enforcement is what the restore enforces for these params.
+func (p backupRestoreFromTarParams) enforcement() restoreEnforcement {
+	return restoreEnforcement{
+		Mode:               p.Mode,
+		AllowedDBNames:     p.AllowedDBNames,
+		AllowedMailDomains: p.AllowedMailDomains,
+		ForeignDBNames:     p.ForeignDBNames,
+		OwnedDockerSlugs:   p.OwnedDockerSlugs,
+		ForeignDockerSlugs: p.ForeignDockerSlugs,
+		KeepExisting:       p.KeepExisting,
+		SkipPostgres:       p.SkipPostgres,
+	}
+}
+
+type backupRestoreFromTarResult struct {
+	JobID          string               `json:"job_id"`
+	User           backup.ManifestUser  `json:"user"`
+	Stages         []backupRestoreStage `json:"stages"`
+	Applied        []string             `json:"applied,omitempty"`
+	Warnings       []string             `json:"warnings,omitempty"`
+	Metadata       json.RawMessage      `json:"metadata,omitempty"`
+	StagingCleanup string               `json:"staging_cleanup,omitempty"`
+	BytesExtracted int64                `json:"bytes_extracted"`
+	// GH #1408 fail-closed ack: a tenant restore's panel handler REQUIRES these
+	// to be true. An agent predating the allowlist feature never sets them, so
+	// the panel rejects the restore rather than running it unrestricted.
+	DBAllowlistEnforced   bool `json:"db_allowlist_enforced"`
+	MailAllowlistEnforced bool `json:"mail_allowlist_enforced"`
+	// UploadConfinementEnforced echoes that an upload-mode restore ran with
+	// its confinement (GH #1993).
+	UploadConfinementEnforced bool `json:"upload_confinement_enforced"`
+	// RestoredDatabases / RestoredDockerSlugs name the databases and docker
+	// app data an upload-mode restore created or wrote for the account; the
+	// panel restores rows from the file only for those (GH #1993).
+	RestoredDatabases   []string `json:"restored_databases,omitempty"`
+	RestoredDockerSlugs []string `json:"restored_docker_slugs,omitempty"`
+	// ArchiveMariaDBs are the restored MariaDB databases whose data is all
+	// the archive's (restoreClaims.ArchiveMariaDBs). In upload mode it is always
+	// a list, empty when there are none: a missing one is an older agent.
+	ArchiveMariaDBs []string `json:"archive_mariadb_databases"`
+	// ArchivePostgresDBs are the same for PostgreSQL
+	// (restoreClaims.ArchivePostgresDBs), a separate list: a name restored
+	// as one engine says nothing about the other engine's database.
+	ArchivePostgresDBs []string `json:"archive_postgres_databases"`
+	// RestoredPostgresDBs are the PostgreSQL databases the restore loaded,
+	// in every mode (restoreReport.PostgresDatabases). The panel grants each
+	// database user it has on them again.
+	RestoredPostgresDBs []string `json:"restored_postgres_databases"`
+	// FTPPasswordsStaged are the FTP subaccounts whose password from the file
+	// the restore staged (GH #1993). In upload mode it is always a list.
+	FTPPasswordsStaged []string `json:"ftp_passwords_staged"`
+}
+
+// setClaims puts what an upload-mode restore created or wrote into the reply.
+func (r *backupRestoreFromTarResult) setClaims(c *restoreClaims) {
+	r.RestoredDatabases, r.RestoredDockerSlugs = c.Databases, c.DockerSlugs
+	r.ArchiveMariaDBs = append([]string{}, c.ArchiveMariaDBs...)
+	r.ArchivePostgresDBs = append([]string{}, c.ArchivePostgresDBs...)
+}
+
+func backupRestoreFromTarHandler(ctx context.Context, raw json.RawMessage) (any, error) {
+	var p backupRestoreFromTarParams
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return nil, bkInvalidArg(fmt.Sprintf("invalid params: %v", err))
+	}
+	apply := true
+	if p.ApplyStaged != nil {
+		apply = *p.ApplyStaged
+	}
+	enf := p.enforcement()
+	// Belt-and-suspenders: a tenant restore MUST carry both allowlists (a nil
+	// list means "unrestricted", so a caller that forgot one would restore
+	// wide-open). Refuse rather than run partially-gated.
+	if enf.Mode == "tenant" && (enf.AllowedDBNames == nil || enf.AllowedMailDomains == nil) {
+		return nil, bkInvalidArg("mode=tenant requires allowed_db_names and allowed_mail_domains (may be empty, not null)")
+	}
+	// GH #1993: every panel caller passes a mode (tenant, or upload for an
+	// admin restore of an uploaded file). A call without one comes from a
+	// panel older than this agent: refuse it rather than restore unconfined.
+	if enf.Mode != "tenant" && !enf.upload() {
+		return nil, bkInvalidArg("mode must be tenant or upload; update the panel before restoring an uploaded backup")
+	}
+	if enf.upload() && (enf.AllowedDBNames == nil || enf.ForeignDBNames == nil || enf.AllowedMailDomains == nil ||
+		enf.OwnedDockerSlugs == nil || enf.ForeignDockerSlugs == nil) {
+		return nil, bkInvalidArg("mode=upload requires allowed_db_names, foreign_db_names, allowed_mail_domains, owned_docker_slugs and foreign_docker_slugs (may be empty, not null)")
+	}
+	return restoreAccountFromTar(ctx, p.JobID, p.TarPath, p.TargetUsername, p.Components, p.SkipComponents, apply, p.FTPPasswords, enf)
+}
+
+// restoreAccountFromTar is the reusable core: extract an untrusted account backup
+// tar and apply it to targetUsername. Shared by the single-upload restore handler
+// and the full-server container restore (which calls it once per inner user tar).
+func restoreAccountFromTar(ctx context.Context, jobID, tarPath, targetUsername string, components, skipComponents []string, apply, ftpPasswords bool, enf restoreEnforcement) (*backupRestoreFromTarResult, error) {
+	if !jobIDRE.MatchString(jobID) {
+		return nil, bkInvalidArg("job_id must be a 26-char ULID")
+	}
+	// GH #1408: a tenant self-restore is limited to the audited-safe components;
+	// docker/dns are never applied from an untrusted self-service upload.
+	if enf.Mode == "tenant" {
+		components = intersectComponents(components, []string{"home", "db", "mail"})
+		if len(components) == 0 {
+			// The caller asked only for components a self-service restore can't
+			// apply. An EMPTY list means "all" downstream (componentFilter), so
+			// substitute a sentinel that matches no stage — apply nothing rather
+			// than fall open to a full restore.
+			components = []string{"__none__"}
+		}
+	}
+	if !backupUsernameRE.MatchString(targetUsername) {
+		return nil, bkInvalidArg("target_username must match ^[a-z][a-z0-9_-]{0,31}$")
+	}
+	// The tar path MUST live under the uploads handoff dir and contain no
+	// traversal — never let the caller point the extractor at an arbitrary file.
+	tarClean := filepath.Clean(tarPath)
+	if tarClean != tarPath || !strings.HasPrefix(tarClean, restoreUploadsRoot+"/") {
+		return nil, bkInvalidArg("tar_path must be a clean path under " + restoreUploadsRoot)
+	}
+	if fi, err := os.Lstat(tarClean); err != nil || !fi.Mode().IsRegular() {
+		return nil, bkInvalidArg("tar_path is not a regular file")
+	}
+
+	// Refuse to stage under the host disk reserve (same guard the DB/PG restore
+	// paths use) so a large archive can't wedge the box.
+	if err := checkHostReserve("/var/lib/dotnext-backups", 0); err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeUnavailable,
+			Message: "restore staging is under the host disk reserve: " + err.Error(),
+		}
+	}
+
+	if err := ensureRestoreStaging(); err != nil {
+		return nil, bkInternal("secure restore staging", err)
+	}
+	staging := filepath.Join(restoreStagingRoot(), jobID+"-upload")
+	_ = os.RemoveAll(staging)
+	if err := os.MkdirAll(staging, 0o750); err != nil {
+		return nil, bkInternal("mkdir staging", err)
+	}
+
+	// GH #1993: backup.restore_progress reports what this restore is doing.
+	var tarSize int64
+	if fi, err := os.Lstat(tarClean); err == nil {
+		tarSize = fi.Size()
+	}
+	progress := startRestoreProgress(jobID, tarSize)
+	defer progress.finish()
+	ctx = withRestoreProgress(ctx, progress)
+
+	written, err := safeExtractZstdTarProgress(ctx, tarClean, staging, progress.addUnpacked)
+	if err != nil {
+		_ = os.RemoveAll(staging)
+		return nil, bkInvalidArg("archive rejected: " + err.Error())
+	}
+
+	root, manifestBytes, metadata, err := readExtractedUpload(staging)
+	if err != nil {
+		_ = os.RemoveAll(staging)
+		return nil, bkInvalidArg(err.Error())
+	}
+	manifest, err := backup.AccountManifestFromBytes(manifestBytes)
+	if err != nil {
+		_ = os.RemoveAll(staging)
+		return nil, bkInvalidArg("manifest parse failed: " + err.Error())
+	}
+
+	out := backupRestoreFromTarResult{JobID: jobID, User: manifest.User, BytesExtracted: written}
+	// Echo which allowlists this agent enforced so the panel's tenant handler can
+	// fail closed against an agent that predates the feature (it never sets these).
+	out.DBAllowlistEnforced = enf.enforceDB()
+	out.MailAllowlistEnforced = enf.enforceMail()
+	out.UploadConfinementEnforced = enf.upload()
+
+	// v1 restores into the SAME username the backup was taken from — the home
+	// tree inside the archive is /home/<backup-user> and applyAccountRestore
+	// keys the source path by the target name, so a mismatch silently leaves
+	// home unrestored. The panel sets target = the manifest's username; warn if
+	// a caller passes something else (renaming on restore is a follow-up).
+	if targetUsername != manifest.User.Username {
+		out.Warnings = append(out.Warnings, fmt.Sprintf(
+			"target_username %q differs from the backup's user %q; the home stage will be skipped (restore into the same username)",
+			targetUsername, manifest.User.Username))
+	}
+
+	// Best-effort metadata (FTP subaccount hashes etc.) from the meta stage.
+	out.Metadata = metadata
+	if enf.upload() {
+		enf.DBPrefix = targetUsername + "_"
+		enf.ServerLevelDockerSlugs, enf.DockerMetadataMissing = serverLevelDockerSlugs(out.Metadata)
+	}
+
+	// Per-stage gate: a stage is applied only when it materialized in the tar AND
+	// (no component filter, or the filter selected it). Aligned by manifest-stage
+	// index — same discipline as backup.restore (docker/db fan out same-named
+	// stages, so a name-keyed gate would collapse them, GH #1360).
+	want, skip := componentFilter(components), componentFilter(skipComponents)
+	stageResults := make([]backupRestoreStage, len(manifest.Stages))
+	for i, st := range manifest.Stages {
+		res := backupRestoreStage{Name: st.Name, Status: backup.StageStatusSkipped}
+		if stageSelected(want, skip, st.Name) && stageMaterializedInTar(root, st.Name) {
+			res.Status = backup.StageStatusOK
+		}
+		stageResults[i] = res
+	}
+	out.Stages = stageResults
+
+	if !apply {
+		out.Warnings = append(out.Warnings, "apply_staged=false — extracted to "+staging+"; nothing applied")
+		out.StagingCleanup = "kept (recon mode)"
+		return &out, nil
+	}
+
+	if enf.upload() {
+		enf.Claims = &restoreClaims{}
+	}
+	applied, warnings, pgDBs := applyAccountRestoreReporting(ctx, root, targetUsername, manifest.User, manifest.Stages, stageResults, enf)
+	out.RestoredPostgresDBs = pgDBs
+	out.Applied = applied
+	out.Warnings = append(out.Warnings, warnings...)
+	if enf.Claims != nil {
+		out.setClaims(enf.Claims)
+	}
+	out.stageFtpPasswords(enf, targetUsername, ftpPasswords, time.Now())
+
+	if removeRestoreStaging(applied, enf) {
+		if rmErr := os.RemoveAll(staging); rmErr != nil {
+			out.StagingCleanup = "cleanup_failed: " + rmErr.Error()
+			out.Warnings = append(out.Warnings, "staging cleanup failed: "+rmErr.Error())
+		} else {
+			out.StagingCleanup = "removed"
+		}
+	} else {
+		out.StagingCleanup = "kept (no stages applied)"
+	}
+	return &out, nil
+}
+
+// stageFtpPasswords stages the file's FTP subaccount passwords for
+// targetUsername when the panel asked for them (ftpPasswords: the restore
+// created the account), and puts what it did in the reply (GH #1993). Upload
+// mode only: a tenant's own restore restores no FTP subaccount.
+func (r *backupRestoreFromTarResult) stageFtpPasswords(enf restoreEnforcement, targetUsername string, ftpPasswords bool, now time.Time) {
+	if !enf.upload() {
+		return
+	}
+	r.FTPPasswordsStaged = []string{}
+	if !ftpPasswords || len(r.Metadata) == 0 {
+		return
+	}
+	var meta backup.AccountMetadata
+	if err := json.Unmarshal(r.Metadata, &meta); err != nil {
+		r.Warnings = append(r.Warnings, "ftp: the backup's FTP passwords weren't read: "+err.Error())
+		return
+	}
+	staged, skipped := stageUploadedFtpPasswords(&meta, targetUsername, now)
+	r.FTPPasswordsStaged = staged
+	if len(staged) > 0 {
+		r.Applied = append(r.Applied, fmt.Sprintf("ftp: staged %d subaccount password(s) for restore", len(staged)))
+	}
+	for _, s := range skipped {
+		r.Warnings = append(r.Warnings, "ftp: password not restored for "+s)
+	}
+}
+
+// readExtractedUpload finds the per-stage root of an extracted upload and reads
+// its manifest and, when present, its metadata (nil when absent).
+func readExtractedUpload(staging string) (root string, manifest, metadata []byte, err error) {
+	// The downloaded archive is tarred as `<source-job-id>/<stage>/…` (the panel
+	// runs `tar -C <downloads> <job-id>`), so the extracted tree has a single
+	// job-id dir on top. Descend into it — that dir IS the per-stage staging
+	// root applyAccountRestore expects (identical to backup.restore's staging).
+	root, err = resolveExtractedRoot(staging)
+	if err != nil {
+		return "", nil, nil, err
+	}
+	// GH #1993: before root reads anything from the tree, refuse a symlink
+	// outside the home and app data trees the restore copies as they are.
+	if err := checkStagedLinks(staging, root); err != nil {
+		return "", nil, nil, err
+	}
+	// manifest lives under the manifest stage: <root>/manifest/manifest.json.
+	manifest, err = readStagedFile(root, filepath.Join(root, "manifest", "manifest.json"))
+	if err != nil {
+		return "", nil, nil, fmt.Errorf("archive has no manifest/manifest.json (not a DotNext account backup)")
+	}
+	if mb, mErr := readStagedFile(root, filepath.Join(root, "meta", "metadata.json")); mErr == nil {
+		metadata = mb
+	}
+	return root, manifest, metadata, nil
+}
+
+// stageSelected reports whether the stage named name is applied: the
+// component filter want selects it (nil selects every stage) and skip doesn't
+// name it.
+func stageSelected(want, skip map[string]bool, name string) bool {
+	return (want == nil || want[name]) && !skip[name]
+}
+
+// removeRestoreStaging reports whether the staging tree goes once the restore
+// applied. An upload restore always removes it: it is a full extracted copy of
+// the uploaded file, and the panel's mail pass applies nothing for an archive
+// without mail (GH #1993). Otherwise a restore that applied nothing keeps it
+// for inspection.
+func removeRestoreStaging(applied []string, enf restoreEnforcement) bool {
+	return len(applied) > 0 || enf.upload()
+}
+
+// componentFilter builds a set of stage names to apply, or nil to apply all.
+func componentFilter(components []string) map[string]bool {
+	if len(components) == 0 {
+		return nil
+	}
+	m := make(map[string]bool, len(components))
+	for _, c := range components {
+		if c = strings.TrimSpace(c); c != "" {
+			m[c] = true
+		}
+	}
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
+// intersectComponents restricts a requested component set to an allowed set. An
+// EMPTY request means "all", so it becomes exactly the allowed set (not empty) —
+// this is what keeps a tenant restore that asked for nothing-in-particular from
+// falling through to an unrestricted all-stages apply. GH #1408.
+func intersectComponents(requested, allowed []string) []string {
+	if len(requested) == 0 {
+		return allowed
+	}
+	allow := make(map[string]bool, len(allowed))
+	for _, a := range allowed {
+		allow[a] = true
+	}
+	out := make([]string, 0, len(requested))
+	for _, r := range requested {
+		if allow[strings.TrimSpace(r)] {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// resolveExtractedRoot returns the per-stage staging root inside the extracted
+// tree. The downloaded archive wraps everything in a single <source-job-id>
+// directory (the panel runs `tar -C <downloads> <job-id>`), so the real root is
+// that lone child. A defensively un-prefixed archive (manifest directly under
+// staging) returns staging itself. Anything else is not a DotNext account backup.
+// It follows no symlink.
+func resolveExtractedRoot(staging string) (string, error) {
+	if stagedEntry(staging, filepath.Join(staging, "manifest", "manifest.json"), false) == nil {
+		return staging, nil
+	}
+	ents, err := os.ReadDir(staging)
+	if err != nil {
+		return "", fmt.Errorf("read extracted tree: %v", err)
+	}
+	var dirs []string
+	for _, e := range ents {
+		if e.IsDir() {
+			dirs = append(dirs, e.Name())
+		}
+	}
+	if len(dirs) == 1 {
+		root := filepath.Join(staging, dirs[0])
+		if stagedEntry(staging, filepath.Join(root, "manifest", "manifest.json"), false) == nil {
+			return root, nil
+		}
+	}
+	return "", fmt.Errorf("archive is not a DotNext account backup (no manifest/manifest.json)")
+}
+
+// stageMaterializedInTar reports whether the extracted tree carries this stage's
+// directory (the tar is a merge of the per-stage snapshots, so stage <name>
+// lands at staging/<name>/). A stage folder that is a symlink doesn't count.
+func stageMaterializedInTar(staging, name string) bool {
+	if name == "" {
+		return false
+	}
+	return stagedEntry(staging, filepath.Join(staging, name), true) == nil
+}
+
+// backup.inspect_uploaded_tar — GH #1408. Read ONLY the manifest from an
+// uploaded archive (no full extraction) so the panel can show what the backup
+// contains + which components can be restored, before the admin commits to the
+// destructive apply. Cheap: it streams the zstd tar and stops at the manifest.
+type backupInspectUploadedTarParams struct {
+	TarPath string `json:"tar_path"`
+}
+
+type backupInspectUploadedTarResult struct {
+	User       backup.ManifestUser `json:"user"`
+	Components []string            `json:"components"`
+	// AllowlistSupported is always true on an agent that has the GH #1408 tenant
+	// enforcement. The tenant restore handler gates on it BEFORE applying, so an
+	// older agent (which never sets it) can't run an unrestricted tenant restore.
+	AllowlistSupported bool `json:"allowlist_supported"`
+	// Summary is what the restore preflight checks against this server (GH
+	// #1993): nil when the archive has no readable metadata. Never the
+	// metadata itself, which holds password hashes.
+	Summary *backup.BundleSummary `json:"summary,omitempty"`
+	// PreflightSupported is always true on an agent that reads Summary and
+	// honours skip_postgres; an older agent never sets it.
+	PreflightSupported bool `json:"preflight_supported"`
+}
+
+func backupInspectUploadedTarHandler(ctx context.Context, raw json.RawMessage) (any, error) {
+	var p backupInspectUploadedTarParams
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return nil, bkInvalidArg(fmt.Sprintf("invalid params: %v", err))
+	}
+	tarClean := filepath.Clean(p.TarPath)
+	if tarClean != p.TarPath || !strings.HasPrefix(tarClean, restoreUploadsRoot+"/") {
+		return nil, bkInvalidArg("tar_path must be a clean path under " + restoreUploadsRoot)
+	}
+	if fi, err := os.Lstat(tarClean); err != nil || !fi.Mode().IsRegular() {
+		return nil, bkInvalidArg("tar_path is not a regular file")
+	}
+
+	manifestBytes, metadataBytes, err := readBundleFromZstdTar(ctx, tarClean)
+	if err != nil {
+		return nil, bkInvalidArg("archive inspect failed: " + err.Error())
+	}
+	return inspectUploadedBundle(manifestBytes, metadataBytes)
+}
+
+// inspectUploadedBundle is the inspect result for an archive's manifest and
+// metadata (nil when it has none).
+func inspectUploadedBundle(manifestBytes, metadataBytes []byte) (backupInspectUploadedTarResult, error) {
+	manifest, err := backup.AccountManifestFromBytes(manifestBytes)
+	if err != nil {
+		return backupInspectUploadedTarResult{}, bkInvalidArg("manifest parse failed: " + err.Error())
+	}
+	// Components the UI can offer = the distinct restorable stage names in the
+	// manifest (manifest/meta are internal). Apply re-gates on actual presence.
+	comps := make([]string, 0, len(manifest.Stages))
+	seen := map[string]bool{}
+	for _, st := range manifest.Stages {
+		if st.Name == "" || st.Name == "manifest" || st.Name == "meta" || seen[st.Name] {
+			continue
+		}
+		comps = append(comps, st.Name)
+		seen[st.Name] = true
+	}
+	out := backupInspectUploadedTarResult{User: manifest.User, Components: comps, AllowlistSupported: true, PreflightSupported: true}
+	if metadataBytes != nil {
+		var m backup.AccountMetadata
+		if json.Unmarshal(metadataBytes, &m) == nil {
+			sum := backup.SummarizeMetadata(&m)
+			out.Summary = &sum
+		}
+	}
+	return out, nil
+}
+
+func init() {
+	Default.Register("backup.restore_from_tar", backupRestoreFromTarHandler)
+	Default.Register("backup.inspect_uploaded_tar", backupInspectUploadedTarHandler)
+}
+
+// serverLevelDockerSlugs returns the data slugs of the docker apps the
+// backup's metadata marks server-level. missing=true when the metadata
+// can't be read, so the caller can't tell which apps those are.
+func serverLevelDockerSlugs(meta []byte) (slugs []string, missing bool) {
+	if len(meta) == 0 {
+		return nil, true
+	}
+	var m backup.AccountMetadata
+	if err := json.Unmarshal(meta, &m); err != nil {
+		return nil, true
+	}
+	for _, a := range m.DockerApps {
+		if !a.ServerLevel {
+			continue
+		}
+		slug := a.InstanceSlug
+		if slug == "" {
+			slug = a.Slug
+		}
+		slugs = append(slugs, slug)
+	}
+	return slugs, false
+}

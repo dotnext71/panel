@@ -1,0 +1,544 @@
+package api
+
+import (
+	"context"
+	"errors"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/dotnext-panel/dotnext/internal/agent"
+	"github.com/dotnext-panel/dotnext/internal/dnscompile"
+	"github.com/dotnext-panel/dotnext/internal/domainmailops"
+	"github.com/dotnext-panel/dotnext/internal/ginctx"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+)
+
+// agentCall adapts an AgentInterface into the neutral domainmailops.CallFunc.
+// Returns nil when the agent is unconfigured so domainmailops.Enable/Disable
+// surface ErrAgentUnconfigured rather than panicking on a nil-interface method
+// value.
+func agentCall(a agent.AgentInterface) domainmailops.CallFunc {
+	if a == nil {
+		return nil
+	}
+	return a.Call
+}
+
+// DomainEmailHandlerConfig wires the email-on-domain endpoints.
+//
+// SSLCerts + SSLReconciler are optional — when both are wired, enabling
+// email on a domain triggers SSL SAN expansion via the reconciler.
+type DomainEmailHandlerConfig struct {
+	Domains        repository.DomainRepository
+	Agent          agent.AgentInterface
+	DNSZones       repository.DNSZoneRepository
+	DNSRecords     repository.DNSRecordRepository
+	ServerSettings repository.ServerSettingsRepository
+	SSLCerts       repository.SSLCertificateRepository
+	SSLReconciler  SSLScheduler
+}
+
+// domainEmailAgentTimeout bounds the agent call budget for the mail-purge
+// endpoints (domain_mail_purge.go). The enable/disable agent budget now lives
+// in internal/domainmailops.
+const domainEmailAgentTimeout = 30 * time.Second
+
+// deps builds the neutral domainmailops dependency set from the handler
+// config. The agent is adapted through agentCall (nil when unconfigured).
+func (h *domainEmailHandler) deps() domainmailops.Deps {
+	return domainmailops.Deps{
+		Domains:        h.cfg.Domains,
+		DNSZones:       h.cfg.DNSZones,
+		DNSRecords:     h.cfg.DNSRecords,
+		ServerSettings: h.cfg.ServerSettings,
+		SSLCerts:       h.cfg.SSLCerts,
+		SSLReconciler:  h.cfg.SSLReconciler,
+		Call:           agentCall(h.cfg.Agent),
+	}
+}
+
+// RegisterDomainEmailRoutes mounts:
+//
+//   - GET    /domains/:id/email      current state (enabled flag, DKIM, recommended DNS)
+//   - POST   /domains/:id/email      enable (idempotent — re-enables are ok)
+//   - DELETE /domains/:id/email      disable (keeps DKIM key material per ADR-0043)
+//
+// Live DNS-record presence status (the blueprint's /email/dns-status)
+// depends on M6 Step 5 (DNS autoconfig) which hasn't landed yet. Until
+// then, GET returns a static list of the records the operator should
+// publish (hint-only). The UI renders that as static instructions; once
+// Step 5 ships, the "status" subfield can be populated without breaking
+// the response shape.
+func RegisterDomainEmailRoutes(g *gin.RouterGroup, cfg DomainEmailHandlerConfig) {
+	h := &domainEmailHandler{cfg: cfg}
+	g.GET("/domains/:id/email", h.get)
+	g.POST("/domains/:id/email", h.enable)
+	g.DELETE("/domains/:id/email", h.disable)
+	g.POST("/domains/:id/email/dkim-rotate", h.rotateDKIM)
+}
+
+type domainEmailHandler struct{ cfg DomainEmailHandlerConfig }
+
+// rotateDKIM rotates the domain's DKIM keys (Gitea #542): the agent gives
+// Stalwart's signatures new Ed25519 and RSA keys (GH #2475), we persist the
+// new public keys, then wipe + republish the M6 email DNS so the new TXT
+// records land at dotnext._domainkey and dotnextrsa._domainkey. Admin or the
+// domain owner.
+func (h *domainEmailHandler) rotateDKIM(c *gin.Context) {
+	ctx := c.Request.Context()
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	dom, err := h.cfg.Domains.FindByID(ctx, c.Param("id"))
+	if err != nil {
+		if isNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "domain_not_found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	if !claims.IsAdmin && dom.UserID != claims.UserID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
+	// The rotation lifecycle (email-enabled guard, agent call, new-key
+	// validation, persistence, wipe + republish of the M6-managed DNS) lives in
+	// internal/domainmailops (JAB-286); this handler only maps the typed result
+	// onto the REST contract. h.deps() wires the same DNS repos the enable path
+	// uses, and agentCall is nil when the agent is unconfigured (→ 503).
+	res, warnings, err := domainmailops.RotateDKIM(ctx, h.deps(), dom)
+	if err != nil {
+		switch {
+		case errors.Is(err, domainmailops.ErrEmailNotEnabled):
+			c.JSON(http.StatusConflict, gin.H{"error": "email_not_enabled", "detail": "enable email on this domain before rotating DKIM"})
+		case errors.Is(err, domainmailops.ErrAgentUnconfigured):
+			c.JSON(http.StatusServiceUnavailable, gin.H{"error": "agent_unconfigured"})
+		case errors.Is(err, domainmailops.ErrAgentFailed):
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "agent_rotate_failed", "detail": firstLineString(err.Error())})
+		case errors.Is(err, domainmailops.ErrAgentBadResponse):
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "agent_bad_response", "detail": "agent returned no new DKIM key"})
+		case errors.Is(err, domainmailops.ErrPersistFailed):
+			// The mail server already signs with the new keys; return them so
+			// they can be published by hand.
+			c.JSON(http.StatusInternalServerError, gin.H{
+				"error":                   "persist_failed",
+				"detail":                  "the mail server signs with the new DKIM keys, but they could not be saved; publish new_dkim_public_key and new_dkim_rsa_public_key by hand: " + firstLineString(err.Error()),
+				"new_dkim_public_key":     res.NewDKIMPublicKey,
+				"new_dkim_rsa_public_key": res.NewDKIMRSAPublicKey,
+			})
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		}
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"domain_id":           dom.ID,
+		"domain_name":         dom.Name,
+		"dkim_selector":       res.Selector,
+		"old_dkim_public_key": res.OldDKIMPublicKey,
+		"new_dkim_public_key": res.NewDKIMPublicKey,
+		"old_key_backup_path": res.OldKeyBackupPath,
+		// GH #2475: "" when the RSA key was not rotated (see warnings).
+		"dkim_rsa_selector":       dnscompile.EmailRecordsRSASelector,
+		"old_dkim_rsa_public_key": res.OldDKIMRSAPublicKey,
+		"new_dkim_rsa_public_key": res.NewDKIMRSAPublicKey,
+		"warnings":                domainmailops.WarningMessages(warnings),
+	})
+}
+
+// domainEmailResponse is what the UI reads on every poll. `warnings`
+// surface operator-actionable messages — typically a conflict with a
+// user-edited DNS record that M6 refused to overwrite.
+type domainEmailResponse struct {
+	DomainID      string `json:"domain_id"`
+	DomainName    string `json:"domain_name"`
+	EmailEnabled  bool   `json:"email_enabled"`
+	DkimSelector  string `json:"dkim_selector,omitempty"`
+	DkimPublicKey string `json:"dkim_public_key,omitempty"`
+	// The RSA key signing beside the Ed25519 one (GH #2475); empty until
+	// the domain has one.
+	DkimRSASelector  string               `json:"dkim_rsa_selector,omitempty"`
+	DkimRSAPublicKey string               `json:"dkim_rsa_public_key,omitempty"`
+	EmailEnabledAt   *time.Time           `json:"email_enabled_at,omitempty"`
+	Records          []domainEmailDNSHint `json:"records"`
+	Warnings         []string             `json:"warnings,omitempty"`
+}
+
+// domainEmailDNSHint is one recommended DNS record. `Status` is one of:
+//
+//	"ok"       — present in dns_records with matching content
+//	"missing"  — expected but no row at (name, type)
+//	"conflict" — a user-edited (ManagedBy=NULL, Managed=false) row is
+//	             there with different content; M6 won't overwrite it
+//	""         — zone missing (domain has no DNS zone on the panel);
+//	             the UI renders this as "no live data" rather than an
+//	             error so non-PowerDNS setups don't look broken
+//
+// Purpose is a human label for the UI table.
+type domainEmailDNSHint struct {
+	Purpose string `json:"purpose"`
+	Name    string `json:"name"`
+	Type    string `json:"type"`
+	Value   string `json:"value"`
+	Status  string `json:"status,omitempty"`
+}
+
+func (h *domainEmailHandler) get(c *gin.Context) {
+	ctx := c.Request.Context()
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	dom, err := h.cfg.Domains.FindByID(ctx, c.Param("id"))
+	if err != nil {
+		if isNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "domain_not_found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	if !claims.IsAdmin && dom.UserID != claims.UserID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
+
+	selector, pubKey := "", ""
+	if dom.DkimSelector != nil {
+		selector = *dom.DkimSelector
+	}
+	if dom.DkimPublicKey != nil {
+		pubKey = *dom.DkimPublicKey
+	}
+	hints, warnings := h.buildHintsWithStatus(ctx, dom, selector, pubKey)
+	rsaSelector, rsaKey := rsaDKIM(dom)
+	c.JSON(http.StatusOK, domainEmailResponse{
+		DomainID:         dom.ID,
+		DomainName:       dom.Name,
+		EmailEnabled:     dom.EmailEnabled,
+		DkimSelector:     selector,
+		DkimPublicKey:    pubKey,
+		DkimRSASelector:  rsaSelector,
+		DkimRSAPublicKey: rsaKey,
+		EmailEnabledAt:   dom.EmailEnabledAt,
+		Records:          hints,
+		Warnings:         warnings,
+	})
+}
+
+func (h *domainEmailHandler) enable(c *gin.Context) {
+	ctx := c.Request.Context()
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	dom, err := h.cfg.Domains.FindByID(ctx, c.Param("id"))
+	if err != nil {
+		if isNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "domain_not_found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	if !claims.IsAdmin && dom.UserID != claims.UserID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
+
+	// GH #1627: a domain created from a custom DNS template carries the external
+	// 'custom' mail posture. Enabling DotNext mail on it would provision a
+	// Stalwart mailbox + DKIM records beside the template's own external MX/SPF
+	// (a split, conflicting posture). Blocked in this phase — delete + recreate
+	// the domain without a template to host mail on DotNext.
+	if dom.MailProvider == models.MailProviderCustom {
+		c.JSON(http.StatusConflict, gin.H{"error": "template_posture_locked", "detail": "this domain was created from a DNS template and uses external mail; enabling dotNext mail is not supported for it"})
+		return
+	}
+
+	selector, pubKey, warnings, err := domainmailops.Enable(ctx, h.deps(), dom)
+	if err != nil {
+		// Translate the module's sentinel errors back to HTTP responses.
+		switch {
+		case errors.Is(err, domainmailops.ErrOwnershipPending):
+			c.JSON(http.StatusConflict, gin.H{"error": "domain_ownership_pending", "detail": "prove ownership of the domain before enabling mail"})
+		case errors.Is(err, domainmailops.ErrAgentUnconfigured):
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "agent_unconfigured"})
+		case errors.Is(err, domainmailops.ErrAgentBadResponse):
+			respondAgentErr(c, "agent_bad_response", err)
+		case errors.Is(err, domainmailops.ErrAgentFailed):
+			respondAgentErr(c, "agent_failed", err)
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		}
+		return
+	}
+
+	hints, statusWarnings := h.buildHintsWithStatus(ctx, dom, selector, pubKey)
+	rsaSelector, rsaKey := rsaDKIM(dom)
+	c.JSON(http.StatusOK, domainEmailResponse{
+		DomainID:         dom.ID,
+		DomainName:       dom.Name,
+		EmailEnabled:     true,
+		DkimSelector:     selector,
+		DkimPublicKey:    pubKey,
+		DkimRSASelector:  rsaSelector,
+		DkimRSAPublicKey: rsaKey,
+		EmailEnabledAt:   dom.EmailEnabledAt,
+		Records:          hints,
+		Warnings:         append(domainmailops.WarningMessages(warnings), statusWarnings...),
+	})
+}
+
+func (h *domainEmailHandler) disable(c *gin.Context) {
+	ctx := c.Request.Context()
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	dom, err := h.cfg.Domains.FindByID(ctx, c.Param("id"))
+	if err != nil {
+		if isNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "domain_not_found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	if !claims.IsAdmin && dom.UserID != claims.UserID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
+
+	// domainmailops.Disable is agent-first: on an agent failure the DB row is
+	// left alone (email_enabled=1) so the operator can retry — the same
+	// delete-ordering rule as mailbox.delete. On success it flips the row off
+	// (keeping DKIM material per ADR-0043) and removes the M6-managed DNS.
+	if err := domainmailops.Disable(ctx, h.deps(), dom); err != nil {
+		switch {
+		case errors.Is(err, domainmailops.ErrAgentUnconfigured):
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "agent_unconfigured"})
+		case errors.Is(err, domainmailops.ErrAgentFailed):
+			respondAgentErr(c, "agent_failed", err)
+		default:
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		}
+		return
+	}
+	c.Status(http.StatusNoContent)
+}
+
+// buildHintsWithStatus projects the authoritative M6 record set onto
+// the UI's list-of-hints shape, marking each entry with its live
+// status from dns_records. Records the blueprint lists (M4 + M6)
+// appear here; status reflects what's actually stored in PowerDNS via
+// the panel's dns_records mirror.
+//
+// When DNS repos aren't wired or the domain has no zone, returns the
+// bare hint list with empty `Status` — the UI falls back to showing
+// them as static instructions.
+func (h *domainEmailHandler) buildHintsWithStatus(ctx context.Context, dom *models.Domain, selector, pubKey string) ([]domainEmailDNSHint, []string) {
+	domainID, domainName := dom.ID, dom.Name
+	// The mail host's public IP (server_settings) leads the record set so an
+	// external-DNS operator (GH #1612) can publish mail.<domain> — every MX/SRV/
+	// autodiscover record points at it. Best-effort: an unwired/unreadable
+	// ServerSettings just omits the A/AAAA rows.
+	ip4, ip6 := "", ""
+	if h.cfg.ServerSettings != nil {
+		if s, err := h.cfg.ServerSettings.Get(ctx); err == nil && s != nil {
+			ip4, ip6 = s.PublicIPv4, s.PublicIPv6
+		}
+	}
+	_, rsaKey := rsaDKIM(dom)
+	hints := staticEmailHints(domainName, selector, pubKey, rsaKey, ip4, ip6, dom.CalDAVHost, dom.CardDAVHost)
+
+	if h.cfg.DNSZones == nil || h.cfg.DNSRecords == nil {
+		return hints, nil
+	}
+	zone, err := h.cfg.DNSZones.FindByDomainID(ctx, domainID)
+	if err != nil || zone == nil {
+		return hints, nil
+	}
+	existing, err := h.cfg.DNSRecords.ListByZoneID(ctx, zone.ID)
+	if err != nil {
+		return hints, nil
+	}
+
+	var warnings []string
+	for i := range hints {
+		// Hints use FQDN form (name + trailing dot); dns_records stores
+		// short labels relative to the zone (and "@" for the apex).
+		// Normalise to the short form before lookup.
+		shortName := shortLabelForHint(hints[i].Name, domainName)
+		rec := findRecord(existing, shortName, hints[i].Type)
+		switch {
+		case rec == nil:
+			hints[i].Status = "missing"
+		case rec.Managed:
+			// Managed=true means M4 bootstrap or M6 — content belongs
+			// to the panel's own render pipeline (compile.go expands
+			// short labels to FQDNs at wire time). Trust it without
+			// textual comparison: the hint's FQDN/priority-inlined
+			// format would never match the stored short label anyway
+			// ("mail" vs "10 mail.example.com."). Drift detection is
+			// the reconciler's job, not this live-check.
+			hints[i].Status = "ok"
+		default:
+			// Managed=false → user-edited. Surface as conflict so the
+			// operator sees the override is blocking M6.
+			hints[i].Status = "conflict"
+			warnings = append(warnings,
+				"User-edited "+hints[i].Type+" record at "+hints[i].Name+
+					" overrides the email autoconfig; remove it to let M6 manage this slot.")
+		}
+	}
+	return hints, warnings
+}
+
+// staticEmailHints is the pure-function part: returns the list of
+// records the operator should see regardless of whether live state
+// can be read. When DKIM isn't set yet (pre-enable) the DKIM entry
+// still appears with an empty Value so the UI shows it as "pending".
+//
+// ip4/ip6 are the server's public addresses (server_settings). When known, the
+// mail host's own A/AAAA records lead the list: MX, every SRV, and the
+// autoconfig/autodiscover CNAMEs all point at mail.<domain>, so on EXTERNAL DNS
+// (GH #1612) this is the record without which none of the others resolve. On a
+// panel-hosted zone the M4 bootstrap already publishes it (status shows "ok"),
+// so listing it universally is honest, not redundant. Empty ip4/ip6 (server IP
+// unknown, or ServerSettings not wired) simply omits the row.
+//
+// calDAVHost/cardDAVHost are the domain's GH #1462 overrides ("" = built-in
+// DAV). Mail apps find calendars and contacts through the secure DAV SRV rows
+// alone, so those rows are listed (GH #1917) with the same target the zone
+// publishes. The plaintext :80 rows are left out on purpose: no client needs
+// them, and an external-DNS operator should not advertise plaintext DAV.
+//
+// rsaPubKey is the domain's RSA DKIM key (GH #2475); its record is listed
+// beside the Ed25519 one once the domain has it.
+func staticEmailHints(domainName, selector, pubKey, rsaPubKey, ip4, ip6, calDAVHost, cardDAVHost string) []domainEmailDNSHint {
+	hints := make([]domainEmailDNSHint, 0, 17)
+	if ip4 != "" {
+		hints = append(hints, domainEmailDNSHint{
+			Purpose: "A — the mail host itself; MX, SRV and autodiscover all point here",
+			Name:    "mail." + domainName + ".", Type: "A", Value: ip4,
+		})
+	}
+	if ip6 != "" {
+		hints = append(hints, domainEmailDNSHint{
+			Purpose: "AAAA — the mail host over IPv6",
+			Name:    "mail." + domainName + ".", Type: "AAAA", Value: ip6,
+		})
+	}
+	hints = append(hints, []domainEmailDNSHint{
+		{Purpose: "MX — delivers incoming mail to this host", Name: domainName + ".", Type: "MX", Value: "10 mail." + domainName + "."},
+		{Purpose: "SPF — authorises this host to send mail for the domain", Name: domainName + ".", Type: "TXT", Value: `v=spf1 mx ~all`},
+		{Purpose: "DMARC — tells receivers to reject unauthenticated mail", Name: "_dmarc." + domainName + ".", Type: "TXT", Value: strings.Trim(dnscompile.BuildDMARCString(domainName, "", false), `"`)},
+		{Purpose: "autoconfig — Thunderbird / mobile client auto-discovery", Name: "autoconfig." + domainName + ".", Type: "CNAME", Value: "mail." + domainName + "."},
+		{Purpose: "autodiscover — Outlook auto-discovery (CNAME flavour)", Name: "autodiscover." + domainName + ".", Type: "CNAME", Value: "mail." + domainName + "."},
+		{Purpose: "_autodiscover._tcp — alternative auto-discovery flavour (Outlook)", Name: "_autodiscover._tcp." + domainName + ".", Type: "SRV", Value: "0 0 443 mail." + domainName + "."},
+		{Purpose: "_imap._tcp — IMAP client auto-config (RFC 6186)", Name: "_imap._tcp." + domainName + ".", Type: "SRV", Value: "0 1 143 mail." + domainName + "."},
+		{Purpose: "_imaps._tcp — IMAPS client auto-config", Name: "_imaps._tcp." + domainName + ".", Type: "SRV", Value: "0 1 993 mail." + domainName + "."},
+		{Purpose: "_submission._tcp — SMTP submission (STARTTLS) auto-config", Name: "_submission._tcp." + domainName + ".", Type: "SRV", Value: "0 1 587 mail." + domainName + "."},
+		{Purpose: "_submissions._tcp — SMTP submission (implicit TLS) auto-config", Name: "_submissions._tcp." + domainName + ".", Type: "SRV", Value: "0 1 465 mail." + domainName + "."},
+		{Purpose: "_caldavs._tcp — mail apps find the mailbox's calendars", Name: "_caldavs._tcp." + domainName + ".", Type: "SRV", Value: davSRVHintValue(calDAVHost, domainName)},
+		{Purpose: "_carddavs._tcp — mail apps find the mailbox's contacts", Name: "_carddavs._tcp." + domainName + ".", Type: "SRV", Value: davSRVHintValue(cardDAVHost, domainName)},
+		{Purpose: "TLS-RPT — receives aggregate TLS-failure reports (RFC 8460)", Name: "_smtp._tls." + domainName + ".", Type: "TXT", Value: "v=TLSRPTv1; rua=mailto:postmaster@" + domainName},
+		{Purpose: "CAA — restricts cert issuance to Let's Encrypt", Name: domainName + ".", Type: "CAA", Value: `0 issue "letsencrypt.org"`},
+		{Purpose: "CAA — incident-reporting address for cert issues", Name: domainName + ".", Type: "CAA", Value: `0 iodef "mailto:postmaster@` + domainName + `"`},
+	}...)
+	if selector != "" && pubKey != "" {
+		hints = append(hints, domainEmailDNSHint{
+			Purpose: "DKIM (Ed25519) — signs outbound mail so receivers can verify it",
+			Name:    selector + "._domainkey." + domainName + ".",
+			Type:    "TXT",
+			Value:   pubKey,
+		})
+		if rsaPubKey != "" {
+			hints = append(hints, domainEmailDNSHint{
+				Purpose: "DKIM (RSA) — the second signature, for receivers that don't check Ed25519 (Gmail, Outlook)",
+				Name:    dnscompile.EmailRecordsRSASelector + "._domainkey." + domainName + ".",
+				Type:    "TXT",
+				Value:   rsaPubKey,
+			})
+		}
+	} else {
+		hints = append(hints, domainEmailDNSHint{
+			Purpose: "DKIM — generated automatically when email is enabled",
+			Name:    "<selector>._domainkey." + domainName + ".",
+			Type:    "TXT",
+			Value:   "",
+		})
+	}
+	return hints
+}
+
+// davSRVHintValue renders a secure DAV SRV row in the hint's record-data form
+// ("<priority> <weight> <port> <fqdn>.") from the content the zone publishes.
+func davSRVHintValue(override, domainName string) string {
+	return "0 " + dnscompile.DAVSecureSRV(override, "mail."+domainName) + "."
+}
+
+// shortLabelForHint maps a hint's FQDN back to the short label stored
+// in dns_records. "@" is used for the apex (matches BootstrapRecords).
+func shortLabelForHint(hintName, domain string) string {
+	// Strip the single trailing dot.
+	n := hintName
+	if len(n) > 0 && n[len(n)-1] == '.' {
+		n = n[:len(n)-1]
+	}
+	if n == domain {
+		return "@"
+	}
+	// Strip ".<domain>" suffix to get the relative label.
+	suffix := "." + domain
+	if len(n) > len(suffix) && n[len(n)-len(suffix):] == suffix {
+		return n[:len(n)-len(suffix)]
+	}
+	return n
+}
+
+func findRecord(records []models.DNSRecord, name, typ string) *models.DNSRecord {
+	for i := range records {
+		if records[i].Name == name && records[i].Type == typ {
+			return &records[i]
+		}
+	}
+	return nil
+}
+
+// hintMatches is a tolerant comparison for TXT-style contents where
+// BootstrapRecords stores `"v=spf1..."` (quoted) and PowerDNS also
+// accepts unquoted. Strips a surrounding pair of double quotes on both
+// sides before comparing so we don't falsely flag a match as conflict.
+func hintMatches(stored, expected string) bool {
+	trim := func(s string) string {
+		if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+			return s[1 : len(s)-1]
+		}
+		return s
+	}
+	return trim(stored) == trim(expected)
+}
+
+// rsaDKIM returns the selector and public key of the domain's RSA DKIM key
+// (GH #2475), or "", "" before it has one.
+func rsaDKIM(dom *models.Domain) (selector, pubKey string) {
+	if dom.DkimRSAPublicKey == nil || *dom.DkimRSAPublicKey == "" {
+		return "", ""
+	}
+	return dnscompile.EmailRecordsRSASelector, *dom.DkimRSAPublicKey
+}

@@ -1,0 +1,24 @@
+[Unit]
+Description=Reclaim moved-away dotnexthosted.com labels (JAB-213)
+After=network-online.target dotnexthosted-svc.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# Same user and env as the service: a reap run as root would leave root-owned
+# files beside svc.db and the service would then fail with "readonly database".
+User=dotnexthosted
+Group=dotnexthosted
+EnvironmentFile=/etc/dotnexthosted/svc.env
+ExecStart=/usr/local/bin/dotnexthosted-svc reap
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+ReadWritePaths=/var/lib/dotnexthosted
+CapabilityBoundingSet=
+AmbientCapabilities=

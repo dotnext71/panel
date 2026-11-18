@@ -1,0 +1,17 @@
+[Unit]
+Description=Run dotnext-sso-reaper.service every 30s
+Documentation=https://github.com/dotnext71/panel/blob/main/docs/adr/0040-m22-sso-file.md
+
+[Timer]
+# OnBootSec gives the panel + agent a head start before the first sweep.
+OnBootSec=60s
+# OnUnitActiveSec means "30s after the last successful start", regardless
+# of how long the run took. Worst-case stale-file lifetime is therefore
+# 60s (TTL) + 30s (interval) ≈ 90s — see ADR-0040 §3.
+OnUnitActiveSec=30s
+# Fire missed runs after a host wakes from sleep / suspend.
+Persistent=true
+Unit=dotnext-sso-reaper.service
+
+[Install]
+WantedBy=timers.target

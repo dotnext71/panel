@@ -1,0 +1,187 @@
+// M30.1 backup destinations (ADR-0078). Schema in migrations
+// 000086 (base) + 000091 (extra_options JSON).
+// Admin-managed remotes for restic copy. Credentials live in env
+// files at /etc/dotnext/restic-remotes/<id>.env (root:root 0600);
+// the DB carries only the file pointer plus a typed-options blob.
+package models
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"regexp"
+	"strings"
+	"time"
+)
+
+const (
+	BackupDestinationKindLocal = "local"
+	BackupDestinationKindSFTP  = "sftp"
+	BackupDestinationKindS3    = "s3"
+	BackupDestinationKindB2    = "b2"
+	BackupDestinationKindAzure = "azure"
+	BackupDestinationKindGCS   = "gcs"
+	BackupDestinationKindREST  = "rest"
+)
+
+// AllBackupDestinationKinds is the canonical list, used by REST validation
+// and the admin UI dropdown. Order matters for the UI menu.
+var AllBackupDestinationKinds = []string{
+	BackupDestinationKindLocal,
+	BackupDestinationKindSFTP,
+	BackupDestinationKindS3,
+	BackupDestinationKindB2,
+	BackupDestinationKindAzure,
+	BackupDestinationKindGCS,
+	BackupDestinationKindREST,
+}
+
+// IsValidBackupDestinationKind reports whether kind is a known destination kind.
+func IsValidBackupDestinationKind(kind string) bool {
+	for _, k := range AllBackupDestinationKinds {
+		if k == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// NormalizeBackupKindsCSV validates + canonicalises a comma-separated list of
+// backup destination kinds (GH #454, hosting_packages.allowed_backup_destination
+// _kinds): lower-cased, trimmed, deduped, order-preserving. Returns an error on
+// any unknown kind so the API rejects bad input rather than silently storing it.
+// The empty string is valid (no kinds allowed).
+func NormalizeBackupKindsCSV(csv string) (string, error) {
+	seen := map[string]struct{}{}
+	out := make([]string, 0)
+	for _, part := range strings.Split(csv, ",") {
+		k := strings.ToLower(strings.TrimSpace(part))
+		if k == "" {
+			continue
+		}
+		if !IsValidBackupDestinationKind(k) {
+			return "", fmt.Errorf("unknown backup destination kind %q (valid: %s)", k, strings.Join(AllBackupDestinationKinds, ", "))
+		}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, k)
+	}
+	return strings.Join(out, ","), nil
+}
+
+// SFTPAuthKey + SFTPAuthPassword are the values BackupDestinationExtraOptions.SFTP.Auth
+// can carry. Default = key (SSH key in /root/.ssh/, picked from a dropdown
+// or generated via the admin's "new key" button).
+const (
+	SFTPAuthKey      = "key"
+	SFTPAuthPassword = "password"
+)
+
+// BackupDestinationExtraOptions is the typed view of extra_options.
+// Marshaled to/from the JSON column verbatim. Wrapper helpers in
+// internal/backup translate this into restic `-o key=value` flags.
+type BackupDestinationExtraOptions struct {
+	SFTP *SFTPOptions `json:"sftp,omitempty"`
+}
+
+// SFTPOptions are the host/user/port/path + auth picker fields the
+// admin UI exposes for sftp destinations. URL composition (`sftp:user@host:/path`)
+// happens in the REST handler; the wrapper consults Auth + KeyPath to
+// build `-o sftp.command=...` when the operator picks a non-default
+// key or password auth.
+type SFTPOptions struct {
+	Host    string `json:"host"`
+	User    string `json:"user"`
+	Port    int    `json:"port,omitempty"`
+	Path    string `json:"path"`
+	Auth    string `json:"auth"` // SFTPAuthKey | SFTPAuthPassword
+	KeyPath string `json:"key_path,omitempty"`
+}
+
+// sftpUnsafeRe matches anything that must never appear in an SSH host or
+// username: whitespace (which would split restic's `-o sftp.command=...` into
+// extra argv entries) plus the usual shell metacharacters.
+var sftpUnsafeRe = regexp.MustCompile("[\\s'\"\\\\;|&$<>()`]")
+
+// ValidateSFTPHostUser rejects a host or user carrying whitespace or shell
+// metacharacters — values with no legitimate meaning as an SSH host/username
+// that would otherwise flow into restic's sftp.command and split or inject.
+// The single owner of this boundary rule so the REST and CLI destination
+// validators cannot drift (JAB-310); the check lives here even though
+// SFTPCommandFlag also quotes downstream, per CONVENTIONS.md's boundary rule.
+func ValidateSFTPHostUser(host, user string) error {
+	if sftpUnsafeRe.MatchString(host) || sftpUnsafeRe.MatchString(user) {
+		return errors.New("host and user must not contain whitespace or shell metacharacters")
+	}
+	// ssh reads a leading `-` as one of its own options; no real host name
+	// or user name starts with one.
+	if strings.HasPrefix(host, "-") || strings.HasPrefix(user, "-") {
+		return errors.New("host and user must not start with '-'")
+	}
+	return nil
+}
+
+// SFTPPasswordWriteAllowed reports whether an sftp password (SSHPASS) write may
+// land on a destination with this effective kind and auth. An SSHPASS is only
+// meaningful for an sftp destination whose auth is "password"; writing one to a
+// key-auth or non-sftp destination is a no-op that must fail loud, never be
+// silently dropped. effectiveAuth is the auth of the block being written this
+// request if the caller supplies one, else the stored block's auth.
+//
+// The single owner of this decision so the REST and CLI update paths cannot
+// drift (JAB-310 AC5), the same reason ValidateSFTPHostUser lives here. The
+// message names no CLI flags so a REST 400 detail can surface it verbatim.
+func SFTPPasswordWriteAllowed(kind, effectiveAuth string) error {
+	if kind != BackupDestinationKindSFTP {
+		return fmt.Errorf("sftp password only applies to sftp destinations (kind=%s)", kind)
+	}
+	if effectiveAuth != SFTPAuthPassword {
+		return fmt.Errorf("sftp password requires the destination to use password auth (current auth=%q)", effectiveAuth)
+	}
+	return nil
+}
+
+type BackupDestination struct {
+	ID             string  `gorm:"type:char(26);primaryKey" json:"id"`
+	Name           string  `gorm:"type:varchar(64);not null;uniqueIndex:uniq_backup_dest_name" json:"name"`
+	Kind           string  `gorm:"type:enum('local','sftp','s3','b2','azure','gcs','rest');not null" json:"kind"`
+	URL            string  `gorm:"type:varchar(512);not null" json:"url"`
+	CredentialsRef *string `gorm:"type:varchar(255)" json:"credentials_ref,omitempty"`
+	// PasswordEnc is the AES-256-GCM-sealed restic repository password
+	// (M30.2 — per-destination encryption rotation, ADR-pending). NULL
+	// rows fall back to the legacy shared password file. Field is
+	// stripped from JSON; the password is never read by the SPA.
+	PasswordEnc       []byte          `gorm:"type:varbinary(512)" json:"-"`
+	PasswordRotatedAt *time.Time      `gorm:"type:datetime(6)" json:"password_rotated_at,omitempty"`
+	ExtraOptions      json.RawMessage `gorm:"type:json" json:"extra_options,omitempty"`
+	// No gorm default:1 — a destination/schedule can be created --disabled
+	// (Enabled=false), and GORM binds the DB default for a zero-valued bool on
+	// INSERT, so default:1 would silently re-enable it. See
+	// feedback_gorm_default1_bool_zero_value. Every create site sets Enabled
+	// explicitly; the DB column keeps its DEFAULT 1 for raw inserts.
+	Enabled bool `gorm:"not null" json:"enabled"`
+	// JAB-362 circuit-breaker: ConsecutiveFailures counts back-to-back 4h
+	// stall-failures of jobs to this destination; BackoffUntil (NULL = healthy)
+	// is the time before which the dispatcher skips this destination. Both reset
+	// to 0 / NULL on the next successful seal. Not tenant-facing.
+	ConsecutiveFailures int        `gorm:"type:int;not null;default:0" json:"consecutive_failures"`
+	BackoffUntil        *time.Time `gorm:"type:datetime(6)" json:"backoff_until,omitempty"`
+	CreatedAt           time.Time  `gorm:"type:datetime(6);not null" json:"created_at"`
+	UpdatedAt           time.Time  `gorm:"type:datetime(6);not null" json:"updated_at"`
+}
+
+func (BackupDestination) TableName() string { return "backup_destinations" }
+
+// ExtraOptionsTyped returns the parsed view of d.ExtraOptions. Empty
+// JSON yields an empty struct (no error) so callers can chain
+// `.SFTP != nil` checks without nil-guarding the typed call.
+func (d *BackupDestination) ExtraOptionsTyped() BackupDestinationExtraOptions {
+	var out BackupDestinationExtraOptions
+	if len(d.ExtraOptions) == 0 {
+		return out
+	}
+	_ = json.Unmarshal(d.ExtraOptions, &out)
+	return out
+}

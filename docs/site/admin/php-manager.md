@@ -1,0 +1,56 @@
+# PHP Manager
+
+`/dotnext-admin/php-pools`. The list of installed PHP versions on the host, with per-version FPM tuning and an extension manager.
+
+## Versions list
+
+Each installed PHP version (Sury packages, currently 8.1 through 8.5+) shows:
+
+- Version number
+- Number of user pools currently using this version
+- Default tunables (`pm`, `pm.max_children`, `pm.start_servers`, `pm.min_spare_servers`, `pm.max_spare_servers`)
+Editing a default propagates to every user pool of that version through the reconciler.
+
+OPcache and JIT are not set here. The server's defaults are reconciled by `dotnext-cli update`:
+- a cache sized to the host's memory;
+- up to 50,000 files;
+- file checks every 60 seconds;
+- JIT off.
+
+An account changes them for one PHP version on its **PHP Settings → OPcache & JIT** tab. That tab needs a package with **Users can pick a PHP Performance Mode** on ([PHP Settings](../user/php-settings.md#opcache)).
+
+## Adding a new PHP version
+
+PHP versions are installed at the OS level via `apt`:
+
+```bash
+apt install php8.x-fpm php8.x-cli php8.x-mbstring php8.x-mysql …
+```
+
+The reconciler detects the new version on the next tick and adds it to this list. The version is then available for selection in [Domains](./domains.md) → Edit → PHP Version.
+
+## Removing a PHP version
+
+Forbidden if any user pool is using the version. Reassign affected domains first, then `apt purge php8.x-fpm` removes the version from the host; the reconciler removes it from the list on the next tick.
+
+## Extensions tab
+
+`/dotnext-admin/php-pools` → Extensions. Server-wide enable / disable for each extension on each installed PHP version. Backed by the `internal/phpext/` Go package.
+
+- Enable: runs `phpenmod <ext>` for the chosen version, then issues a graceful FPM reload (no in-flight request loss).
+- Disable: runs `phpdismod <ext>`, then reload.
+- Some extensions require a corresponding `apt install` first; the row indicates the missing package.
+
+## Per-pool view
+
+Click a version row to drill into the per-user pools currently using that version. Each row links to the user's edit page; from there the admin can move the user to a different PHP version, or to a different per-user tuning override.
+
+## CLI
+
+```bash
+dotnext-cli php version list                         # installed PHP versions
+dotnext-cli php version install <version>            # install a PHP version, e.g. 8.4
+dotnext-cli php ext list --version <version>         # extensions and their state
+dotnext-cli php ext enable <ext> --version <version>
+dotnext-cli php ext disable <ext> --version <version>
+```

@@ -1,0 +1,237 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"testing"
+
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+)
+
+// Fakes embed the repo interfaces and override only the methods RunAppDelete
+// exercises; anything else would nil-panic, which is the point — the test proves
+// exactly which rows the lifecycle touches.
+
+type adAgent struct {
+	failApp, failDBUser, failDB bool
+	calls                       []string
+}
+
+func (a *adAgent) Call(_ context.Context, cmd string, _ any) (json.RawMessage, error) {
+	a.calls = append(a.calls, cmd)
+	switch cmd {
+	case "app.delete":
+		if a.failApp {
+			return nil, errors.New("app.delete boom")
+		}
+	case "db_user.drop":
+		if a.failDBUser {
+			return nil, errors.New("db_user.drop boom")
+		}
+	case "db.drop":
+		if a.failDB {
+			return nil, errors.New("db.drop boom")
+		}
+	}
+	return json.RawMessage("{}"), nil
+}
+
+type adInstalls struct {
+	repository.ApplicationInstallRepository
+	status  string
+	deleted bool
+}
+
+func (r *adInstalls) UpdateStatus(_ context.Context, _, status string, _, _ *string) error {
+	r.status = status
+	return nil
+}
+func (r *adInstalls) Delete(context.Context, string) error { r.deleted = true; return nil }
+
+type adDatabases struct {
+	repository.DatabaseRepository
+	deleted bool
+}
+
+func (r *adDatabases) FindByID(context.Context, string) (*models.Database, error) {
+	return &models.Database{Name: "db1"}, nil
+}
+func (r *adDatabases) Delete(context.Context, string) error { r.deleted = true; return nil }
+
+type adDBUsers struct {
+	repository.DatabaseUserRepository
+	deleted bool
+}
+
+// RunAppDelete looks the row up to learn the engine for the login drop; the
+// default app fixture is a MariaDB user, so the transcript stays db_user.drop.
+func (r *adDBUsers) FindByID(context.Context, string) (*models.DatabaseUser, error) {
+	return &models.DatabaseUser{Username: "alice_wp", Engine: "mariadb"}, nil
+}
+func (r *adDBUsers) Delete(context.Context, string) error { r.deleted = true; return nil }
+
+type adGrants struct {
+	repository.DatabaseUserGrantRepository
+	deletedGrants int
+}
+
+func (r *adGrants) ListByDatabaseUserID(context.Context, string) ([]models.DatabaseUserGrant, error) {
+	return []models.DatabaseUserGrant{{ID: "g1"}}, nil
+}
+func (r *adGrants) Delete(context.Context, string) error { r.deletedGrants++; return nil }
+
+type adCron struct {
+	repository.CronJobRepository
+	listed bool
+}
+
+func (r *adCron) ListByUserID(context.Context, string) ([]*models.CronJob, error) {
+	r.listed = true
+	return nil, nil
+}
+
+func newAppDeleteFakes() (*adAgent, *adInstalls, *adDatabases, *adDBUsers, *adGrants, *adCron, AppDeleteDeps) {
+	ag, inst, dbs, dbu, gr, cr := &adAgent{}, &adInstalls{}, &adDatabases{}, &adDBUsers{}, &adGrants{}, &adCron{}
+	return ag, inst, dbs, dbu, gr, cr, AppDeleteDeps{
+		Installs: inst, Databases: dbs, DatabaseUsers: dbu, DatabaseGrants: gr, CronJobs: cr, Agent: ag,
+	}
+}
+
+func appDeleteArgs() AppDeleteArgs {
+	return AppDeleteArgs{
+		InstallID: "i1", UserID: "u1", AppType: "wordpress", OSUser: "alice",
+		Docroot: "/home/alice/public_html", DomainName: "ex.com",
+		DatabaseID: "d1", DBUserID: "du1", DBUserUsername: "alice_wp",
+	}
+}
+
+// JAB-314: an agent app.delete failure must RETAIN the install row (retryable)
+// and must NOT drop any DB row — the old CLI dropped everything regardless,
+// which is how invisible orphans were made.
+func TestRunAppDelete_AgentFailureRetainsRowNoDrops(t *testing.T) {
+	ag, inst, dbs, dbu, _, _, deps := newAppDeleteFakes()
+	ag.failApp = true
+	if err := RunAppDelete(appDeleteArgs(), deps); err == nil {
+		t.Fatal("want an error on agent app.delete failure")
+	}
+	if inst.status != "failed" {
+		t.Errorf("install status = %q, want failed", inst.status)
+	}
+	if inst.deleted {
+		t.Error("install row must be RETAINED on agent failure, not deleted")
+	}
+	if dbs.deleted || dbu.deleted {
+		t.Error("no DB rows may be dropped when the agent app.delete failed")
+	}
+}
+
+// JAB-314: a db_user.drop / db.drop failure must KEEP the DB rows visible (not
+// deleted) so the database/user never becomes an invisible orphan.
+func TestRunAppDelete_DropFailureKeepsDBRowsVisible(t *testing.T) {
+	ag, inst, dbs, dbu, gr, _, deps := newAppDeleteFakes()
+	ag.failDBUser = true
+	if err := RunAppDelete(appDeleteArgs(), deps); err == nil {
+		t.Fatal("want an error when a DB drop fails")
+	}
+	if !inst.deleted {
+		t.Error("install row should be deleted (its files are gone)")
+	}
+	if dbs.deleted || dbu.deleted || gr.deletedGrants > 0 {
+		t.Error("DB/user/grant rows must be KEPT visible when a drop fails, not deleted")
+	}
+}
+
+// Happy path: every row removed, cron teardown attempted, no error.
+func TestRunAppDelete_HappyPathRemovesEverything(t *testing.T) {
+	_, inst, dbs, dbu, gr, cr, deps := newAppDeleteFakes()
+	if err := RunAppDelete(appDeleteArgs(), deps); err != nil {
+		t.Fatalf("want nil error, got %v", err)
+	}
+	if !inst.deleted || !dbs.deleted || !dbu.deleted || gr.deletedGrants == 0 {
+		t.Errorf("all rows must be removed on success: install=%v db=%v dbuser=%v grants=%d",
+			inst.deleted, dbs.deleted, dbu.deleted, gr.deletedGrants)
+	}
+	if !cr.listed {
+		t.Error("cron teardown must run for a wordpress app — the CLI path never did this before")
+	}
+}
+
+// pgAppDB is an app-owned database whose engine is postgres, to prove the
+// teardown dispatches on the row's engine rather than hardcoding db.drop.
+type pgAppDB struct {
+	repository.DatabaseRepository
+}
+
+func (r *pgAppDB) FindByID(context.Context, string) (*models.Database, error) {
+	return &models.Database{Name: "alice_blog", Engine: "postgres"}, nil
+}
+func (r *pgAppDB) Delete(context.Context, string) error { return nil }
+
+// JAB-275 AC6 / GH #1013: application teardown must route the database drop
+// through the shared lifecycle operation, which dispatches on the row's engine.
+// A Postgres app database must get db.postgres.drop_db — the hardcoded MariaDB
+// db.drop no-ops on a name that was never there and orphans the real database.
+func TestRunAppDelete_PostgresAppDatabaseUsesPostgresDrop(t *testing.T) {
+	ag, _, _, _, _, _, deps := newAppDeleteFakes()
+	deps.Databases = &pgAppDB{}
+	if err := RunAppDelete(appDeleteArgs(), deps); err != nil {
+		t.Fatalf("want nil error, got %v", err)
+	}
+	var sawPGDrop bool
+	for _, c := range ag.calls {
+		switch c {
+		case "db.postgres.drop_db":
+			sawPGDrop = true
+		case "db.drop":
+			t.Errorf("app teardown sent MariaDB db.drop for a postgres database — orphans it (GH #1013); calls=%v", ag.calls)
+		}
+	}
+	if !sawPGDrop {
+		t.Errorf("app teardown must send db.postgres.drop_db for a postgres database; calls=%v", ag.calls)
+	}
+}
+
+// pgAppDBUser is an app db-user whose engine is postgres, to prove the login
+// teardown dispatches on the row's engine rather than hardcoding db_user.drop.
+type pgAppDBUser struct {
+	repository.DatabaseUserRepository
+}
+
+func (r *pgAppDBUser) FindByID(context.Context, string) (*models.DatabaseUser, error) {
+	return &models.DatabaseUser{Username: "alice_role", Engine: "postgres"}, nil
+}
+func (r *pgAppDBUser) Delete(context.Context, string) error { return nil }
+
+// JAB-275 AC6 / GH #1013: application teardown must route the db-user/role drop
+// through the shared lifecycle op, which dispatches on the row's engine. A
+// Postgres app role must get db.postgres.drop_role — the hardcoded MariaDB
+// db_user.drop no-ops on a name that was never there and leaves the live role
+// orphaned. It must also come AFTER the database drop, because a role that
+// still owns its database cannot be dropped (DROP ROLE fails).
+func TestRunAppDelete_PostgresAppDBUserUsesDropRole(t *testing.T) {
+	ag, _, _, _, _, _, deps := newAppDeleteFakes()
+	deps.Databases = &pgAppDB{}
+	deps.DatabaseUsers = &pgAppDBUser{}
+	if err := RunAppDelete(appDeleteArgs(), deps); err != nil {
+		t.Fatalf("want nil error, got %v", err)
+	}
+	dropRoleIdx, dropDBIdx := -1, -1
+	for i, c := range ag.calls {
+		switch c {
+		case "db.postgres.drop_role":
+			dropRoleIdx = i
+		case "db.postgres.drop_db":
+			dropDBIdx = i
+		case "db_user.drop":
+			t.Errorf("app teardown sent MariaDB db_user.drop for a postgres role — orphans it (GH #1013); calls=%v", ag.calls)
+		}
+	}
+	if dropRoleIdx == -1 {
+		t.Errorf("app teardown must send db.postgres.drop_role for a postgres db-user; calls=%v", ag.calls)
+	}
+	if dropDBIdx == -1 || dropRoleIdx == -1 || dropDBIdx > dropRoleIdx {
+		t.Errorf("database must be dropped BEFORE the role (a role owning its db can't be dropped); calls=%v", ag.calls)
+	}
+}

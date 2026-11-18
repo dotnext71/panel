@@ -1,0 +1,68 @@
+slug: onlyoffice
+popularity: 44
+name: ONLYOFFICE Docs
+tags: ["Productivity", "File sharing"]
+version: "10.0.0.1"
+# Release track (GH #1956): new installs get ONLYOFFICE Docs 10. Update moves
+# a 9 install to 10 in place: neither Community image keeps state in a
+# database, and 10 starts and converts on a 9 install's data (box-tested). A
+# 9 install keeps the 9.4.0 image on an env or domain edit. After the update,
+# check any app connected to it: 10 no longer accepts a token from the editor
+# config for /converter, /docbuilder and /command.
+track: "10"
+update_from: ["9"]
+description: >-
+  ONLYOFFICE Document Server: online editors for documents, spreadsheets, and
+  presentations (OOXML-native), used standalone or as the editing backend for
+  Nextcloud, Seafile, and others. Single container; the Community edition
+  keeps editing state in memory and starts no database.
+  JWT request-signing is enabled with a generated secret (JWT_SECRET in the
+  install .env) — set the same secret in any app that connects to it.
+icon: icon.svg
+upstream: https://github.com/ONLYOFFICE/DocumentServer
+documentation: https://helpcenter.onlyoffice.com/installation/docs-developer-index.aspx
+
+image_channel: onlyoffice/documentserver:10.0.0.1@sha256:ca17889f10b11141cc6441836aebdd2835cf3e1b49681b2fd6e155c94b7850b3
+held_tracks:
+  - track: "9"
+    version: "9.4.0"
+    image_channel: onlyoffice/documentserver:9.4.0@sha256:e3da62a847b9a5d51a11f73cfea1d9c13c3be3809614490d4edddcf01dcf919b
+update_mode: manual
+
+resources:
+  cpu: "2.0"
+  memory: "2g"
+  pids: 500
+
+# Neither the 9.4.0 nor the 10 Community image starts its bundled
+# postgres/rabbitmq/redis: run-document-server.sh starts them only when
+# PRODUCT_EDITION is set, and editor state is kept in memory. Both run the
+# entrypoint as root, chowning their data dirs on start — no volume_owner. The
+# db volume stays so the compose is unchanged.
+volumes:
+  - name: data
+    container_path: /var/www/onlyoffice/Data
+  - name: lib
+    container_path: /var/lib/onlyoffice
+  - name: db
+    container_path: /var/lib/postgresql
+  - name: logs
+    container_path: /var/log/onlyoffice
+    rotate:
+      retention_days: 14
+      max_size: 50M
+      mode: copytruncate
+
+ports:
+  - name: http
+    container_port: 80
+    protocol: tcp
+    default_enabled: true
+    default_bind: loopback
+    default_reverse_proxy: true
+    health_path: /healthcheck
+
+env:
+  - name: JWT_SECRET
+    secret: true
+    generate: password64

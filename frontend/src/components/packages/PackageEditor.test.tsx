@@ -1,0 +1,395 @@
+// PackageEditor.test.tsx — JAB-331 AC1. Mount the shared Module once and assert
+// every canonical entitlement field renders. This is the render-path witness that
+// both PackageCreate and PackageEdit go through one form, and it catches a
+// byName() lookup returning undefined (which would crash at render) — something
+// only Playwright would otherwise see.
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { render, screen } from "@testing-library/react";
+import { describe, expect, it, vi } from "vitest";
+
+// No network: the two catalog fetches and the disk-quota settings query all land
+// on the same apiClient; an empty payload exercises the "|| []" / "?? false" paths.
+vi.mock("../../apiClient", () => ({
+  apiClient: { get: vi.fn().mockResolvedValue({ data: {} }) },
+}));
+vi.mock("react-i18next", () => ({ useTranslation: () => ({ t: (k: string) => k }) }));
+
+import { PackageEditor } from "./PackageEditor";
+import { PACKAGE_DEFAULTS, PACKAGE_LIMIT_FIELDS } from "./packageFields";
+
+function renderEditor() {
+  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  return render(
+    <QueryClientProvider client={qc}>
+      <PackageEditor title="Create package" submitting={false} onSubmit={vi.fn()} />
+    </QueryClientProvider>,
+  );
+}
+
+describe("PackageEditor renders the full entitlement set (JAB-331 AC1)", () => {
+  it("renders a labelled field for every canonical limit field", () => {
+    renderEditor();
+    for (const f of PACKAGE_LIMIT_FIELDS) {
+      expect(screen.getByText(`packageedit.${f.labelKey}`), `missing field label: ${f.name}`).toBeTruthy();
+    }
+  });
+
+  it("renders the special disk-quota field and the name field", () => {
+    renderEditor();
+    expect(screen.getByText("packageedit.disk_quota_mb")).toBeTruthy();
+    expect(screen.getByText("packageedit.name")).toBeTruthy();
+  });
+
+  it("renders the passed title and a Save button", () => {
+    renderEditor();
+    expect(screen.getByText("Create package")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Save" })).toBeTruthy();
+  });
+
+  // GH #1628: webmail is a package entitlement that defaults ON. In create mode
+  // (no record) the form seeds from PACKAGE_DEFAULTS, so the Webmail switch must
+  // render already checked — the admin has to opt OUT, not opt in.
+  it("renders the Webmail toggle defaulting ON", () => {
+    renderEditor();
+    const row = screen.getByText("Webmail Enabled").closest("div");
+    expect(row).toBeTruthy();
+    const sw = row?.querySelector('[role="switch"]');
+    expect(sw, "Webmail switch renders").toBeTruthy();
+    expect(sw?.getAttribute("aria-checked")).toBe("true");
+  });
+});
+
+// GH #1798: outbound SSH and ping for the M34 egress firewall are per-package
+// opt-ins that default OFF (the firewall stays closed unless the admin opens it).
+describe("PackageEditor egress allowances (GH #1798)", () => {
+  it("renders the outbound SSH and ping switches defaulting OFF", () => {
+    renderEditor();
+    for (const label of ["Allow outbound SSH (port 22)", "Allow ping (ICMP echo)"]) {
+      const row = screen.getByText(label).closest("div");
+      const sw = row?.querySelector('[role="switch"]');
+      expect(sw, `${label} switch renders`).toBeTruthy();
+      expect(sw?.getAttribute("aria-checked"), label).toBe("false");
+    }
+  });
+
+  it("hides the SSH destination list until outbound SSH is on", () => {
+    renderEditor();
+    expect(screen.queryByText("Outbound SSH destinations")).toBeNull();
+  });
+
+  it("loads a stored package's outbound SSH scope into the destination list (edit mode)", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <PackageEditor
+          title="Edit package"
+          initialValue={{
+            ...PACKAGE_DEFAULTS,
+            id: "pkg-1",
+            egress_ssh_out: true,
+            egress_ssh_out_cidrs: '["203.0.113.0/24"]',
+            egress_icmp: true,
+          }}
+          submitting={false}
+          onSubmit={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+    expect(await screen.findByText("Outbound SSH destinations")).toBeTruthy();
+    expect(await screen.findByText("203.0.113.0/24")).toBeTruthy();
+    const ping = screen.getByText("Allow ping (ICMP echo)").closest("div")?.querySelector('[role="switch"]');
+    expect(ping?.getAttribute("aria-checked")).toBe("true");
+  });
+});
+
+// GH #1701: one policy select per catalog directive, and a save keeps a stored
+// key the editor does not render (a sensitive directive set through the CLI).
+describe("PackageEditor PHP settings policy (GH #1701)", () => {
+  it("renders a policy select for every catalog and sensitive domain directive", async () => {
+    const { PHP_SENSITIVE_DOMAIN_DIRECTIVES, PHP_SETTING_DIRECTIVES } = await import(
+      "./phpSettingsPolicy"
+    );
+    renderEditor();
+    for (const d of [...PHP_SETTING_DIRECTIVES, ...PHP_SENSITIVE_DOMAIN_DIRECTIVES]) {
+      expect(screen.getAllByText(d).length, `missing policy row: ${d}`).toBeGreaterThan(0);
+    }
+  });
+
+  it("an edit save keeps the stored policy, including keys it does not render", async () => {
+    const { fireEvent, waitFor } = await import("@testing-library/react");
+    const onSubmit = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <PackageEditor
+          title="Edit package"
+          initialValue={{
+            ...PACKAGE_DEFAULTS,
+            id: "pkg-1",
+            name: "Basic",
+            php_settings_policy:
+              '{"include_path":"tenant_privileged","memory_limit":"admin_only","open_basedir":"tenant_privileged"}',
+          }}
+          submitting={false}
+          onSubmit={onSubmit}
+        />
+      </QueryClientProvider>,
+    );
+    await screen.findAllByText("Admin only");
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalled());
+    expect(onSubmit.mock.calls[0][0].php_settings_policy).toBe(
+      '{"include_path":"tenant_privileged","memory_limit":"admin_only","open_basedir":"tenant_privileged"}',
+    );
+  });
+});
+
+// GH #1701: the package's disabled PHP functions replace the all-or-nothing
+// exec switch. The list is sent; php_exec_enabled is derived by the backend.
+describe("PackageEditor disabled PHP functions (GH #1701)", () => {
+  async function renderEdit(record: Partial<Record<string, unknown>>) {
+    const onSubmit = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <PackageEditor
+          title="Edit package"
+          initialValue={{ ...PACKAGE_DEFAULTS, id: "pkg-1", name: "Basic", ...record }}
+          submitting={false}
+          onSubmit={onSubmit}
+        />
+      </QueryClientProvider>,
+    );
+    await screen.findByText("Disabled PHP functions");
+    return onSubmit;
+  }
+
+  it("a package at the default saves null and never sends php_exec_enabled", async () => {
+    const { fireEvent, waitFor } = await import("@testing-library/react");
+    const onSubmit = await renderEdit({ php_disabled_functions: null, php_exec_enabled: false });
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalled());
+    expect(onSubmit.mock.calls[0][0].php_disabled_functions).toBeNull();
+    expect("php_exec_enabled" in onSubmit.mock.calls[0][0]).toBe(false);
+  });
+
+  it("unchecking shell_exec saves the list without it", async () => {
+    const { fireEvent, waitFor } = await import("@testing-library/react");
+    const onSubmit = await renderEdit({ php_disabled_functions: null, php_exec_enabled: false });
+    const box = screen.getByRole("checkbox", { name: "shell_exec" }) as HTMLInputElement;
+    expect(box.checked).toBe(true);
+    fireEvent.click(box);
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalled());
+    expect(onSubmit.mock.calls[0][0].php_disabled_functions).toBe(
+      "exec,passthru,system,proc_open,popen,pcntl_exec,pcntl_fork,proc_nice,dl",
+    );
+  });
+
+  it("a package saved with the old exec switch on loads with every box unchecked", async () => {
+    await renderEdit({ php_disabled_functions: null, php_exec_enabled: true });
+    const box = screen.getByRole("checkbox", { name: "exec" }) as HTMLInputElement;
+    expect(box.checked).toBe(false);
+  });
+});
+
+// GH #2001: allowing a command-execution function says what it can start on
+// this server, from the dotnext-fpm-app AppArmor profile's mode.
+describe("PackageEditor command execution vs AppArmor (GH #2001)", () => {
+  async function renderWithProfile(mode: "enforce" | "complain" | null, disabled: string | null) {
+    const { apiClient } = await import("../../apiClient");
+    const get = apiClient.get as unknown as ReturnType<typeof vi.fn>;
+    get.mockImplementation(async (url: string) =>
+      url === "/admin/security/apparmor/status"
+        ? {
+            data: {
+              enabled: true,
+              profiles: mode ? [{ name: "dotnext-fpm-app", mode }] : [{ name: "dotnext-agent", mode: "enforce" }],
+              denials: [],
+              violations: [],
+            },
+          }
+        : { data: {} },
+    );
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <PackageEditor
+          title="Edit package"
+          initialValue={{ ...PACKAGE_DEFAULTS, id: "pkg-1", name: "Dev", php_disabled_functions: disabled }}
+          submitting={false}
+          onSubmit={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+  }
+
+  it("warns that an allowed exec function can run any program while the profile only logs", async () => {
+    await renderWithProfile("complain", "pcntl_fork,proc_nice,dl");
+    expect(await screen.findByText(/is in complain mode, so it only logs/)).toBeTruthy();
+    expect(screen.getByText(/the same as shell access/)).toBeTruthy();
+  });
+
+  it("warns when the profile is not loaded at all", async () => {
+    await renderWithProfile(null, "pcntl_fork,proc_nice,dl");
+    expect(await screen.findByText(/dotnext-fpm-app\) is not active/)).toBeTruthy();
+  });
+
+  it("says an allowed exec function starts only the shell and cat under an enforced profile", async () => {
+    await renderWithProfile("enforce", "pcntl_fork,proc_nice,dl");
+    expect(await screen.findByText(/can start only the shell \(sh\) and cat/)).toBeTruthy();
+    expect(screen.queryByText(/the same as shell access/)).toBeNull();
+  });
+
+  it("says nothing while every command-execution function stays disabled", async () => {
+    const { waitFor } = await import("@testing-library/react");
+    await renderWithProfile("complain", null);
+    const { apiClient } = await import("../../apiClient");
+    await waitFor(() => expect(apiClient.get).toHaveBeenCalledWith("/admin/security/apparmor/status"));
+    expect(screen.queryByText(/dotnext-fpm-app/)).toBeNull();
+  });
+});
+
+
+// GH #2056: "Websites can send email" — a new package starts with it off
+// (existing packages got it on in the migration); a stored package loads its
+// value in edit mode.
+describe("PackageEditor website mail (GH #2056)", () => {
+  it("renders the switch defaulting OFF for a new package", () => {
+    renderEditor();
+    const sw = screen.getByRole("switch", { name: "Websites can send email" });
+    expect(sw.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("loads a stored package's value (edit mode)", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <PackageEditor
+          title="Edit package"
+          initialValue={{ ...PACKAGE_DEFAULTS, id: "pkg-1", name: "Basic", website_sends_email: true }}
+          submitting={false}
+          onSubmit={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+    const sw = await screen.findByRole("switch", { name: "Websites can send email" });
+    expect(sw.getAttribute("aria-checked")).toBe("true");
+  });
+});
+
+// GH #2276: Composer runs amount to shell access in the SSH sandbox, so a new
+// package starts without them; a stored package loads its value.
+describe("PackageEditor Composer (GH #2276)", () => {
+  it("renders the switch defaulting OFF for a new package", () => {
+    renderEditor();
+    const sw = screen.getByRole("switch", { name: "Composer" });
+    expect(sw.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("loads a stored package's value (edit mode)", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <PackageEditor
+          title="Edit package"
+          initialValue={{ ...PACKAGE_DEFAULTS, id: "pkg-1", name: "Basic", composer_enabled: true }}
+          submitting={false}
+          onSubmit={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+    const sw = await screen.findByRole("switch", { name: "Composer" });
+    expect(sw.getAttribute("aria-checked")).toBe("true");
+  });
+});
+
+// GH #2277: deploy commands run as the user in the SSH sandbox, so a new
+// package starts without Git deploy; a stored package loads its value.
+describe("PackageEditor Git deploy (GH #2277)", () => {
+  it("renders the switch defaulting OFF for a new package", () => {
+    renderEditor();
+    const sw = screen.getByRole("switch", { name: "Git deploy" });
+    expect(sw.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("loads a stored package's value (edit mode)", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <PackageEditor
+          title="Edit package"
+          initialValue={{ ...PACKAGE_DEFAULTS, id: "pkg-1", name: "Basic", git_deploy_enabled: true }}
+          submitting={false}
+          onSubmit={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+    const sw = await screen.findByRole("switch", { name: "Git deploy" });
+    expect(sw.getAttribute("aria-checked")).toBe("true");
+  });
+});
+
+// GH #2502: a new package starts without per-domain webmail branding; a
+// stored package loads its value.
+describe("PackageEditor Webmail branding (GH #2502)", () => {
+  it("renders the switch defaulting OFF for a new package", () => {
+    renderEditor();
+    const sw = screen.getByRole("switch", { name: "Webmail branding" });
+    expect(sw.getAttribute("aria-checked")).toBe("false");
+  });
+
+  it("loads a stored package's value (edit mode)", async () => {
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <PackageEditor
+          title="Edit package"
+          initialValue={{ ...PACKAGE_DEFAULTS, id: "pkg-1", name: "Basic", webmail_branding_enabled: true }}
+          submitting={false}
+          onSubmit={vi.fn()}
+        />
+      </QueryClientProvider>,
+    );
+    const sw = await screen.findByRole("switch", { name: "Webmail branding" });
+    expect(sw.getAttribute("aria-checked")).toBe("true");
+  });
+});
+
+describe("PackageEditor Redis keys per call (GH #2165)", () => {
+  it("starts a new package at 500", () => {
+    renderEditor();
+    const input = screen
+      .getByText("packageedit.redis_keys_per_call")
+      .closest(".ant-form-item")
+      ?.querySelector("input");
+    expect(input?.value).toBe("500");
+  });
+
+  it("saves a stored package's value (edit mode)", async () => {
+    const { fireEvent, waitFor } = await import("@testing-library/react");
+    const onSubmit = vi.fn();
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <PackageEditor
+          title="Edit package"
+          initialValue={{ ...PACKAGE_DEFAULTS, id: "pkg-1", name: "Basic", redis_keys_per_call: 2000 }}
+          submitting={false}
+          onSubmit={onSubmit}
+        />
+      </QueryClientProvider>,
+    );
+    await waitFor(() =>
+      expect(
+        screen
+          .getByText("packageedit.redis_keys_per_call")
+          .closest(".ant-form-item")
+          ?.querySelector("input")?.value,
+      ).toBe("2000"),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(onSubmit).toHaveBeenCalled());
+    expect(onSubmit.mock.calls[0][0].redis_keys_per_call).toBe(2000);
+  });
+});

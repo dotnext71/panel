@@ -1,0 +1,92 @@
+# AppArmor profile — stalwart-mail (M40.1, ADR-0086)
+#
+# Stalwart is the M6 mail daemon. Listens on 25/465/587 (mail
+# submission + transport). State at /var/lib/stalwart/.
+#
+# AA 4.x (Debian 13) enforces the `unix` mediation class separately
+# from `network unix`. Without explicit unix rules the daemon fails to
+# connect to MariaDB via /run/mysqld/mysqld.sock even in complain mode.
+
+# GH #705: pin AppArmor 3.0 ABI — predates unix-socket mediation, so
+# these broken-mediation kernels (Debian 13/Ubuntu 24.04) SKIP unix
+# mediation for this profile; attaching it can't EACCES a unix connect()
+# while still confining files/caps/network. Verified on .86.
+abi <abi/3.0>,
+
+#include <tunables/global>
+
+# AppArmor matches on the canonicalized exec path. /usr/local/bin/stalwart
+# is a symlink to /opt/stalwart/stalwart; attaching the profile to the
+# symlink leaves the daemon unconfined. Attach to the real binary path
+# so systemd-launched + direct-exec both pick it up.
+profile stalwart-mail /opt/stalwart/stalwart {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+  #include <abstractions/openssl>
+  #include <abstractions/ssl_certs>
+
+  capability net_bind_service,
+  capability setuid,
+  capability setgid,
+  capability dac_override,
+
+  network inet  stream,
+  network inet6 stream,
+  network unix  stream,
+
+  # AA 4.x unix mediation — stream sockets (MariaDB, admin/JMAP sockets).
+  unix (create, bind, listen, accept, connect, send, receive) type=stream,
+  # AA 4.x: complain mode still enforces unix peer-label checks. Without
+  # this rule connecting to MariaDB (unconfined) is denied even in complain
+  # mode — stalwart fails at startup with EACCES on mysqld.sock.
+  unix (connect, send, receive) type=stream peer=(label=unconfined),
+
+  /usr/local/bin/stalwart       mr,
+  /opt/stalwart/stalwart        mr,
+  /etc/stalwart/                r,
+  /etc/stalwart/**              r,
+
+  /var/lib/stalwart/            rw,
+  /var/lib/stalwart/**          rwk,
+
+  # ADR-0115 — Stalwart Log tracer writes plaintext key-value logs to
+  # /var/log/stalwart/ so the dotnext CrowdSec parser
+  # (infrastructure/crowdsec/stalwart/) can tail them for mail-bf detection.
+  # Without these rules the tracer silently EPERMs and the file never
+  # appears (Stalwart traps the error gracefully). The trailing **
+  # covers daily-rotated suffixes (stalwart.2026-06-04.log etc.).
+  /var/log/stalwart/            rw,
+  /var/log/stalwart/**          rw,
+
+  /etc/letsencrypt/live/        r,
+  /etc/letsencrypt/live/**      r,
+  /etc/letsencrypt/archive/     r,
+  /etc/letsencrypt/archive/**   r,
+
+  # M25 unix-socket layout (ADR-0050).
+  /run/stalwart-admin.sock      rw,
+  /run/stalwart-mail.sock       rw,
+  /var/run/mysqld/mysqld.sock   rw,
+  /run/mysqld/mysqld.sock       rw,
+
+  /proc/sys/net/core/somaxconn  r,
+  /proc/*/status                r,
+  # tokio runtime memory accounting reads its own smaps (owner-scoped —
+  # smaps of other processes stays denied). Live enforce denial 2026-08-01.
+  owner /proc/*/smaps           r,
+
+  /etc/dotnext/stalwart-admin.token r,
+  /etc/dotnext/dkim/               r,
+  /etc/dotnext/dkim/**             r,
+
+  deny /etc/dotnext/** rwklx,
+  deny /etc/shadow rwklx,
+  deny /home/** rwlkx,
+  deny /root/** rwlkx,
+
+  # Site-specific rules, kept across updates: dotnext update overwrites this
+  # file but not /etc/apparmor.d/local/usr.local.bin.stalwart-mail. After editing that
+  # file, reload with: apparmor_parser -r /etc/apparmor.d/usr.local.bin.stalwart-mail
+  # A deny rule above still wins over an allow rule added there.
+  include if exists <local/usr.local.bin.stalwart-mail>
+}

@@ -1,0 +1,838 @@
+package panelcmd
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"strings"
+	"text/tabwriter"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/dotnext-panel/dotnext/internal/ids"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/packageops"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+)
+
+// Hosting packages are pure DB rows — no agent side-effect, no Kratos hook.
+// Under M20 the CLI goes direct-DB so these commands stay usable even after
+// the legacy JWT middleware is gone.
+
+func newPackageCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "package",
+		Short: "Manage hosting packages",
+	}
+	cmd.AddCommand(
+		newPackageListCmd(),
+		newPackageCreateCmd(),
+		newPackageEditCmd(),
+		newPackageDeleteCmd(),
+	)
+	return cmd
+}
+
+func newPackageListCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "list",
+		Short: "List hosting packages (direct DB)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
+			defer cancel()
+			if err := initConfig(); err != nil {
+				return err
+			}
+			if err := initDB(); err != nil {
+				return err
+			}
+			pkgs, _, err := packageRepoFromDB().List(ctx, repository.ListOptions{Limit: 1000})
+			if err != nil {
+				return fmt.Errorf("list packages: %w", err)
+			}
+			if jsonOutput {
+				return printJSON(map[string]interface{}{
+					"packages": pkgs,
+					"total":    len(pkgs),
+				})
+			}
+			if len(pkgs) == 0 {
+				fmt.Println("No packages found")
+				return nil
+			}
+			w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
+			fmt.Fprintln(w, "ID\tNAME\tDISK_MB\tBW_MB\tDOMAINS\tDBS\tSSH\tCGI\tWEBMAIL\tWEBSITE_MAIL")
+			for _, p := range pkgs {
+				fmt.Fprintf(w, "%s\t%s\t%d\t%d\t%d\t%d\t%s\t%s\t%s\t%s\n",
+					p.ID, p.Name, p.DiskQuotaMB, p.BandwidthQuotaMB,
+					p.MaxDomains, p.MaxDatabases,
+					boolYN(p.SSHEnabled), boolYN(p.CGIEnabled), boolYN(p.WebmailEnabled),
+					boolYN(p.WebsiteSendsEmail))
+			}
+			return w.Flush()
+		},
+	}
+}
+
+// packageCreateFlags collects every `package create` flag so the row build is a
+// pure function of the flag values — testable without a live DB. Bool flags are
+// plain booleans here (create has no "leave unchanged" state; absence = false,
+// same as the REST create request's zero value) — except --webmail, which
+// defaults true to match the entitlement's ON-by-default (GH #1628), so the
+// admin opts OUT with --webmail=false.
+type packageCreateFlags struct {
+	name string
+
+	diskMB, bwMB, domains, emails, databases      uint32
+	cpuPercent, memoryMB, ioReadMbps, ioWriteMbps uint32
+	maxTasks                                      uint32
+
+	maxDBUsers, maxDockerApps, maxPythonApps, maxFTP uint32
+
+	maxBackups, maxBackupSchedules uint32
+	scheduledBackups               bool
+	backupKinds, backupRetention   string
+
+	sshEnabled, cgiEnabled, phpExec bool
+	webmailEnabled                  bool // GH #1628; defaults ON
+	websiteSendsEmail               bool // GH #2056; defaults OFF
+	composerEnabled                 bool // GH #2276; defaults OFF
+	gitDeployEnabled                bool // GH #2277; defaults OFF
+	redisKeysPerCall                int  // GH #2165; defaults 500
+
+	webmailBranding bool // GH #2502; defaults OFF
+
+	// GH #1798: per-package egress allowances (default false = DENY).
+	egressSSHOut, egressICMP bool
+	egressSSHOutCIDRs        string
+	phpSettingsPolicy        string // GH #1701
+	phpDisabledFunctions     string // GH #1701; "" = flag not given
+
+	fpmMaxChildren, fpmWorkerMemMB uint32
+	fpmUserCanEdit, fpmAdvanced    bool
+	fpmVersionDefaults             string
+
+	dockerAppSlugs string
+	nspawnImage    string
+}
+
+// buildPackageFromCreateFlags maps create-flag values onto a hosting_packages
+// row and applies the SAME defaulting the REST create handler does
+// (internal/api/packages.go:166-242), so an equivalent CLI invocation persists
+// the identical row. We apply the FPM/retention/version defaults explicitly
+// rather than leaning on the GORM `default:` column tags (which only fill a
+// field left at its zero value) so "equivalent inputs → identical rows" is
+// provable by reading the two blocks side by side. packageops.Validate is the
+// shared final gate the caller runs on the returned row.
+func buildPackageFromCreateFlags(f packageCreateFlags) (*models.HostingPackage, error) {
+	now := time.Now().UTC()
+	p := &models.HostingPackage{
+		ID:               ids.NewULID(),
+		Name:             f.name,
+		DiskQuotaMB:      f.diskMB,
+		BandwidthQuotaMB: f.bwMB,
+		MaxDomains:       f.domains,
+		MaxEmailAccounts: f.emails,
+		MaxDatabases:     f.databases,
+		CPUQuotaPercent:  f.cpuPercent,
+		MemoryLimitMB:    f.memoryMB,
+		IOReadMbps:       f.ioReadMbps,
+		IOWriteMbps:      f.ioWriteMbps,
+		MaxTasks:         f.maxTasks,
+		MaxDatabaseUsers: f.maxDBUsers,
+		MaxDockerApps:    f.maxDockerApps,
+		MaxPythonApps:    f.maxPythonApps,
+		MaxFTPAccounts:   f.maxFTP,
+
+		MaxBackups:                    f.maxBackups,
+		MaxBackupSchedules:            f.maxBackupSchedules,
+		ScheduledBackupsEnabled:       f.scheduledBackups,
+		AllowedBackupDestinationKinds: f.backupKinds,
+		BackupRetentionPolicy:         f.backupRetention,
+
+		SSHEnabled:     f.sshEnabled,
+		CGIEnabled:     f.cgiEnabled,
+		WebmailEnabled: f.webmailEnabled, // GH #1628
+		// GH #2056: a new package's sites can't send mail unless asked.
+		WebsiteSendsEmail: f.websiteSendsEmail,
+		ComposerEnabled:   f.composerEnabled,  // GH #2276: off unless asked
+		GitDeployEnabled:  f.gitDeployEnabled, // GH #2277: off unless asked
+		RedisKeysPerCall:  f.redisKeysPerCall, // GH #2165; Validate bounds it
+
+		WebmailBrandingEnabled: f.webmailBranding, // GH #2502: off unless asked
+
+		EgressSSHOut:      f.egressSSHOut, // GH #1798
+		EgressSSHOutCIDRs: f.egressSSHOutCIDRs,
+		EgressICMP:        f.egressICMP,
+
+		FpmMaxChildrenCap:  f.fpmMaxChildren,
+		FpmWorkerMemMb:     f.fpmWorkerMemMB,
+		FpmUserCanEdit:     f.fpmUserCanEdit,
+		FpmAdvancedMode:    f.fpmAdvanced,
+		FpmVersionDefaults: f.fpmVersionDefaults,
+		DockerAppSlugs:     f.dockerAppSlugs,
+
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+	// GH #1701: the disabled-functions list, mirroring the REST create
+	// handler. --php-disabled-functions wins; --php-exec is the legacy toggle.
+	var disabledFns *string
+	if f.phpDisabledFunctions != "" {
+		list, err := parseCLIDisabledFunctions(f.phpDisabledFunctions)
+		if err != nil {
+			return nil, err
+		}
+		disabledFns = list
+	} else if f.phpExec {
+		disabledFns = models.SetPHPExecOnList(models.PHPLockdownFunctions, true)
+	}
+	p.SetPHPDisabledFunctions(disabledFns)
+	// FPM policy defaults (mirror packages.go:166-182).
+	if p.FpmMaxChildrenCap == 0 {
+		p.FpmMaxChildrenCap = 20
+	}
+	if p.FpmWorkerMemMb == 0 {
+		p.FpmWorkerMemMb = 64
+	}
+	if p.FpmVersionDefaults == "" {
+		p.FpmVersionDefaults = "{}"
+	}
+	if p.FpmAdvancedMode {
+		p.FpmUserCanEdit = true // advanced implies can-edit
+	}
+	// Backup destination kinds: canonicalise (dedup/lowercase) so a CLI-supplied
+	// list stores byte-for-byte what the REST path would (packages.go:183-189).
+	normKinds, err := models.NormalizeBackupKindsCSV(p.AllowedBackupDestinationKinds)
+	if err != nil {
+		return nil, fmt.Errorf("invalid backup kinds: %w", err)
+	}
+	p.AllowedBackupDestinationKinds = normKinds
+	// Retention policy: empty → the safe "reject" default (packages.go:190-196).
+	if p.BackupRetentionPolicy == "" {
+		p.BackupRetentionPolicy = models.BackupRetentionReject
+	}
+	// nspawn image: empty → server default (NULL). A non-empty value is pinned
+	// and pattern-checked by packageops.Validate.
+	if v := strings.TrimSpace(f.nspawnImage); v != "" {
+		p.NspawnImageVersion = &v
+	}
+	// GH #1798: validate + canonicalise the SSH-out CIDR scope (mirrors
+	// packages.go). Empty stays empty (= anywhere at apply time).
+	normEgressCIDRs, egressErr := models.NormalizeEgressSSHOutCIDRs(p.EgressSSHOutCIDRs)
+	if egressErr != nil {
+		return nil, fmt.Errorf("invalid egress-ssh-out-cidrs: %w", egressErr)
+	}
+	p.EgressSSHOutCIDRs = normEgressCIDRs
+	// GH #1701: validate + canonicalise the PHP settings policy (mirrors
+	// packages.go).
+	normPHPPolicy, phpPolicyErr := models.NormalizePHPSettingsPolicy(f.phpSettingsPolicy)
+	if phpPolicyErr != nil {
+		return nil, fmt.Errorf("invalid php-settings-policy: %w", phpPolicyErr)
+	}
+	p.PHPSettingsPolicy = normPHPPolicy
+	return p, nil
+}
+
+func newPackageCreateCmd() *cobra.Command {
+	var f packageCreateFlags
+
+	cmd := &cobra.Command{
+		Use:   "create",
+		Short: "Create a hosting package (direct DB)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
+			defer cancel()
+			if err := initConfig(); err != nil {
+				return err
+			}
+			if err := initDB(); err != nil {
+				return err
+			}
+			p, err := buildPackageFromCreateFlags(f)
+			if err != nil {
+				return err
+			}
+			// JAB-306: the operator CLI persists direct-to-DB, so it must run the
+			// same invariant check the REST handler does — otherwise an
+			// out-of-range value the API rejects with 422 (e.g. --cpu 999999 or
+			// --fpm-max-children 3000) would silently land in the row.
+			if err := packageops.Validate(p); err != nil {
+				return fmt.Errorf("invalid package: %w", err)
+			}
+			if err := packageRepoFromDB().Create(ctx, p); err != nil {
+				if errors.Is(err, repository.ErrConflict) {
+					return fmt.Errorf("package name %q already exists", f.name)
+				}
+				return fmt.Errorf("create package: %w", err)
+			}
+			if jsonOutput {
+				return printJSON(p)
+			}
+			cliAuditOK(ctx, "package.create", "package", p.ID, nil)
+			fmt.Printf("Created package %s (%s)\n", p.ID, p.Name)
+			return nil
+		},
+	}
+
+	registerPackageCreateFlags(cmd, &f)
+	_ = cmd.MarkFlagRequired("name")
+	return cmd
+}
+
+// registerPackageCreateFlags wires every hosting_packages entitlement onto the
+// create command. Every field of the REST create request has a flag here — the
+// JAB-306 AC3 parity guarantee ("new entitlement fields cannot be omitted by one
+// adapter"), enforced by TestPackageCLI_EntitlementFlagParity.
+func registerPackageCreateFlags(cmd *cobra.Command, f *packageCreateFlags) {
+	fl := cmd.Flags()
+	fl.StringVar(&f.name, "name", "", "package name (required)")
+	fl.Uint32Var(&f.diskMB, "disk-mb", 0, "disk quota in MB (0=unlimited)")
+	fl.Uint32Var(&f.bwMB, "bw-mb", 0, "bandwidth quota in MB (0=unlimited)")
+	fl.Uint32Var(&f.domains, "domains", 0, "max domains (0=unlimited)")
+	fl.Uint32Var(&f.emails, "emails", 0, "max email accounts (0=unlimited)")
+	fl.Uint32Var(&f.databases, "databases", 0, "max databases (0=unlimited)")
+	fl.Uint32Var(&f.cpuPercent, "cpu", 0, "CPU quota percent across all cores (0=unlimited)")
+	fl.Uint32Var(&f.memoryMB, "memory-mb", 0, "memory limit in MB (0=unlimited)")
+	fl.Uint32Var(&f.ioReadMbps, "io-read-mbps", 0, "disk read bandwidth limit in MB/s (0=unlimited)")
+	fl.Uint32Var(&f.ioWriteMbps, "io-write-mbps", 0, "disk write bandwidth limit in MB/s (0=unlimited)")
+	fl.Uint32Var(&f.maxTasks, "max-tasks", 0, "max processes/threads per user slice (0=unlimited)")
+	fl.Uint32Var(&f.maxDBUsers, "max-db-users", 0, "max database users (0=unlimited)")
+	fl.Uint32Var(&f.maxDockerApps, "max-docker-apps", 0, "max tenant docker apps (0=docker apps not included)")
+	fl.Uint32Var(&f.maxPythonApps, "max-python-apps", 0, "max tenant python apps (0=python apps not included)")
+	fl.Uint32Var(&f.maxFTP, "max-ftp-accounts", 0, "max tenant FTP/SFTP subaccounts (0=feature not included)")
+	fl.Uint32Var(&f.maxBackups, "max-backups", 0, "tenant backup retention cap (0=backups not included)")
+	fl.Uint32Var(&f.maxBackupSchedules, "max-backup-schedules", 0, "max tenant scheduled backups (0=default 1)")
+	fl.BoolVar(&f.scheduledBackups, "scheduled-backups", false, "allow tenant scheduled backups")
+	fl.StringVar(&f.backupKinds, "backup-kinds", "", "CSV of allowed backup destination kinds (empty=none)")
+	fl.StringVar(&f.backupRetention, "backup-retention", "", "retention policy at the cap: reject or prune (empty=reject)")
+	fl.BoolVar(&f.sshEnabled, "ssh", false, "enable SSH access")
+	fl.BoolVar(&f.cgiEnabled, "cgi", false, "enable CGI")
+	fl.BoolVar(&f.phpExec, "php-exec", false, "opt out of the PHP command-exec lockdown (exec/proc_open work)")
+	fl.StringVar(&f.phpDisabledFunctions, "php-disabled-functions", "", phpDisabledFunctionsFlagHelp)
+	fl.BoolVar(&f.egressSSHOut, "egress-ssh-out", false, "allow outbound SSH (:22) for enforced tenants on this package")
+	fl.StringVar(&f.egressSSHOutCIDRs, "egress-ssh-out-cidrs", "", `JSON array of CIDRs scoping outbound SSH (empty=anywhere), e.g. '["140.82.112.0/20"]'`)
+	fl.StringVar(&f.phpSettingsPolicy, "php-settings-policy", "", `JSON object of php.ini directive to level (admin_only / tenant_allowed; tenant_privileged for security-sensitive directives) saying who may set it on the per-domain PHP Settings page. Empty = defaults (tenants may set every directive they can today). The CLI and admins are not limited by it. e.g. '{"memory_limit":"admin_only"}'`)
+	fl.BoolVar(&f.egressICMP, "egress-icmp", false, "allow outbound ICMP echo-request (ping) for enforced tenants on this package")
+	// GH #1628: webmail defaults ON, so this create flag defaults true (pass
+	// --webmail=false to withhold webmail from the plan). Mirrors the REST
+	// create handler's nil->true default.
+	fl.BoolVar(&f.webmailEnabled, "webmail", true, "enable webmail (Bulwark UI) for this package")
+	// GH #2056: off for a new package, like the REST create.
+	fl.BoolVar(&f.websiteSendsEmail, "website-mail", false, "let the sites on this package send email with PHP mail()")
+	// GH #2276: off for a new package, like the REST create.
+	fl.BoolVar(&f.composerEnabled, "composer", false, composerFlagHelp)
+	// GH #2277: off for a new package, like the REST create.
+	fl.BoolVar(&f.gitDeployEnabled, "git-deploy", false, gitDeployFlagHelp)
+	// GH #2502: off for a new package, like the REST create.
+	fl.BoolVar(&f.webmailBranding, "webmail-branding", false, webmailBrandingFlagHelp)
+	// GH #2165: defaults to 500 like the REST create; 0 is not "unlimited".
+	fl.IntVar(&f.redisKeysPerCall, "redis-keys-per-call", models.RedisKeysPerCallDefault, redisKeysPerCallFlagHelp)
+	fl.Uint32Var(&f.fpmMaxChildren, "fpm-max-children", 0, "FPM pm.max_children cap (0=default 20)")
+	fl.Uint32Var(&f.fpmWorkerMemMB, "fpm-worker-mem-mb", 0, "FPM advisory per-worker memory budget in MB (0=default 64)")
+	fl.BoolVar(&f.fpmUserCanEdit, "fpm-user-can-edit", false, "let tenants pick an FPM performance mode")
+	fl.BoolVar(&f.fpmAdvanced, "fpm-advanced", false, "unlock tenant advanced FPM knobs (implies --fpm-user-can-edit)")
+	fl.StringVar(&f.fpmVersionDefaults, "fpm-version-defaults", "", `JSON map of per-version FPM defaults (empty={})`)
+	fl.StringVar(&f.dockerAppSlugs, "docker-app-slugs", "", "CSV allowlist of catalog slugs tenants may install (empty=server default)")
+	fl.StringVar(&f.nspawnImage, "nspawn-image", "", "pin users to an nspawn rootfs version (empty=server default)")
+}
+
+// packageEditFlags mirrors packageCreateFlags for the edit command. The six
+// boolean entitlements are tri-state strings ("" leave unchanged, "true",
+// "false") so an edit only touches a toggle the operator names — the same
+// convention the original --ssh/--cgi edit flags use.
+type packageEditFlags struct {
+	name string
+
+	diskMB, bwMB, domains, emails, databases      uint32
+	cpuPercent, memoryMB, ioReadMbps, ioWriteMbps uint32
+	maxTasks                                      uint32
+
+	maxDBUsers, maxDockerApps, maxPythonApps, maxFTP uint32
+
+	maxBackups, maxBackupSchedules uint32
+	backupKinds, backupRetention   string
+
+	fpmMaxChildren, fpmWorkerMemMB                  uint32
+	fpmVersionDefaults, dockerAppSlugs, nspawnImage string
+
+	// tri-state toggles.
+	sshEnabled, cgiEnabled, phpExec               string
+	webmailEnabled                                string // GH #1628
+	websiteSendsEmail                             string // GH #2056
+	composerEnabled                               string // GH #2276
+	gitDeployEnabled                              string // GH #2277
+	redisKeysPerCall                              int    // GH #2165
+	scheduledBackups, fpmUserCanEdit, fpmAdvanced string
+	webmailBranding                               string // GH #2502
+	// GH #1798: per-package egress allowances. The two flags are tri-state
+	// (true/false/unset); the CIDR scope is a plain string.
+	egressSSHOut, egressICMP string
+	egressSSHOutCIDRs        string
+	phpSettingsPolicy        string // GH #1701
+	phpDisabledFunctions     string // GH #1701
+}
+
+// applyPackageEditFlags applies the named edit flags onto a loaded row and
+// reports whether anything changed. `changed` is cmd.Flags().Changed (passed in
+// so the builder is a pure function testable without cobra plumbing). Every
+// per-field copy is gated on the operator naming that flag, mirroring the REST
+// update handler (internal/api/packages.go:296-419) — an omitted flag never
+// heals an untouched field. Backup-kinds normalisation, retention defaulting,
+// nspawn clear-on-empty and the unconditional advanced→can-edit implication all
+// match the REST update path. packageops.Validate is the shared final gate the
+// caller runs afterwards.
+func applyPackageEditFlags(changed func(string) bool, p *models.HostingPackage, f packageEditFlags) (bool, error) {
+	dirty := false
+	u32 := func(flag string, dst *uint32, v uint32) {
+		if changed(flag) {
+			*dst = v
+			dirty = true
+		}
+	}
+	str := func(flag string, dst *string, v string) {
+		if changed(flag) {
+			*dst = v
+			dirty = true
+		}
+	}
+	var triErr error
+	tri := func(flag string, dst *bool, v string) {
+		switch v {
+		case "":
+			// unset — leave the toggle unchanged.
+		case "true":
+			*dst = true
+			dirty = true
+		case "false":
+			*dst = false
+			dirty = true
+		default:
+			// Fail loud on a garbage value ("--php-exec=yes") instead of silently
+			// ignoring it — a silently-dropped security toggle is exactly the
+			// reported-success-that-does-nothing trap (feedback_silent_exit0_failures).
+			if triErr == nil {
+				triErr = fmt.Errorf("--%s: want true or false, got %q", flag, v)
+			}
+		}
+	}
+
+	str("name", &p.Name, f.name)
+	u32("disk-mb", &p.DiskQuotaMB, f.diskMB)
+	u32("bw-mb", &p.BandwidthQuotaMB, f.bwMB)
+	u32("domains", &p.MaxDomains, f.domains)
+	u32("emails", &p.MaxEmailAccounts, f.emails)
+	u32("databases", &p.MaxDatabases, f.databases)
+	u32("cpu", &p.CPUQuotaPercent, f.cpuPercent)
+	u32("memory-mb", &p.MemoryLimitMB, f.memoryMB)
+	u32("io-read-mbps", &p.IOReadMbps, f.ioReadMbps)
+	u32("io-write-mbps", &p.IOWriteMbps, f.ioWriteMbps)
+	u32("max-tasks", &p.MaxTasks, f.maxTasks)
+	u32("max-db-users", &p.MaxDatabaseUsers, f.maxDBUsers)
+	u32("max-docker-apps", &p.MaxDockerApps, f.maxDockerApps)
+	u32("max-python-apps", &p.MaxPythonApps, f.maxPythonApps)
+	u32("max-ftp-accounts", &p.MaxFTPAccounts, f.maxFTP)
+	u32("max-backups", &p.MaxBackups, f.maxBackups)
+	u32("max-backup-schedules", &p.MaxBackupSchedules, f.maxBackupSchedules)
+	u32("fpm-max-children", &p.FpmMaxChildrenCap, f.fpmMaxChildren)
+	u32("fpm-worker-mem-mb", &p.FpmWorkerMemMb, f.fpmWorkerMemMB)
+	str("fpm-version-defaults", &p.FpmVersionDefaults, f.fpmVersionDefaults)
+	str("docker-app-slugs", &p.DockerAppSlugs, f.dockerAppSlugs)
+
+	tri("ssh", &p.SSHEnabled, f.sshEnabled)
+	tri("cgi", &p.CGIEnabled, f.cgiEnabled)
+	// GH #1701: --php-disabled-functions sets the list and wins; --php-exec
+	// is the legacy toggle, applied to the list so other entries stay.
+	if changed("php-disabled-functions") {
+		list, err := parseCLIDisabledFunctions(f.phpDisabledFunctions)
+		if err != nil {
+			return false, err
+		}
+		p.SetPHPDisabledFunctions(list)
+		dirty = true
+	} else {
+		var execAllowed bool
+		tri("php-exec", &execAllowed, f.phpExec)
+		if f.phpExec == "true" || f.phpExec == "false" {
+			p.SetPHPDisabledFunctions(models.SetPHPExecOnList(models.EffectivePHPDisabledFunctions(p), execAllowed))
+		}
+	}
+	tri("webmail", &p.WebmailEnabled, f.webmailEnabled)            // GH #1628
+	tri("website-mail", &p.WebsiteSendsEmail, f.websiteSendsEmail) // GH #2056
+	tri("composer", &p.ComposerEnabled, f.composerEnabled)         // GH #2276
+	tri("git-deploy", &p.GitDeployEnabled, f.gitDeployEnabled)     // GH #2277
+	if changed("redis-keys-per-call") {                            // GH #2165; Validate bounds it
+		p.RedisKeysPerCall = f.redisKeysPerCall
+		dirty = true
+	}
+	// GH #2502
+	tri("webmail-branding", &p.WebmailBrandingEnabled, f.webmailBranding)
+	tri("egress-ssh-out", &p.EgressSSHOut, f.egressSSHOut) // GH #1798
+	tri("egress-icmp", &p.EgressICMP, f.egressICMP)        // GH #1798
+	tri("scheduled-backups", &p.ScheduledBackupsEnabled, f.scheduledBackups)
+	tri("fpm-user-can-edit", &p.FpmUserCanEdit, f.fpmUserCanEdit)
+	tri("fpm-advanced", &p.FpmAdvancedMode, f.fpmAdvanced)
+	if triErr != nil {
+		return false, triErr
+	}
+
+	if changed("backup-kinds") {
+		nk, err := models.NormalizeBackupKindsCSV(f.backupKinds)
+		if err != nil {
+			return false, fmt.Errorf("invalid backup kinds: %w", err)
+		}
+		p.AllowedBackupDestinationKinds = nk
+		dirty = true
+	}
+	if changed("backup-retention") {
+		v := f.backupRetention
+		if v == "" {
+			v = models.BackupRetentionReject
+		}
+		p.BackupRetentionPolicy = v
+		dirty = true
+	}
+	if changed("nspawn-image") {
+		if v := strings.TrimSpace(f.nspawnImage); v == "" {
+			p.NspawnImageVersion = nil // empty clears the pin (server default)
+		} else {
+			p.NspawnImageVersion = &v
+		}
+		dirty = true
+	}
+	// GH #1798: validate + canonicalise the SSH-out CIDR scope on change.
+	if changed("egress-ssh-out-cidrs") {
+		norm, err := models.NormalizeEgressSSHOutCIDRs(f.egressSSHOutCIDRs)
+		if err != nil {
+			return false, fmt.Errorf("invalid egress-ssh-out-cidrs: %w", err)
+		}
+		p.EgressSSHOutCIDRs = norm
+		dirty = true
+	}
+	// GH #1701: validate + canonicalise the PHP settings policy on change.
+	if changed("php-settings-policy") {
+		norm, err := models.NormalizePHPSettingsPolicy(f.phpSettingsPolicy)
+		if err != nil {
+			return false, fmt.Errorf("invalid php-settings-policy: %w", err)
+		}
+		p.PHPSettingsPolicy = norm
+		dirty = true
+	}
+	// Advanced implies can-edit — unconditional, matching packages.go:399.
+	if p.FpmAdvancedMode {
+		p.FpmUserCanEdit = true
+	}
+	return dirty, nil
+}
+
+func newPackageEditCmd() *cobra.Command {
+	var f packageEditFlags
+
+	cmd := &cobra.Command{
+		Use:   "edit <package-id>",
+		Short: "Edit a hosting package (direct DB)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
+			defer cancel()
+			if err := initConfig(); err != nil {
+				return err
+			}
+			if err := initDB(); err != nil {
+				return err
+			}
+
+			repo := packageRepoFromDB()
+			p, err := resolvePackage(ctx, repo, args[0])
+			if err != nil {
+				return err
+			}
+
+			// JAB-306 AC4: remember the pre-edit disabled-functions list so the
+			// pool re-render fans out only when it actually changes (a value
+			// gate, not flag presence) — `--php-exec true` on an already-true
+			// package must not force a fleet-wide re-render. GH #1701: the list,
+			// not the php_exec flag, so a list edit fans out too.
+			prevDisabledFns := strings.Join(models.EffectivePHPDisabledFunctions(p), ",")
+
+			didChange, err := applyPackageEditFlags(cmd.Flags().Changed, p, f)
+			if err != nil {
+				return err
+			}
+			if !didChange {
+				return fmt.Errorf("no changes specified")
+			}
+			p.UpdatedAt = time.Now().UTC()
+			// JAB-306: same invariant gate as create + the REST handler, so an
+			// edit can't drive a value out of the bounds the API enforces. The
+			// loaded row already carries valid FPM/backup values, so this only
+			// rejects an operator's out-of-range edit — never "heals" untouched
+			// fields.
+			if err := packageops.Validate(p); err != nil {
+				return fmt.Errorf("invalid package: %w", err)
+			}
+			if err := repo.Update(ctx, p); err != nil {
+				return fmt.Errorf("update package: %w", err)
+			}
+			// JAB-306 AC4/AC5: fan out a php_exec change to existing tenants
+			// AFTER the row persists. The reconciler sweep re-applies only
+			// pending/error pools, so without this a CLI php_exec flip would not
+			// reach a serving tenant until their next PHP-settings save. The CLI
+			// runs no reconciler, so the fan-out is DB-only: mark every serving
+			// pool on this package pending and let the ~60s sweep re-render it
+			// from the new package state (the same active->pending mechanism
+			// `dotnext php pool reapply-all` uses). Strictly after Update — a
+			// persist failure returned above, so a failed edit fans out nothing
+			// (AC5: repository failure causes no fanout). SSH needs no
+			// equivalent: the SSH reconcile sweep re-reads the package and diffs
+			// group membership every tick (ssh_keys_reconcile.go), so a CLI
+			// ssh_enabled flip converges on its own.
+			if newDisabledFns := strings.Join(models.EffectivePHPDisabledFunctions(p), ","); newDisabledFns != prevDisabledFns {
+				fanCtx, fanCancel := context.WithTimeout(cmd.Context(), 2*time.Minute)
+				n, ferr := markPackagePHPPoolsPending(fanCtx, userRepo(), repository.NewPHPPoolRepository(sharedDB), p.ID)
+				fanCancel()
+				shown := newDisabledFns
+				if shown == "" {
+					shown = "(none)"
+				}
+				fmt.Fprintf(os.Stderr, "disabled PHP functions set to %s: marked %d serving PHP pool(s) pending; the reconciler re-renders them on its next sweep(s)\n", shown, n)
+				if ferr != nil {
+					return fmt.Errorf("mark php pools pending after disabled-functions change: %w", ferr)
+				}
+			}
+			if jsonOutput {
+				return printJSON(p)
+			}
+			cliAuditOK(ctx, "package.update", "package", p.ID, nil)
+			fmt.Printf("Updated package %s (%s)\n", p.ID, p.Name)
+			return nil
+		},
+	}
+
+	registerPackageEditFlags(cmd, &f)
+	return cmd
+}
+
+// registerPackageEditFlags wires the entitlement flags onto the edit command.
+// The uint32/string flags share the create names; the six boolean toggles are
+// tri-state strings (true/false) so an edit only flips a toggle the operator
+// names. Parity with the REST update request is enforced by
+// TestPackageCLI_EntitlementFlagParity.
+func registerPackageEditFlags(cmd *cobra.Command, f *packageEditFlags) {
+	fl := cmd.Flags()
+	fl.StringVar(&f.name, "name", "", "package name")
+	fl.Uint32Var(&f.diskMB, "disk-mb", 0, "disk quota MB")
+	fl.Uint32Var(&f.bwMB, "bw-mb", 0, "bandwidth MB")
+	fl.Uint32Var(&f.domains, "domains", 0, "max domains")
+	fl.Uint32Var(&f.emails, "emails", 0, "max emails")
+	fl.Uint32Var(&f.databases, "databases", 0, "max databases")
+	fl.Uint32Var(&f.cpuPercent, "cpu", 0, "CPU quota percent")
+	fl.Uint32Var(&f.memoryMB, "memory-mb", 0, "memory limit MB")
+	fl.Uint32Var(&f.ioReadMbps, "io-read-mbps", 0, "io read MB/s")
+	fl.Uint32Var(&f.ioWriteMbps, "io-write-mbps", 0, "io write MB/s")
+	fl.Uint32Var(&f.maxTasks, "max-tasks", 0, "max processes/threads")
+	fl.Uint32Var(&f.maxDBUsers, "max-db-users", 0, "max database users")
+	fl.Uint32Var(&f.maxDockerApps, "max-docker-apps", 0, "max tenant docker apps")
+	fl.Uint32Var(&f.maxPythonApps, "max-python-apps", 0, "max tenant python apps")
+	fl.Uint32Var(&f.maxFTP, "max-ftp-accounts", 0, "max tenant FTP/SFTP subaccounts")
+	fl.Uint32Var(&f.maxBackups, "max-backups", 0, "tenant backup retention cap")
+	fl.Uint32Var(&f.maxBackupSchedules, "max-backup-schedules", 0, "max tenant scheduled backups")
+	fl.StringVar(&f.backupKinds, "backup-kinds", "", "CSV of allowed backup destination kinds")
+	fl.StringVar(&f.backupRetention, "backup-retention", "", "retention policy at the cap: reject or prune")
+	fl.Uint32Var(&f.fpmMaxChildren, "fpm-max-children", 0, "FPM pm.max_children cap")
+	fl.Uint32Var(&f.fpmWorkerMemMB, "fpm-worker-mem-mb", 0, "FPM advisory per-worker memory budget MB")
+	fl.StringVar(&f.fpmVersionDefaults, "fpm-version-defaults", "", "JSON map of per-version FPM defaults")
+	fl.StringVar(&f.dockerAppSlugs, "docker-app-slugs", "", "CSV allowlist of catalog slugs tenants may install")
+	fl.StringVar(&f.nspawnImage, "nspawn-image", "", "pin users to an nspawn rootfs version (empty clears the pin)")
+	fl.StringVar(&f.sshEnabled, "ssh", "", "SSH access (true/false)")
+	fl.StringVar(&f.cgiEnabled, "cgi", "", "CGI access (true/false)")
+	fl.StringVar(&f.phpExec, "php-exec", "", "PHP command-exec opt-out (true/false)")
+	fl.StringVar(&f.phpDisabledFunctions, "php-disabled-functions", "", phpDisabledFunctionsFlagHelp)
+	fl.StringVar(&f.webmailEnabled, "webmail", "", "webmail Bulwark UI (true/false)")                           // GH #1628
+	fl.StringVar(&f.websiteSendsEmail, "website-mail", "", "sites may send email with PHP mail() (true/false)") // GH #2056
+	fl.StringVar(&f.composerEnabled, "composer", "", composerFlagHelp+" (true/false)")                          // GH #2276
+	fl.StringVar(&f.gitDeployEnabled, "git-deploy", "", gitDeployFlagHelp+" (true/false)")                      // GH #2277
+	fl.StringVar(&f.webmailBranding, "webmail-branding", "", webmailBrandingFlagHelp+" (true/false)")           // GH #2502
+	fl.IntVar(&f.redisKeysPerCall, "redis-keys-per-call", 0, redisKeysPerCallEditFlagHelp)                      // GH #2165
+	fl.StringVar(&f.egressSSHOut, "egress-ssh-out", "", "allow outbound SSH :22 for enforced tenants (true/false)")
+	fl.StringVar(&f.egressICMP, "egress-icmp", "", "allow outbound ICMP ping for enforced tenants (true/false)")
+	fl.StringVar(&f.egressSSHOutCIDRs, "egress-ssh-out-cidrs", "", `JSON array of CIDRs scoping outbound SSH (empty=anywhere)`)
+	fl.StringVar(&f.phpSettingsPolicy, "php-settings-policy", "", `JSON object of php.ini directive to level (admin_only / tenant_allowed; tenant_privileged for security-sensitive directives) saying who may set it on the per-domain PHP Settings page. Empty = defaults (tenants may set every directive they can today). The CLI and admins are not limited by it. e.g. '{"memory_limit":"admin_only"}'`)
+	fl.StringVar(&f.scheduledBackups, "scheduled-backups", "", "tenant scheduled backups (true/false)")
+	fl.StringVar(&f.fpmUserCanEdit, "fpm-user-can-edit", "", "tenant FPM performance mode (true/false)")
+	fl.StringVar(&f.fpmAdvanced, "fpm-advanced", "", "tenant advanced FPM knobs (true/false, true implies fpm-user-can-edit)")
+}
+
+func newPackageDeleteCmd() *cobra.Command {
+	var force bool
+	cmd := &cobra.Command{
+		Use:   "delete <package-id>",
+		Short: "Delete a hosting package (direct DB)",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := context.WithTimeout(cmd.Context(), 10*time.Second)
+			defer cancel()
+			if err := initConfig(); err != nil {
+				return err
+			}
+			if err := initDB(); err != nil {
+				return err
+			}
+			repo := packageRepoFromDB()
+			p, err := resolvePackage(ctx, repo, args[0])
+			if err != nil {
+				return err
+			}
+			if !force {
+				if err := confirmOrAbort(cmd, os.Stdin, fmt.Sprintf("Delete package %s (%s)?", p.ID, p.Name), "--force"); err != nil {
+					return err
+				}
+			}
+			if err := repo.Delete(ctx, p.ID); err != nil {
+				return fmt.Errorf("delete package: %w", err)
+			}
+			if jsonOutput {
+				return printJSON(map[string]string{"deleted": p.ID})
+			}
+			cliAuditOK(ctx, "package.delete", "package", p.ID, nil)
+			fmt.Printf("Deleted package %s (%s)\n", p.ID, p.Name)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&force, "force", false, "skip confirmation")
+	return cmd
+}
+
+// packageUserLister is the narrow user-repo behavior the php_exec fan-out
+// needs: enumerate users so it can find everyone on a package. Kept small so
+// markPackagePHPPoolsPending is unit-testable with a tiny fake.
+type packageUserLister interface {
+	List(ctx context.Context, opts repository.ListOptions) ([]models.User, int64, error)
+}
+
+// poolPendingMarker is the narrow pool-repo behavior the fan-out needs: read a
+// user's pools and flip a pool's status.
+type poolPendingMarker interface {
+	ListByUserID(ctx context.Context, userID string) ([]models.PHPPool, error)
+	SetStatus(ctx context.Context, id, status string, lastErr *string) error
+}
+
+// markPackagePHPPoolsPending flips every SERVING PHP pool (status active or
+// ready) of every user on packageID to "pending", so the reconciler re-renders
+// it from the current package state on its next sweep. This is the CLI
+// counterpart of the REST fanOutPHPPoolReapply (packages.go): the CLI runs no
+// reconciler, so it marks the rows DB-only and lets the ~60s sweep converge —
+// the same active->pending mechanism `dotnext php pool reapply-all` uses
+// (markActivePoolsPending), extended to "ready" pools too. A settings-save
+// leaves a pool "ready" (phppoolops.ReconcileViaAgent); the sweep re-applies
+// only pending/error pools, so a serving pool in either active or ready state
+// is otherwise skipped. A php_exec tighten must reach both, so both serving
+// states are flipped. Pending/error pools are already in the sweep's work set
+// and are left as-is (re-marking an error pool would also hide its LastError).
+//
+// Users are enumerated the same bounded way as the REST fan-out (List up to
+// 10k, filter by package). Errors are collected per pool — a failed flip on one
+// tenant must not skip the others — and joined; the caller surfaces them and
+// exits non-zero so an operator sees a tighten that did not fully land.
+func markPackagePHPPoolsPending(ctx context.Context, users packageUserLister, pools poolPendingMarker, packageID string) (int, error) {
+	all, _, err := users.List(ctx, repository.ListOptions{Limit: 10000})
+	if err != nil {
+		return 0, fmt.Errorf("list users: %w", err)
+	}
+	marked := 0
+	var errs []error
+	for i := range all {
+		u := &all[i]
+		if u.PackageID == nil || *u.PackageID != packageID {
+			continue
+		}
+		userPools, perr := pools.ListByUserID(ctx, u.ID)
+		if perr != nil {
+			errs = append(errs, fmt.Errorf("user %s: list pools: %w", u.ID, perr))
+			continue
+		}
+		for j := range userPools {
+			if userPools[j].Status != "active" && userPools[j].Status != "ready" {
+				continue
+			}
+			if serr := pools.SetStatus(ctx, userPools[j].ID, "pending", nil); serr != nil {
+				errs = append(errs, fmt.Errorf("pool %s: %w", userPools[j].ID, serr))
+				continue
+			}
+			marked++
+		}
+	}
+	return marked, errors.Join(errs...)
+}
+
+// resolvePackage accepts either a package ULID or its name (operators
+// remember names; ULIDs only useful when scripting). Tries ID first
+// (cheap exact-match lookup); falls back to name. Mirrors resolveUser
+// but unique to packages because hosting_packages has both columns
+// indexed.
+func resolvePackage(ctx context.Context, repo repository.PackageRepository, lookup string) (*models.HostingPackage, error) {
+	if p, err := repo.FindByID(ctx, lookup); err == nil {
+		return p, nil
+	} else if !errors.Is(err, repository.ErrNotFound) {
+		return nil, fmt.Errorf("lookup by id: %w", err)
+	}
+	if p, err := repo.FindByName(ctx, lookup); err == nil {
+		return p, nil
+	} else if !errors.Is(err, repository.ErrNotFound) {
+		return nil, fmt.Errorf("lookup by name: %w", err)
+	}
+	return nil, fmt.Errorf("package %q not found", lookup)
+}
+
+func boolYN(b bool) string {
+	if b {
+		return "yes"
+	}
+	return "no"
+}
+
+// redisKeysPerCallFlagHelp documents --redis-keys-per-call on both create
+// and edit (GH #2165).
+var redisKeysPerCallFlagHelp = fmt.Sprintf("most keys one Redis key browser API call may list or delete for users on this package (%d to %d, default %d)",
+	models.RedisKeysPerCallMin, models.RedisKeysPerCallMax, models.RedisKeysPerCallDefault)
+
+var redisKeysPerCallEditFlagHelp = fmt.Sprintf("most keys one Redis key browser API call may list or delete for users on this package (%d to %d); unchanged unless given",
+	models.RedisKeysPerCallMin, models.RedisKeysPerCallMax)
+
+// phpDisabledFunctionsFlagHelp documents --php-disabled-functions on both
+// package create and edit (GH #1701).
+const phpDisabledFunctionsFlagHelp = `PHP functions disabled for this package's sites, comma-separated. "default" = the command-exec lockdown (exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec,pcntl_fork,proc_nice,dl); "none" = nothing disabled. Allowing system/exec/shell_exec/passthru/popen/proc_open/pcntl_exec also lifts the PHP Defense ban on it for these sites. Wins over --php-exec.`
+
+// parseCLIDisabledFunctions turns a --php-disabled-functions value into the
+// stored column value (nil = the lockdown default).
+func parseCLIDisabledFunctions(v string) (*string, error) {
+	switch strings.TrimSpace(v) {
+	case "default":
+		return nil, nil
+	case "none":
+		empty := ""
+		return &empty, nil
+	case "":
+		return nil, fmt.Errorf(`--php-disabled-functions: want a list of functions, "default" or "none"`)
+	}
+	norm, err := models.NormalizePHPDisabledFunctions(v)
+	if err != nil {
+		return nil, fmt.Errorf("invalid php-disabled-functions: %w", err)
+	}
+	return models.PHPDisabledFunctionsField(norm), nil
+}
+
+// composerFlagHelp (GH #2276, ADR-0176): a Composer run executes the
+// user's composer.json scripts, which can run any command in their SSH
+// sandbox.
+const composerFlagHelp = "let users on this package run Composer for their domains; their composer.json scripts can run commands in their SSH sandbox, so grant it as you would SSH"
+
+// gitDeployFlagHelp (GH #2277, ADR-0178): a deployment runs the user's
+// composer.json scripts and deploy hooks in their SSH sandbox.
+const gitDeployFlagHelp = "let users on this package deploy their domains from a Git repository; a deployment runs their own commands in their SSH sandbox, so grant it as you would SSH"
+
+// webmailBrandingFlagHelp (GH #2502): the owner sets the name, logos,
+// favicon and links webmail shows on mail.<domain>.
+const webmailBrandingFlagHelp = "let users on this package brand the webmail of their domains (mail.<domain>): its name, logos, favicon and links"

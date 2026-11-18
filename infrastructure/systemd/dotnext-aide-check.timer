@@ -1,0 +1,12 @@
+[Unit]
+Description=dotNext AIDE daily integrity check (04:30 UTC + 15m jitter)
+Documentation=https://github.com/dotnext71/panel/blob/main/docs/adr/0087-aide-system-fim.md
+
+[Timer]
+OnCalendar=*-*-* 04:30:00 UTC
+RandomizedDelaySec=900
+Persistent=true
+Unit=dotnext-aide-check.service
+
+[Install]
+WantedBy=timers.target

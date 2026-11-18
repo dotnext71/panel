@@ -1,0 +1,52 @@
+slug: linkwarden
+popularity: 48
+tenant_installable: true
+name: Linkwarden
+tags: ["Productivity"]
+version: "2.16.3"
+description: |
+  Self-hosted bookmark and link manager with built-in archiving
+  (PDF, screenshot, single-page HTML). Two services: NextJS app +
+  PostgreSQL.
+icon: icon.svg
+upstream: https://github.com/linkwarden/linkwarden
+documentation: https://docs.linkwarden.app/
+
+image_channel: ghcr.io/linkwarden/linkwarden:v2.16.3@sha256:0664c28a039bda8ffa6663389e8536b2fc717219e329f85b83faca7efed3b144
+update_mode: manual
+
+resources:
+  cpu: "1.5"
+  memory: "1g"
+  pids: 400
+
+volumes:
+  - name: app
+    container_path: /data/data
+  - name: db
+    container_path: /var/lib/postgresql/data
+
+ports:
+  - name: http
+    container_port: 3000
+    protocol: tcp
+    default_enabled: true
+    default_bind: loopback
+    default_reverse_proxy: true
+    health_path: /
+
+env:
+  - name: NEXTAUTH_SECRET
+    secret: true
+    generate: password64
+  - name: NEXTAUTH_URL
+    value: ""
+  - name: POSTGRES_PASSWORD
+    secret: true
+    generate: password32
+  - name: DATABASE_URL
+    value: ""
+
+# Operator-supplied SMTP (GH #322): auto-injects standard SMTP_* install fields;
+# compose maps them to this app's SMTP env.
+smtp: true

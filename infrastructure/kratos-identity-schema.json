@@ -1,0 +1,51 @@
+{
+  "$id": "https://dotnext.local/identity.schema.json",
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "DotNext Panel Identity",
+  "description": "JSON Schema for Kratos identity traits in DotNext Panel",
+  "type": "object",
+  "properties": {
+    "traits": {
+      "type": "object",
+      "properties": {
+        "email": {
+          "type": "string",
+          "title": "Email",
+          "description": "Contact email (may be shared across accounts; not used for login).",
+          "format": "email"
+        },
+        "username": {
+          "type": "string",
+          "title": "Username",
+          "description": "Your account login name (unique). Not your email.",
+          "minLength": 1,
+          "maxLength": 32,
+          "pattern": "^[a-z_][a-z0-9_-]*$",
+          "ory.sh/kratos": {
+            "credentials": {
+              "password": {
+                "identifier": true
+              },
+              "passkey": {
+                "display_name": true
+              },
+              "webauthn": {
+                "identifier": true
+              }
+            }
+          }
+        },
+        "is_admin": {
+          "type": "boolean",
+          "title": "Administrator",
+          "description": "Whether this identity has admin privileges. Settable only via Admin API.",
+          "default": false
+        }
+      },
+      "required": [
+        "username"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

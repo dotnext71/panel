@@ -1,0 +1,301 @@
+<?php
+/**
+ * DotNext Cache — WP-CLI commands.
+ *
+ *   wp dotnext-cache status
+ *   wp dotnext-cache enable
+ *   wp dotnext-cache disable
+ *   wp dotnext-cache flush [--pages]
+ *   wp dotnext-cache update-dropins
+ *   wp dotnext-cache remove-dropins
+ *   wp dotnext-cache diagnose
+ *
+ * @package DotNext_Cache
+ */
+
+defined( 'ABSPATH' ) || exit;
+
+if ( ! defined( 'WP_CLI' ) || ! WP_CLI ) {
+	return;
+}
+
+class DotNext_Cache_CLI {
+
+	/** @var string */
+	private $plugin_dir;
+
+	public function __construct( $plugin_dir = '' ) {
+		$this->plugin_dir = $plugin_dir ? $plugin_dir : dirname( __DIR__ );
+	}
+
+	/**
+	 * Show cache status and live Redis connectivity.
+	 *
+	 * @when after_wp_load
+	 */
+	public function status() {
+		$s   = DotNext_Cache_Settings::get();
+		$cfg = DotNext_Cache_Config::load();
+		$c   = new DotNext_Cache_Client( $cfg );
+		$ok  = $c->connect();
+
+		// GH #602: report the RUNTIME state. When the DotNext panel manages this
+		// site (DOTNEXT_CACHE_* constants in wp-config.php), the drop-ins read
+		// those constants, NOT the plugin options — so status must too, or it
+		// lies. Fall back to the option only on a non-panel-managed install.
+		$managed = defined( 'DOTNEXT_CACHE_SOCKET' ) || defined( 'DOTNEXT_CACHE_MAXTTL' ) || defined( 'DOTNEXT_CACHE_DISABLED' );
+		$enabled = $managed
+			? ! ( defined( 'DOTNEXT_CACHE_DISABLED' ) && DOTNEXT_CACHE_DISABLED )
+			: (bool) $s['enabled'];
+		$page = $managed
+			? ( defined( 'DOTNEXT_CACHE_PAGE_CACHE' ) && DOTNEXT_CACHE_PAGE_CACHE )
+			: (bool) $s['page_cache'];
+
+		// JAB-94: cheap cached + bounded key count for the status view (this is
+		// a UI-polled path); an exact full scan stays in `diagnose`.
+		$kc           = $ok ? $c->stats_key_count( $cfg['prefix'] ) : array( 'count' => 0, 'approx' => false );
+		$keys_display = $ok ? ( ( ! empty( $kc['approx'] ) ? '~' : '' ) . (int) $kc['count'] ) : '-';
+
+		$rows = array(
+			array( 'field' => 'managed_by', 'value' => $managed ? 'dotnext panel (wp-config constants)' : 'plugin options' ),
+			array( 'field' => 'enabled', 'value' => $enabled ? 'yes' : 'no' ),
+			array( 'field' => 'connected', 'value' => $ok ? 'yes' : 'no' ),
+			array( 'field' => 'driver', 'value' => $ok ? $c->driver() : '-' ),
+			array( 'field' => 'target', 'value' => ( 'unix' === $cfg['scheme'] ? $cfg['socket'] : $cfg['host'] . ':' . $cfg['port'] ) ),
+			array( 'field' => 'database', 'value' => (string) $cfg['database'] ),
+			array( 'field' => 'prefix', 'value' => $cfg['prefix'] ),
+			array( 'field' => 'keys', 'value' => $keys_display ),
+			array( 'field' => 'page_cache', 'value' => $page ? 'on' : 'off' ),
+		);
+		if ( ! $ok ) {
+			$rows[] = array( 'field' => 'error', 'value' => $c->last_error() );
+			// JAB-89: surface the circuit breaker so an operator sees Redis is
+			// held down (fail-fast) rather than being re-probed every request.
+			$open = $c->circuit_open_until();
+			if ( $open > 0 ) {
+				$rows[] = array( 'field' => 'circuit_open_until', 'value' => gmdate( 'c', $open ) . ' (' . max( 0, $open - time() ) . 's)' );
+			}
+		}
+		$c->close();
+		\WP_CLI\Utils\format_items( 'table', $rows, array( 'field', 'value' ) );
+	}
+
+	/**
+	 * Enable caching.
+	 *
+	 * @when after_wp_load
+	 */
+	public function enable() {
+		// GH #602: on a panel-managed site the option is inert (drop-ins read
+		// constants), so don't persist a misleading value — just warn.
+		if ( ! ( defined( 'DOTNEXT_CACHE_SOCKET' ) || defined( 'DOTNEXT_CACHE_MAXTTL' ) || defined( 'DOTNEXT_CACHE_DISABLED' ) ) ) {
+			$s            = DotNext_Cache_Settings::get();
+			$s['enabled'] = true;
+			DotNext_Cache_Settings::save( $s );
+		}
+		$this->ensure_dropins();
+		\WP_CLI::success( 'Object-cache drop-ins installed/repaired.' );
+		// GH #602: on/off + connection are constant-driven (panel-managed), not
+		// gated by this option — be honest so "enabled" isn't a false claim.
+		\WP_CLI::warning( 'Runtime caching is driven by the DOTNEXT_CACHE_* constants the DotNext panel writes to wp-config.php. This installed the drop-ins, but the Redis connection + on/off state are panel-managed — enable/disable caching from the DotNext panel.' );
+	}
+
+	/**
+	 * Disable caching (settings kept; drop-ins left in place but inert).
+	 *
+	 * @when after_wp_load
+	 */
+	public function disable() {
+		if ( ! ( defined( 'DOTNEXT_CACHE_SOCKET' ) || defined( 'DOTNEXT_CACHE_MAXTTL' ) || defined( 'DOTNEXT_CACHE_DISABLED' ) ) ) {
+			$s            = DotNext_Cache_Settings::get();
+			$s['enabled'] = false;
+			DotNext_Cache_Settings::save( $s );
+		}
+		if ( function_exists( 'wp_cache_flush' ) ) {
+			wp_cache_flush();
+		}
+		\WP_CLI::success( 'Local cache flushed and setting recorded.' );
+		\WP_CLI::warning( 'Runtime caching is driven by the DOTNEXT_CACHE_* constants the DotNext panel writes to wp-config.php; this option does not gate the drop-ins. To actually turn caching off, disable it in the DotNext panel (which strips the constants + drop-ins).' );
+	}
+
+	/**
+	 * Flush the cache.
+	 *
+	 * [--pages]
+	 * : Also purge full-page cache entries.
+	 *
+	 * @when after_wp_load
+	 */
+	public function flush( $args, $assoc ) {
+		if ( function_exists( 'wp_cache_flush' ) && false === wp_cache_flush() ) {
+			\WP_CLI::error( 'Cache flush failed: Redis did not record it.' );
+		}
+		if ( isset( $assoc['pages'] ) && class_exists( 'DotNext_Cache_Page_Cache' ) ) {
+			$pc = new DotNext_Cache_Page_Cache();
+			$n  = $pc->purge_all();
+			if ( false === $n ) {
+				\WP_CLI::error( 'Page cache purge failed: Redis did not record it.' );
+			}
+			\WP_CLI::log( "Purged {$n} page cache entries." );
+		}
+		\WP_CLI::success( 'Cache flushed.' );
+	}
+
+	/**
+	 * Install or repair the wp-content drop-ins.
+	 *
+	 * @when after_wp_load
+	 */
+	public function update_dropins() {
+		$res = $this->ensure_dropins();
+		if ( $res['object'] ) {
+			\WP_CLI::success( 'Drop-ins installed/updated.' );
+		} else {
+			\WP_CLI::error( 'Could not install object-cache.php (a foreign drop-in may be present, or wp-content is not writable).' );
+		}
+	}
+
+	/**
+	 * Remove the DotNext drop-ins.
+	 *
+	 * @when after_wp_load
+	 */
+	public function remove_dropins() {
+		$mgr = new DotNext_Cache_Dropin_Manager( $this->plugin_dir );
+		$mgr->remove();
+		\WP_CLI::success( 'Drop-ins removed.' );
+	}
+
+	/**
+	 * Verify live Redis connectivity with a real write/read/delete round-trip
+	 * under the site's ACL-scoped prefix. Exits non-zero (WP_CLI::error) on any
+	 * failure so a caller (the DotNext agent) can gate "cache enabled" on actual
+	 * health instead of a bare exit-0. A plain connect()/PING is NOT enough — a
+	 * wrong-prefix or mis-derived ACL token still connects but NOPERMs on the
+	 * first key op, which only a real SET/GET surfaces (GH #410).
+	 *
+	 * @when after_wp_load
+	 */
+	public function verify() {
+		$cfg = DotNext_Cache_Config::load();
+		// JAB-89: force a live probe so an open circuit breaker never masks a
+		// real diagnostic run.
+		$c = ( new DotNext_Cache_Client( $cfg ) )->force_probe();
+		if ( ! $c->connect() ) {
+			\WP_CLI::error( 'Redis connect failed: ' . $c->last_error() );
+		}
+		$key = $cfg['prefix'] . '__dotnext_verify';
+		if ( ! $c->set( $key, '1', 10 ) ) {
+			$err = $c->last_error();
+			$c->close();
+			\WP_CLI::error( 'Redis SET failed (NOPERM / keyspace denied for ' . $cfg['prefix'] . '*): ' . $err );
+		}
+		$val = $c->get( $key );
+		$c->del( $key );
+		$c->close();
+		if ( '1' !== (string) $val ) {
+			\WP_CLI::error( 'Redis round-trip mismatch (set 1, got ' . var_export( $val, true ) . ')' );
+		}
+		\WP_CLI::success( 'Cache verified: live Redis read/write under ' . $cfg['prefix'] );
+	}
+
+	/**
+	 * Diagnose connectivity and print an actionable hint on failure.
+	 *
+	 * @when after_wp_load
+	 */
+	public function diagnose() {
+		$cfg = DotNext_Cache_Config::load();
+		\WP_CLI::log( 'phpredis extension: ' . ( class_exists( 'Redis' ) ? 'present' : 'absent (using pure-PHP client)' ) );
+		\WP_CLI::log( 'igbinary extension: ' . ( function_exists( 'igbinary_serialize' ) ? 'present' : 'absent' ) );
+		\WP_CLI::log( 'scheme/target: ' . $cfg['scheme'] . ' ' . ( 'unix' === $cfg['scheme'] ? $cfg['socket'] : $cfg['host'] . ':' . $cfg['port'] ) );
+
+		// JAB-89: diagnose forces a live probe too (bypass the breaker).
+		$c = ( new DotNext_Cache_Client( $cfg ) )->force_probe();
+		if ( $c->connect() ) {
+			\WP_CLI::success( 'Connected via ' . $c->driver() . '. Keys for this site: ' . $c->count_keys( $cfg['prefix'] ) );
+			$c->close();
+			return;
+		}
+		\WP_CLI::warning( 'Not connected: ' . $c->last_error() );
+		\WP_CLI::log( 'Hints:' );
+		\WP_CLI::log( '  - open_basedir must include /run/redis (or the socket path).' );
+		\WP_CLI::log( '  - the PHP-FPM system user needs read/write on the Redis socket (the DotNext panel grants this automatically).' );
+		\WP_CLI::log( '  - redis-server must be running on the panel host.' );
+	}
+
+	/**
+	 * Cache stats as JSON (GH #617). keyspace hits/misses + used_memory are
+	 * Redis-instance-wide (shared); `keys` is this site's prefix only.
+	 *
+	 * @when after_wp_load
+	 */
+	public function stats() {
+		$cfg = DotNext_Cache_Config::load();
+		$out = array(
+			'connected'   => false,
+			'driver'      => '-',
+			'keys'        => 0,
+			'hits'        => 0,
+			'misses'      => 0,
+			'hit_ratio'   => 0.0,
+			'used_memory' => 0,
+		);
+		$c = new DotNext_Cache_Client( $cfg );
+		if ( $c->connect() ) {
+			$out['connected'] = true;
+			$out['driver']    = $c->driver();
+			// JAB-94: cached + bounded (stats is polled); `keys_approx` flags a
+			// capped count so the panel can render "~N".
+			$kc                = $c->stats_key_count( $cfg['prefix'] );
+			$out['keys']       = (int) $kc['count'];
+			$out['keys_approx'] = ! empty( $kc['approx'] );
+			$info             = $c->info();
+			$h                = $this->info_int( $info, 'keyspace_hits' );
+			$m                = $this->info_int( $info, 'keyspace_misses' );
+			$out['hits']      = $h;
+			$out['misses']    = $m;
+			$out['hit_ratio'] = ( $h + $m ) > 0 ? round( 100 * $h / ( $h + $m ), 1 ) : 0.0;
+			$out['used_memory'] = $this->info_int( $info, 'used_memory' );
+			$c->close();
+		}
+		\WP_CLI::log( wp_json_encode( $out ) );
+	}
+
+	/**
+	 * Enforce the per-site object-cache budget (GH #612). Deletes keys over the
+	 * DOTNEXT_CACHE_MAXMEMORY_MB budget (~2KB/key estimate). Shared Redis has no
+	 * per-user maxmemory, so this bounds the site's key footprint; the instance
+	 * allkeys-lru still handles global eviction. Safe to run on a timer.
+	 *
+	 * @when after_wp_load
+	 */
+	public function trim() {
+		$cfg = DotNext_Cache_Config::load();
+		$mb  = defined( 'DOTNEXT_CACHE_MAXMEMORY_MB' ) ? (int) DOTNEXT_CACHE_MAXMEMORY_MB : 0;
+		if ( $mb <= 0 ) {
+			\WP_CLI::log( wp_json_encode( array( 'trimmed' => 0, 'budget_mb' => 0, 'note' => 'no budget set' ) ) );
+			return;
+		}
+		$max_keys = $mb * 512; // ~2 KiB per object-cache key.
+		$c        = new DotNext_Cache_Client( $cfg );
+		$deleted  = 0;
+		if ( $c->connect() ) {
+			$deleted = (int) $c->trim_to_budget( $cfg['prefix'], $max_keys );
+			$c->close();
+		}
+		\WP_CLI::log( wp_json_encode( array( 'trimmed' => $deleted, 'budget_mb' => $mb, 'max_keys' => $max_keys ) ) );
+	}
+
+	private function info_int( $info, $key ) {
+		if ( preg_match( '/^' . preg_quote( $key, '/' ) . ':(\\d+)/m', (string) $info, $mm ) ) {
+			return (int) $mm[1];
+		}
+		return 0;
+	}
+
+	private function ensure_dropins() {
+		$mgr = new DotNext_Cache_Dropin_Manager( $this->plugin_dir );
+		return $mgr->install();
+	}
+}

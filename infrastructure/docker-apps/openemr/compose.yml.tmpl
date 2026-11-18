@@ -1,0 +1,71 @@
+services:
+  # The host bind mount hides the image's sites/ (sqlconf.php and the default
+  # site), so OpenEMR never ran its setup and exited on every start. Copy it
+  # into the mount once (--skip-old-files: an existing site is never
+  # overwritten). tar as root keeps the image's owner (apache); the mount
+  # itself is created root-owned 0750, so it is handed to apache like the
+  # image's own sites/.
+  init-seed:
+    image: {{ .ImageChannel }}
+    container_name: dotnext-app-{{ .Slug }}-init
+    user: "0:0"
+    entrypoint:
+      - sh
+      - -c
+      - "cd /var/www/localhost/htdocs/openemr/sites && tar cf - . | tar xf - --skip-old-files -C /seed && chown apache:root /seed && chmod 0755 /seed"
+    volumes:
+      - {{ .DataRoot }}/sites:/seed
+
+  openemr:
+    image: {{ .ImageChannel }}
+    container_name: dotnext-app-{{ .Slug }}
+    restart: unless-stopped
+    depends_on:
+      init-seed:
+        condition: service_completed_successfully
+      db:
+        condition: service_healthy
+    environment:
+      MYSQL_HOST: "db"
+      MYSQL_ROOT_PASS: {{ q (index .Env "MYSQL_ROOT_PASSWORD") }}
+      MYSQL_USER: "openemr"
+      MYSQL_PASS: {{ q (index .Env "MYSQL_PASS") }}
+      MYSQL_DATABASE: "openemr"
+      OE_USER: "admin"
+      OE_PASS: {{ q (index .Env "OE_PASS") }}
+    volumes:
+      - {{ .DataRoot }}/sites:/var/www/localhost/htdocs/openemr/sites
+    ports:
+{{- with index .Ports "http" }}
+      - "{{ .BindInterface }}:{{ .HostPort }}:{{ .ContainerPort }}/{{ .Protocol }}"
+{{- end }}
+    deploy:
+      resources:
+        limits:
+          cpus: "{{ .CPULimit }}"
+          memory: {{ .MemoryLimit }}
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1/ -o /dev/null || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 120s
+
+  db:
+    image: mariadb:11@sha256:be1ef4fe5f14589325c08a41c76334097ce66c86264b75e1d28342c742782a61
+    container_name: dotnext-app-{{ .Slug }}-db
+    restart: unless-stopped
+    command: --max-allowed-packet=64MB
+    environment:
+      MYSQL_DATABASE: "openemr"
+      MYSQL_USER: "openemr"
+      MYSQL_PASSWORD: {{ q (index .Env "MYSQL_PASS") }}
+      MYSQL_ROOT_PASSWORD: {{ q (index .Env "MYSQL_ROOT_PASSWORD") }}
+    volumes:
+      - {{ .DataRoot }}/db:/var/lib/mysql
+    healthcheck:
+      test: ["CMD-SHELL", "healthcheck.sh --connect --innodb_initialized"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s

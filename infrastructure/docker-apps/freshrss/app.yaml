@@ -1,0 +1,41 @@
+slug: freshrss
+popularity: 55
+tenant_installable: true
+name: FreshRSS
+tags: ["Productivity"]
+version: "1.30.4"
+description: |
+  Self-hosted RSS / Atom feed aggregator. Lightweight, extensible
+  via plugins, multi-user. Single container, SQLite by default.
+icon: icon.svg
+upstream: https://github.com/FreshRSS/FreshRSS
+documentation: https://freshrss.github.io/FreshRSS/
+
+image_channel: freshrss/freshrss:1.30.4@sha256:af44385229541bee24aa9148d0ff8f3b40e095373c63a2c0f74e09a27d3c59df
+update_mode: manual
+
+resources:
+  cpu: "0.5"
+  memory: "256m"
+  pids: 100
+
+volumes:
+  - name: data
+    container_path: /var/www/FreshRSS/data
+  - name: extensions
+    container_path: /var/www/FreshRSS/extensions
+
+ports:
+  - name: http
+    container_port: 80
+    protocol: tcp
+    default_enabled: true
+    default_bind: loopback
+    default_reverse_proxy: true
+    health_path: /
+
+env:
+  - name: TZ
+    value: "UTC"
+  - name: CRON_MIN
+    value: "*/20"

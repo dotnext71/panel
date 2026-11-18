@@ -1,0 +1,106 @@
+// Playwright config for panel-ui.
+//
+// Default mode: spins up Vite's `preview` command (built SPA served as
+// production assets) and drives it through headless Chromium. The tests
+// mock /api/* responses with route.fulfill(), so no backend is required
+// in CI or on a fresh developer machine.
+//
+// A "live" mode for running against a real deployment can be added later
+// by branching on an env var; not worth the YAML yet with one use case.
+import { defineConfig, devices } from "@playwright/test";
+
+const PORT = 4173;
+
+export default defineConfig({
+  testDir: "./tests/e2e",
+  // 30s per test (was 15s). Local median is ~2s; 15s had ~7x headroom,
+  // which isn't enough on the single-host-mode act_runner where go +
+  // ui-unit jobs run in parallel with e2e and eat CPU. CI run 60's
+  // users-spec create flow timed out on .fill() actionability waits
+  // (element resolved in DOM but wasn't "visible + enabled + editable"
+  // within 15s under load). 30s is still under Playwright's own 30s
+  // default; no structural risk, just breathing room.
+  // CI runner is slower/contended — more headroom so timing-sensitive specs
+  // (which pass fast locally) do not flake. GH: stabilize CI E2E.
+  timeout: process.env.CI ? 60_000 : 30_000,
+  expect: { timeout: process.env.CI ? 15_000 : 4_000 },
+  fullyParallel: true,
+  forbidOnly: !!process.env.CI,
+  retries: process.env.CI ? 3 : 0,
+  // CI => 2 workers against one webServer: specs mock the API per-test
+  // (page.route), so no shared backend state. Halves the 35-spec wall-clock;
+  // retries above absorb any transient cross-worker flake. Bump higher only
+  // after watching a few runs stay green.
+  workers: process.env.CI ? 2 : undefined,
+  reporter: process.env.CI ? [["list"], ["html", { open: "never" }]] : "list",
+
+  use: {
+    baseURL: `http://127.0.0.1:${PORT}`,
+    // Block the PWA service worker (sw-push.js): its network-first nav handler
+    // intercepts top-level navigations before Playwright's page.route sees them
+    // (SW-initiated requests bypass page.route), which silently defeats mocked
+    // routes like the Kratos logout redirect. E2E must be deterministic.
+    serviceWorkers: "block",
+    trace: "retain-on-failure",
+    screenshot: "only-on-failure",
+  },
+
+  projects: [
+    {
+      name: "chromium",
+      use: { ...devices["Desktop Chrome"] },
+    },
+    // Mobile responsive coverage (M23 / ADR-0046). Phone and tablet
+    // share the same spec; what changes is the viewport. Both projects
+    // use the Chromium engine — iPhone 13 / iPad Mini in the AntD
+    // `devices` map would switch the engine to WebKit, which isn't
+    // installed in our CI (we only ship the Chromium browsers to keep
+    // the act_runner image small). Overlaying viewport + userAgent
+    // onto Desktop Chrome gives us the same pixel surface.
+    {
+      name: "mobile-chromium",
+      testMatch: /responsive\.spec\.ts/,
+      use: {
+        ...devices["Desktop Chrome"],
+        viewport: { width: 390, height: 844 },
+        userAgent:
+          "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Mobile Safari/537.36",
+        hasTouch: true,
+        isMobile: true,
+      },
+    },
+    {
+      name: "tablet-chromium",
+      testMatch: /responsive\.spec\.ts/,
+      use: {
+        ...devices["Desktop Chrome"],
+        viewport: { width: 768, height: 1024 },
+        hasTouch: true,
+      },
+    },
+  ],
+
+  // Serve the production build locally so we're testing what ships, not
+  // dev-mode vite with HMR + extra magic. `npm run build` is expected
+  // to have already run; `vite preview` just serves dist/.
+  //
+  // Timeout 120s (not 30s): preview boots in ~5s locally, but the
+  // self-hosted Gitea act_runner is on a constrained host.
+  // stdout: "pipe" so the server's "Local: http://…" line is visible
+  // in the job log.
+  //
+  // --strictPort: run #24 showed vite picking port 4174 when 4173 was
+  // still held by a leftover process from a previous CI run on the
+  // host-mode runner. Playwright then waited for 4173 forever and
+  // timed out. --strictPort makes vite fail fast with "Port 4173 is
+  // already in use" instead, which is a loud signal the runner needs
+  // cleanup — and the CI step below kills any stray process first.
+  webServer: {
+    command: `npm run preview -- --port ${PORT} --host 127.0.0.1 --strictPort`,
+    url: `http://127.0.0.1:${PORT}`,
+    reuseExistingServer: !process.env.CI,
+    stdout: "pipe",
+    stderr: "pipe",
+    timeout: 120_000,
+  },
+});

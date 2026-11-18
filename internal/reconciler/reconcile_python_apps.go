@@ -1,0 +1,335 @@
+package reconciler
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"strings"
+
+	"github.com/oklog/ulid/v2"
+
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/pyframeworks"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+)
+
+// WithPythonApps wires the python-app repository into the reconciler (ADR-0131).
+func (r *Reconciler) WithPythonApps(repo repository.PythonAppRepository) *Reconciler {
+	r.pythonApps = repo
+	return r
+}
+
+// WithPyFrameworks wires the JAB-164 framework marketplace catalog so the
+// reconciler can run one-shot framework scaffolds. Optional.
+func (r *Reconciler) WithPyFrameworks(cat *pyframeworks.Catalog) *Reconciler {
+	r.pyFrameworks = cat
+	return r
+}
+
+// reconcilePythonApps converges every Application Manager app's runtime: it
+// dispatches app.python.apply (venv + systemd unit), or app.node.apply for a
+// Node.js app (ADR-0175), to the agent and writes back the resulting status.
+// nginx is handled separately by the domain reconciler via the proxy_pass nginx
+// rule the API attached to the domain. No-op without the repo/agent; an app
+// whose runtime's setting is off is left in its last state.
+func (r *Reconciler) reconcilePythonApps(ctx context.Context) {
+	if r.pythonApps == nil || r.agent == nil || r.users == nil {
+		return
+	}
+	python, node := true, true
+	if r.serverSettings != nil {
+		if s, err := r.settingsGet(ctx); err == nil && s != nil {
+			python, node = s.PythonAppsEnabled, s.NodeAppsEnabled
+		}
+	}
+	if !python && !node {
+		return
+	}
+	apps, err := r.pythonApps.ListAll(ctx)
+	if err != nil {
+		r.log.Warn("pyapp: listAll failed", "err", err)
+		return
+	}
+	for _, app := range apps {
+		if (app.Runtime == "node" && !node) || (app.Runtime != "node" && !python) {
+			continue
+		}
+		r.reconcileOnePythonApp(ctx, app)
+	}
+	r.sweepPythonAppUnits(ctx, apps)
+}
+
+func (r *Reconciler) reconcileOnePythonApp(ctx context.Context, app *models.PythonApp) {
+	if app.LoopbackPort == nil {
+		return // API allocates the port on create; nothing to converge yet
+	}
+	user, err := r.users.FindByID(ctx, app.UserID)
+	if err != nil || user == nil || user.Username == nil || *user.Username == "" || user.IsAdmin {
+		r.failPythonApp(ctx, app.ID, "owner has no linux username")
+		return
+	}
+
+	// JAB-164: one-shot framework scaffold (starter project + pinned deps +
+	// generated secrets) before the first apply. Gated on scaffolded_at so it
+	// never re-runs over the tenant's code.
+	if app.Framework != "" && app.ScaffoldedAt == nil {
+		if !r.scaffoldPythonApp(ctx, app, *user.Username) {
+			return // scaffold failed; status already set to failed
+		}
+	}
+
+	envRows, _ := r.pythonApps.ListEnv(ctx, app.ID)
+	env := make(map[string]string, len(envRows))
+	for _, e := range envRows {
+		env[e.Key] = e.Value
+	}
+
+	method := "app.python.apply"
+	params := map[string]any{
+		"app_id":         app.ID,
+		"username":       *user.Username,
+		"user_id":        app.UserID,
+		"app_root":       app.AppRoot,
+		"python_version": app.PythonVersion,
+		"app_type":       app.AppType,
+		"entrypoint":     app.Entrypoint,
+		"base_uri":       app.BaseURI,
+		"port":           *app.LoopbackPort,
+		"env":            env,
+	}
+	if app.Runtime == "node" {
+		// ADR-0175: a Node.js app keeps its Node.js major in python_version.
+		method = "app.node.apply"
+		delete(params, "python_version")
+		delete(params, "base_uri")
+		params["node_version"] = app.PythonVersion
+	}
+	if app.StartCommand != nil && app.Runtime != "node" {
+		params["start_command"] = *app.StartCommand
+	}
+	if app.MemoryLimit != nil {
+		params["memory_limit"] = *app.MemoryLimit
+	}
+	if app.CPULimit != nil {
+		params["cpu_limit"] = *app.CPULimit
+	}
+	if app.PIDsLimit != nil {
+		params["pids_limit"] = *app.PIDsLimit
+	}
+	// GH #2156: name the app's shared libraries on every apply, not only at
+	// scaffold, so a host that lost one (restore, distro upgrade) gets it back.
+	if app.Framework != "" && r.pyFrameworks != nil {
+		if entry, ok := r.pyFrameworks.Get(app.Framework); ok && len(entry.SystemLibs) > 0 {
+			params["system_libs"] = append([]string(nil), entry.SystemLibs...)
+		}
+	}
+
+	// GH #2289: the pass reads the rows once, and the app may have been
+	// deleted, its unit removed, since. Applied now, the unit would come back
+	// with no row to own it, so make sure the row is still there.
+	if _, err := r.pythonApps.FindByID(ctx, app.ID); err != nil {
+		if !errors.Is(err, repository.ErrNotFound) {
+			r.log.Warn("pyapp: re-reading the app failed — apply skipped this pass", "id", app.ID, "err", err)
+		}
+		return
+	}
+	raw, err := r.agent.Call(ctx, method, params)
+	if err != nil {
+		r.failPythonApp(ctx, app.ID, err.Error())
+		return
+	}
+	var res struct {
+		Active   bool   `json:"active"`
+		Unit     string `json:"unit"`
+		Detail   string `json:"detail"`
+		Hint     string `json:"hint"`
+		Building bool   `json:"building"`
+	}
+	_ = json.Unmarshal(raw, &res)
+	if res.Building {
+		// GH #357: the agent is still installing the venv and requirements in
+		// the background. Show it as building (clearing any earlier error)
+		// and ask again next tick.
+		if app.Status != models.PythonAppStatusBuilding {
+			if err := r.pythonApps.UpdateStatus(ctx, app.ID, models.PythonAppStatusBuilding, nil); err != nil {
+				r.log.Warn("pyapp: status update failed", "id", app.ID, "err", err)
+			}
+		}
+		return
+	}
+	status := models.PythonAppStatusFailed
+	var lastErr *string
+	if res.Active {
+		status = models.PythonAppStatusRunning
+	} else {
+		// GH #357: surface the ACTUAL startup error (the unit's journal tail the
+		// agent captured), not just "not active" — that opaque message was the
+		// reporter's "nothing in logs" wall. Fall back to the pointer when the
+		// agent couldn't read the journal.
+		m := "app started but is not active — check the app logs (journalctl -u " + res.Unit + ")"
+		if d := strings.TrimSpace(res.Detail); d != "" {
+			m = "app started but is not active. Recent logs (journalctl -u " + res.Unit + "):\n" + d
+		}
+		if h := strings.TrimSpace(res.Hint); h != "" {
+			// GH #1820: the account's slice is full. The journal only shows
+			// the symptom (a process that could not start), so lead with the
+			// cause.
+			m = "The app is not running because " + h + ".\n\n" + m
+		}
+		lastErr = &m
+		r.log.Warn("pyapp: app applied but not active", "id", app.ID, "unit", res.Unit, "detail", res.Detail, "hint", res.Hint)
+	}
+	// Also rewrite when only the reason changed: an app that was already
+	// failed would otherwise keep showing its first reason forever.
+	if app.Status != status || (lastErr != nil && (app.LastError == nil || *app.LastError != *lastErr)) {
+		if err := r.pythonApps.UpdateStatus(ctx, app.ID, status, lastErr); err != nil {
+			r.log.Warn("pyapp: status update failed", "id", app.ID, "err", err)
+		}
+	}
+}
+
+func (r *Reconciler) failPythonApp(ctx context.Context, id, msg string) {
+	// GH #357: log the reason so a failed apply is diagnosable from the server
+	// log, not only the app's last_error column. The agent returns detailed
+	// errors (pip install / systemd restart output) that were previously
+	// swallowed into the DB row alone.
+	r.log.Warn("pyapp: apply failed", "id", id, "reason", msg)
+	if err := r.pythonApps.UpdateStatus(ctx, id, models.PythonAppStatusFailed, &msg); err != nil {
+		r.log.Warn("pyapp: fail status update failed", "id", id, "err", err)
+	}
+}
+
+// scaffoldPythonApp lays down the framework starter (venv + pinned deps +
+// starter project + optional Django hardening) via app.python.scaffold, persists
+// generated secrets + framework default env, and stamps scaffolded_at. Returns
+// false and marks the app failed on any error. Runs once per app.
+func (r *Reconciler) scaffoldPythonApp(ctx context.Context, app *models.PythonApp, username string) bool {
+	if r.pyFrameworks == nil {
+		r.failPythonApp(ctx, app.ID, "framework catalog unavailable")
+		return false
+	}
+	entry, ok := r.pyFrameworks.Get(app.Framework)
+	if !ok {
+		r.failPythonApp(ctx, app.ID, "unknown framework "+app.Framework)
+		return false
+	}
+	spec, err := entry.ResolveCreate()
+	if err != nil {
+		r.failPythonApp(ctx, app.ID, "resolve framework: "+err.Error())
+		return false
+	}
+
+	var domainName string
+	if r.domains != nil {
+		if d, derr := r.domains.FindByID(ctx, app.DomainID); derr == nil && d != nil {
+			domainName = d.Name
+		}
+	}
+
+	params := map[string]any{
+		"app_id":         app.ID,
+		"username":       username,
+		"app_root":       app.AppRoot,
+		"python_version": app.PythonVersion,
+		"server":         spec.Server,
+		"requirements":   spec.Requirements,
+		"scaffold_kind":  spec.ScaffoldKind,
+	}
+	switch spec.ScaffoldKind {
+	case "cmd":
+		params["scaffold_argv"] = spec.ScaffoldCommand
+		params["project"] = spec.Project
+	case "source":
+		// GH #2156: a full upstream app at a pinned commit; the agent checks
+		// the archive against the sha256 before unpacking it.
+		params["source_url"] = spec.SourceURL
+		params["source_sha256"] = spec.SourceSHA256
+	default:
+		params["template_files"] = spec.TemplateFiles
+	}
+	if len(spec.SystemLibs) > 0 {
+		params["system_libs"] = spec.SystemLibs
+	}
+	if spec.PatchScript != "" {
+		// Framework-specific settings surgery (Wagtail/Channels): the agent runs
+		// the entry's patch as the tenant with this env + minted secrets.
+		params["patch_script"] = spec.PatchScript
+		env := map[string]string{}
+		for _, v := range spec.Env {
+			if v.Generate == "" {
+				env[v.Key] = v.Default
+			}
+		}
+		if domainName != "" {
+			env["DJANGO_ALLOWED_HOSTS"] = domainName
+		}
+		if spec.StaticRoot != "" {
+			env["JAB_STATIC_ROOT"] = spec.StaticRoot
+		}
+		if spec.Project != "" {
+			env["JAB_PROJECT"] = spec.Project
+		}
+		params["env"] = env
+		gen := make([]string, 0, len(spec.GenerateEnv))
+		for _, v := range spec.GenerateEnv {
+			gen = append(gen, v.Key)
+		}
+		params["generate"] = gen
+	} else if spec.HardenSettings {
+		params["harden_django"] = true
+		params["static_root"] = spec.StaticRoot
+		params["allowed_hosts"] = domainName
+	}
+	if len(spec.PostInstall) > 0 {
+		params["post_install"] = spec.PostInstall
+	}
+
+	raw, err := r.agent.Call(ctx, "app.python.scaffold", params)
+	if err != nil {
+		r.failPythonApp(ctx, app.ID, "scaffold: "+err.Error())
+		return false
+	}
+	var res struct {
+		GeneratedEnv map[string]string `json:"generated_env"`
+		Skipped      bool              `json:"skipped"`
+	}
+	_ = json.Unmarshal(raw, &res)
+
+	r.persistFrameworkEnv(ctx, app, spec, res.GeneratedEnv, domainName)
+	if err := r.pythonApps.MarkScaffolded(ctx, app.ID); err != nil {
+		r.log.Warn("pyapp: mark scaffolded failed", "id", app.ID, "err", err)
+	}
+	return true
+}
+
+// persistFrameworkEnv merges the framework's default + generated env into the
+// app's env set WITHOUT clobbering values the operator already set. Generated
+// secrets (e.g. Django SECRET_KEY) come from the agent's scaffold result;
+// DJANGO_ALLOWED_HOSTS defaults to the mounted domain when the catalog leaves it
+// blank. Secrets live only in the app env (never in source), per ADR-0131.
+func (r *Reconciler) persistFrameworkEnv(ctx context.Context, app *models.PythonApp, spec pyframeworks.CreateSpec, generated map[string]string, domainName string) {
+	existing, _ := r.pythonApps.ListEnv(ctx, app.ID)
+	have := make(map[string]bool, len(existing))
+	merged := make([]models.PythonAppEnv, 0, len(existing)+len(spec.Env))
+	for _, e := range existing {
+		have[e.Key] = true
+		merged = append(merged, models.PythonAppEnv{ID: e.ID, AppID: app.ID, Key: e.Key, Value: e.Value})
+	}
+	for _, v := range spec.Env {
+		if v.Key == "" || have[v.Key] {
+			continue // never overwrite an operator-set value
+		}
+		val := v.Default
+		if v.Generate != "" {
+			val = generated[v.Key]
+		}
+		if v.Key == "DJANGO_ALLOWED_HOSTS" && val == "" {
+			val = domainName
+		}
+		have[v.Key] = true
+		merged = append(merged, models.PythonAppEnv{ID: ulid.Make().String(), AppID: app.ID, Key: v.Key, Value: val})
+	}
+	if err := r.pythonApps.ReplaceEnv(ctx, app.ID, merged); err != nil {
+		r.log.Warn("pyapp: persist framework env failed", "id", app.ID, "err", err)
+	}
+}

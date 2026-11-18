@@ -1,0 +1,71 @@
+package migrate
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/dotnext-panel/dotnext/internal/models"
+)
+
+type fakeServerSettings struct {
+	row *models.ServerSettings
+	err error
+}
+
+func (f *fakeServerSettings) Get(_ context.Context) (*models.ServerSettings, error) {
+	return f.row, f.err
+}
+func (f *fakeServerSettings) SetDigestLastSent(context.Context, string) error { return nil }
+func (f *fakeServerSettings) RecordDRSync(context.Context, string, string, string) error {
+	return nil
+}
+
+func (f *fakeServerSettings) ReassertDRPairing(context.Context, string, string, *time.Time) error {
+	return nil
+}
+func (f *fakeServerSettings) Upsert(_ context.Context, _ *models.ServerSettings) error {
+	return nil
+}
+func (f *fakeServerSettings) EnsureVAPID(_ context.Context, _ string) (bool, error) {
+	return false, nil
+}
+
+func TestResolveWorkingFolder_DefaultsWhenNil(t *testing.T) {
+	got := ResolveWorkingFolder(context.Background(), nil)
+	require.Equal(t, DefaultWorkingFolder, got)
+}
+
+func TestResolveWorkingFolder_DefaultsOnEmptyValue(t *testing.T) {
+	s := &fakeServerSettings{row: &models.ServerSettings{WorkingFolder: ""}}
+	got := ResolveWorkingFolder(context.Background(), s)
+	require.Equal(t, DefaultWorkingFolder, got)
+}
+
+func TestResolveWorkingFolder_DefaultsOnRepoError(t *testing.T) {
+	s := &fakeServerSettings{err: errors.New("db down")}
+	got := ResolveWorkingFolder(context.Background(), s)
+	require.Equal(t, DefaultWorkingFolder, got)
+}
+
+func TestResolveWorkingFolder_HonorsConfiguredValue(t *testing.T) {
+	s := &fakeServerSettings{row: &models.ServerSettings{WorkingFolder: "/mnt/storage/dotnext"}}
+	got := ResolveWorkingFolder(context.Background(), s)
+	require.Equal(t, "/mnt/storage/dotnext", got)
+}
+
+func TestMigrationsRoot_Default(t *testing.T) {
+	require.Equal(t, DefaultWorkingFolder+"/migrations", MigrationsRoot(context.Background(), nil))
+}
+
+func TestBackupsRoot_Default(t *testing.T) {
+	require.Equal(t, DefaultWorkingFolder+"/backups", BackupsRoot(context.Background(), nil))
+}
+
+func TestMigrationsRoot_HonorsConfigured(t *testing.T) {
+	s := &fakeServerSettings{row: &models.ServerSettings{WorkingFolder: "/mnt/storage/dotnext"}}
+	require.Equal(t, "/mnt/storage/dotnext/migrations", MigrationsRoot(context.Background(), s))
+}

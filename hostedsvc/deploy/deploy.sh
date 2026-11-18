@@ -1,0 +1,156 @@
+#!/usr/bin/env bash
+# dotnexthosted.com service deploy (JAB-213). Idempotent; run as root on the
+# service box (hostsclick / 182.54.236.100). Implements the go-live ordering
+# from plans/jab213-free-hostname-service.md — the sequence is load-bearing:
+#
+#   0. disk precondition   (DNS on a full disk dies at 3am)
+#   1. pdns + FULL zone    (incl. _psl TXT — the PSL PR attestation MUST
+#                           survive the NS cutover; SPF/DMARC — a PSL-listed
+#                           base is a spoofing magnet)
+#   2. service binary + unit + nginx vhost
+#   3. glue + NS switch at the registrar   (MANUAL/API step, printed at end)
+#   4. public _psl verify → LE cert for api vhost → live
+#
+# Secrets: /etc/dotnexthosted/svc.env must exist (0600) with PDNS_API_KEY +
+# SMTP_* before the service starts; this script generates PDNS_API_KEY if
+# the file is absent and leaves SMTP_* placeholders to fill in.
+set -euo pipefail
+
+BASE=dotnexthosted.com
+SVC_IP=182.54.236.100
+PSL_PR_URL="https://github.com/publicsuffix/list/pull/3127"
+NEED_FREE_GB=10
+
+say() { echo "==> $*"; }
+die() { echo "FATAL: $*" >&2; exit 1; }
+
+# ---- 0. disk gate -----------------------------------------------------------
+free_gb=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+if (( free_gb < NEED_FREE_GB )); then
+  die "only ${free_gb}GB free on / — clean the box below ${NEED_FREE_GB}GB and rerun (fleet DNS does not go on a full disk)"
+fi
+
+# ---- 1. pdns + zone ---------------------------------------------------------
+say "installing PowerDNS (Debian native) + sqlite backend"
+apt-get install -y -qq pdns-server pdns-backend-sqlite3 >/dev/null
+
+install -d -m 0755 /var/lib/powerdns
+if [[ ! -s /var/lib/powerdns/pdns.sqlite3 ]]; then
+  sqlite3 /var/lib/powerdns/pdns.sqlite3 < /usr/share/pdns-backend-sqlite3/schema/schema.sqlite3.sql
+  chown pdns:pdns /var/lib/powerdns/pdns.sqlite3
+fi
+
+if [[ ! -f /etc/dotnexthosted/svc.env ]]; then
+  install -d -m 0755 /etc/dotnexthosted
+  PDNS_KEY=$(head -c 32 /dev/urandom | sha256sum | cut -c1-48)
+  # Created under umask 077 so the secret is never readable before chmod.
+  (umask 077; cat > /etc/dotnexthosted/svc.env <<EOF
+PDNS_API_KEY=${PDNS_KEY}
+SMTP_ADDR=mail.reeva.me:587
+SMTP_HOST=mail.reeva.me
+SMTP_FROM=FILL-ME-IN
+SMTP_PASSWORD=FILL-ME-IN
+EOF
+  )
+  chmod 0600 /etc/dotnexthosted/svc.env
+  say "wrote /etc/dotnexthosted/svc.env — FILL IN SMTP_FROM/SMTP_PASSWORD"
+fi
+# shellcheck disable=SC1091
+source /etc/dotnexthosted/svc.env
+
+# The file carries api-key: create it 0600 under umask 077, then set the
+# final owner and mode (root:pdns 0640, readable by the pdns daemon only).
+(umask 077; cat > /etc/powerdns/pdns.d/dotnexthosted.conf <<EOF
+launch=gsqlite3
+gsqlite3-database=/var/lib/powerdns/pdns.sqlite3
+api=yes
+api-key=${PDNS_API_KEY}
+webserver=yes
+webserver-address=127.0.0.1
+webserver-port=8081
+local-address=0.0.0.0:53, [::]:53
+EOF
+)
+chown root:pdns /etc/powerdns/pdns.d/dotnexthosted.conf
+chmod 0640 /etc/powerdns/pdns.d/dotnexthosted.conf
+systemctl enable --now pdns
+systemctl restart pdns
+
+say "bootstrapping zone ${BASE} (idempotent)"
+PD="curl -s -H X-API-Key:${PDNS_API_KEY} http://127.0.0.1:8081/api/v1/servers/localhost"
+if ! $PD/zones/${BASE}. >/dev/null 2>&1 || $PD/zones/${BASE}. | grep -q "Not Found"; then
+  curl -s -X POST -H "X-API-Key:${PDNS_API_KEY}" -H "Content-Type: application/json" \
+    http://127.0.0.1:8081/api/v1/servers/localhost/zones -d "{
+      \"name\": \"${BASE}.\", \"kind\": \"Native\",
+      \"nameservers\": [\"ns1.${BASE}.\", \"ns2.${BASE}.\"]
+    }" >/dev/null
+fi
+
+# Full base rrsets. _psl MUST be here BEFORE any NS cutover (PSL attestation).
+curl -s -X PATCH -H "X-API-Key:${PDNS_API_KEY}" -H "Content-Type: application/json" \
+  http://127.0.0.1:8081/api/v1/servers/localhost/zones/${BASE}. -d "{
+  \"rrsets\": [
+    {\"name\": \"ns1.${BASE}.\", \"type\": \"A\", \"ttl\": 3600, \"changetype\": \"REPLACE\",
+     \"records\": [{\"content\": \"${SVC_IP}\"}]},
+    {\"name\": \"ns2.${BASE}.\", \"type\": \"A\", \"ttl\": 3600, \"changetype\": \"REPLACE\",
+     \"records\": [{\"content\": \"${SVC_IP}\"}]},
+    {\"name\": \"api.${BASE}.\", \"type\": \"A\", \"ttl\": 300, \"changetype\": \"REPLACE\",
+     \"records\": [{\"content\": \"${SVC_IP}\"}]},
+    {\"name\": \"_psl.${BASE}.\", \"type\": \"TXT\", \"ttl\": 3600, \"changetype\": \"REPLACE\",
+     \"records\": [{\"content\": \"\\\"${PSL_PR_URL}\\\"\"}]},
+    {\"name\": \"${BASE}.\", \"type\": \"TXT\", \"ttl\": 3600, \"changetype\": \"REPLACE\",
+     \"records\": [{\"content\": \"\\\"v=spf1 -all\\\"\"}]},
+    {\"name\": \"_dmarc.${BASE}.\", \"type\": \"TXT\", \"ttl\": 3600, \"changetype\": \"REPLACE\",
+     \"records\": [{\"content\": \"\\\"v=DMARC1; p=reject; rua=mailto:abuse@dotnext-panel.com\\\"\"}]}
+  ]}" >/dev/null
+say "zone ready (ns1/ns2/api/_psl/SPF/DMARC)"
+
+# ---- 2. service -------------------------------------------------------------
+id -u dotnexthosted >/dev/null 2>&1 || useradd --system --home /var/lib/dotnexthosted --shell /usr/sbin/nologin dotnexthosted
+install -d -m 0750 -o dotnexthosted -g dotnexthosted /var/lib/dotnexthosted
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+[[ -x "${HERE}/dotnexthosted-svc" ]] || die "build first: go build -o hostedsvc/deploy/dotnexthosted-svc ./hostedsvc/cmd/dotnexthosted-svc"
+install -m 0755 "${HERE}/dotnexthosted-svc" /usr/local/bin/dotnexthosted-svc
+install -m 0644 "${HERE}/dotnexthosted-svc.service" /etc/systemd/system/dotnexthosted-svc.service
+# The unit runs as the service user; it needs the env file readable.
+chown root:dotnexthosted /etc/dotnexthosted/svc.env
+chmod 0640 /etc/dotnexthosted/svc.env
+# Daily reap runs as the service user through a timer, never root cron: a
+# root run can leave root-owned files beside svc.db ("readonly database").
+# The timer is installed but NOT enabled here — see step 6.
+install -m 0644 "${HERE}/dotnexthosted-reap.service" /etc/systemd/system/dotnexthosted-reap.service
+install -m 0644 "${HERE}/dotnexthosted-reap.timer" /etc/systemd/system/dotnexthosted-reap.timer
+systemctl daemon-reload
+systemctl enable --now dotnexthosted-svc
+install -m 0644 "${HERE}/nginx-api.conf" /etc/nginx/sites-available/dotnexthosted-api.conf
+ln -sf ../sites-available/dotnexthosted-api.conf /etc/nginx/sites-enabled/dotnexthosted-api.conf
+
+say "service up on loopback; nginx vhost staged (cert comes after delegation)"
+
+# ---- 3+4. manual gate -------------------------------------------------------
+cat <<EOF
+
+NEXT (in this order — do not reorder):
+ 1. Fill SMTP_FROM/SMTP_PASSWORD in /etc/dotnexthosted/svc.env if still
+    placeholders, then: systemctl restart dotnexthosted-svc
+ 2. Registrar (Namecheap API):
+      domains.ns.create  ns1.${BASE} -> ${SVC_IP}
+      domains.ns.create  ns2.${BASE} -> ${SVC_IP}
+      domains.dns.setCustom ${BASE} = ns1.${BASE},ns2.${BASE}
+ 3. VERIFY the PSL attestation survived the cutover:
+      dig +short TXT _psl.${BASE} @8.8.8.8   → must print ${PSL_PR_URL}
+ 4. Only then issue the API cert:
+      certbot certonly --webroot -w /var/www/html -d api.${BASE}
+      nginx -t && systemctl reload nginx
+ 5. Nightly off-box dump (add to root crontab):
+      sqlite3 /var/lib/dotnexthosted/svc.db ".backup /root/svc-db-backup/svc-\$(date +%u).db"
+      + rsync that dir off-box. Lost DB = every issued token dead.
+ 6. Daily reap of moved-away labels. Deletes the dangling DNS a box leaves
+    when it re-claims at a new IP. Dry-run once first, as the service user,
+    to see the worklist:
+      systemd-run --wait --pipe --collect -p User=dotnexthosted -p Group=dotnexthosted \\
+        -p EnvironmentFile=/etc/dotnexthosted/svc.env /usr/local/bin/dotnexthosted-svc reap --dry-run
+    then turn on the timer:
+      systemctl enable --now dotnexthosted-reap.timer
+EOF

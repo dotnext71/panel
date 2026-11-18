@@ -1,0 +1,272 @@
+# DotNext Panel HTTPS vhost (M25 Step 4).
+#
+# Rendered by install.sh install_nginx_panel_vhost(). Substitutes:
+#   ${SSL_CERT_PATH}     — path to the panel TLS certificate
+#   ${SSL_KEY_PATH}      — path to the panel TLS key
+#
+# Until M25 Step 4, panel-api terminated TLS itself on 127.0.0.1:8443.
+# The TLS-strip-and-front-with-nginx pivot moved TLS termination here so
+# the panel-api process can listen on a Unix-domain socket. nginx is the
+# only thing on :8443 now; everything else flows through the Form D
+# upstream below.
+#
+# Form D (per pre-dispatch I2): named upstream + plain proxy_pass — swap
+# unix↔TCP in one line without touching any proxy_pass directive. Matches
+# the same pattern adopted in infrastructure/nginx/.ory-location.conf and
+# infrastructure/nginx/dotnext-mail-vhost.conf.tmpl.
+
+# WebSocket upgrade map (used by /api/v1/logs/stream/* and any future
+# WS endpoints in panel-api). Lives in server{} scope via a map needed
+# at http{} — but nginx allows map only at http{}, so this is provided
+# by /etc/nginx/nginx.conf (added by install_nginx_websocket_map()).
+
+upstream dotnext_panel_api {
+  # M25 Step 4: panel-api listens on this socket (mode 0660,
+  # group dotnext-sockets — nginx as www-data is in that group).
+  # Rollback: replace with `server 127.0.0.1:8443;` and restart nginx.
+  server unix:/run/dotnext-panel/api.sock;
+}
+
+server {
+  listen 8443 ssl${NGX_H2_PARAM};
+  listen [::]:8443 ssl${NGX_H2_PARAM};
+  ${NGX_H2_DIR}
+  server_name _;
+
+  # Plain HTTP sent to this HTTPS port (e.g. http://<host>:8443) → redirect to
+  # HTTPS instead of nginx's default 400 "plain HTTP request was sent to HTTPS
+  # port". 497 is nginx's internal code for exactly that case.
+  error_page 497 =301 https://$host:8443$request_uri;
+
+  ssl_certificate     ${SSL_CERT_PATH};
+  ssl_certificate_key ${SSL_KEY_PATH};
+  ssl_protocols       TLSv1.2 TLSv1.3;
+  # JAB-69: Mozilla-intermediate cipher list (no 3DES/RC4/CBC-weak).
+  ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+  ssl_prefer_server_ciphers on;
+
+  # Browser uploads: WordPress imports, file-manager uploads, etc.
+  # 10 GB = the ceiling of server_settings.upload_max_size_mb (1-10240).
+  # nginx is the coarse OUTER bound here; the panel API enforces the
+  # precise per-user limit via http.MaxBytesReader + the chunked-upload
+  # cap, both driven by upload_max_size_mb (#211). Chunked uploads
+  # (>100 MB) send 10 MB chunks so they never approach this; single-
+  # multipart is <=100 MB. Set to the ceiling so raising the admin
+  # setting "just works" without re-rendering this vhost.
+  client_max_body_size 10240m;
+
+  # JAB-142: the SPA (JS/CSS) is served by panel-api (go:embed) via the
+  # proxied `location /` below, so nginx must compress PROXIED responses —
+  # gzip_proxied defaults to `off` and would skip them entirely, shipping the
+  # ~3.1 MB main bundle raw. Compress the text asset types (~3.5x smaller).
+  gzip on;
+  gzip_proxied any;
+  gzip_vary on;
+  gzip_min_length 1024;
+  gzip_types application/javascript text/javascript text/css application/json image/svg+xml application/manifest+json;
+
+  access_log /var/log/nginx/dotnext-panel.access.log;
+  error_log  /var/log/nginx/dotnext-panel.error.log;
+
+  # Security headers.
+  # HSTS is toggled by cert kind (GH #1507): the snippet is empty while the panel
+  # serves a self-signed cert (Strict-Transport over an untrusted cert hard-blocks
+  # the browser with no exception path), and carries the header once a CA cert is
+  # deployed. install_nginx_panel_vhost writes it; dotnext-panel-cert.sh flips it on.
+  include /etc/nginx/snippets/dotnext-panel-hsts.conf;
+  add_header X-Frame-Options "DENY" always;
+  add_header X-Content-Type-Options "nosniff" always;
+  add_header X-XSS-Protection "1; mode=block" always;
+  add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+  # CSP: unsafe-inline needed for AntD emotion CSS-in-JS; img allows
+  # Gravatar + Libravatar avatars (Libravatar uploads serve from seccdn,
+  # Gravatar-federated ones redirect to gravatar.com). The header lives in a
+  # snippet because Server Settings -> Support chat adds the support chat's
+  # origin to it while the chat is on (agent nginx.panel_csp.apply rewrites
+  # it). install_nginx_panel_vhost seeds the chat-off copy when it is missing.
+  include /etc/nginx/snippets/dotnext-panel-csp.conf;
+
+  # M37: phpMyAdmin + Adminer share this vhost so the SSO redirect
+  # (mint endpoint hands the browser a URL on the panel's :8443
+  # origin) routes to the PHP backends instead of falling through
+  # to the SPA catch-all (which previously sent users to
+  # /dotnext-api/dashboard). Both snippets ship via install.sh
+  # (install_phpmyadmin + install_adminer); each uses `location ^~`
+  # so it wins over the SPA `location /` below.
+  include /etc/nginx/sites-available/includes/phpmyadmin.conf;
+  include /etc/nginx/snippets/dotnext-adminer.conf;
+
+  # GoAccess iframe HTML — must execute upstream JS that uses
+  # `new Function(...)` for its template compiler. The server-scope CSP
+  # forbids 'unsafe-eval' which is correct for the panel SPA; this
+  # location overrides CSP for the goaccess endpoint only so the iframe
+  # (loaded by URL, not srcdoc) can run that script.
+  #
+  # nginx add_header semantics: if a location declares ANY add_header,
+  # parent block add_headers are NOT inherited — must re-declare every
+  # security header we still want.
+  #
+  # The CSP's `sandbox allow-scripts` (and the panel iframe's matching
+  # sandbox attribute) gives the report an opaque origin, so its scripts
+  # never run as the panel. CSP frame-ancestors 'self' limits embedding
+  # to the panel itself.
+  # Internal-only API surface. These routes are called by dotnext-agent dialling
+  # /run/dotnext-panel/api.sock DIRECTLY; their only in-app gate is
+  # middleware.RequireLocalhost. That gate could not see the difference between
+  # the agent and a proxied request, because nginx reaches panel-api over the
+  # same socket, so every proxied request looks local (RemoteAddr "@").
+  #
+  # Result before this: /api/v1/internal/notifications/enqueue and the malware
+  # ingest were reachable UNAUTHENTICATED from the internet. Verified against a
+  # live panel -- the enqueue handler answered a public POST with a body
+  # validation error rather than 403, and an attacker controls the
+  # notification's title, body, deeplink, target user and channels.
+  #
+  # Nothing legitimate reaches these through nginx, so refuse at the edge.
+  # RequireLocalhost now also rejects requests carrying proxy headers, so the
+  # fix does not depend on this block alone.
+  location ^~ /api/v1/internal/ {
+    return 404;
+  }
+  location = /api/v1/admin/security/malware/event {
+    return 404;
+  }
+
+  location ^~ /api/v1/logs/stream/ {
+    proxy_pass http://dotnext_panel_api;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Port $server_port;
+    proxy_http_version 1.1;
+    # WebSocket support — the same prefix also serves the access/error
+    # log WS stream; the upgrade headers stay so both routes work.
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+    # Re-declared security headers (parent's not inherited because of
+    # the per-location CSP override below).
+    include /etc/nginx/snippets/dotnext-panel-hsts.conf;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    # Scoped relaxed CSP — the panel-api response also sets this header
+    # (renderGoAccessHTTP); nginx hides the upstream copy to avoid two
+    # CSP headers in the response (browsers intersect — would re-block).
+    # Must stay identical to goaccessCSP in panel-api/internal/api/
+    # websocket_logs.go (TestGoAccessCSP_VhostSendsTheSamePolicy).
+    add_header Content-Security-Policy "sandbox allow-scripts; default-src 'self' 'unsafe-inline' 'unsafe-eval' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; frame-ancestors 'self'; form-action 'self';" always;
+    # SAMEORIGIN (not DENY) so the panel SPA can frame this URL.
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    proxy_hide_header Content-Security-Policy;
+    proxy_hide_header X-Frame-Options;
+  }
+
+  # JAB-143/144: content-hashed build assets (index-<hash>.js / .css) are
+  # immutable — every build emits a new filename — so cache them for a year.
+  # JAB-144: serve them straight from disk (the on-disk panel-ui/dist that the
+  # panel-api binary was built from) instead of proxying every static file
+  # through the Go process. `root` (not `alias`) keeps try_files sane: a request
+  # /assets/x maps to ${PANEL_DIST_DIR}/assets/x. If a hashed file isn't on disk
+  # yet (e.g. mid-update, before the rebuilt dist lands), fall back to the
+  # panel-api go:embed copy so the asset still resolves — no white-screen.
+  location ^~ /assets/ {
+    root ${PANEL_DIST_DIR};
+    try_files $uri @panel_assets_embed;
+    add_header Cache-Control "public, max-age=31536000, immutable" always;
+    include /etc/nginx/snippets/dotnext-panel-hsts.conf;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+  }
+
+  # Fallback for /assets/* not present on disk: serve from the panel-api
+  # embedded SPA. Same immutable cache + security headers as the disk path.
+  location @panel_assets_embed {
+    proxy_pass http://dotnext_panel_api;
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Port $server_port;
+    proxy_http_version 1.1;
+    proxy_hide_header Cache-Control;
+    add_header Cache-Control "public, max-age=31536000, immutable" always;
+    include /etc/nginx/snippets/dotnext-panel-hsts.conf;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-Frame-Options "DENY" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+  }
+
+  # GH #1146: WebDAV for FTP/SFTP subaccounts. ONE endpoint serves every
+  # subaccount — the HTTP Basic username selects the worker. auth_request hands
+  # the credentials to the privileged dotnext-webdav authenticator (unix_chkpwd
+  # over /run/dotnext-webdav/auth.sock); it validates the subaccount (owned,
+  # webdav-enabled, unlocked, non-system) and returns the worker to proxy to.
+  # The per-subaccount worker runs as the tenant uid inside its #1145 chroot and
+  # performs no auth of its own — so it is NEVER reachable without passing here.
+  location = /dotnext-webdav-auth {
+    internal;
+    proxy_pass http://unix:/run/dotnext-webdav/auth.sock:/;
+    proxy_pass_request_body off;              # auth is decided before any body streams
+    proxy_set_header Content-Length "";
+    proxy_set_header Authorization $http_authorization;
+  }
+  location ^~ /dav/ {
+    # Outer per-IP flood cap. Complements the authenticator's per-username token
+    # bucket (which a username-spraying attacker would otherwise sidestep). Zone
+    # defined in /etc/nginx/conf.d/dotnext-webdav-ratelimit.conf.
+    limit_req zone=dotnext_webdav burst=30 nodelay;
+
+    auth_request /dotnext-webdav-auth;
+    # The worker socket is named by the AUTHENTICATOR (X-Webdav-Sub = the
+    # username IT validated), never by anything the client supplied.
+    auth_request_set $dn_wdsub $upstream_http_x_webdav_sub;
+    error_page 401 = @dotnext_webdav_401;
+
+    # The worker owns the /dav prefix (Prefix=/dav) — it strips it from the
+    # request path AND rewrites the Destination header for MOVE/COPY — so pass
+    # the original URI through unstripped.
+    proxy_pass http://unix:/run/dotnext-webdav/$dn_wdsub.sock:$request_uri;
+    # $http_host (NOT $host) preserves the port: x/net/webdav rejects a MOVE/COPY
+    # whose Destination host:port (e.g. host:8443) doesn't match the request Host,
+    # and $host strips the port — breaking every MOVE/COPY.
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_read_timeout 300s;
+    proxy_request_buffering off;               # stream large PUTs; never buffer to disk
+    client_max_body_size 0;                    # no nginx cap — the per-uid disk quota bounds it
+  }
+  # auth_request discards the upstream 401's WWW-Authenticate header, so re-emit
+  # it here or WebDAV clients never prompt for credentials.
+  location @dotnext_webdav_401 {
+    add_header WWW-Authenticate 'Basic realm="DotNext WebDAV"' always;
+    return 401;
+  }
+
+  # /.ory/* is handled by panel-api itself (in-process reverse proxy
+  # to the Kratos public socket). nginx just forwards to the panel
+  # upstream — no special-case for /.ory/.
+  # __JAB159_DEMO_SELFSERVICE_GUARD__ (rendered by install_nginx_panel_vhost when deploy-profile=demo)
+  location / {
+    proxy_pass http://dotnext_panel_api/;
+    # Use $http_host to preserve port number (mx.dotnext-panel.local:8443)
+    # so backend can build correct WebSocket URLs. $host strips the port.
+    proxy_set_header Host $http_host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_set_header X-Forwarded-Host $http_host;
+    proxy_set_header X-Forwarded-Port $server_port;
+    proxy_http_version 1.1;
+    # WebSocket support (logs streaming, etc.)
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection $connection_upgrade;
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+  }
+}

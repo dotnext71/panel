@@ -1,0 +1,253 @@
+# M25 — Unix Sockets Runbook
+
+Operator-facing day-2 ops for the M25 socket cutover. Pair with `docs/adr/0050-m25-unix-sockets.md` (the design rationale).
+
+## Bind state — what should be true after `dotnext update`
+
+Run `ss -lntp` on a healthy M25-installed host. The expected localhost-only state:
+
+```
+LISTEN  *:25                            stalwart-mail   # SMTP — public, intentional
+LISTEN  *:465                           stalwart-mail   # SMTPS — public, intentional
+LISTEN  *:587                           stalwart-mail   # submission — public, intentional
+LISTEN  *:993                           stalwart-mail   # IMAPS — public, intentional
+LISTEN  127.0.0.1:8080                  stalwart-mail   # admin-http (M25 Step 7)
+LISTEN  127.0.0.1:8446                  stalwart-mail   # JMAP loopback
+LISTEN  127.0.0.1:18181                 stalwart-mail   # internal/training (M25 Step 7)
+LISTEN  *:443                           nginx
+LISTEN  *:80                            nginx
+LISTEN  *:8443                          nginx           # M25 Step 4 — terminates TLS for panel
+# MariaDB no longer binds TCP — skip-networking (see 99-dotnext-skip-networking.cnf); socket at /var/run/mysqld/mysqld.sock
+LISTEN  127.0.0.1:53                    pdns_recursor   # M6.3
+LISTEN  192.168.100.150:53                    pdns_server     # public DNS
+LISTEN  127.0.0.1:5300                  pdns_server     # M6.3 split-port
+```
+
+What MUST NOT appear:
+
+- `*:4433` or `*:4434` — Kratos public/admin must be Unix sockets.
+- `*:3000` or `127.0.0.1:3000` — Bulwark must be Unix socket.
+- `*:35181` (or any non-`127.0.0.1` :8080) — Stalwart admin must be loopback-pinned.
+- `*:8443` bound by anything other than `nginx` — panel-api must be Unix socket; only nginx terminates TLS on :8443.
+- `0.0.0.0:5355` — LLMNR must be off.
+
+Sockets that MUST exist with correct perms:
+
+| Path | Owner | Group | Mode |
+|---|---|---|---|
+| `/run/dotnext-kratos/admin.sock` | dotnext | dotnext-sockets | 0660 |
+| `/run/dotnext-kratos/public.sock` | dotnext | dotnext-sockets | 0660 |
+| `/run/dotnext-panel/api.sock` | dotnext | dotnext-sockets | 0660 |
+| `/run/dotnext-bulwark/bulwark.sock` | dotnext-webmail | dotnext-sockets | 0660 |
+
+`dotnext-sockets` group must contain `dotnext`, `www-data`, `dotnext-webmail` (NOT `dotnext-mail`):
+
+```bash
+getent group dotnext-sockets
+# dotnext-sockets:x:9XX:dotnext,www-data,dotnext-webmail
+```
+
+## Symptom → fix
+
+### nginx 502 Bad Gateway
+
+Almost always: nginx (running as www-data) can't `connect(2)` to a backend socket.
+
+```bash
+# Confirm the socket exists + check perms
+ls -la /run/dotnext-kratos/public.sock /run/dotnext-panel/api.sock /run/dotnext-bulwark/bulwark.sock
+
+# Confirm www-data is in dotnext-sockets
+groups www-data | grep dotnext-sockets
+
+# If the group is missing the membership: re-run install.sh (idempotent —
+# ensure_dotnext_sockets_group adds the user in seconds), then RESTART
+# nginx (group changes don't apply to running processes — workers must
+# fork from a re-exec'd master).
+sudo install.sh --debug
+sudo systemctl restart nginx
+
+# If the socket file mode is 0644 (umask race): restart the offending
+# service so its ExecStartPost chmod block runs.
+sudo systemctl restart dotnext-kratos     # for kratos
+sudo systemctl restart dotnext-panel      # for panel-api
+sudo systemctl restart dotnext-webmail    # for bulwark
+```
+
+### Panel returns 502 only on /sso/webmail
+
+The mail vhost (`/etc/nginx/sites-available/<domain>-mail.conf`) references the `dotnext_panel_api` upstream defined in `/etc/nginx/sites-available/dotnext-panel.conf`. If the panel vhost was hand-edited away, the upstream isn't declared and nginx can't proxy `/sso/webmail`.
+
+```bash
+# Re-render the panel vhost from the template:
+sudo install.sh --debug
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+### Kratos won't start: "address already in use"
+
+Stale Unix socket from an unclean shutdown. The systemd unit's `RuntimeDirectoryPreserve=no` should clean it on stop, but a hard kill bypasses that.
+
+```bash
+sudo rm -f /run/dotnext-kratos/admin.sock /run/dotnext-kratos/public.sock
+sudo systemctl restart dotnext-kratos
+```
+
+`panel-api/cmd/server/listener.go` already does this for `/run/dotnext-panel/api.sock` automatically — no operator action needed for panel-api.
+
+### `ss -lntp` shows `*:8080` (Stalwart admin still bound to all interfaces)
+
+Existing Stalwart install with the pre-M25 apply-plan in its registry. `stalwart-cli apply` is `create`-only and won't update the listener.
+
+```bash
+# Wipe Stalwart's data (DESTRUCTIVE — only on a host where Stalwart
+# state is rebuildable from MariaDB):
+sudo systemctl stop dotnext-stalwart
+sudo rm -rf /var/lib/stalwart
+sudo install.sh --debug   # re-runs install_stalwart_apply with the M25 plan
+```
+
+If wiping isn't acceptable, edit Stalwart's runtime config via `stalwart-cli` to mutate the existing listener's `bind`:
+
+```bash
+stalwart-cli config update '#admin-http.bind' '{"127.0.0.1:8080":true}'
+sudo systemctl restart dotnext-stalwart
+```
+
+### Wildcard `:35181` lingers
+
+Same as above — Stalwart's ephemeral was running before the `#internal-loopback` listener landed. Restart picks up the pinned bind.
+
+```bash
+sudo systemctl restart dotnext-stalwart
+ss -lntp | grep 35181   # should be empty
+ss -lntp | grep 18181   # should show 127.0.0.1:18181
+```
+
+## Rollback per service (systemd drop-in templates)
+
+Each service has a per-service revert. They DO NOT chain — reverting Kratos doesn't auto-revert panel-api. After dropping any of these in:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart <unit>
+ss -lntp | grep <port>   # confirm TCP back up
+```
+
+### Revert Kratos to TCP
+
+`/etc/systemd/system/dotnext-kratos.service.d/90-revert-to-tcp.conf`:
+
+```ini
+[Service]
+# Override RuntimeDirectory bits so /run/dotnext-kratos is no longer
+# created on start (the socket file would otherwise still be made
+# alongside the TCP listener).
+RuntimeDirectory=
+ExecStartPost=
+```
+
+Then edit `/etc/dotnext-panel/kratos.yml`:
+
+```yaml
+serve:
+  public:
+    host: "127.0.0.1"
+    port: 4433
+  admin:
+    host: "127.0.0.1"
+    port: 4434
+```
+
+And `/etc/dotnext-panel/config.toml`:
+
+```toml
+[auth.kratos]
+public_url = "http://127.0.0.1:4433"
+admin_url  = "http://127.0.0.1:4434"
+```
+
+### Revert panel-api to TCP + self-TLS
+
+`/etc/systemd/system/dotnext-panel.service.d/90-revert-to-tcp.conf`:
+
+```ini
+[Service]
+Group=dotnext
+RuntimeDirectory=
+```
+
+Then edit `/etc/dotnext-panel/config.toml`:
+
+```toml
+[server]
+addr = "127.0.0.1:8443"
+tls_cert = "/etc/dotnext/tls/panel.crt"
+tls_key  = "/etc/dotnext/tls/panel.key"
+```
+
+Disable the panel nginx vhost (port 8443 collision):
+
+```bash
+sudo rm -f /etc/nginx/sites-enabled/dotnext-panel.conf
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+### Revert Bulwark to TCP
+
+`/etc/systemd/system/dotnext-webmail.service.d/90-revert-to-tcp.conf`:
+
+```ini
+[Service]
+Group=dotnext-webmail
+RuntimeDirectory=
+Environment=
+Environment=HOSTNAME=127.0.0.1
+Environment=PORT=3000
+Environment=NODE_ENV=production
+ExecStart=
+ExecStart=/usr/bin/node /opt/dotnext-webmail/server.js
+```
+
+And edit the per-domain mail vhosts to swap `proxy_pass http://dotnext_bulwark/;` back to `proxy_pass http://127.0.0.1:3000;` — OR change `/etc/nginx/conf.d/dotnext-bulwark-upstream.conf`'s `server unix:...;` to `server 127.0.0.1:3000;` (Form D pays off here — one line, no per-vhost sweep).
+
+## External monitoring
+
+Pre-M25 monitoring that pinged `https://localhost:8443/health` or `http://127.0.0.1:4433/health/ready` no longer works. Two options:
+
+1. **Hit the edge.** `https://<panel-host>:8443/health` still works — nginx terminates TLS and proxies through. This is also the preferred path because it goes through the same code path real users hit.
+2. **`curl --unix-socket`.** For monitoring tools running on the host:
+   ```bash
+   curl --unix-socket /run/dotnext-panel/api.sock     http://x/health
+   curl --unix-socket /run/dotnext-kratos/admin.sock  http://x/admin/health/ready
+   curl --unix-socket /run/dotnext-kratos/public.sock http://x/health/ready
+   curl --unix-socket /run/dotnext-bulwark/bulwark.sock http://x/api/health
+   ```
+
+## LLMNR
+
+Disabled via `/etc/systemd/resolved.conf.d/10-dotnext-disable-llmnr.conf`. To re-enable on a Windows-heavy LAN:
+
+```bash
+sudo tee /etc/systemd/resolved.conf.d/20-operator-enable-llmnr.conf <<EOF
+[Resolve]
+LLMNR=yes
+EOF
+sudo systemctl restart systemd-resolved
+```
+
+Higher-numbered drop-in wins. The dotnext drop-in stays in place; operator overrides cleanly.
+
+## M25.1 — shipped
+
+- **Kratos DSN flip to socket** — commit `67bcc9a feat(m25.1): flip Kratos DSN to unix socket`. Verified on 192.168.100.150.
+- **phpMyAdmin SSO socket-awareness + MariaDB `skip-networking`** — commit `f04d4f2 feat(m25.1): phpMyAdmin → unix socket + MariaDB skip-networking`. `sso_phpmyadmin_validate.go` returns a `socket` field; `sso.php` forwards it via `PMA_single_signon` as `connect_type=socket`. `install.sh` writes `/etc/mysql/mariadb.conf.d/99-dotnext-skip-networking.cnf` and asserts `ss -tln` shows no `:3306`. Verified on 192.168.100.150: no TCP listener; processlist shows `dotnext_panel_app` + `dotnext_kratos` + `dotnext_pdns` all via socket.
+
+Rollback (single host): remove `/etc/mysql/mariadb.conf.d/99-dotnext-skip-networking.cnf` and `systemctl restart mariadb` — restores `127.0.0.1:3306` and TCP loopback for clients that haven't been socket-flipped.
+
+## What's out of scope (won't be re-litigated)
+
+- DNS-protocol services (`pdns_recursor`, `pdns_server`, `systemd-resolved`) — sockets don't apply to the protocol.
+- Public listeners (nginx :80/:443, sshd :22, Stalwart SMTP/IMAP/POP3) — wildcard binds are the contract.
+- Cross-host deployments (memory `project_arch_decisions.md` is single-host).
+- mTLS between backends — superseded by socket permissions.

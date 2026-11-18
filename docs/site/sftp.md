@@ -1,0 +1,151 @@
+# SFTP, SSH Shell & Keys
+
+SFTP and the sandboxed SSH shell.
+
+## What's exposed
+
+- SFTP over the system `sshd` on port **22**, restricted to panel users via `Match Group dotnext-sftp` in `/etc/ssh/sshd_config.d/dotnext-sftp.conf`.
+- **SFTP-only users** (the default) get `ForceCommand internal-sftp`,
+  `X11Forwarding no`, `AllowTcpForwarding no`, chrooted to `/home/<user>`
+  (read-write inside, no escape). No interactive shell.
+- **SSH-shell users** (those on a hosting package with SSH enabled) get an
+  interactive shell, but it always runs **inside a sandbox** — never a
+  bare shell on the host. See [SSH shell sandbox](#ssh-shell-sandbox).
+
+## SSH key management
+
+Each user manages their own keys at `/dotnext-api/ssh-keys`:
+
+- Paste a public key (`ssh-ed25519 …` or `ssh-rsa …`); the panel validates the format.
+- Name the key (e.g. "Laptop", "CI").
+- Revoke any key from the same page.
+
+The agent writes `~/.ssh/authorized_keys` with `0600` permissions owned by the user. A reconciler tick re-syncs the file on demand and on schedule (15 min, hash-cached so a no-op tick is free).
+
+## SSH shell sandbox
+
+Every panel user's login shell is `/usr/local/bin/dotnext-ssh-shell`, a
+small wrapper. SFTP-only users never reach it (`ForceCommand internal-sftp`
+wins in their `Match` block). Users on an **SSH-enabled** package get an
+interactive shell through the wrapper, which drops them into a sandbox.
+
+There is **no "plain shell" mode** — sandboxing is mandatory for shell
+users. An admin who wants no shell at all makes the user SFTP-only.
+
+### Modes
+
+Server-wide setting (Server Settings → SSH Access), one of:
+
+- **`bubblewrap`** (default) — a namespace + bind-mount jail via the
+  setuid `bwrap` binary. Lightweight, no image to build. **This is the
+  shipped, working path.**
+- **`nspawn`** — an ephemeral `systemd-nspawn` container off a versioned
+  base image. *Not yet wired for login in this release — the mode can be
+  selected and persisted, but the per-user nspawn image path is still unused
+  (`install.sh`: "currently unused; Step 3 follow-up"). Use bubblewrap, the
+  shipped, supported path.*
+
+The mode is a single file, `/etc/dotnext/ssh-sandbox-mode`, read fresh on
+every connect — no sshd reload needed to switch.
+
+### What the bubblewrap sandbox gives the user
+
+- Their own `/home/<user>`, read-write.
+- A read-only system (`/usr`, libraries, a shell) — enough to run
+  `git`, `composer`, `wp-cli`, editors, etc.
+- **Network egress stays open** so those tools work.
+- `scp`, `rsync`, and `git-over-ssh` work (the wrapper forwards the SSH
+  command into the sandbox).
+- Two host sockets, both gated by their own login:
+  - MariaDB, `/run/mysqld/mysqld.sock`: `mysql -u <dbuser> -p <db>`
+    and `.sql` imports work with the database user's password, and reach only
+    the databases that user is granted.
+  - Redis, `/run/redis/redis.sock`: CLI and cron apps (queue
+    workers, `artisan`, `wp-cli` with the object cache) connect with the
+    account's Redis credential (Databases → **Redis access**), and reach only
+    its own keys.
+    Without a credential, Redis answers `NOAUTH`.
+- Only when the admin turns on **Log PHP Defense blocks from the sandbox**
+  (off by default): the system log socket at `/dev/log`, so PHP
+  Defense blocks in shell and cron PHP reach the incidents list. The flag is
+  `/etc/dotnext/ssh-sandbox-syslog`, read on every connect like the mode.
+
+### What it hides
+
+- `/etc/shadow`, `/etc/dotnext`, `/etc/ssh`, and every other tenant's
+  `/home/*` — invisible.
+- A **filtered `/etc/passwd` / `/etc/group`**: only system accounts plus
+  the connecting user, so other tenants can't be enumerated.
+- Other tenants' **processes** (private PID namespace — `ps` shows only
+  the session's own processes).
+- Every other host **Unix socket** (PHP-FPM, the agent, Kratos, …):
+  `/run` is a fresh tmpfs that holds only the two sockets above.
+
+### Failure mode
+
+If anything is misconfigured (mode file unreadable, `bwrap` missing or
+not setuid, an unrecognised mode), the wrapper exits to
+`/usr/sbin/nologin` — it **never** falls through to an unsandboxed shell.
+The user can still SFTP.
+
+## FTP / SFTP subaccounts
+
+Beyond the main account login, a tenant can create **FTP/SFTP subaccounts** —
+extra login users scoped to a subdirectory of the account. The whole surface is
+**admin opt-in** (an admin enables it and sets a per-package cap) before tenants
+see it:
+
+- **Tenant self-service** page to add / reset / delete subaccounts, with a
+  **password generator** on the create + reset forms.
+- **Isolation modes**: a lighter **same-uid alias** (shares the account's uid),
+  or **true separate-uid isolation** — a dedicated system user in its own jail
+  with its own quota and ACLs. Separate-uid is the default where a
+  filesystem quota exists; where quota is absent it falls back to off.
+  A separate-uid account's quota comes out of the account's own disk
+  quota: the account's user keeps its quota less its separate-uid
+  accounts' quotas ([Resource limits](resource-limits.md#1-posix-disk-quota)).
+  A same-uid alias is kept to its directory over FTPS only: its SFTP session
+  is chrooted to the account's home (sshd needs a root-owned chroot) and
+  starts in the alias's directory, so it can reach the whole home. Use a
+  separate-uid account for a login that must stay in its folder.
+  Deleting a separate-uid account gives the files it uploaded to the
+  account's owner, wherever they are in the owner's home, and in the
+  server's shared temporary folders (`/var/tmp`, `/tmp`) when those are on
+  the home's disk. A file that also has a hard link anywhere else is left
+  as it is.
+- **vsftpd module**: plain FTP(S) is an **opt-in, PAM-gated** module that stays
+  masked while off. SFTP subaccounts work through the existing `sshd`.
+- **Operator-tunable server limits**: max sessions, per-IP limit, transfer rate.
+- **WebDAV** access on a subaccount — a per-subaccount `dotnext-webdav`
+  worker, so the same scoped directory is reachable over WebDAV as well as
+  FTP/SFTP.
+
+The panel surfaces **observed-vs-desired** FTP state so drift between the DB rows
+and the live system is visible rather than silent.
+
+## SSH TCP forwarding (opt-in)
+
+SFTP/shell users get `AllowTcpForwarding no` by default. An admin can grant a
+**durable per-user opt-in for SSH TCP forwarding** — e.g. for VS Code
+Remote-SSH — which is firewall-guarded and applied via the sshd `Match` block.
+It is off unless explicitly enabled.
+
+## Password auth
+
+Disabled by default for panel users. SSH keys are required. Admin can enable password auth per-user via Users → Edit → SSH section, but it is not the default.
+
+## Connection example
+
+```bash
+sftp -i ~/.ssh/dotnext-key alice@example.com
+```
+
+Or with `lftp`, FileZilla, Cyberduck — anything that speaks SFTP.
+
+## What about FTP?
+
+FTP is an opt-in module for FTP/SFTP subaccounts (see above): off until an administrator turns on the FTP server. When on, it serves FTPS (explicit TLS on port 21, with the panel hostname's certificate) and refuses logins and transfers without TLS, unless the administrator explicitly allows plaintext. SFTP needs none of it.
+
+## What about root SSH?
+
+The host's root account is unchanged; this matters only for the operator, not for panel users. The DotNext installer does not enforce a password-vs-key policy for root — that's your call.

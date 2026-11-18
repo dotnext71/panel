@@ -1,0 +1,57 @@
+# Users
+
+`/dotnext-admin/users`. The list and lifecycle controls for every panel user (administrators and hosting customers).
+
+## What is a User
+
+A panel user combines several pieces of state:
+
+- A Kratos identity (email, password credential, optional TOTP).
+- A row in the panel `users` table (display name, role, package assignment, suspension flags).
+- A Linux account under `/home/<username>` with disabled shell login (used by SFTP, PHP-FPM, per-user cron, and per-user egress firewall slice).
+- A per-user PHP-FPM pool socket at `/run/php/dotnext-<username>/fpm.sock`.
+
+The reconciler converges Linux account state, PHP pool drop-ins, quota assignments, and slice limits from the `users` table on each tick.
+
+## List
+
+Columns: username, email, role (admin / user), package, domains, disk used / quota, suspended flag, last login.
+
+Filters: by role, by package, by suspension state, by free-text search across email + username + primary domain.
+
+## Actions per row
+
+- **Edit** — opens [Edit User](./users-edit.md).
+- **Reset password** — generates a new password (shown once) and sets it for the panel login, the account's SSH and SFTP, and the stored password, the same way as a password set on **Edit**. If the server account can't be updated, the new password still works for the panel, and the dialog says SSH and SFTP keep the old one; reset again to retry.
+- **Reset 2FA** — strips TOTP and recovery codes; the user must re-enrol on next login.
+- **Suspend** — sets `users.is_suspended=1`; the reconciler returns a "suspended" page on every vhost owned by the user. The user's mailboxes stop signing in: IMAP, POP3, SMTP submission, JMAP and webmail. Mail to them is still accepted and stored, so nothing is lost, and they can sign in again as soon as the user is unsuspended. Suspending and unsuspending both clear Stalwart's webmail login cache, so the change reaches webmail at once.
+- **Delete** — destructive; removes domains, databases, mailboxes, OS account, `/home/<user>`, and all related rows.
+
+## Create
+
+Top-right **Create User** button opens [Create User](./users-create.md).
+
+## CLI parity
+
+Every operation here has a CLI equivalent:
+
+```bash
+dotnext-cli user list
+dotnext-cli user create --username … --email … --password-stdin
+dotnext-cli user password <email>
+dotnext-cli user 2fa-reset <email>
+dotnext-cli user delete <email>
+```
+
+Direct-DB path; bypasses the HTTP layer, runs from the panel host.
+
+Deleting a user now removes its Kratos identity as well as the DB row and OS account, so the username and email free up immediately and the same user can be recreated. To clear an identity orphaned by an older build (a delete that left the identity behind, so recreate failed with "username taken"):
+
+```bash
+dotnext-cli admin purge-orphan-identities                       # dry-run, lists orphans
+dotnext-cli admin purge-orphan-identities --username <name> --apply
+```
+
+## Audit
+
+Every action above writes an audit row: actor user, subject user, action, result. See [Audit Log](./audit-log.md).

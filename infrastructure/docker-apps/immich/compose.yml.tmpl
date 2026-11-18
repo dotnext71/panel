@@ -1,0 +1,78 @@
+services:
+  immich-server:
+    image: {{ .ImageChannel }}
+    container_name: dotnext-app-{{ .Slug }}
+    restart: unless-stopped
+    depends_on:
+      - postgres
+      - redis
+      - immich-machine-learning
+    environment:
+      DB_HOSTNAME: "postgres"
+      DB_USERNAME: "postgres"
+      DB_PASSWORD: {{ q (index .Env "DB_PASSWORD") }}
+      DB_DATABASE_NAME: "immich"
+      REDIS_HOSTNAME: "redis"
+      IMMICH_MACHINE_LEARNING_URL: "http://immich-machine-learning:3003"
+    volumes:
+      - {{ .DataRoot }}/upload:/usr/src/app/upload
+      - /etc/localtime:/etc/localtime:ro
+    ports:
+{{- with index .Ports "http" }}
+      - "{{ .BindInterface }}:{{ .HostPort }}:{{ .ContainerPort }}/{{ .Protocol }}"
+{{- end }}
+    deploy:
+      resources:
+        limits:
+          cpus: "{{ .CPULimit }}"
+          memory: {{ .MemoryLimit }}
+    healthcheck:
+      # The image has no wget (and /api/server-info/ping is gone); this is
+      # the probe its own HEALTHCHECK runs (/api/server/ping).
+      test: ["CMD", "immich-healthcheck"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  immich-machine-learning:
+    image: ghcr.io/immich-app/immich-machine-learning:v3.2.2@sha256:60dfcf266a9ef3b7376f5678e8c980d4fb61db5fc48c078fe8a326ab1535d60d
+    container_name: dotnext-app-{{ .Slug }}-ml
+    restart: unless-stopped
+    volumes:
+      - {{ .DataRoot }}/model-cache:/cache
+    healthcheck:
+      # The image has no wget; this is the probe its own HEALTHCHECK runs.
+      test: ["CMD", "python3", "/usr/src/healthcheck.py"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  postgres:
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0@sha256:bcf63357191b76a916ae5eb93464d65c07511da41e3bf7a8416db519b40b1c23
+    container_name: dotnext-app-{{ .Slug }}-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: {{ q (index .Env "DB_PASSWORD") }}
+      POSTGRES_USER: "postgres"
+      POSTGRES_DB: "immich"
+    volumes:
+      - {{ .DataRoot }}/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  redis:
+    image: docker.io/valkey/valkey:9-alpine@sha256:a35428eba9043cc0b79dbe54100f0c92784f2de00ad09b01182bfb1c5c83d1bd
+    container_name: dotnext-app-{{ .Slug }}-redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "valkey-cli ping | grep -q PONG"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s

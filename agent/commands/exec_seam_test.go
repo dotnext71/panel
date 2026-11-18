@@ -1,0 +1,135 @@
+package commands
+
+import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"testing"
+)
+
+// TestMain makes the commands test suite structurally incapable of mutating the
+// host. Unless the operator opts into real host mutation
+// (DOTNEXT_ALLOW_HOST_MUTATION=1), every exec routed through the package seam is
+// redirected to a harmless shell stub that drains stdin, emits nothing, and
+// exits 0 — no systemctl, no timedatectl, no rm, no polkit prompt. This is the
+// real cure for GH #994; the per-test requireHostMutationAllowed gates remain as
+// belt-and-suspenders and compose with it (they skip before reaching exec).
+func TestMain(m *testing.M) {
+	// ftpaccount.delete notes whose a deleted isolated account was, and
+	// orphan_uids prunes those notes with passwd lookups tests stub. A run as
+	// root on a box must never read, write or prune its real notes, host
+	// mutation allowed or not; tests that need notes make their own.
+	ftpDeletedUIDDir = filepath.Join(os.TempDir(), "dotnext-agent-tests-absent-ftp-deleted-uids")
+	if os.Getenv("DOTNEXT_ALLOW_HOST_MUTATION") == "1" {
+		// Integration path: real exec, real host. The per-test gates decide what
+		// actually runs.
+		os.Exit(m.Run())
+	}
+
+	dir, err := os.MkdirTemp("", "dotnext-exec-stub-")
+	if err != nil {
+		panic("exec seam stub: " + err.Error())
+	}
+	// dns.* handlers connect to the PowerDNS database on demand (pdns.Acquire,
+	// GH #2377). Point them at an env file that does not exist, so a test run
+	// on a box with PowerDNS never writes to its real zones.
+	if err := os.Setenv("DOTNEXT_PDNS_ENV_FILE", filepath.Join(dir, "absent-pdns.env")); err != nil {
+		panic("pdns env seam: " + err.Error())
+	}
+	// The AppSec renders scope the panel's paths to the addresses this
+	// host's nginx holds too. A test box's must not reach the configs tests
+	// render.
+	appsecPanelAddrs = func() []string { return nil }
+	// The vhost renders refuse the panel's names. A test box's name must not
+	// reach the vhosts tests render.
+	vhostPanelScope = func() (string, []string) { return "", nil }
+
+	stub := filepath.Join(dir, "noexec")
+	// The stub path is baked into argv (below), NOT into an env marker, so the
+	// 28 handlers that set cmd.Env cannot defeat it. `cat >/dev/null` drains any
+	// piped stdin so handlers that set cmd.Stdin do not see EPIPE.
+	script := "#!/bin/sh\ncat >/dev/null 2>&1\nexit 0\n"
+	if err := os.WriteFile(stub, []byte(script), 0o700); err != nil {
+		panic("exec seam stub: " + err.Error())
+	}
+
+	// Set once, before any test runs → race-free (no testMutex needed).
+	execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		return exec.CommandContext(ctx, stub, append([]string{name}, args...)...)
+	}
+	execCommand = func(name string, args ...string) *exec.Cmd {
+		return exec.Command(stub, append([]string{name}, args...)...)
+	}
+	// The free space of the machine running the tests is not a test input:
+	// with the real check, a nearly full disk failed every test that got past
+	// a reserve check. A test of the refusal sets its own (refuseHostReserve).
+	checkHostReserve = func(string, int64) error { return nil }
+	// The bandwidth scan remembers which rotated log it counted; keep that
+	// state out of /var/lib/dotnext.
+	bandwidthScanStatePath = filepath.Join(dir, "bandwidth-scan-state.json")
+	// A PHP vhost write and a pool apply make the tenant's ~/logs and its
+	// logrotate stanza; keep both out of /home and /etc/logrotate.d. The dirs
+	// are not created, so those writes fail and are only logged, unless a test
+	// points the vars at dirs of its own.
+	userLogsHomeRoot = filepath.Join(dir, "home")
+	phpErrorLogrotateDir = filepath.Join(dir, "logrotate.d")
+	// domain.create writes the default page (GH #2422); keep it out of /var/www.
+	defaultPagesDir = filepath.Join(dir, "default-pages")
+
+	code := m.Run()
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
+
+// withRealExec restores the real os/exec dispatch for the duration of a single
+// NON-PARALLEL test. Use it ONLY for a test that must run a genuinely read-only
+// command (du, id, getent, sshd -t) to be meaningful — the stub's empty output
+// would otherwise break it. NEVER use it for a test that could mutate the host;
+// gate those with requireHostMutationAllowed instead. Safe without a mutex
+// because Go pauses t.Parallel tests until the sequential phase (where these
+// run) completes. GH #994.
+func withRealExec(t *testing.T) {
+	t.Helper()
+	prevCtx, prevCmd := execCommandContext, execCommand
+	execCommandContext = exec.CommandContext
+	execCommand = exec.Command
+	t.Cleanup(func() {
+		execCommandContext = prevCtx
+		execCommand = prevCmd
+	})
+}
+
+// TestExecSeam_NoRawExec keeps the cure durable: no non-test file in package
+// commands may call os/exec directly. New destructive handlers must route
+// through the execCommand / execCommandContext seam, which the stub above
+// neutralizes in tests. GH #994.
+func TestExecSeam_NoRawExec(t *testing.T) {
+	entries, err := os.ReadDir(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	re := regexp.MustCompile(`\bexec\.Command(Context)?\(`)
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || !strings.HasSuffix(name, ".go") {
+			continue
+		}
+		if strings.HasSuffix(name, "_test.go") {
+			continue // test scaffolding (incl. this file's stub redirect) may use raw exec
+		}
+		if name == "exec_seam.go" {
+			continue // the seam itself defines the vars from os/exec
+		}
+		b, err := os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if loc := re.FindIndex(b); loc != nil {
+			line := 1 + strings.Count(string(b[:loc[0]]), "\n")
+			t.Errorf("%s:%d: raw exec.Command/CommandContext — route through the execCommand/execCommandContext seam instead (GH #994)", name, line)
+		}
+	}
+}

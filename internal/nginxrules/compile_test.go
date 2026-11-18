@@ -1,0 +1,610 @@
+package nginxrules
+
+import (
+	"strings"
+	"testing"
+
+	"github.com/dotnext-panel/dotnext/internal/models"
+)
+
+// TestStaticCacheNoAddHeader pins the JAB-70 security property: static_cache
+// must render `expires` only. An `add_header` inside a location suppresses the
+// server-scope security headers (HSTS, X-Frame-Options, …) the panel sets, so a
+// static_cache that emitted one would silently weaken hardening on every cached
+// asset. Kept as its own test so a future "add Cache-Control immutable" change
+// trips here loudly.
+func TestStaticCacheNoAddHeader(t *testing.T) {
+	got := Compile(&models.Domain{
+		NginxRules: []models.NginxRule{
+			{Type: "static_cache", Extensions: []string{"pdf"}, Duration: "30d"},
+		},
+	})
+	if strings.Contains(got, "add_header") {
+		t.Fatalf("static_cache must not emit add_header (JAB-70 header suppression); got:\n%s", got)
+	}
+	if !strings.Contains(got, "expires 30d;") {
+		t.Fatalf("static_cache should emit `expires 30d;`; got:\n%s", got)
+	}
+}
+
+func TestCompile(t *testing.T) {
+	tests := []struct {
+		name     string
+		domain   *models.Domain
+		want     string
+		wantBool bool // true to check contains, false for exact match
+	}{
+		{
+			name:   "nil domain returns empty string",
+			domain: nil,
+			want:   "",
+		},
+		{
+			name: "empty rules returns empty string",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{},
+			},
+			want: "",
+		},
+		{
+			name: "custom_header without always flag",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{
+					{
+						Type:  "custom_header",
+						Name:  "X-Custom",
+						Value: "test-value",
+					},
+				},
+			},
+			want:     `add_header X-Custom "test-value";`,
+			wantBool: true,
+		},
+		{
+			name: "deny_paths compiles a case-insensitive extension deny block",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{
+					{Type: "deny_paths", Extensions: []string{"env", "sql", "bak"}},
+				},
+			},
+			want:     "location ~* \\.(env|sql|bak)$ {\n        deny all;\n    }\n",
+			wantBool: true,
+		},
+		{
+			name: "deny_paths lowercases and de-duplicates extensions",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{
+					{Type: "deny_paths", Extensions: []string{"ENV", "env", "Sql"}},
+				},
+			},
+			want:     "location ~* \\.(env|sql)$ {\n        deny all;\n    }\n",
+			wantBool: true,
+		},
+		{
+			name: "static_cache renders expires only (no add_header — JAB-70)",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{
+					{Type: "static_cache", Extensions: []string{"pdf", "mp4"}, Duration: "30d"},
+				},
+			},
+			want:     "location ~* \\.(pdf|mp4)$ {\n        expires 30d;\n    }\n",
+			wantBool: true,
+		},
+		{
+			name: "static_cache with empty extensions emits nothing",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{
+					{Type: "static_cache", Extensions: []string{}, Duration: "30d"},
+				},
+			},
+			want: "",
+		},
+		{
+			name: "custom_header with always flag true",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{
+					{
+						Type:   "custom_header",
+						Name:   "X-Custom",
+						Value:  "test-value",
+						Always: boolPtr(true),
+					},
+				},
+			},
+			want:     `add_header X-Custom "test-value" always;`,
+			wantBool: true,
+		},
+		{
+			name: "custom_header with always flag false",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{
+					{
+						Type:   "custom_header",
+						Name:   "X-Custom",
+						Value:  "test-value",
+						Always: boolPtr(false),
+					},
+				},
+			},
+			want:     `add_header X-Custom "test-value";`,
+			wantBool: true,
+		},
+		{
+			name: "custom_header with special characters",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{
+					{
+						Type:  "custom_header",
+						Name:  "X-Quoted",
+						Value: `test"value`,
+					},
+				},
+			},
+			want:     `add_header X-Quoted "test\"value";`,
+			wantBool: true,
+		},
+		{
+			name: "rewrite with default flag",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{
+					{
+						Type:        "rewrite",
+						Pattern:     "^/old/(.*)$",
+						Replacement: "/new/$1",
+						Flag:        "",
+					},
+				},
+			},
+			want:     `rewrite "^/old/(.*)$" "/new/$1" last;`,
+			wantBool: true,
+		},
+		{
+			name: "rewrite with explicit flag",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{
+					{
+						Type:        "rewrite",
+						Pattern:     "^/old/(.*)$",
+						Replacement: "/new/$1",
+						Flag:        "permanent",
+					},
+				},
+			},
+			want:     `rewrite "^/old/(.*)$" "/new/$1" permanent;`,
+			wantBool: true,
+		},
+		{
+			name: "proxy_pass with headers",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{
+					{
+						Type:   "proxy_pass",
+						Path:   "/api",
+						Target: "http://localhost:9000",
+					},
+				},
+			},
+			want:     `location ^~ /api {`,
+			wantBool: true,
+		},
+		{
+			name: "proxy_pass with location needing quotes",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{
+					{
+						Type:   "proxy_pass",
+						Path:   "/api v1",
+						Target: "http://localhost:9000",
+					},
+				},
+			},
+			want:     `location ^~ "/api v1" {`,
+			wantBool: true,
+		},
+		{
+			name: "ip_access allow_list mode",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{
+					{
+						Type: "ip_access",
+						Path: "/admin",
+						Mode: "allow_list",
+						IPs:  []string{"192.168.1.0/24", "10.0.0.1"},
+					},
+				},
+			},
+			want:     `allow 192.168.1.0/24;`,
+			wantBool: true,
+		},
+		{
+			name: "ip_access deny_list mode",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{
+					{
+						Type: "ip_access",
+						Path: "/blocked",
+						Mode: "deny_list",
+						IPs:  []string{"203.0.113.0/24"},
+					},
+				},
+			},
+			want:     `deny 203.0.113.0/24;`,
+			wantBool: true,
+		},
+		{
+			name: "php_setting",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{
+					{
+						Type:  "php_setting",
+						Name:  "upload_max_filesize",
+						Value: "100M",
+					},
+				},
+			},
+			want:     `fastcgi_param PHP_VALUE "upload_max_filesize=100M";`,
+			wantBool: true,
+		},
+		{
+			name: "max_upload_size",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{
+					{
+						Type: "max_upload_size",
+						Size: "50M",
+					},
+				},
+			},
+			want:     `client_max_body_size 50M;`,
+			wantBool: true,
+		},
+		{
+			name: "unknown rule type is silently skipped",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{
+					{
+						Type: "unknown_rule",
+					},
+				},
+			},
+			want: "",
+		},
+		{
+			name: "multiple rules in order",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{
+					{
+						Type:  "custom_header",
+						Name:  "X-Test",
+						Value: "value1",
+					},
+					{
+						Type: "max_upload_size",
+						Size: "100M",
+					},
+				},
+			},
+			want:     `add_header X-Test "value1";`,
+			wantBool: true,
+		},
+		{
+			name: "backslash escaping in values",
+			domain: &models.Domain{
+				NginxRules: []models.NginxRule{
+					{
+						Type:  "custom_header",
+						Name:  "X-Path",
+						Value: `C:\path\to\file`,
+					},
+				},
+			},
+			want:     `add_header X-Path "C:\\path\\to\\file";`,
+			wantBool: true,
+		},
+		{
+			// GH #1175: a reverse-proxy domain carries no persisted rule;
+			// the proxy_pass block is synthesised from the column.
+			name: "reverse_proxy_port synthesises a root proxy_pass",
+			domain: &models.Domain{
+				ReverseProxyPort: 30000,
+			},
+			want:     "proxy_pass http://127.0.0.1:30000;",
+			wantBool: true,
+		},
+		{
+			name: "reverse_proxy_port sets the forwarding headers",
+			domain: &models.Domain{
+				ReverseProxyPort: 34567,
+			},
+			want:     "proxy_set_header X-Forwarded-Proto $scheme;",
+			wantBool: true,
+		},
+		{
+			name: "no rules and no reverse proxy is empty",
+			domain: &models.Domain{
+				ReverseProxyPort: 0,
+			},
+			want: "",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := Compile(tt.domain)
+			if tt.wantBool {
+				// "contains" check: the emitted vhost fragment must carry the
+				// expected directive verbatim.
+				if !strings.Contains(got, tt.want) {
+					t.Errorf("Compile(%v) = %q, want it to contain %q", tt.domain, got, tt.want)
+				}
+			} else {
+				// Exact match
+				if got != tt.want {
+					t.Errorf("Compile(%v) = %q, want %q", tt.domain, got, tt.want)
+				}
+			}
+		})
+	}
+}
+
+func TestQuoteNginxString(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{
+			input: "simple",
+			want:  `"simple"`,
+		},
+		{
+			input: `has"quotes`,
+			want:  `"has\"quotes"`,
+		},
+		{
+			input: `has\backslash`,
+			want:  `"has\\backslash"`,
+		},
+		{
+			input: `both"and\`,
+			want:  `"both\"and\\"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := quoteNginxString(tt.input)
+			if got != tt.want {
+				t.Errorf("quoteNginxString(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestQuoteNginxLocation(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{
+			input: "/simple",
+			want:  "/simple",
+		},
+		{
+			input: "/path with spaces",
+			want:  `"/path with spaces"`,
+		},
+		{
+			input: `/path	with	tabs`,
+			want:  `"/path	with	tabs"`,
+		},
+		{
+			input: `/path"with"quotes`,
+			want:  `"/path\"with\"quotes"`,
+		},
+		{
+			input: `/path'with'single`,
+			want:  `"/path'with'single"`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			got := quoteNginxLocation(tt.input)
+			if got != tt.want {
+				t.Errorf("quoteNginxLocation(%q) = %q, want %q", tt.input, got, tt.want)
+			}
+		})
+	}
+}
+
+func boolPtr(b bool) *bool {
+	return &b
+}
+
+// TestCompileProxyPassDefaults pins the upload-safe defaults baked into
+// every proxy_pass block (GH#172): http/1.1 keepalive, request buffering
+// off, and default timeouts. Non-websocket proxies get Connection "";
+// websocket proxies get Connection "upgrade" + the Upgrade header.
+func TestCompileProxyPassDefaults(t *testing.T) {
+	d := &models.Domain{
+		NginxRules: []models.NginxRule{
+			{Type: "proxy_pass", Path: "/app", Target: "http://127.0.0.1:8080"},
+		},
+	}
+	got := Compile(d)
+	for _, want := range []string{
+		"location ^~ /app {",
+		"proxy_pass http://127.0.0.1:8080;",
+		"proxy_http_version 1.1;",
+		"proxy_request_buffering off;",
+		`proxy_set_header Connection "";`,
+		"proxy_connect_timeout 300s;",
+		"proxy_send_timeout 300s;",
+		"proxy_read_timeout 300s;",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("proxy_pass output missing %q\n--- got ---\n%s", want, got)
+		}
+	}
+	// Non-websocket must NOT carry the upgrade header.
+	if strings.Contains(got, "Upgrade $http_upgrade") {
+		t.Errorf("non-websocket proxy unexpectedly set Upgrade header:\n%s", got)
+	}
+}
+
+// TestCompileProxyPassWebsocket verifies the websocket branch still emits
+// the Upgrade/Connection-upgrade pair and an overridable read timeout.
+func TestCompileProxyPassWebsocket(t *testing.T) {
+	ws := true
+	d := &models.Domain{
+		NginxRules: []models.NginxRule{
+			{Type: "proxy_pass", Path: "/ws", Target: "http://127.0.0.1:9000", Websocket: &ws, ReadTimeout: "600s"},
+		},
+	}
+	got := Compile(d)
+	for _, want := range []string{
+		"proxy_http_version 1.1;",
+		"proxy_set_header Upgrade $http_upgrade;",
+		`proxy_set_header Connection "upgrade";`,
+		"proxy_read_timeout 600s;",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("websocket proxy output missing %q\n--- got ---\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, `Connection "";`) {
+		t.Errorf("websocket proxy should not emit empty Connection header:\n%s", got)
+	}
+}
+
+func TestCompile_StaticAlias(t *testing.T) {
+	d := &models.Domain{NginxRules: models.NginxRules{
+		{Type: "static_alias", Path: "/dj/static/", Target: "/home/u/djtest/staticfiles/"},
+	}}
+	got := Compile(d)
+	for _, want := range []string{
+		"location ^~ /dj/static/ {",
+		"alias /home/u/djtest/staticfiles/;",
+		"expires 30d;",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("compiled output missing %q:\n%s", want, got)
+		}
+	}
+}
+
+// TestReverseProxySynthesisEdges covers GH #1175 behaviour the contains/exact
+// table can't express: suppression when the tenant already has a root
+// proxy_pass, and that synthesis never mutates the domain's backing slice.
+func TestReverseProxySynthesisEdges(t *testing.T) {
+	t.Run("explicit root proxy_pass suppresses the synthetic loopback one", func(t *testing.T) {
+		d := &models.Domain{
+			ReverseProxyPort: 30001,
+			NginxRules: []models.NginxRule{
+				{Type: "proxy_pass", Path: "/", Target: "http://example.test:8080"},
+			},
+		}
+		got := Compile(d)
+		if strings.Contains(got, "127.0.0.1:30001") {
+			t.Fatalf("synthetic loopback proxy_pass should be suppressed, got:\n%s", got)
+		}
+		if strings.Count(got, "location ^~ /") != 1 {
+			t.Fatalf("want exactly one root location, got:\n%s", got)
+		}
+	})
+
+	t.Run("synthesis does not mutate the domain NginxRules slice", func(t *testing.T) {
+		d := &models.Domain{
+			ReverseProxyPort: 30002,
+			NginxRules: []models.NginxRule{
+				{Type: "custom_header", Name: "X-A", Value: "1"},
+			},
+		}
+		_ = Compile(d)
+		if len(d.NginxRules) != 1 {
+			t.Fatalf("Compile mutated NginxRules: len=%d", len(d.NginxRules))
+		}
+	})
+}
+
+// TestCompileRewritePatternQuoted pins the GH #1624 hardening: the rewrite MATCH
+// pattern renders as a single quoted nginx token, so a tenant can't terminate
+// the directive and inject sibling directives, and so regex escapes and {n,m}
+// quantifiers survive intact.
+func TestCompileRewritePatternQuoted(t *testing.T) {
+	// A pattern carrying nginx metacharacters (`;`, spaces, a `location { … }`
+	// block) must render as exactly one `rewrite` line with the whole pattern
+	// wrapped in one double-quoted token — never as extra directives.
+	inj := &models.Domain{NginxRules: []models.NginxRule{{
+		Type:        "rewrite",
+		Pattern:     `.*$ /d; location ~ ^/z$ { return 418; } #`,
+		Replacement: "/x",
+		Flag:        "last",
+	}}}
+	got := Compile(inj)
+	want := `rewrite ".*$ /d; location ~ ^/z$ { return 418; } #" "/x" last;`
+	if !strings.Contains(got, want) {
+		t.Fatalf("injection payload must render as one quoted token, got:\n%s", got)
+	}
+	if strings.Count(strings.TrimSpace(got), "\n") != 0 {
+		t.Fatalf("must be a single rewrite line, got:\n%s", got)
+	}
+
+	// A {n,m} quantifier renders quoted — unquoted it terminates the token and
+	// fails `nginx -t`.
+	q := Compile(&models.Domain{NginxRules: []models.NginxRule{{
+		Type: "rewrite", Pattern: `^/x[0-9]{2,3}$`, Replacement: "/y", Flag: "last",
+	}}})
+	if !strings.Contains(q, `rewrite "^/x[0-9]{2,3}$" "/y" last;`) {
+		t.Fatalf("quantifier pattern should render quoted, got:\n%s", q)
+	}
+
+	// A regex escape round-trips: quoteNginxString doubles the backslash and
+	// nginx un-escapes `\\`->`\`, so PCRE still sees `\.` (verified on nginx 1.24).
+	e := Compile(&models.Domain{NginxRules: []models.NginxRule{{
+		Type: "rewrite", Pattern: `^/foo\.php$`, Replacement: "/bar", Flag: "last",
+	}}})
+	if !strings.Contains(e, `rewrite "^/foo\\.php$" "/bar" last;`) {
+		t.Fatalf("regex escape should render backslash-doubled, got:\n%s", e)
+	}
+}
+
+// TestCompileLocationQuotesInjectionChars (GH #1624) pins that a location path
+// carrying `;` or `{` renders as one quoted token, so it can't terminate the
+// location line or open a block (admin-only proxy_pass/ip_access/alias Path).
+func TestCompileLocationQuotesInjectionChars(t *testing.T) {
+	got := Compile(&models.Domain{NginxRules: []models.NginxRule{{
+		Type: "proxy_pass", Path: "/a;b{", Target: "http://upstream:9000",
+	}}})
+	if !strings.Contains(got, `location ^~ "/a;b{" {`) {
+		t.Fatalf("location path with ; and { must render quoted, got:\n%s", got)
+	}
+}
+
+// GH #1999: front_controller is not a server-scope directive. Compile renders
+// nothing for it (a second `location /` would make the agent drop its PHP
+// locations), and FrontController returns the try_files fallback.
+func TestFrontController(t *testing.T) {
+	d := &models.Domain{NginxRules: []models.NginxRule{
+		{Type: "front_controller", Script: "/index.php", Query: "mod=$uri&$args"},
+	}}
+	if got := Compile(d); got != "" {
+		t.Fatalf("Compile rendered a front_controller rule: %q", got)
+	}
+	if got := FrontController(d); got != "/index.php?mod=$uri&$args" {
+		t.Fatalf("FrontController = %q", got)
+	}
+	if got := FrontController(&models.Domain{NginxRules: []models.NginxRule{{Type: "front_controller", Script: "/app.php"}}}); got != "/app.php" {
+		t.Fatalf("FrontController without a query = %q", got)
+	}
+	for name, dom := range map[string]*models.Domain{
+		"nil":      nil,
+		"no rules": {},
+		"other":    {NginxRules: []models.NginxRule{{Type: "rewrite", Pattern: "^/a$", Replacement: "/b"}}},
+		"invalid":  {NginxRules: []models.NginxRule{{Type: "front_controller", Script: "/index.php", Query: "a=1;deny all"}}},
+	} {
+		if got := FrontController(dom); got != "" {
+			t.Errorf("%s: FrontController = %q, want \"\"", name, got)
+		}
+	}
+}

@@ -1,0 +1,171 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/dotnext-panel/dotnext/internal/auth"
+	"github.com/dotnext-panel/dotnext/internal/ginctx"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+)
+
+// --- minimal fakes: only the methods create()/loadMailbox/Converge call ---
+
+type fwFakeMailboxes struct {
+	repository.MailboxRepository
+	mb *models.Mailbox
+}
+
+func (f fwFakeMailboxes) FindByID(context.Context, string) (*models.Mailbox, error) {
+	return f.mb, nil
+}
+
+type fwFakeDomains struct {
+	repository.DomainRepository
+	dom *models.Domain
+}
+
+func (f fwFakeDomains) FindByID(context.Context, string) (*models.Domain, error) {
+	return f.dom, nil
+}
+
+type fwFakeForwarders struct {
+	repository.EmailForwarderRepository
+	rows []models.EmailForwarder
+}
+
+func (f *fwFakeForwarders) Create(_ context.Context, row *models.EmailForwarder) error {
+	f.rows = append(f.rows, *row)
+	return nil
+}
+
+func (f *fwFakeForwarders) ListByMailboxID(context.Context, string, repository.ListOptions) ([]models.EmailForwarder, int64, error) {
+	return f.rows, int64(len(f.rows)), nil
+}
+
+// fwStubAgent returns a fixed result/error for forwarder.apply.
+type fwStubAgent struct{ err error }
+
+func (a fwStubAgent) Call(context.Context, string, any) (json.RawMessage, error) {
+	return json.RawMessage(`{"ok":true}`), a.err
+}
+
+func postForwarder(h *forwarderHandler, body string) *httptest.ResponseRecorder {
+	return postForwarderAs(h, body, &auth.AccessClaims{UserID: "u1", IsAdmin: true})
+}
+
+func postForwarderAs(h *forwarderHandler, body string, claims *auth.AccessClaims) *httptest.ResponseRecorder {
+	gin.SetMode(gin.TestMode)
+	w := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(w)
+	c.Params = gin.Params{{Key: "mbid", Value: "mb1"}}
+	c.Request = httptest.NewRequest(http.MethodPost, "/mailboxes/mb1/forwarders", strings.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+	ginctx.SetClaims(c, claims)
+	h.create(c)
+	return w
+}
+
+type fwWarningBody struct {
+	Warning *struct {
+		Code   string `json:"code"`
+		Detail string `json:"detail"`
+	} `json:"warning"`
+}
+
+func newForwarderHandlerFake(agentErr error) *forwarderHandler {
+	return &forwarderHandler{cfg: MailboxForwarderHandlerConfig{
+		Mailboxes:  fwFakeMailboxes{mb: &models.Mailbox{ID: "mb1", LocalPart: "joe", DomainID: "dom1"}},
+		Domains:    fwFakeDomains{dom: &models.Domain{ID: "dom1", Name: "example.com", UserID: "u1", OwnershipState: models.OwnershipState{OwnershipStatus: models.OwnershipVerified}}},
+		Forwarders: &fwFakeForwarders{},
+		Agent:      fwStubAgent{err: agentErr},
+	}}
+}
+
+// GH #1795: a forwarder create whose follow-up forwarder.apply FAILS must not
+// report an unqualified 201 — the row persists but is not forwarding until it
+// converges. The response carries warning.code=convergence_failed so the caller
+// (and a future UI) can see the divergence. Falsify by reverting create() to
+// swallow the applyForwarders error: the warning field disappears → RED.
+func TestForwarderCreate_SurfacesConvergenceFailure(t *testing.T) {
+	h := newForwarderHandlerFake(errors.New("mailbox not registered with mail server"))
+	w := postForwarder(h, `{"type":"external","target":"out@elsewhere.com"}`)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (DB is truth; the row still persists)", w.Code)
+	}
+	var resp struct {
+		Warning *struct {
+			Code   string `json:"code"`
+			Detail string `json:"detail"`
+		} `json:"warning"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Warning == nil {
+		t.Fatalf("expected a convergence_failed warning, got none: %s", w.Body.String())
+	}
+	if resp.Warning.Code != "convergence_failed" {
+		t.Errorf("warning.code = %q, want convergence_failed", resp.Warning.Code)
+	}
+	if !strings.Contains(resp.Warning.Detail, "mailbox not registered with mail server") {
+		t.Errorf("warning.detail = %q; an admin must see the agent error", resp.Warning.Detail)
+	}
+}
+
+// A tenant still learns the forwarder is not live yet (the warning stays), but
+// not the agent's error text: it can name panel internals such as the agent
+// socket path ("dial unix /run/dotnext/agent.sock: ..."). The full error goes to
+// the log, and an admin caller still gets it in the response (GH #1795).
+func TestForwarderCreate_TenantWarningHidesTheAgentError(t *testing.T) {
+	h := newForwarderHandlerFake(errors.New("agent: unavailable: dial unix /run/dotnext/agent.sock: connect: permission denied"))
+	w := postForwarderAs(h, `{"type":"external","target":"out@elsewhere.com"}`, &auth.AccessClaims{UserID: "u1"})
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", w.Code)
+	}
+	var resp fwWarningBody
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Warning == nil || resp.Warning.Code != "convergence_failed" || resp.Warning.Detail == "" {
+		t.Fatalf("tenant must still get the convergence_failed warning with a detail: %s", w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "agent.sock") || strings.Contains(w.Body.String(), "dial unix") {
+		t.Errorf("tenant response leaks the agent error: %s", w.Body.String())
+	}
+}
+
+// The happy path stays clean: a successful apply carries no warning, so the
+// normal 201 is unchanged and the SPA sees exactly what it did before.
+func TestForwarderCreate_NoWarningOnSuccess(t *testing.T) {
+	h := newForwarderHandlerFake(nil)
+	w := postForwarder(h, `{"type":"external","target":"out@elsewhere.com"}`)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", w.Code)
+	}
+	if strings.Contains(w.Body.String(), "warning") {
+		t.Fatalf("no warning expected on a successful apply, got: %s", w.Body.String())
+	}
+}
+
+// GH #1816 / ADR-0170: no new forwarder on a name that is not proven.
+func TestForwarderCreate_PendingOwnership409(t *testing.T) {
+	h := newForwarderHandlerFake(nil)
+	h.cfg.Domains = fwFakeDomains{dom: &models.Domain{ID: "dom1", Name: "example.com", UserID: "u1",
+		OwnershipState: models.OwnershipState{OwnershipStatus: models.OwnershipPending}}}
+	w := postForwarderAs(h, `{"type":"external","target":"out@elsewhere.com"}`, tenantU1)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "domain_ownership_pending") {
+		t.Fatalf("want 409 domain_ownership_pending, got %d %s", w.Code, w.Body.String())
+	}
+}

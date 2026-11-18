@@ -1,0 +1,86 @@
+package commands
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"os/user"
+	"path/filepath"
+	"strings"
+
+	"github.com/dotnext-panel/dotnext/agentwire"
+	"github.com/dotnext-panel/dotnext/internal/filesafe"
+)
+
+// sshAuthorizedKeysDeleteParams is the input shape for ssh.authorized_keys.delete.
+type sshAuthorizedKeysDeleteParams struct {
+	Username string `json:"username"`
+}
+
+// sshAuthorizedKeysDeleteResponse is the output shape for ssh.authorized_keys.delete.
+type sshAuthorizedKeysDeleteResponse struct {
+	Username string `json:"username"`
+	Deleted  bool   `json:"deleted"`
+}
+
+func sshAuthorizedKeysDeleteHandler(ctx context.Context, params json.RawMessage) (any, error) {
+	var p sshAuthorizedKeysDeleteParams
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: fmt.Sprintf("failed to parse params: %v", err),
+		}
+	}
+
+	// Validate username and resolve user's homedir
+	u, err := user.Lookup(p.Username)
+	if err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: fmt.Sprintf("user %q not found: %v", p.Username, err),
+		}
+	}
+
+	// All .ssh ops are escape-proof via a home-rooted scope (Gitea #467).
+	scope, serr := filesafe.NewScope(p.Username, p.Username, []string{u.HomeDir})
+	if serr != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: "scope init: " + serr.Error()}
+	}
+
+	sshDir := filepath.Join(u.HomeDir, ".ssh")
+	authorizedKeysPath := filepath.Join(sshDir, "authorized_keys")
+
+	// "delete" means remove dotnext's managed block ONLY — never the
+	// whole file. Operator keys outside the markers survive (incident
+	// 2026-05-17: the every-tick reconciler delete was wiping operator
+	// SSH access on every dotnext host).
+	existing, rerr := readAuthorizedKeys(scope, authorizedKeysPath)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if existing == "" {
+		return &sshAuthorizedKeysDeleteResponse{Username: p.Username, Deleted: true}, nil
+	}
+	remainder := applyManagedBlock(existing, nil)
+	if strings.TrimSpace(remainder) == "" {
+		// Nothing but the dotnext block was present — clean removal.
+		if err := scope.RemoveInScope(authorizedKeysPath, false); err != nil && !os.IsNotExist(err) {
+			return nil, &agentwire.AgentError{
+				Code:    agentwire.CodeInternal,
+				Message: fmt.Sprintf("failed to delete authorized_keys: %v", err),
+			}
+		}
+	} else if werr := writeAuthorizedKeysAtomic(scope, u, sshDir, authorizedKeysPath, remainder); werr != nil {
+		return nil, werr
+	}
+
+	return &sshAuthorizedKeysDeleteResponse{
+		Username: p.Username,
+		Deleted:  true,
+	}, nil
+}
+
+func init() {
+	Default.Register("ssh.authorized_keys.delete", sshAuthorizedKeysDeleteHandler)
+}

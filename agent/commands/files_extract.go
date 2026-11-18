@@ -1,0 +1,487 @@
+package commands
+
+import (
+	"archive/tar"
+	"archive/zip"
+	"compress/bzip2"
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"os/user"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/dotnext-panel/dotnext/agentwire"
+	"github.com/dotnext-panel/dotnext/internal/filesafe"
+	"golang.org/x/sys/unix"
+)
+
+// extractWallClockBudget bounds the total wall-clock of one archive extraction
+// (JAB-387 defense-in-depth). The per-entry ex.ctx.Err() checks (GH #664) plus
+// the entry-count / uncompressed-size / decompression-bomb caps already bound
+// the work, and go1.25.13 (JAB-383) fixes the archive/zip quadratic-index CVE
+// (GO-2026-4342); this adds an explicit ceiling so a pathological tenant archive
+// can never hold a root-side extract worker indefinitely, regardless of the
+// caller's deadline. Generous relative to the size cap so legitimate large
+// archives are unaffected.
+const extractWallClockBudget = 5 * time.Minute
+
+// files.extract — unpack an archive (.zip / .tar / .tar.gz / .tgz / .tar.bz2 /
+// .gz) into a directory inside the user's scope. Every destination path is
+// re-validated against the scope (zip-slip defense); symlink/hardlink/device
+// entries are skipped (they could escape the scope); total entry count and
+// uncompressed size are capped (decompression-bomb defense); extracted files
+// are chowned to the hosting user.
+//
+// Security notes:
+//   - The archive itself is resolved + opened through filesafe.Scope.
+//   - Each entry name is cleaned and joined to the (scoped) destination, then
+//     the result is re-Resolved so a "../../etc/passwd" or absolute-path entry
+//     is rejected, not written.
+//   - Files are created O_NOFOLLOW so a pre-planted symlink at the destination
+//     can't redirect the write outside the docroot.
+const (
+	maxExtractEntries   = 100_000
+	maxExtractTotalSize = int64(10) << 30 // 10 GiB uncompressed, total
+	maxExtractFileSize  = int64(5) << 30  // 5 GiB per file
+)
+
+type filesExtractParams struct {
+	UserID    string `json:"user_id"`
+	Username  string `json:"username"`
+	AdminRoot bool   `json:"admin_root"`     // GH #1184 admin FM
+	Path      string `json:"path"`           // archive to extract (scope-relative)
+	Dest      string `json:"dest,omitempty"` // target dir; default = archive's parent
+}
+
+type filesExtractResult struct {
+	Dest      string `json:"dest"`
+	Extracted int    `json:"extracted"`
+	Skipped   int    `json:"skipped"` // symlinks/unsafe entries not written
+}
+
+func filesExtractHandler(ctx context.Context, params json.RawMessage) (any, error) {
+	var p filesExtractParams
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: fmt.Sprintf("failed to parse params: %v", err)}
+	}
+	if p.Username == "" || p.Path == "" {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: "username and path are required"}
+	}
+	return runExtract(ctx, p, nil)
+}
+
+// runExtract performs one archive extraction, sharing the exact scope/zip-slip/
+// decompression-bomb defenses of the synchronous path. When job is non-nil the
+// extractor reports progress into it (GH #1392 async path); nil = the sync
+// handler above.
+func runExtract(ctx context.Context, p filesExtractParams, job *fileJob) (any, error) {
+	scope, err := fileScopeFor(ctx, p.UserID, p.Username, p.AdminRoot)
+	if err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("failed to create scope: %v", err)}
+	}
+
+	cleanArchive, err := scope.Clean(p.Path)
+	if err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: fmt.Sprintf("path validation failed: %v", err)}
+	}
+
+	// JAB-358: the archive may be READ from anywhere the admin FM can browse
+	// (cleanArchive above, on the broad scope), but extraction WRITES land in a
+	// separate write scope narrowed to the safe data roots — the admin FM can
+	// unpack into /home, /var/www, … but never into /etc, /usr, systemd, etc.
+	// No-op for tenant scopes.
+	wscope := scope.WriteScope()
+
+	// Destination directory: explicit dest, else the archive's parent.
+	destRel := p.Dest
+	if strings.TrimSpace(destRel) == "" {
+		destRel = filepath.Dir(p.Path)
+	}
+	destDir, err := wscope.Clean(destRel)
+	if err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: fmt.Sprintf("destination validation failed: %v", err)}
+	}
+	// Verify the destination is an existing directory via the escape-proof stat,
+	// not an os.Stat(string) that re-resolves a swapped parent.
+	if di, derr := wscope.StatInScope(destDir); derr != nil || !di.IsDir {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: "destination is not a directory"}
+	}
+
+	uid, gid := fileOwnerIDs(ctx, p.Username, p.AdminRoot)
+
+	// SECURITY (Gitea #423 write side / #424): every extracted entry is created
+	// relative to an escape-proof destDir fd (openat/mkdirat O_NOFOLLOW per
+	// component), so a tenant-planted parent-directory symlink inside their own
+	// destDir (e.g. sub -> /etc/cron.d) cannot redirect a root-side write.
+	ed, err := wscope.NewExtractDir(destDir, uid, gid)
+	if err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("failed to open destination: %v", err)}
+	}
+	defer ed.Close()
+
+	// JAB-387: cap the extraction wall-clock; the per-entry ctx.Err() checks in
+	// untar/unzip enforce it.
+	ctx, cancel := context.WithTimeout(ctx, extractWallClockBudget)
+	defer cancel()
+
+	ex := &extractor{ctx: ctx, ed: ed, job: job}
+
+	// SECURITY (Gitea #423): open the archive through the escape-proof fd. The
+	// previous scope.Open(p.Path) / zip.OpenReader(path) re-resolved the path and
+	// followed a tenant-planted PARENT symlink, letting a tenant read another
+	// tenant's / root's archive. OpenInScope (RESOLVE_BENEATH) cannot be
+	// redirected out of the docroot.
+	f, err := scope.OpenInScope(cleanArchive, os.O_RDONLY, 0)
+	if err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeNotFound, Message: fmt.Sprintf("failed to open archive: %v", err)}
+	}
+	defer f.Close()
+
+	lower := strings.ToLower(p.Path)
+	switch {
+	case strings.HasSuffix(lower, ".zip"):
+		err = ex.unzip(f)
+	case strings.HasSuffix(lower, ".tar.gz"), strings.HasSuffix(lower, ".tgz"):
+		var gz *gzip.Reader
+		if gz, err = gzip.NewReader(f); err == nil {
+			defer gz.Close()
+			err = ex.untar(gz)
+		}
+	case strings.HasSuffix(lower, ".tar.bz2"), strings.HasSuffix(lower, ".tbz2"):
+		err = ex.untar(bzip2.NewReader(f))
+	case strings.HasSuffix(lower, ".tar"):
+		err = ex.untar(f)
+	case strings.HasSuffix(lower, ".gz"):
+		// Single-file gunzip -> drop the .gz suffix.
+		err = ex.gunzipSingle(f, strings.TrimSuffix(filepath.Base(p.Path), filepath.Ext(p.Path)))
+	default:
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: "unsupported archive type (supported: .zip, .tar, .tar.gz, .tgz, .tar.bz2, .gz)"}
+	}
+	if err != nil {
+		if ae, ok := err.(*agentwire.AgentError); ok {
+			return nil, ae
+		}
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("extract failed: %v", err)}
+	}
+
+	return filesExtractResult{Dest: destRel, Extracted: ex.extracted, Skipped: ex.skipped}, nil
+}
+
+// extractor carries the scope + running counters/limits across one archive.
+type extractor struct {
+	ctx       context.Context // GH #664: cancellation for the extract loop
+	ed        *filesafe.ExtractDir
+	extracted int
+	skipped   int
+	total     int64
+	job       *fileJob // GH #1392: non-nil on the async path — receives progress
+}
+
+// tick reports the running entry count into the async job (no-op on the sync
+// path). Called once per processed archive entry.
+func (ex *extractor) tick() {
+	if ex.job != nil {
+		ex.job.tick(int64(ex.extracted + ex.skipped))
+	}
+}
+
+// isUnsafeExtractTarget reports whether an extract create/mkdir error means the
+// target (or a parent component) is a planted symlink / not-a-directory / an
+// already-conflicting node — such entries are skipped, never written through.
+func isUnsafeExtractTarget(err error) bool {
+	if errors.Is(err, unix.ELOOP) || errors.Is(err, unix.ENOTDIR) || errors.Is(err, os.ErrExist) {
+		return true
+	}
+	var ve *filesafe.ValidationError
+	return errors.As(err, &ve)
+}
+
+// safeDest cleans an archive entry name and resolves it inside destDir,
+// rejecting absolute paths and "../" escapes. Returns the validated absolute
+// destination path.
+func (ex *extractor) safeDest(name string) (string, error) {
+	name = strings.ReplaceAll(name, `\`, "/")
+	if name == "" || name == "." {
+		return "", &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: "empty archive entry name"}
+	}
+	escape := func() (string, error) {
+		return "", &agentwire.AgentError{Code: agentwire.CodePermissionDenied, Message: fmt.Sprintf("archive entry escapes destination: %q", name)}
+	}
+	// Reject absolute paths and any ".." traversal outright (rather than
+	// silently re-rooting) so a malicious archive surfaces an error.
+	if strings.HasPrefix(name, "/") || filepath.IsAbs(name) {
+		return escape()
+	}
+	cleaned := filepath.Clean(name)
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return escape()
+	}
+	// Return the cleaned RELATIVE path; the write descends from the destDir fd
+	// component-by-component (escape-proof), so we never hand an absolute string
+	// to an os.* call that would re-resolve a planted parent symlink (#423 write).
+	return cleaned, nil
+}
+
+func (ex *extractor) bump(n int64) error {
+	ex.total += n
+	if ex.total > maxExtractTotalSize {
+		return &agentwire.AgentError{Code: agentwire.CodeFailedPrecondition, Message: "archive exceeds the uncompressed size limit"}
+	}
+	return nil
+}
+
+func (ex *extractor) mkdirAll(dir string, mode os.FileMode) error {
+	if err := ex.ed.MkdirAll(dir, mode); err != nil {
+		if isUnsafeExtractTarget(err) {
+			ex.skipped++
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// writeFile streams r into the entry at rel (a destDir-relative path), creating
+// intermediate dirs and the leaf via the escape-proof ExtractDir (openat/mkdirat
+// O_NOFOLLOW per component). A symlink planted at the leaf OR any parent
+// component is refused and the entry skipped — root never writes THROUGH it
+// (Gitea #423 write side). Capped at the per-file + total limits.
+func (ex *extractor) writeFile(rel string, mode os.FileMode, r io.Reader) error {
+	if mode == 0 {
+		mode = 0o644
+	}
+	// GH #654: a tenant secret (wp-config.php/.env) inside an archive must land
+	// owner-only, same as when written/uploaded — not the archive's stored mode.
+	mode = sensitiveFileMode(rel, mode)
+	out, err := ex.ed.Create(rel, mode)
+	if err != nil {
+		if isUnsafeExtractTarget(err) {
+			ex.skipped++
+			return nil
+		}
+		return err
+	}
+
+	limited := io.LimitReader(r, maxExtractFileSize+1)
+	n, cpErr := io.Copy(out, limited)
+	out.Close()
+	if cpErr != nil {
+		return cpErr
+	}
+	if n > maxExtractFileSize {
+		_ = ex.ed.Remove(rel)
+		return &agentwire.AgentError{Code: agentwire.CodeFailedPrecondition, Message: "an archived file exceeds the per-file size limit"}
+	}
+	if err := ex.bump(n); err != nil {
+		_ = ex.ed.Remove(rel)
+		return err
+	}
+	ex.extracted++
+	return nil
+}
+
+func (ex *extractor) countGuard() error {
+	if ex.extracted+ex.skipped >= maxExtractEntries {
+		return &agentwire.AgentError{Code: agentwire.CodeFailedPrecondition, Message: "archive has too many entries"}
+	}
+	return nil
+}
+
+func (ex *extractor) unzip(f *os.File) error {
+	// Random-access zip read straight from the escape-proof fd (no path reopen).
+	fi, err := f.Stat()
+	if err != nil {
+		return &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("stat archive: %v", err)}
+	}
+	zr, err := zip.NewReader(f, fi.Size())
+	if err != nil {
+		return &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: fmt.Sprintf("not a valid zip: %v", err)}
+	}
+	if ex.job != nil {
+		ex.job.setTotal(int64(len(zr.File))) // zip TOC → a real percentage
+	}
+	for _, zf := range zr.File {
+		if err := ex.ctx.Err(); err != nil { // GH #664
+			return err
+		}
+		if err := ex.countGuard(); err != nil {
+			return err
+		}
+		dest, err := ex.safeDest(zf.Name)
+		if err != nil {
+			return err
+		}
+		info := zf.FileInfo()
+		switch {
+		case info.IsDir():
+			if err := ex.mkdirAll(dest, info.Mode()); err != nil {
+				return err
+			}
+		case info.Mode()&os.ModeSymlink != 0, info.Mode()&os.ModeType != 0 && !info.Mode().IsRegular():
+			ex.skipped++ // symlink / device / fifo — never materialize
+		default:
+			rc, err := zf.Open()
+			if err != nil {
+				return err
+			}
+			err = ex.writeFile(dest, info.Mode(), rc)
+			rc.Close()
+			if err != nil {
+				return err
+			}
+		}
+		ex.tick()
+	}
+	return nil
+}
+
+func (ex *extractor) untar(r io.Reader) error {
+	tr := tar.NewReader(r)
+	for {
+		if err := ex.ctx.Err(); err != nil { // GH #664
+			return err
+		}
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
+			return &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: fmt.Sprintf("not a valid tar: %v", err)}
+		}
+		if err := ex.countGuard(); err != nil {
+			return err
+		}
+		dest, err := ex.safeDest(hdr.Name)
+		if err != nil {
+			return err
+		}
+		switch hdr.Typeflag {
+		case tar.TypeDir:
+			if err := ex.mkdirAll(dest, os.FileMode(hdr.Mode)); err != nil {
+				return err
+			}
+		case tar.TypeReg, tar.TypeRegA:
+			if err := ex.writeFile(dest, os.FileMode(hdr.Mode), tr); err != nil {
+				return err
+			}
+		default:
+			// Symlink, hardlink, char/block device, fifo — skip (unsafe).
+			ex.skipped++
+		}
+		ex.tick()
+	}
+}
+
+func (ex *extractor) gunzipSingle(r io.Reader, outName string) error {
+	if outName == "" {
+		outName = "extracted"
+	}
+	gz, err := gzip.NewReader(r)
+	if err != nil {
+		return &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: fmt.Sprintf("not a valid gzip: %v", err)}
+	}
+	defer gz.Close()
+	dest, err := ex.safeDest(outName)
+	if err != nil {
+		return err
+	}
+	werr := ex.writeFile(dest, 0o644, gz)
+	ex.tick()
+	return werr
+}
+
+// hostingIDs returns the uid + the www-data gid for the hosting user (matching
+// the ownership the other files.* handlers set). Falls back to the user's own
+// gid if www-data isn't present.
+func hostingIDs(username string) (int, int) {
+	u, err := user.Lookup(username)
+	if err != nil {
+		return 0, 0
+	}
+	uid, _ := strconv.Atoi(u.Uid)
+	gid, _ := strconv.Atoi(u.Gid)
+	if g, err := user.LookupGroup("www-data"); err == nil {
+		if wgid, err := strconv.Atoi(g.Gid); err == nil {
+			gid = wgid
+		}
+	}
+	return uid, gid
+}
+
+// filesExtractStartHandler (files.extract.start, GH #1392) kicks off an
+// extraction in a background goroutine and returns a job id immediately, so a
+// large archive can't block the HTTP request past a proxy timeout and the UI can
+// poll files.job.status for a progress bar. Same params + defenses as the
+// synchronous files.extract.
+func filesExtractStartHandler(ctx context.Context, params json.RawMessage) (any, error) {
+	var p filesExtractParams
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: fmt.Sprintf("failed to parse params: %v", err)}
+	}
+	if p.Username == "" || p.Path == "" {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: "username and path are required"}
+	}
+	job, err := newFileJob(p.Username, "extract")
+	if err != nil {
+		return nil, err
+	}
+	// JAB-357 AC4: extract builds its scope inside runExtract, which here runs in
+	// the detached goroutine below. Carry the connecting peer's identity onto that
+	// goroutine's context so the admin_root capability gate in fileScopeFor is
+	// evaluated with the SAME authorization the request was admitted with. We copy
+	// only the identity — not the request's deadline — onto a fresh Background so
+	// the long extraction is still not cancelled when the start call returns. An
+	// unauthorized peer that spoofs admin_root=true therefore fails the job closed
+	// (permission_denied), never silently gets the root scope.
+	jobCtx := withPeerIdentityFrom(context.Background(), ctx)
+	go func() {
+		res, rerr := runExtract(jobCtx, p, job)
+		if rerr != nil {
+			msg := "extract failed"
+			if ae, ok := rerr.(*agentwire.AgentError); ok && ae.Message != "" {
+				msg = ae.Message
+			}
+			job.fail(msg)
+			return
+		}
+		r, _ := res.(filesExtractResult)
+		job.finish(int64(r.Extracted+r.Skipped), r)
+	}()
+	return map[string]string{"job_id": job.id}, nil
+}
+
+type filesJobStatusParams struct {
+	JobID    string `json:"job_id"`
+	Username string `json:"username"`
+}
+
+// filesJobStatusHandler (files.job.status) returns a job's progress ONLY to a
+// caller passing the username the job was started for (the panel sends the
+// caller's verified username). Unknown id or wrong owner → not_found.
+func filesJobStatusHandler(_ context.Context, params json.RawMessage) (any, error) {
+	var p filesJobStatusParams
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: fmt.Sprintf("failed to parse params: %v", err)}
+	}
+	if p.JobID == "" || p.Username == "" {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: "job_id and username are required"}
+	}
+	j := getFileJob(p.JobID, p.Username)
+	if j == nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeNotFound, Message: "job not found"}
+	}
+	return j.snapshot(), nil
+}
+
+func init() {
+	Default.Register("files.extract", filesExtractHandler)
+	Default.Register("files.extract.start", filesExtractStartHandler)
+	Default.Register("files.job.status", filesJobStatusHandler)
+}

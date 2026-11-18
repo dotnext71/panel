@@ -1,0 +1,446 @@
+// mailbox_forwarder.go — M6.5 Step 5 forwarders (alias + external).
+//
+// Wire contract:
+//   GET    /mail/forwarders                    all forwarders for caller's mailboxes
+//   POST   /mailboxes/:mbid/forwarders         create forwarder (alias or external)
+//   DELETE /forwarders/:id                     delete
+//
+// Type=alias → x:EmailAlias on UserAccount.aliases.
+// Type=external → entry in dotnext-fwds sieve script (concatenated per mailbox).
+
+package api
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/dotnext-panel/dotnext/internal/mailaddr"
+	"github.com/dotnext-panel/dotnext/internal/agent"
+	"github.com/dotnext-panel/dotnext/internal/auth"
+	"github.com/dotnext-panel/dotnext/internal/forwarderops"
+	"github.com/dotnext-panel/dotnext/internal/ginctx"
+	"github.com/dotnext-panel/dotnext/internal/ids"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+)
+
+type MailboxForwarderHandlerConfig struct {
+	Mailboxes      repository.MailboxRepository
+	Domains        repository.DomainRepository
+	Forwarders     repository.EmailForwarderRepository
+	Autoresponders repository.EmailAutoresponderRepository
+	Agent          agent.AgentInterface
+	// Addresses takes a new alias's address off the other Stalwart accounts
+	// that still hold it, best effort (the reconciler's sweep catches what
+	// this misses). Nil skips it.
+	Addresses MailAddressReleaser
+}
+
+type forwarderResponse struct {
+	ID           string `json:"id"`
+	MailboxID    string `json:"mailbox_id"`
+	MailboxEmail string `json:"mailbox_email"`
+	DomainID     string `json:"domain_id"`
+	DomainName   string `json:"domain_name"`
+	Type         string `json:"type"`
+	LocalPart    string `json:"local_part,omitempty"`
+	Target       string `json:"target"`
+	KeepCopy     bool   `json:"keep_copy"`
+	Enabled      bool   `json:"enabled"`
+	CreatedAt    string `json:"created_at"`
+	// Warning is set (GH #1795) when the row was persisted but the follow-up
+	// forwarder.apply to Stalwart failed — the DB is truth, so the row stands,
+	// but forwarding is NOT live until it converges. Without this the endpoint
+	// returned 201 on a failed converge, so a forwarder that never actually
+	// forwards looked like a success. omitempty: absent on the normal path and
+	// on list/get (which never converge).
+	Warning *forwarderWarning `json:"warning,omitempty"`
+}
+
+// forwarderWarning describes a non-fatal convergence failure surfaced on an
+// otherwise-successful forwarder write.
+type forwarderWarning struct {
+	Code   string `json:"code"`
+	Detail string `json:"detail"`
+}
+
+type forwarderCreateRequest struct {
+	Type      string `json:"type"`       // alias | external
+	LocalPart string `json:"local_part"` // for alias
+	Target    string `json:"target"`     // for external (email); for alias (mailbox@domain)
+	KeepCopy  bool   `json:"keep_copy"`  // external only: keep a copy in the mailbox
+}
+
+type forwarderHandler struct {
+	cfg MailboxForwarderHandlerConfig
+}
+
+func RegisterMailboxForwarderRoutes(g *gin.RouterGroup, cfg MailboxForwarderHandlerConfig) {
+	if cfg.Forwarders == nil {
+		return
+	}
+	h := &forwarderHandler{cfg: cfg}
+	g.GET("/mail/forwarders", h.listAll)
+	g.POST("/mailboxes/:mbid/forwarders", h.create)
+	g.DELETE("/forwarders/:id", h.del)
+	// Domain-scoped (NULL mailbox) forwarders — M35 DA importer leaves
+	// /etc/virtual/<dom>/aliases entries here. Read-only for now;
+	// Stalwart push deferred to a follow-up reconciler phase.
+	g.GET("/mail/forwarders/domain-scoped", h.listDomainScoped)
+}
+
+func (h *forwarderHandler) loadMailbox(ctx context.Context, id string, claims *auth.AccessClaims) (*models.Mailbox, *models.Domain, error) {
+	mb, err := h.cfg.Mailboxes.FindByID(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	dom, err := h.cfg.Domains.FindByID(ctx, mb.DomainID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !claims.IsAdmin && dom.UserID != claims.UserID {
+		return nil, nil, errMailboxForbidden
+	}
+	return mb, dom, nil
+}
+
+func (h *forwarderHandler) listAll(c *gin.Context) {
+	ctx := c.Request.Context()
+	claims := ginctx.Claims(c)
+	page, pageSize := paginationParams(c)
+	opts := repository.ListOptions{Offset: (page - 1) * pageSize, Limit: pageSize}
+
+	// JAB-107: scope to the tenant in SQL so every one of their forwarders is
+	// returned regardless of the global row count (the old global newest-500
+	// window hid a tenant's rows past 500 total). Admins keep the cross-tenant
+	// view via ListAll.
+	var (
+		fwds  []models.EmailForwarder
+		total int64
+		err   error
+	)
+	// GH #1997: a mail domain's page lists that domain's forwarders only.
+	scope, ok := listDomainFilter(c, h.cfg.Domains, claims)
+	if !ok {
+		return
+	}
+	if scope != nil {
+		fwds, total, err = h.cfg.Forwarders.ListMailboxForwardersByDomainID(ctx, scope.ID, opts)
+	} else if claims.IsAdmin {
+		fwds, total, err = h.cfg.Forwarders.ListAll(ctx, opts)
+	} else {
+		fwds, total, err = h.cfg.Forwarders.ListByUserID(ctx, claims.UserID, opts)
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal", "detail": "the server could not complete the request"})
+		return
+	}
+	// JAB-147: batch-load the mailboxes + domains once instead of a per-row
+	// FindByID pair (N+1). Build id→row maps, then resolve from memory.
+	mbIDs := make([]string, 0, len(fwds))
+	domIDs := make([]string, 0, len(fwds))
+	for _, f := range fwds {
+		if f.MailboxID != nil {
+			mbIDs = append(mbIDs, *f.MailboxID)
+		}
+		domIDs = append(domIDs, f.DomainID)
+	}
+	mbByID := mailboxMapByID(ctx, h.cfg.Mailboxes, mbIDs)
+	domByID := domainMapByID(ctx, h.cfg.Domains, domIDs)
+
+	items := make([]forwarderResponse, 0, len(fwds))
+	for _, f := range fwds {
+		if f.MailboxID == nil {
+			// Domain-scoped DA-imported forwarder; M65 mailbox-keyed UI
+			// can't render it. Skip — future domain-scoped endpoint will
+			// surface these. (ListByUserID already excludes these; only the
+			// admin ListAll path reaches here.)
+			continue
+		}
+		mb := mbByID[*f.MailboxID]
+		dom := domByID[f.DomainID]
+		if mb == nil || dom == nil {
+			continue
+		}
+		if !claims.IsAdmin && dom.UserID != claims.UserID {
+			continue // defense-in-depth; ListByUserID already enforces this
+		}
+		items = append(items, h.resolve(ctx, f, mb, dom))
+	}
+	c.JSON(http.StatusOK, gin.H{"data": items, "total": total, "page": page, "page_size": pageSize})
+}
+
+// applyForwarders re-lists a mailbox's forwarders and pushes the full
+// desired state to Stalwart via forwarder.apply. Best-effort: the DB is
+// truth, so a transient agent failure is logged and retried on the next
+// mutation. GH #237 — until this was added, forwarders were written to the
+// DB but NEVER converged: the reconciler phase that was meant to push them
+// was never wired (removed in GH #1795 as dead code). This inline dispatch,
+// mirroring autoresponder.set, is the sole convergence path; the agent's
+// forwarder.apply self-heals the Stalwart Principal when it isn't registered
+// yet (GH #1795), so a forwarder added to a brand-new mailbox still lands.
+// applyForwarders converges the mailbox's forwarders and returns the failure
+// (also logged) so the caller can surface it — a persisted row whose apply
+// failed is not forwarding yet, and the caller must not report unqualified
+// success (GH #1795). The DB stays truth; the error is advisory.
+func (h *forwarderHandler) applyForwarders(ctx context.Context, mb *models.Mailbox, dom *models.Domain) error {
+	if err := forwarderops.Converge(ctx, h.cfg.Agent, h.cfg.Forwarders, h.cfg.Autoresponders, mb.ID, mb.LocalPart+"@"+dom.Name); err != nil {
+		slog.Warn("forwarder.apply: convergence failed", "mailbox_id", mb.ID, "err", err)
+		return err
+	}
+	return nil
+}
+
+func (h *forwarderHandler) create(c *gin.Context) {
+	ctx := c.Request.Context()
+	claims := ginctx.Claims(c)
+	mb, dom, err := h.loadMailbox(ctx, c.Param("mbid"), claims)
+	if err != nil {
+		h.writeErr(c, err)
+		return
+	}
+	// GH #1816 / ADR-0170: no new addresses on a name that is not proven
+	// (a domain that went back to pending keeps its mailboxes, not new aliases).
+	if !dom.Verified() {
+		c.JSON(http.StatusConflict, gin.H{"error": "domain_ownership_pending", "detail": "prove ownership of the domain before adding forwarders"})
+		return
+	}
+	var req forwarderCreateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body", "detail": "the forwarder is incomplete"})
+		return
+	}
+	if req.Type != "alias" && req.Type != "external" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_type", "detail": "type must be alias or external"})
+		return
+	}
+	if req.Type == "alias" && req.LocalPart == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "alias_requires_local_part", "detail": "an alias needs its address"})
+		return
+	}
+	// postmaster@ on a tenant domain is the server admin's (ADR-0110).
+	if req.Type == "alias" && mailaddr.CheckPostmasterOn(req.LocalPart, dom.IsPanelPrimary) != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "reserved_local_part", "detail": "postmaster@ belongs to the server administrator"})
+		return
+	}
+	if req.Target == "" {
+		// External default target is the mailbox itself. For an ALIAS the target
+		// column is unused at apply (delivery is by local_part -> mailbox), but it
+		// is part of uq_external_forward(mailbox_id,type,target) — every alias used
+		// to default to the SAME mailbox address, so the 2nd alias collided on that
+		// key and failed (GH #280). Store the alias's OWN address, which is unique
+		// per alias, so a mailbox can hold many aliases.
+		if req.Type == "alias" {
+			req.Target = models.AliasForwarderTarget(req.LocalPart, dom.Name)
+		} else {
+			req.Target = mb.LocalPart + "@" + dom.Name
+		}
+	}
+	f := &models.EmailForwarder{
+		ID:        ids.NewULID(),
+		MailboxID: &mb.ID,
+		DomainID:  dom.ID,
+		Type:      req.Type,
+		Target:    req.Target,
+		Enabled:   true,
+		ManagedBy: "m6.5",
+	}
+	if req.Type == "alias" {
+		lp := req.LocalPart
+		f.LocalPart = &lp
+	}
+	if req.Type == "external" {
+		f.KeepCopy = req.KeepCopy
+	}
+	if err := h.cfg.Forwarders.Create(ctx, f); err != nil {
+		if errors.Is(err, mailaddr.ErrLocalReserved) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "reserved_local_part", "detail": "postmaster@ belongs to the server administrator"})
+			return
+		}
+		if isDuplicateKeyErr(err) {
+			// uq_external_forward (this mailbox already forwards there) or
+			// uq_alias_local (the alias address is taken in the domain).
+			c.JSON(http.StatusConflict, gin.H{"error": "already_exists", "detail": "that forwarder or alias address already exists"})
+			return
+		}
+		if errors.Is(err, repository.ErrAddressInUse) {
+			c.JSON(http.StatusConflict, gin.H{"error": "address_in_use", "detail": "a mailbox already uses this address"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal", "detail": "the server could not complete the request"})
+		return
+	}
+	if f.Type == "alias" && f.LocalPart != nil && h.cfg.Addresses != nil {
+		// An alias that moved here from another mailbox is still on that
+		// mailbox's Stalwart account, which would keep its mail.
+		alias := *f.LocalPart + "@" + dom.Name
+		if err := h.cfg.Addresses.ReleaseTo(ctx, alias, mb.LocalPart+"@"+dom.Name); err != nil {
+			slog.Warn("forwarder create: stale alias release failed; the sweep retries", "alias", alias, "err", err)
+		}
+	}
+	resp := h.resolve(ctx, *f, mb, dom)
+	if err := h.applyForwarders(ctx, mb, dom); err != nil {
+		// Row persisted, but it is not forwarding until Stalwart converges.
+		// Surface it instead of a bare 201 (GH #1795). The agent's error text
+		// can name panel internals (the agent socket path, Stalwart replies),
+		// so only an admin gets it to diagnose; a tenant gets a fixed detail.
+		// applyForwarders logs the full error either way.
+		detail := "saved, but the mail server did not accept it, so it is not forwarding yet"
+		if claims != nil && claims.IsAdmin {
+			detail = err.Error()
+		}
+		resp.Warning = &forwarderWarning{Code: "convergence_failed", Detail: detail}
+	}
+	c.JSON(http.StatusCreated, resp)
+}
+
+func (h *forwarderHandler) del(c *gin.Context) {
+	ctx := c.Request.Context()
+	claims := ginctx.Claims(c)
+	f, err := h.cfg.Forwarders.FindByID(ctx, c.Param("id"))
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not_found", "detail": "forwarder not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal", "detail": "the server could not complete the request"})
+		return
+	}
+	if f.MailboxID == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "domain_scoped_forwarder", "detail": "this is a domain-wide forwarder, not a mailbox forwarder"})
+		return
+	}
+	mb, dom, err := h.loadMailbox(ctx, *f.MailboxID, claims)
+	if err != nil {
+		h.writeErr(c, err)
+		return
+	}
+	if err := h.cfg.Forwarders.Delete(ctx, f.ID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal", "detail": "the server could not complete the request"})
+		return
+	}
+	if f.Type == "alias" && f.LocalPart != nil && h.cfg.Addresses != nil {
+		// Stalwart keeps a deleted alias on the account, which would go on
+		// receiving its mail. Best effort: a mailbox created at the address
+		// later clears it again before its row is written.
+		alias := *f.LocalPart + "@" + dom.Name
+		if err := h.cfg.Addresses.ReleaseAddress(ctx, alias); err != nil {
+			slog.Warn("forwarder delete: alias release failed", "alias", alias, "err", err)
+		}
+	}
+	// A failed re-converge on delete leaves a stale redirect, but 204 carries
+	// no body to surface it; the slog.Warn inside applyForwarders records it.
+	_ = h.applyForwarders(ctx, mb, dom)
+	// Stalwart 1.0 would go on taking mail for a deleted alias until its
+	// caches are dropped.
+	flushMailCaches(ctx, h.cfg.Agent, "forwarder delete")
+	c.JSON(http.StatusNoContent, nil)
+}
+
+func (h *forwarderHandler) resolve(_ context.Context, f models.EmailForwarder, mb *models.Mailbox, dom *models.Domain) forwarderResponse {
+	lp := ""
+	if f.LocalPart != nil {
+		lp = *f.LocalPart
+	}
+	return forwarderResponse{
+		ID: f.ID,
+		MailboxID: func() string {
+			if f.MailboxID != nil {
+				return *f.MailboxID
+			}
+			return ""
+		}(),
+		MailboxEmail: mb.LocalPart + "@" + dom.Name,
+		DomainID:     f.DomainID,
+		DomainName:   dom.Name,
+		Type:         f.Type,
+		LocalPart:    lp,
+		Target:       f.Target,
+		KeepCopy:     f.KeepCopy,
+		Enabled:      f.Enabled,
+		CreatedAt:    f.CreatedAt.Format("2006-01-02T15:04:05Z07:00"),
+	}
+}
+
+func (h *forwarderHandler) writeErr(c *gin.Context, err error) {
+	if isNotFound(err) {
+		c.JSON(http.StatusNotFound, gin.H{"error": "not_found", "detail": "mailbox not found"})
+		return
+	}
+	if errors.Is(err, errMailboxForbidden) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden", "detail": "you do not have access to that mailbox"})
+		return
+	}
+	c.JSON(http.StatusInternalServerError, gin.H{"error": "internal", "detail": "the server could not complete the request"})
+}
+
+// domainScopedForwarderResponse is the row shape for the NULL-
+// mailbox list. No mailbox_email — the entry redirects without a
+// source account.
+type domainScopedForwarderResponse struct {
+	ID         string `json:"id"`
+	DomainID   string `json:"domain_id"`
+	DomainName string `json:"domain_name"`
+	Type       string `json:"type"`
+	LocalPart  string `json:"local_part"`
+	Target     string `json:"target"`
+	Enabled    bool   `json:"enabled"`
+	ManagedBy  string `json:"managed_by"`
+	CreatedAt  string `json:"created_at"`
+}
+
+func (h *forwarderHandler) listDomainScoped(c *gin.Context) {
+	ctx := c.Request.Context()
+	claims := ginctx.Claims(c)
+	// GH #1997: a mail domain's page lists that domain's imported aliases only.
+	scope, ok := listDomainFilter(c, h.cfg.Domains, claims)
+	if !ok {
+		return
+	}
+	var (
+		fwds []models.EmailForwarder
+		err  error
+	)
+	if scope != nil {
+		fwds, _, err = h.cfg.Forwarders.ListByDomainID(ctx, scope.ID, repository.ListOptions{})
+	} else {
+		fwds, _, err = h.cfg.Forwarders.ListAll(ctx, repository.ListOptions{Limit: 1000})
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal", "detail": "the server could not complete the request"})
+		return
+	}
+	items := make([]domainScopedForwarderResponse, 0)
+	for _, f := range fwds {
+		if f.MailboxID != nil {
+			continue
+		}
+		dom := scope
+		if dom == nil {
+			d, err := h.cfg.Domains.FindByID(ctx, f.DomainID)
+			if err != nil {
+				continue
+			}
+			dom = d
+		}
+		if !claims.IsAdmin && dom.UserID != claims.UserID {
+			continue
+		}
+		lp := ""
+		if f.LocalPart != nil {
+			lp = *f.LocalPart
+		}
+		items = append(items, domainScopedForwarderResponse{
+			ID: f.ID, DomainID: f.DomainID, DomainName: dom.Name,
+			Type: f.Type, LocalPart: lp, Target: f.Target,
+			Enabled: f.Enabled, ManagedBy: f.ManagedBy,
+			CreatedAt: f.CreatedAt.Format(time.RFC3339),
+		})
+	}
+	c.JSON(http.StatusOK, gin.H{"data": items, "total": int64(len(items)), "page": 1, "page_size": len(items)})
+}

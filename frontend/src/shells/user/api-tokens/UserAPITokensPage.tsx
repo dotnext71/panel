@@ -1,0 +1,518 @@
+// User API Tokens — list / mint / revoke for the signed-in tenant.
+//
+// Wire path:   GET    /api/v1/me/api-tokens
+//              POST   /api/v1/me/api-tokens     {name, expires_in_seconds?, scopes?}
+//                       → {token: {…}, secret: "jat_…"}  (plaintext shown ONCE)
+//              DELETE /api/v1/me/api-tokens/:id
+//
+// The "shown once" rule is enforced server-side (the plaintext is
+// never persisted), so this page MUST surface it loudly in a modal
+// the user can't dismiss without copying. Anything else risks a
+// "wait, what was that secret?" support ticket.
+
+import { useTranslation } from "react-i18next";
+import { useEffect, useMemo, useState, type JSX } from "react";
+import { Alert, Button, Card, Checkbox, Form, Input, InputNumber, Modal, Popconfirm, Radio, Space, Table, Tag, Tooltip, Typography } from "antd";
+import { feedback } from "../../../lib/feedback"; // GH #970: themed toasts
+import type { ColumnsType } from "antd/es/table";
+
+// GH #245 / ADR-0144: per-area permissions. Empty scopes = full access (the
+// historical default). AREAS mirrors the panel-api scope vocabulary.
+// `actions` overrides the default Read + Write checkboxes for an area that has
+// only some of them, or other names for them (GH #2003, #2165: Redis read lists
+// key names, write deletes keys; nothing reveals the Redis password).
+type ScopeAction = { label: string; value: "read" | "write" };
+const DEFAULT_ACTIONS: ScopeAction[] = [
+  { label: "Read", value: "read" },
+  { label: "Write", value: "write" },
+];
+const AREAS: { key: string; label: string; actions?: ScopeAction[] }[] = [
+  { key: "dns", label: "DNS" },
+  { key: "mail", label: "Mail" },
+  { key: "files", label: "Files" },
+  { key: "databases", label: "Databases" },
+  { key: "apps", label: "Applications" },
+  { key: "domains", label: "Domains" },
+  { key: "ssl", label: "SSL" },
+  { key: "php", label: "PHP" },
+  { key: "cron", label: "Cron" },
+  // GH #2276, #2277: Composer runs and Git deploy take the ssh scope (they run
+  // in the SSH sandbox).
+  { key: "ssh", label: "SSH keys, Composer and Git deploy" },
+  { key: "backups", label: "Backups" },
+  { key: "logs", label: "Logs" },
+  { key: "notifications", label: "Notifications" },
+  {
+    key: "redis",
+    label: "Redis",
+    actions: [
+      { label: "List keys", value: "read" },
+      { label: "Delete keys", value: "write" },
+    ],
+  },
+];
+
+const SCOPE_LABELS: Record<string, string> = { ddns: "DDNS" };
+for (const a of AREAS) {
+  for (const act of a.actions ?? DEFAULT_ACTIONS) {
+    SCOPE_LABELS[`${act.value}:${a.key}`] = `${a.label} ${act.label.toLowerCase()}`;
+  }
+}
+import {
+  ApiOutlined,
+  DeleteOutlined,
+  KeyOutlined,
+  PlusOutlined,
+} from "@icons";
+import { apiClient } from "../../../apiClient";
+import { CopyableInput } from "../../../components/CopyableInput";
+import { APIDocsBrowser } from "../../shared/APIDocsPage";
+import { DDNSSetupGuide } from "./DDNSSetupGuide";
+import { MCPSetupGuide } from "./MCPSetupGuide";
+import { Timestamp } from "../../../components/Timestamp";
+
+type UserAPIToken = {
+  id: string;
+  user_id: string;
+  name: string;
+  secret_last4: string;
+  scopes: string[] | null;
+  last_used_at: string | null;
+  last_used_ip: string | null;
+  expires_at: string | null;
+  revoked_at: string | null;
+  created_at: string;
+};
+
+type CreateResponse = {
+  token: UserAPIToken;
+  secret: string;
+};
+
+// fmtDate shows a token time on the panel clock (GH #2164: the server's
+// timezone and date format, the same in every browser), UTC on hover.
+function fmtDate(s: string | null) {
+  if (!s) return "—";
+  return <Timestamp value={s} />;
+}
+
+// statusTag projects (revoked, expires_at) into a single coloured tag.
+function statusTag(t: UserAPIToken): JSX.Element {
+  if (t.revoked_at) {
+    return <Tag color="default">Revoked</Tag>;
+  }
+  if (t.expires_at && new Date(t.expires_at).getTime() < Date.now()) {
+    return <Tag color="orange">Expired</Tag>;
+  }
+  return <Tag color="green">Active</Tag>;
+}
+
+// GH #2244: the page is laid out like Notifications — its heading, then one
+// card whose tabs hold the tokens, the two setup guides and the API docs.
+const TAB_KEYS = ["tokens", "ddns", "mcp", "docs"] as const;
+type TabKey = (typeof TAB_KEYS)[number];
+
+const TAB_LABELS: Record<TabKey, string> = {
+  tokens: "Tokens",
+  ddns: "Dynamic DNS",
+  mcp: "MCP",
+  docs: "Automation API",
+};
+
+// A link to an API docs section (#tag-<slug>) opens the docs tab.
+const initialTab = (): TabKey => (window.location.hash.startsWith("#tag-") ? "docs" : "tokens");
+
+export function UserAPITokensPage(): JSX.Element {
+  const { t } = useTranslation();
+  const [tab, setTab] = useState<TabKey>(initialTab);
+  // Each tab mounts the first time it is opened and then stays mounted, so
+  // the MCP wizard keeps its step and the API docs are fetched once while
+  // the user goes to Tokens and back (as the old <Tabs> did).
+  const [visited, setVisited] = useState<ReadonlySet<TabKey>>(() => new Set([tab]));
+  const [rows, setRows] = useState<UserAPIToken[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [createOpen, setCreateOpen] = useState(false);
+  const [secret, setSecret] = useState<{ secret: string; name: string } | null>(
+    null,
+  );
+  const [createForm] = Form.useForm<{
+    name: string;
+    expires_in_seconds?: number;
+  }>();
+  const [accessMode, setAccessMode] = useState<"full" | "custom">("full");
+  const [scopeSel, setScopeSel] = useState<Record<string, string[]>>({});
+  const [ddnsSel, setDdnsSel] = useState(false);
+  const [ddnsRecordId, setDdnsRecordId] = useState("");
+
+  const load = async () => {
+    setLoading(true);
+    try {
+      const resp = await apiClient.get<{ items: UserAPIToken[] }>(
+        "/me/api-tokens",
+      );
+      setRows(resp.data.items ?? []);
+    } catch (err) {
+      const e = err as { message?: string };
+      feedback.message.error(`Failed to load API tokens: ${e.message ?? "Unknown error"}`);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    void load();
+  }, []);
+
+  useEffect(() => {
+    if (createOpen) {
+      setAccessMode("full");
+      setScopeSel({});
+      setDdnsSel(false);
+      setDdnsRecordId("");
+    }
+  }, [createOpen]);
+
+  const onCreate = async () => {
+    try {
+      const values = await createForm.validateFields();
+      const body: { name: string; expires_in_seconds?: number; scopes?: string[] } = {
+        name: values.name,
+      };
+      if (values.expires_in_seconds && values.expires_in_seconds > 0) {
+        body.expires_in_seconds = values.expires_in_seconds;
+      }
+      if (accessMode === "custom") {
+        const scopes: string[] = [];
+        for (const a of AREAS) {
+          for (const act of scopeSel[a.key] ?? []) scopes.push(`${act}:${a.key}`);
+        }
+        if (ddnsSel) scopes.push("ddns");
+        if (ddnsSel && ddnsRecordId.trim()) scopes.push(`record:${ddnsRecordId.trim()}`);
+        if (scopes.length === 0) {
+          feedback.message.error("Select at least one permission — pick some, or choose Full access.");
+          return;
+        }
+        body.scopes = scopes;
+      }
+      const resp = await apiClient.post<CreateResponse>("/me/api-tokens", body);
+      setSecret({ secret: resp.data.secret, name: resp.data.token.name });
+      setCreateOpen(false);
+      createForm.resetFields();
+      void load();
+    } catch (err) {
+      // validateFields throws with a list of errors; nothing to toast.
+      if ((err as { errorFields?: unknown }).errorFields) return;
+      const e = err as { message?: string };
+      feedback.message.error(`Failed to create token: ${e.message ?? "Unknown error"}`);
+    }
+  };
+
+  const onRevoke = async (t: UserAPIToken) => {
+    try {
+      await apiClient.delete(`/me/api-tokens/${t.id}`);
+      feedback.message.success(`Token "${t.name}" revoked`);
+      void load();
+    } catch (err) {
+      const e = err as { message?: string };
+      feedback.message.error(`Failed to revoke token: ${e.message ?? "Unknown error"}`);
+    }
+  };
+
+
+  const columns: ColumnsType<UserAPIToken> = useMemo(
+    () => [
+      {
+        title: "Name",
+        dataIndex: "name",
+        sorter: (a, b) => a.name.localeCompare(b.name),
+        defaultSortOrder: "ascend" as const,
+        render: (name: string, row) => (
+          <Space>
+            <KeyOutlined />
+            <span>{name}</span>
+            <Typography.Text type="secondary">
+              (jat_…{row.secret_last4})
+            </Typography.Text>
+          </Space>
+        ),
+      },
+      {
+        title: "Permissions",
+        render: (_: unknown, row) =>
+          row.scopes && row.scopes.length > 0 ? (
+            <Space size={[0, 4]} wrap>
+              {row.scopes.map((sc) => (
+                <Tag key={sc}>{SCOPE_LABELS[sc] ?? sc}</Tag>
+              ))}
+            </Space>
+          ) : (
+            <Tag color="blue">Full access</Tag>
+          ),
+      },
+      {
+        title: "Status",
+        render: (_: unknown, row) => statusTag(row),
+      },
+      {
+        title: "Created",
+        dataIndex: "created_at",
+        sorter: (a, b) => (a.created_at ? +new Date(a.created_at) : 0) - (b.created_at ? +new Date(b.created_at) : 0),
+        render: fmtDate,
+      },
+      {
+        title: "Last used",
+        render: (_: unknown, row) => (
+          <Tooltip
+            title={
+              row.last_used_ip
+                ? `from ${row.last_used_ip}`
+                : "no usage recorded"
+            }
+          >
+            <span>{fmtDate(row.last_used_at)}</span>
+          </Tooltip>
+        ),
+      },
+      {
+        title: "Expires",
+        dataIndex: "expires_at",
+        sorter: (a, b) => (a.expires_at ? +new Date(a.expires_at) : 0) - (b.expires_at ? +new Date(b.expires_at) : 0),
+        render: fmtDate,
+      },
+      {
+        title: "Actions",
+        render: (_: unknown, row) =>
+          row.revoked_at ? (
+            <Typography.Text type="secondary">
+              revoked {fmtDate(row.revoked_at)}
+            </Typography.Text>
+          ) : (
+            <Popconfirm
+              title={t("userapitokenspage.revoke_this_token")}
+              description={t("userapitokenspage.any_script_using_it_will_start_getting_401")}
+              okText={t("userapitokenspage.revoke")}
+              okType="danger"
+              onConfirm={() => onRevoke(row)}
+            >
+              <Button danger icon={<DeleteOutlined />} size="small">
+                Revoke
+              </Button>
+            </Popconfirm>
+          ),
+      },
+    ],
+    [],
+  );
+
+  const tokensTab = (
+    <>
+      <div
+        style={{
+          display: "flex",
+          alignItems: "flex-start",
+          gap: 16,
+          flexWrap: "wrap",
+          marginBottom: 16,
+        }}
+      >
+        <Typography.Paragraph type="secondary" style={{ margin: 0, flex: 1, minWidth: 260 }}>
+          Tokens authenticate API requests as you, scoped to resources
+          you own. Use them to script the documented{" "}
+          <Typography.Text strong>Automation API</Typography.Text> — DNS
+          records, WordPress deploys, a DDNS updater on your router, and the
+          other endpoints listed under Automation API (a stable, documented
+          subset, not every endpoint the web UI uses). Send the token as{" "}
+          <Typography.Text code>Authorization: Bearer jat_…</Typography.Text>
+          .
+        </Typography.Paragraph>
+        <Button
+          type="primary"
+          icon={<PlusOutlined />}
+          onClick={() => setCreateOpen(true)}
+        >
+          New token
+        </Button>
+      </div>
+
+      <Table<UserAPIToken>
+        rowKey="id"
+        loading={loading}
+        dataSource={rows}
+        columns={columns}
+        pagination={false}
+        scroll={{ x: "max-content" }}
+      />
+    </>
+  );
+
+  const renderTab = (k: TabKey) => {
+    switch (k) {
+      case "tokens":
+        return tokensTab;
+      case "ddns":
+        return <DDNSSetupGuide />;
+      case "mcp":
+        return <MCPSetupGuide />;
+      case "docs":
+        return <APIDocsBrowser />;
+    }
+  };
+
+  return (
+    <div>
+      <Typography.Title level={3} style={{ marginTop: 0, marginBottom: 16 }}>
+        <ApiOutlined /> {t("userapitokenspage.personal_api_tokens")}
+      </Typography.Title>
+
+      <Card
+        tabList={TAB_KEYS.map((k) => ({
+          key: k,
+          // nowrap so "Automation API" stays on one line at phone width, as on
+          // the Notifications page.
+          tab: <span style={{ whiteSpace: "nowrap" }}>{TAB_LABELS[k]}</span>,
+        }))}
+        activeTabKey={tab}
+        onTabChange={(k) => {
+          setTab(k as TabKey);
+          setVisited((prev) => new Set(prev).add(k as TabKey));
+        }}
+      >
+        {TAB_KEYS.filter((k) => visited.has(k)).map((k) => (
+          <div key={k} hidden={k !== tab}>
+            {renderTab(k)}
+          </div>
+        ))}
+      </Card>
+
+      <Modal
+        title={t("userapitokenspage.create_api_token")}
+        open={createOpen}
+        onCancel={() => {
+          setCreateOpen(false);
+          createForm.resetFields();
+        }}
+        onOk={onCreate}
+        okText={t("userapitokenspage.create")}
+      >
+        <Form form={createForm} layout="vertical">
+          <Form.Item
+            label={t("userapitokenspage.name")}
+            name="name"
+            rules={[
+              { required: true, message: "Required" },
+              { max: 100, message: "Max 100 characters" },
+            ]}
+            extra="A label for you — e.g. 'office router DDNS', 'CI deploy bot'."
+          >
+            <Input placeholder={t("userapitokenspage.my_token")} autoFocus maxLength={100} />
+          </Form.Item>
+          <Form.Item
+            label={t("userapitokenspage.expires_in_seconds_optional")}
+            name="expires_in_seconds"
+            extra="Leave blank for a token that never expires. Max 1 year (31536000)."
+            rules={[
+              {
+                type: "number",
+                min: 60,
+                max: 31536000,
+                message: "60 to 31,536,000 (1 minute to 1 year)",
+              },
+            ]}
+          >
+            <InputNumber
+              min={60}
+              max={31536000}
+              step={3600}
+              style={{ width: "100%" }}
+              placeholder="e.g. 86400 for 1 day"
+            />
+          </Form.Item>
+          <Form.Item
+            label={t("userapitokenspage.permissions")}
+            tooltip={t("userapitokenspage.full_access_can_do_anything_you_can_a_custom")}
+          >
+            <Radio.Group
+              value={accessMode}
+              onChange={(e) => setAccessMode(e.target.value)}
+              style={{ marginBottom: accessMode === "custom" ? 12 : 0 }}
+            >
+              <Radio value="full">Full access</Radio>
+              <Radio value="custom">Custom</Radio>
+            </Radio.Group>
+            {accessMode === "custom" && (
+              <div
+                style={{
+                  maxHeight: 280,
+                  overflowY: "auto",
+                  border: "1px solid #f0f0f0",
+                  borderRadius: 6,
+                  padding: 12,
+                }}
+              >
+                <div style={{ marginBottom: 10 }}>
+                  <Checkbox checked={ddnsSel} onChange={(e) => setDdnsSel(e.target.checked)}>
+                    DDNS only — update DNS records from a router (safe for router config)
+                  </Checkbox>
+                  {ddnsSel && (
+                    <div style={{ marginTop: 6, marginLeft: 24 }}>
+                      <Input
+                        size="small"
+                        placeholder={t("userapitokenspage.limit_to_one_dns_record_id_optional")}
+                        value={ddnsRecordId}
+                        onChange={(e) => setDdnsRecordId(e.target.value)}
+                        allowClear
+                      />
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        Leave blank to allow updating any of your DNS records. The record ID is shown on the domain&apos;s DNS page.
+                      </Typography.Text>
+                    </div>
+                  )}
+                </div>
+                {AREAS.map((a) => (
+                  <div
+                    key={a.key}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      justifyContent: "space-between",
+                      marginBottom: 6,
+                    }}
+                  >
+                    <span style={{ width: 120 }}>{a.label}</span>
+                    <Checkbox.Group
+                      options={a.actions ?? DEFAULT_ACTIONS}
+                      value={scopeSel[a.key] ?? []}
+                      onChange={(v) =>
+                        setScopeSel((prev) => ({ ...prev, [a.key]: v as string[] }))
+                      }
+                    />
+                  </div>
+                ))}
+              </div>
+            )}
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      <Modal
+        title={`Token created: ${secret?.name ?? ""}`}
+        open={!!secret}
+        onCancel={() => setSecret(null)}
+        onOk={() => setSecret(null)}
+        okText={t("userapitokenspage.i_ve_copied_it")}
+        cancelButtonProps={{ style: { display: "none" } }}
+        closable={false}
+        maskClosable={false}
+      >
+        <Alert
+          type="warning"
+          showIcon
+          message={t("userapitokenspage.copy_this_secret_now")}
+          description={t("userapitokenspage.the_plaintext_token_is_shown_only_once_after")}
+          style={{ marginBottom: 16 }}
+        />
+        <CopyableInput value={secret?.secret ?? ""} style={{ fontFamily: "monospace" }} />
+      </Modal>
+    </div>
+  );
+}

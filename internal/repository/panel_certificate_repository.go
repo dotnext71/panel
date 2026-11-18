@@ -1,0 +1,317 @@
+package repository
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+
+	"github.com/dotnext-panel/dotnext/internal/models"
+)
+
+// PanelCertificateRepository owns the panel_certificate rows. Post
+// ADR-0105 there are two rows discriminated by `kind` ∈
+// {hostname, mail}; each is an independent cert lifecycle. The
+// non-kind methods operate on the hostname kind so existing callers
+// keep their behaviour while the mail path is added additively.
+type PanelCertificateRepository interface {
+	Get(ctx context.Context) (*models.PanelCertificate, error)
+	GetByKind(ctx context.Context, kind string) (*models.PanelCertificate, error)
+	ListAll(ctx context.Context) ([]*models.PanelCertificate, error)
+	EnsureDefault(ctx context.Context, hostname string) (*models.PanelCertificate, error)
+	Upsert(ctx context.Context, c *models.PanelCertificate) error
+	MarkIssued(ctx context.Context, issuedAt, expiresAt time.Time) error
+	MarkPendingRetry(ctx context.Context, errMsg string, retryAfter time.Duration) error
+	MarkIssuedKind(ctx context.Context, kind string, issuedAt, expiresAt time.Time) error
+	MarkPendingRetryKind(ctx context.Context, kind, errMsg string, retryAfter time.Duration) error
+	// SetSelfSignedState brings a row in line with self-signed mode (GH
+	// #2166, models.SelfSignedState): status, expires_at when non-nil, and
+	// no Let's Encrypt retry state. It changes the row only while Let's
+	// Encrypt is off for the panel, so it can't undo an admin turning it on.
+	SetSelfSignedState(ctx context.Context, kind, status string, expiresAt *time.Time) error
+
+	// A new install turns the panel's Let's Encrypt certificate on by itself
+	// (ADR-0066 amendment, models.PanelCertificate.LEAutoUntil). Each is one
+	// guarded UPDATE of the hostname row, so a caller holding an older copy
+	// of the row can't undo an admin's toggle.
+	//
+	// AutoEnableLE turns use_le on while the window is open and Let's
+	// Encrypt is still off. le_auto_until stays: it now marks the first,
+	// automatic issue. It reports whether the row changed.
+	AutoEnableLE(ctx context.Context, now time.Time) (bool, error)
+	// RevertLEAuto turns Let's Encrypt back off after the automatic issue
+	// failed: use_le off, self_signed, no retry, and the window ends. It
+	// reports whether the row changed.
+	RevertLEAuto(ctx context.Context) (bool, error)
+	// EndLEAuto ends the window or the automatic attempt: the admin acted
+	// on the certificate, the window passed, or the issue succeeded.
+	EndLEAuto(ctx context.Context) error
+}
+
+type panelCertRepo struct{ db *gorm.DB }
+
+// NewPanelCertificateRepository returns a repository backed by db.
+func NewPanelCertificateRepository(db *gorm.DB) PanelCertificateRepository {
+	return &panelCertRepo{db: db}
+}
+
+func kindOrHostname(k string) string {
+	if k == "" {
+		return models.PanelCertKindHostname
+	}
+	return k
+}
+
+// panelCertPathForKind is the default install target per kind. The
+// hostname cert keeps /etc/dotnext/tls/panel.crt; the mail cert lands
+// beside it as panel-mail.crt (ADR-0105).
+func panelCertPathForKind(kind string) string {
+	if kind == models.PanelCertKindMail {
+		return "/etc/dotnext/tls/panel-mail.crt"
+	}
+	return "/etc/dotnext/tls/panel.crt"
+}
+
+func (r *panelCertRepo) GetByKind(ctx context.Context, kind string) (*models.PanelCertificate, error) {
+	var c models.PanelCertificate
+	if err := r.db.WithContext(ctx).Where("kind = ?", kindOrHostname(kind)).First(&c).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (r *panelCertRepo) Get(ctx context.Context) (*models.PanelCertificate, error) {
+	return r.GetByKind(ctx, models.PanelCertKindHostname)
+}
+
+func (r *panelCertRepo) ListAll(ctx context.Context) ([]*models.PanelCertificate, error) {
+	var rows []*models.PanelCertificate
+	if err := r.db.WithContext(ctx).Order("kind").Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// ensureOne loads (or creates) the row for kind. When the row already
+// exists and renameOnDrift is true, its hostname is re-synced to the
+// current value on drift; when renameOnDrift is false the existing
+// hostname is left exactly as seeded (JAB-389 — see EnsureDefault).
+func (r *panelCertRepo) ensureOne(ctx context.Context, kind, hostname string, renameOnDrift bool) (*models.PanelCertificate, error) {
+	existing, err := r.GetByKind(ctx, kind)
+	if err == nil {
+		if renameOnDrift && existing.Hostname != hostname && hostname != "" {
+			existing.Hostname = hostname
+			if uerr := r.Upsert(ctx, existing); uerr != nil {
+				return nil, uerr
+			}
+		}
+		return existing, nil
+	}
+	if !errors.Is(err, ErrNotFound) {
+		return nil, err
+	}
+	return r.createRow(ctx, kind, hostname)
+}
+
+// createRow inserts a fresh self-signed row for kind.
+//
+// The hostname row is created once in a server's life, on a fresh install's
+// first pass: no migration seeds it, a hostname change updates it in place
+// (ensureOne) and nothing deletes it. So that is where a new install opens
+// its Let's Encrypt window (ADR-0066 amendment); existing servers already
+// have the row and never get one.
+func (r *panelCertRepo) createRow(ctx context.Context, kind, hostname string) (*models.PanelCertificate, error) {
+	row := &models.PanelCertificate{
+		Kind:        kind,
+		ID:          1,
+		Hostname:    hostname,
+		Status:      models.PanelCertStatusSelfSigned,
+		CertPEMPath: panelCertPathForKind(kind),
+	}
+	if kind == models.PanelCertKindHostname {
+		until := time.Now().UTC().Add(models.PanelLEAutoWindow)
+		row.LEAutoUntil = &until
+	}
+	if err := r.db.WithContext(ctx).Create(row).Error; err != nil {
+		return nil, err
+	}
+	return row, nil
+}
+
+func (r *panelCertRepo) EnsureDefault(ctx context.Context, hostname string) (*models.PanelCertificate, error) {
+	// The hostname cert tracks the panel FQDN: on a hostname change it must
+	// follow so the panel keeps serving a cert for the name it answers on.
+	host, err := r.ensureOne(ctx, models.PanelCertKindHostname, hostname, true)
+	if err != nil {
+		return nil, err
+	}
+	// JAB-389: the mail cert is SEEDED from the panel hostname at creation
+	// (mail.<hostname>) but is never renamed afterwards. Changing the panel
+	// access hostname must not silently cascade the panel mail cert to
+	// mail.<new-fqdn> and start pursuing a new Let's Encrypt cert for it —
+	// the operator may deliberately keep mail on the original name. The mail
+	// identity stays pinned to whatever it was seeded with; changing it is a
+	// separate, deliberate action (JAB-390), not a side effect of a rename.
+	//
+	// JAB-390: server_settings.mail_hostname is the APPLIED mail hostname,
+	// and only the switchover moves this row to a new name. A missing row
+	// (first boot, or a manual delete after a switchover) is seeded from the
+	// EFFECTIVE mail hostname — the applied one when set, else
+	// mail.<hostname> — so a re-created row never pursues a certificate for a
+	// name the panel no longer serves mail on. An existing row is left as is.
+	if _, err := r.GetByKind(ctx, models.PanelCertKindMail); err != nil {
+		if !errors.Is(err, ErrNotFound) {
+			return nil, err
+		}
+		seed, err := r.effectiveMailHostname(ctx, hostname)
+		if err != nil {
+			return nil, err
+		}
+		if _, err := r.createRow(ctx, models.PanelCertKindMail, seed); err != nil {
+			return nil, err
+		}
+	}
+	return host, nil
+}
+
+// effectiveMailHostname reads the applied mail hostname and resolves the
+// effective one. No settings row (a fresh install) means none is applied;
+// any other read error is returned, because guessing the derived name could
+// seed the wrong mail identity.
+func (r *panelCertRepo) effectiveMailHostname(ctx context.Context, hostname string) (string, error) {
+	var s models.ServerSettings
+	err := r.db.WithContext(ctx).Select("mail_hostname").Where("id = ?", 1).Take(&s).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return models.PanelMailHostname(hostname), nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("read applied mail hostname: %w", err)
+	}
+	return models.EffectiveMailHostname(s.MailHostname, hostname), nil
+}
+
+// Upsert mirrors ServerSettingsRepository.Upsert: explicit
+// exists-check + Create/Updates instead of Save() to avoid GORM's
+// ON DUPLICATE path tripping over the string primary key.
+func (r *panelCertRepo) Upsert(ctx context.Context, c *models.PanelCertificate) error {
+	c.Kind = kindOrHostname(c.Kind)
+	if c.ID == 0 {
+		c.ID = 1
+	}
+
+	var existing models.PanelCertificate
+	err := r.db.WithContext(ctx).Where("kind = ?", c.Kind).First(&existing).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) {
+		return r.db.WithContext(ctx).Create(c).Error
+	}
+	if err != nil {
+		return err
+	}
+	return r.db.WithContext(ctx).Model(&existing).Where("kind = ?", c.Kind).Select("*").Omit("kind").Updates(c).Error
+}
+
+func (r *panelCertRepo) markIssued(ctx context.Context, kind string, issuedAt, expiresAt time.Time) error {
+	return r.db.WithContext(ctx).
+		Model(&models.PanelCertificate{}).
+		Where("kind = ?", kindOrHostname(kind)).
+		Updates(map[string]any{
+			"status":        models.PanelCertStatusIssued,
+			"issued_at":     issuedAt.UTC(),
+			"expires_at":    expiresAt.UTC(),
+			"last_error":    "",
+			"attempt_count": 0,
+			"next_retry_at": nil,
+		}).Error
+}
+
+func (r *panelCertRepo) markPendingRetry(ctx context.Context, kind, errMsg string, retryAfter time.Duration) error {
+	next := time.Now().Add(retryAfter).UTC()
+	return r.db.WithContext(ctx).
+		Model(&models.PanelCertificate{}).
+		Where("kind = ?", kindOrHostname(kind)).
+		Updates(map[string]any{
+			"status":        models.PanelCertStatusPendingACMERetry,
+			"last_error":    errMsg,
+			"attempt_count": gorm.Expr("attempt_count + 1"),
+			"next_retry_at": next,
+		}).Error
+}
+
+func (r *panelCertRepo) MarkIssued(ctx context.Context, issuedAt, expiresAt time.Time) error {
+	return r.markIssued(ctx, models.PanelCertKindHostname, issuedAt, expiresAt)
+}
+
+func (r *panelCertRepo) MarkPendingRetry(ctx context.Context, errMsg string, retryAfter time.Duration) error {
+	return r.markPendingRetry(ctx, models.PanelCertKindHostname, errMsg, retryAfter)
+}
+
+func (r *panelCertRepo) MarkIssuedKind(ctx context.Context, kind string, issuedAt, expiresAt time.Time) error {
+	return r.markIssued(ctx, kind, issuedAt, expiresAt)
+}
+
+func (r *panelCertRepo) MarkPendingRetryKind(ctx context.Context, kind, errMsg string, retryAfter time.Duration) error {
+	return r.markPendingRetry(ctx, kind, errMsg, retryAfter)
+}
+
+func (r *panelCertRepo) SetSelfSignedState(ctx context.Context, kind, status string, expiresAt *time.Time) error {
+	updates := map[string]any{
+		"status":        status,
+		"last_error":    "",
+		"attempt_count": 0,
+		"next_retry_at": nil,
+	}
+	if expiresAt != nil {
+		updates["expires_at"] = expiresAt.UTC()
+	}
+	// The hostname row's use_le governs both certs: the toggle writes only
+	// that row, so the mail row's own flag can be stale. Locking it holds
+	// back a toggle until the update commits, and a toggle that committed
+	// first is seen here.
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var host models.PanelCertificate
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("use_le").
+			Where("kind = ?", models.PanelCertKindHostname).
+			Take(&host).Error; err != nil {
+			return err
+		}
+		if host.UseLE {
+			return nil
+		}
+		return tx.Model(&models.PanelCertificate{}).
+			Where("kind = ?", kindOrHostname(kind)).
+			Updates(updates).Error
+	})
+}
+
+func (r *panelCertRepo) AutoEnableLE(ctx context.Context, now time.Time) (bool, error) {
+	res := r.db.WithContext(ctx).Model(&models.PanelCertificate{}).
+		Where("kind = ? AND use_le = ? AND le_auto_until IS NOT NULL AND le_auto_until > ?",
+			models.PanelCertKindHostname, false, now.UTC()).
+		Updates(map[string]any{"use_le": true})
+	return res.RowsAffected > 0, res.Error
+}
+
+func (r *panelCertRepo) RevertLEAuto(ctx context.Context) (bool, error) {
+	res := r.db.WithContext(ctx).Model(&models.PanelCertificate{}).
+		Where("kind = ? AND use_le = ? AND le_auto_until IS NOT NULL", models.PanelCertKindHostname, true).
+		Updates(map[string]any{
+			"use_le":        false,
+			"status":        models.PanelCertStatusSelfSigned,
+			"next_retry_at": nil,
+			"le_auto_until": nil,
+		})
+	return res.RowsAffected > 0, res.Error
+}
+
+func (r *panelCertRepo) EndLEAuto(ctx context.Context) error {
+	return r.db.WithContext(ctx).Model(&models.PanelCertificate{}).
+		Where("kind = ? AND le_auto_until IS NOT NULL", models.PanelCertKindHostname).
+		Update("le_auto_until", nil).Error
+}

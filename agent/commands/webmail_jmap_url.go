@@ -1,0 +1,146 @@
+package commands
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"strings"
+	"syscall"
+
+	"github.com/dotnext-panel/dotnext/agentwire"
+)
+
+// webmail_jmap_url.go — webmail.jmap_url.apply (JAB-390): point Bulwark's
+// JMAP_SERVER_URL at the panel mail hostname and restart dotnext-webmail.
+//
+// The shared-mail-hostname switchover calls it when the applied mail
+// hostname changes. The URL must equal the name every webmail vhost's
+// sub_filter rewrites (webmail.vhost_apply panel_mail_hostname), or tenant
+// webmail breaks cross-origin. install.sh renders the same value from the
+// DB (`dotnext settings mail-hostname --applied`), so a later `dotnext update`
+// keeps it.
+//
+// The JMAP_SERVERS line (GH #2518), one sign-in server at the same URL,
+// follows it.
+//
+// Only those two lines change, in place (a missing one is appended); every
+// other line — including the SSO secrets and branding keys other writers
+// append — is kept byte-for-byte. Idempotent: an unchanged file is not rewritten and
+// the service is not restarted.
+
+// webmailJMAPEnvFile is bulwark.env; a var so tests can point it elsewhere.
+var webmailJMAPEnvFile = webmailEnvFile
+
+type webmailJMAPURLApplyParams struct {
+	// MailHostname is the panel mail hostname (bare FQDN).
+	MailHostname string `json:"mail_hostname"`
+}
+
+type webmailJMAPURLApplyResponse struct {
+	Ok      bool `json:"ok"`
+	Changed bool `json:"changed"`
+}
+
+const (
+	jmapServerURLKey = "JMAP_SERVER_URL="
+	// jmapServersKey is Bulwark's sign-in server list (GH #2518): one entry
+	// at the same URL, so the login page has no "JMAP Server" field.
+	jmapServersKey = "JMAP_SERVERS="
+)
+
+// jmapServersLine is the JMAP_SERVERS line for the panel mail hostname host,
+// byte for byte what infrastructure/bulwark/bulwark.env.tmpl renders.
+func jmapServersLine(host string) string {
+	js := `[{"id":"dotnext","label":"Mail","url":"https://` + host + `"}]`
+	return jmapServersKey + systemdEnvQuote(js)
+}
+
+func webmailJMAPURLApplyHandler(ctx context.Context, params json.RawMessage) (any, error) {
+	var p webmailJMAPURLApplyParams
+	if len(params) > 0 {
+		if err := json.Unmarshal(params, &p); err != nil {
+			return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: fmt.Sprintf("parse params: %v", err)}
+		}
+	}
+	// The value lands in an EnvironmentFile line: only a plain DNS name.
+	host, err := normalizeVhostServerName("mail_hostname", p.MailHostname)
+	if err != nil {
+		return nil, err
+	}
+
+	orig, err := os.ReadFile(webmailJMAPEnvFile)
+	if os.IsNotExist(err) {
+		// Bulwark not installed on this host: nothing to point.
+		return webmailJMAPURLApplyResponse{Ok: true}, nil
+	}
+	if err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("read bulwark.env: %v", err)}
+	}
+
+	want := map[string]string{
+		jmapServerURLKey: jmapServerURLKey + "https://" + host,
+		jmapServersKey:   jmapServersLine(host),
+	}
+	found := map[string]bool{}
+	lines := strings.Split(string(orig), "\n")
+	for i, line := range lines {
+		for key, w := range want {
+			if strings.HasPrefix(line, key) {
+				lines[i] = w
+				found[key] = true
+			}
+		}
+	}
+	body := strings.Join(lines, "\n")
+	for _, key := range []string{jmapServerURLKey, jmapServersKey} {
+		if !found[key] {
+			body = strings.TrimRight(body, "\n") + "\n" + want[key] + "\n"
+		}
+	}
+	if body == string(orig) {
+		return webmailJMAPURLApplyResponse{Ok: true}, nil
+	}
+
+	if err := replaceFileKeepingOwner(webmailJMAPEnvFile, []byte(body)); err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: err.Error()}
+	}
+	// Bulwark reads its env only at start.
+	if out, err := runSystemctl(ctx, "restart", "dotnext-webmail.service"); err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("restart dotnext-webmail: %v (%s)", err, bytesTrim(out))}
+	}
+	return webmailJMAPURLApplyResponse{Ok: true, Changed: true}, nil
+}
+
+// replaceFileKeepingOwner atomically replaces path with body, keeping the
+// existing file's mode and owner.
+func replaceFileKeepingOwner(path string, body []byte) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat %s: %w", path, err)
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, body, fi.Mode().Perm()); err != nil {
+		return fmt.Errorf("write %s: %w", tmp, err)
+	}
+	// WriteFile's mode is filtered by the umask; set it exactly.
+	if err := os.Chmod(tmp, fi.Mode().Perm()); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("chmod %s: %w", tmp, err)
+	}
+	if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+		if err := os.Chown(tmp, int(st.Uid), int(st.Gid)); err != nil {
+			_ = os.Remove(tmp)
+			return fmt.Errorf("chown %s: %w", tmp, err)
+		}
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return fmt.Errorf("rename %s: %w", tmp, err)
+	}
+	return nil
+}
+
+func init() {
+	Default.Register("webmail.jmap_url.apply", webmailJMAPURLApplyHandler)
+}

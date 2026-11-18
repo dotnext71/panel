@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# dotnext-panel-cert.sh — certbot deploy-hook for the panel certs.
+#
+# install.sh drops this at /etc/letsencrypt/renewal-hooks/deploy/
+# during install_dotnext_panel_cert_hook. Certbot invokes it on every
+# successful renewal AND the panel-agent invokes it directly after
+# first-issue in ssl.panel.issue.
+#
+# Post ADR-0105 the panel has TWO independent certs:
+#   kind=hostname  → /etc/dotnext/tls/panel.{crt,key};
+#                    reload nginx, restart dotnext-api + dotnext-bulwark.
+#   kind=mail      → /etc/dotnext/tls/panel-mail.{crt,key};
+#                    reload nginx, push into Stalwart, THEN restart
+#                    dotnext-stalwart (it loads certs only at startup).
+#
+# Inputs:
+#   $RENEWED_LINEAGE        — LE lineage dir (certbot or ssl.panel.issue).
+#   $DOTNEXT_PANEL_CERT_KIND — "hostname" (default) or "mail". On a real
+#                             certbot renewal the var is absent, so the
+#                             kind is derived from the lineage basename
+#                             (mail.* → mail) to keep unattended
+#                             renewals correct.
+#
+# Idempotent + best-effort reloads. set -euo pipefail.
+set -euo pipefail
+
+# The kind=mail arm records here the lineage name it deployed. certbot's
+# unattended renewals carry no DOTNEXT_PANEL_CERT_KIND, so the lineage name
+# is the only routing signal, and the panel MAIL lineage is not always
+# mail.<current-hostname>: JAB-389 pins it to the name it was seeded with
+# (it stays mail.<old-hostname> after a panel rename) and JAB-390 lets the
+# shared mail hostname be any FQDN. Without this record those renewals were
+# treated as tenant lineages and never deployed.
+PANEL_MAIL_LINEAGE_FILE="/etc/dotnext/tls/panel-mail.lineage"
+
+# panel_cert_kind SRC CN — the deploy target for the lineage at SRC when no
+# explicit DOTNEXT_PANEL_CERT_KIND was given: "hostname", "mail",
+# "mail-domain", or "" for a lineage this hook must not touch.
+panel_cert_kind() {
+  local src="$1" cn="$2" base recorded=""
+  base="$(basename "$src")"
+  # mail-domain lineages also start with `mail.` -- disambiguate via the
+  # env var ssl.mail.issue sets.
+  if [[ "$base" == mail.* && -n "${DOTNEXT_MAIL_DOMAIN_ID:-}" ]]; then
+    echo "mail-domain"
+    return
+  fi
+  if [[ -f "$PANEL_MAIL_LINEAGE_FILE" ]]; then
+    recorded="$(head -n 1 "$PANEL_MAIL_LINEAGE_FILE" 2>/dev/null || true)"
+  fi
+  if [[ -n "$recorded" && "$base" == "$recorded" ]]; then
+    echo "mail"
+    return
+  fi
+  # No record yet (boxes before their next mail deploy): the derived name.
+  # Once a lineage is recorded it is the ONLY panel mail lineage: after a
+  # JAB-390 switchover the old live/mail.<hostname> lineage still exists and
+  # certbot still renews it, and deploying that renewal would replace the
+  # current mail cert with one that lacks the new name.
+  if [[ -z "$recorded" && "$base" == "mail.${cn}" ]]; then
+    echo "mail"
+    return
+  fi
+  # Only the panel hostname's own lineage feeds /etc/dotnext/tls/panel.*.
+  # Any other lineage here is a TENANT domain renewed by certbot's
+  # unattended timer -- its nginx vhost references the LE lineage
+  # directly, so this hook must NOT touch it. Copying it to panel.crt
+  # made the panel (:8443), Stalwart and Bulwark serve a random
+  # tenant's certificate (incident: puzzle.linux-hosting.net panel
+  # served freecrosswordpuzzleanswers.com after that domain renewed).
+  # Likewise a mail.<tenant> lineage is owned by the per-domain mail
+  # reconciler, never copied to panel-mail.crt.
+  if [[ "$base" == "$cn" ]]; then
+    echo "hostname"
+    return
+  fi
+  echo ""
+}
+
+# stalwart_installed — whether this box has the mail server: the user
+# dotnext-stalwart.service runs as and its binary. `dotnext update` installs the
+# unit on every box, so the unit alone proves nothing. Starting it on a box
+# without the mail module fails at step USER and restarts in a loop, each
+# failure a "Stalwart is down" alert (GH #2166).
+STALWART_USER="dotnext-mail"
+STALWART_BIN="/usr/local/bin/stalwart"
+stalwart_installed() {
+  getent passwd "$STALWART_USER" >/dev/null 2>&1 && [[ -x "$STALWART_BIN" ]]
+}
+
+# Library mode for install/tests: define the functions, run nothing.
+if [[ "${DOTNEXT_PANEL_CERT_HOOK_LIB:-}" == "1" ]]; then
+  return 0
+fi
+
+cn="$(hostname -f 2>/dev/null || hostname)"
+src="${RENEWED_LINEAGE:-/etc/letsencrypt/live/${cn}}"
+
+if [[ ! -d "$src" ]]; then
+  echo "dotnext-panel-cert.sh: no LE lineage at $src — nothing to deploy" >&2
+  exit 0
+fi
+if [[ ! -f "$src/fullchain.pem" || ! -f "$src/privkey.pem" ]]; then
+  echo "dotnext-panel-cert.sh: lineage at $src missing fullchain.pem or privkey.pem" >&2
+  exit 1
+fi
+
+# Resolve kind: explicit env wins; otherwise infer from the lineage name.
+kind="${DOTNEXT_PANEL_CERT_KIND:-}"
+if [[ -z "$kind" ]]; then
+  kind="$(panel_cert_kind "$src" "$cn")"
+  if [[ -z "$kind" ]]; then
+    exit 0
+  fi
+fi
+
+dst_dir="/etc/dotnext/tls"
+install -d -m 0755 -o root -g root "$dst_dir"
+
+case "$kind" in
+  mail)
+    install -m 0640 -o root -g dotnext "$src/fullchain.pem" "$dst_dir/panel-mail.crt"
+    install -m 0640 -o root -g dotnext "$src/privkey.pem"   "$dst_dir/panel-mail.key"
+    # Record which lineage is the panel mail cert so certbot's unattended
+    # renewals of it route back here (see PANEL_MAIL_LINEAGE_FILE above).
+    printf '%s\n' "$(basename "$src")" >"${PANEL_MAIL_LINEAGE_FILE}.tmp"
+    chmod 0644 "${PANEL_MAIL_LINEAGE_FILE}.tmp"
+    mv -f "${PANEL_MAIL_LINEAGE_FILE}.tmp" "$PANEL_MAIL_LINEAGE_FILE"
+    # nginx serves mail.<hostname> :443; Stalwart reads the mail cert
+    # for SMTP/IMAPS. dotnext-api / dotnext-bulwark use the hostname
+    # cert and are deliberately NOT bounced here.
+    systemctl reload nginx            || echo "dotnext-panel-cert.sh: nginx reload failed (continuing)" >&2
+    # Push the renewed PEM into Stalwart's Certificate object so
+    # IMAPS / 465 / 587 serve the LE cert instead of Stalwart's rcgen
+    # self-signed fallback. Idempotent; safe to call multiple times.
+    #
+    # Order matters: push FIRST, restart AFTER. Stalwart serves TLS from
+    # its x:Certificate registry and loads it only at startup — a push
+    # after the restart sits unloaded, so :993/:465 keep the PREVIOUS
+    # certificate and key until something else restarts Stalwart (seen
+    # during the JAB-357 key rotation). The mail-domain arm below has the
+    # same order. `start` first (a no-op when running) so the push can
+    # reach the management API even if Stalwart was down; the script
+    # waits for it to answer. A box without the mail server has nothing to
+    # push to (GH #2166).
+    if stalwart_installed; then
+      systemctl start dotnext-stalwart   || echo "dotnext-panel-cert.sh: dotnext-stalwart start failed (continuing)" >&2
+      if [[ -x /usr/local/bin/dotnext-stalwart-push-cert ]]; then
+        /usr/local/bin/dotnext-stalwart-push-cert || \
+          echo "dotnext-panel-cert.sh: dotnext-stalwart-push-cert non-zero (continuing)" >&2
+      fi
+      systemctl restart dotnext-stalwart || echo "dotnext-panel-cert.sh: dotnext-stalwart restart failed (continuing)" >&2
+    else
+      echo "dotnext-panel-cert.sh: no mail server on this box; Stalwart left alone" >&2
+    fi
+    ;;
+  mail-domain)
+    # M6.6: per-tenant-domain mail cert. DOTNEXT_MAIL_DOMAIN_ID is
+    # the panel's domain row ULID; ssl.mail.issue sets it so the
+    # cert lands in Stalwart's x:Certificate registry under a name
+    # the reconciler can find by domain id. The cert itself stays
+    # under the lineage dir (/etc/letsencrypt/live/mail.<d>/); we
+    # do NOT copy it to /etc/dotnext/tls -- only the panel-hostname
+    # mail cert lives there. Stalwart reads each per-domain cert
+    # directly from its lineage path via the push-cert subprocess.
+    if [[ -z "${DOTNEXT_MAIL_DOMAIN_ID:-}" ]]; then
+      echo "dotnext-panel-cert.sh: mail-domain kind requires DOTNEXT_MAIL_DOMAIN_ID" >&2
+      exit 1
+    fi
+    if [[ -x /usr/local/bin/dotnext-stalwart-push-cert ]]; then
+      DOTNEXT_STALWART_CERT_NAME="domain-${DOTNEXT_MAIL_DOMAIN_ID}" \
+      DOTNEXT_STALWART_CERT_PATH="$src/fullchain.pem" \
+      DOTNEXT_STALWART_KEY_PATH="$src/privkey.pem" \
+        /usr/local/bin/dotnext-stalwart-push-cert || \
+        echo "dotnext-panel-cert.sh: mail-domain push-cert non-zero (continuing)" >&2
+      # Stalwart caches its TLS certs in memory at startup and does NOT
+      # hot-reload the x:Certificate registry when push-cert writes a
+      # new entry — without a restart it keeps presenting the previously
+      # loaded cert (the panel default) for the new SNI on :465/:993.
+      # The kind=mail branch already restarts for the same reason; the
+      # per-domain branch must too or GH #132 stays broken (cert pushed
+      # but never served).
+      systemctl restart dotnext-stalwart || \
+        echo "dotnext-panel-cert.sh: mail-domain dotnext-stalwart restart failed (continuing)" >&2
+    fi
+    ;;
+
+  *)
+    install -m 0640 -o root -g dotnext "$src/fullchain.pem" "$dst_dir/panel.crt"
+    install -m 0640 -o root -g dotnext "$src/privkey.pem"   "$dst_dir/panel.key"
+    # GH #1507: a CA (Let's Encrypt) cert is now on :8443 — enable HSTS. The vhost
+    # includes this snippet; install.sh writes it OFF while self-signed. The ON
+    # body is byte-identical to install.sh's _write_panel_hsts_snippet (drift test).
+    install -d -m 0755 /etc/nginx/snippets
+    cat > /etc/nginx/snippets/dotnext-panel-hsts.conf <<'HSTS_ON'
+# GH #1507: panel serves a CA-issued cert — HSTS enabled.
+add_header Strict-Transport-Security "max-age=31536000" always;
+HSTS_ON
+    systemctl reload nginx           || echo "dotnext-panel-cert.sh: nginx reload failed (continuing)" >&2
+    # --no-block on dotnext-api: this hook is invoked synchronously by
+    # the panel-agent ssl.panel.issue command, whose CALLER is
+    # dotnext-api's own panel-cert reconciler. A blocking
+    # `systemctl restart dotnext-api` SIGTERMs the panel mid-RPC, so
+    # the reconciler never reaches MarkIssued and the row stays
+    # pending_acme forever — every tick re-dispatches, re-runs this
+    # hook, re-kills the panel (observed on mx: clean SIGTERM every
+    # ~10 min, NRestarts=0, row never leaving pending_acme). --no-block
+    # queues the restart so the agent reply propagates and the
+    # reconciler commits status=issued BEFORE systemd fires it; the
+    # panel then restarts into an already-issued row and does not
+    # re-dispatch. dotnext-bulwark is not the caller — synchronous.
+    systemctl restart --no-block dotnext-api || echo "dotnext-panel-cert.sh: dotnext-api restart failed (continuing)" >&2
+    systemctl restart dotnext-bulwark || echo "dotnext-panel-cert.sh: dotnext-bulwark restart failed (continuing)" >&2
+    # FTPS (vsftpd, opt-in) reads the SAME panel.crt/panel.key but has no
+    # deploy hook of its own, so after renewal it keeps presenting the old
+    # in-memory certificate until the daemon next restarts — once the old cert
+    # expires, strict FTPS clients start failing (JAB-268). Reload it here.
+    #
+    # Guarded on is-active on purpose: FTP is the panel's one deliberately-OFF
+    # service (server_settings.ftp_enabled=0 → vsftpd masked). is-active is
+    # false for the masked/disabled opt-out state, so this never starts FTP an
+    # operator chose to keep off — it only refreshes a daemon already serving.
+    # vsftpd has no reload verb; try-reload-or-restart falls back to a restart,
+    # which re-reads the cert from disk. A failure is surfaced (not silently
+    # swallowed) naming vsftpd as the consumer left on the stale certificate.
+    if systemctl is-active --quiet vsftpd; then
+      systemctl try-reload-or-restart vsftpd \
+        || echo "dotnext-panel-cert.sh: vsftpd reload FAILED — FTPS is serving the STALE certificate until vsftpd restarts" >&2
+    fi
+    ;;
+esac
+
+exit 0

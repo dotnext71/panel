@@ -1,0 +1,7 @@
+# Adminer 6.2.0 — served on the panel vhost behind dotNext SSO with full
+# database access, so a swapped file is arbitrary PHP running as www-data
+# with the operator's DB credentials. Pinned per the same rule as every other
+# third-party artifact here (wp-cli, phpMyAdmin, Stalwart, Kratos, Bulwark).
+# Bump together with adminer_version in install.sh, then
+# `scripts/deps-check.sh --refresh-sha adminer_version` to re-capture this.
+9047c00dfc8258c6046c6720d7d201eaa0ca016fa0fc554bf0c4c137306e1c16  adminer-6.2.0.php

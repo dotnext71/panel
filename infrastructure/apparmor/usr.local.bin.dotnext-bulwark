@@ -1,0 +1,139 @@
+# AppArmor profile — dotnext-bulwark (M40.1 / JAB-375, ADR-0086)
+#
+# bulwark is the Node.js public-facing webmail daemon (Next.js). It is an
+# untrusted-input boundary, so the profile is tight: a read-only app tree,
+# its own state dir + a dedicated tmp, the listen socket, the panel-api
+# upstream socket, and outbound TCP for JMAP/relay. NO access to panel
+# secrets, /etc/shadow, user homes, the audit log, or the shared /tmp.
+#
+# JAB-375 path correction: the app actually runs as
+# `/usr/bin/node /opt/dotnext-webmail/server-unix.js`, reads its config from
+# /etc/dotnext/bulwark.env, and keeps state under /var/lib/dotnext-webmail.
+# The M40 profile granted the old /usr/local/bin + /var/lib/dotnext-bulwark
+# layout and therefore confined nothing real. Paths are corrected here.
+#
+# JAB-375 attach contract: the unit attaches this via
+# `AppArmorProfile=-dotnext-bulwark` and MUST NOT set ProtectSystem= /
+# PrivateTmp= / ProtectHome=. A systemd private MOUNT NAMESPACE combined
+# with this label transition makes Node self-abort at node::Start
+# (status=6/ABRT, no message) — reproduced deterministically on .86: any one
+# of those three directives is enough; aa-exec (no mount ns) never triggers
+# it. This profile REPLACES that mount-ns hardening with file MAC
+# (default-deny read+write of everything unlisted, which is strictly tighter
+# than ProtectSystem=strict's read-only-rootfs) and redirects tmp to a
+# dedicated per-service subtree (the unit sets TMPDIR=/var/lib/dotnext-webmail/tmp)
+# with the shared /tmp explicitly denied — equal-or-tighter than PrivateTmp.
+#
+# GH #705: pin AppArmor 3.0 ABI — it predates unix-socket mediation, so
+# broken-mediation kernels (Debian 13 / Ubuntu 24.04, no
+# /sys/kernel/security/apparmor/features/unix) SKIP unix mediation for this
+# profile; attaching it can't EACCES a unix connect() while still confining
+# files/caps/network. Verified on .86.
+abi <abi/3.0>,
+
+#include <tunables/global>
+
+profile dotnext-bulwark /usr/local/bin/dotnext-bulwark {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+  #include <abstractions/openssl>
+  #include <abstractions/ssl_certs>
+
+  # Inline minimum Node.js runtime needs — Debian 13 doesn't ship
+  # abstractions/nodejs. These cover libuv epoll/eventfd, V8 ICU tables,
+  # libc DNS, /dev/urandom for crypto.randomBytes, CPU topology Node samples
+  # at startup, and /proc/self/{maps,stat,status} that Node reads to print a
+  # native stack trace.
+  /dev/urandom                    r,
+  /dev/null                       rw,
+  /proc/sys/kernel/random/uuid    r,
+  /proc/*/maps                    r,
+  /proc/*/stat                    r,
+  /proc/*/status                  r,
+  # Node samples its own cgroup at startup for the memory/CPU limits it
+  # derives V8 heap sizing from.
+  /proc/*/cgroup                  r,
+  /proc/sys/net/core/somaxconn    r,
+  /sys/devices/system/cpu/        r,
+  /sys/devices/system/cpu/**      r,
+  # Node reads its cgroup-v2 memory limits (memory.max / memory.high) to
+  # auto-size the V8 heap; the lookup chains /proc/self/cgroup → these files.
+  /sys/fs/cgroup/                 r,
+  /sys/fs/cgroup/**               r,
+  /etc/ssl/openssl.cnf            r,
+
+  capability net_bind_service,
+  capability setuid,
+  capability setgid,
+
+  network inet  stream,
+  network inet6 stream,
+  network unix  stream,
+
+  # AA 4.x unix mediation — bind own listener socket + connect to the
+  # panel-api upstream socket.
+  unix (create, bind, listen, accept, connect, send, receive) type=stream,
+  # AA 4.x: complain mode still enforces unix peer-label checks. Explicit
+  # peer=(label=unconfined) allows connecting to the panel-api upstream
+  # socket when that profile label differs from bulwark's.
+  unix (connect, send, receive) type=stream peer=(label=unconfined),
+
+  # systemd (unconfined) sends SIGTERM/SIGKILL on stop; Node signals its own
+  # workers under this same label. Allow both without over-mediating.
+  signal,
+
+  # Node binary itself (abstractions/base covers libc + system libs; V8
+  # native addons that live under the app tree get their mmap grant below).
+  /usr/bin/node                    mr,
+  /usr/local/bin/node              mr,
+
+  # --- Application tree: read-only, native addons mmap'd ---
+  /opt/dotnext-webmail/               r,
+  /opt/dotnext-webmail/**             r,
+  /opt/dotnext-webmail/**.node        mr,
+  /opt/dotnext-webmail/**.so*         mr,
+  # Next.js writes its build/runtime cache here — the only writable spot in
+  # the app tree (the unit's ExecStartPre pre-creates it).
+  /opt/dotnext-webmail/.next/cache/   rw,
+  /opt/dotnext-webmail/.next/cache/** rwk,
+
+  # --- Writable state + the dedicated tmp subtree (replaces PrivateTmp) ---
+  /var/lib/dotnext-webmail/         rw,
+  /var/lib/dotnext-webmail/**       rwk,
+
+  # --- Config: its OWN env file only, NOT the rest of /etc/dotnext ---
+  /etc/dotnext/bulwark.env    r,
+
+  # --- Sockets (M25 layout, ADR-0050) ---
+  # Own listener (nginx upstream: server unix:/run/dotnext-bulwark/bulwark.sock).
+  /run/dotnext-bulwark/             rw,
+  /run/dotnext-bulwark/**           rwlk,
+  # panel-api upstream sockets (api + sso).
+  /run/dotnext-panel/               r,
+  /run/dotnext-panel/**             rw,
+
+  # Hard denies — bulwark must NOT read panel secrets, /etc/shadow, user
+  # homes, or audit logs, and must NOT touch the shared /tmp (its tmp is
+  # redirected to /var/lib/dotnext-webmail/tmp).
+  deny /etc/dotnext/ rwklx,
+  deny /etc/dotnext/** rwklx,
+  deny /etc/shadow rwklx,
+  deny /home/** rwlkx,
+  deny /root/** rwlkx,
+  deny /var/log/audit/** rwklx,
+  deny /tmp/** rwklx,
+  deny /var/tmp/** rwklx,
+  # The stock Bulwark update-check best-effort writes state under the app
+  # tree (/opt/dotnext-webmail/data/version-check/). That path is read-only
+  # under the app-tree grant above — and was already read-only under the old
+  # ProtectSystem=strict unit — so this write has never worked and is
+  # non-fatal. A silent deny keeps the app tree read-only AND suppresses the
+  # audit noise so the profile stays soak-clean for the flip-mature timer.
+  deny /opt/dotnext-webmail/data/** wk,
+
+  # Site-specific rules, kept across updates: dotnext update overwrites this
+  # file but not /etc/apparmor.d/local/usr.local.bin.dotnext-bulwark. After editing that
+  # file, reload with: apparmor_parser -r /etc/apparmor.d/usr.local.bin.dotnext-bulwark
+  # A deny rule above still wins over an allow rule added there.
+  include if exists <local/usr.local.bin.dotnext-bulwark>
+}

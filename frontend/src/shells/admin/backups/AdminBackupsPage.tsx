@@ -1,0 +1,822 @@
+// AdminBackupsPage — admin overview of every backup run.
+// Scheduler-fired jobs roll up under their run_id (one parent row,
+// expandable to per-user children). Manual creates render flat.
+import { Badge, Button, Card, Space, Table, Tag, Typography } from "antd";
+import { feedback } from "../../../lib/feedback"; // GH #970: themed toasts
+import { useBackupDownloadPrepare } from "../../../utils/backupDownload";
+import { backupTypeColor, backupTypeLabel, runScopeSummary } from "../../../utils/backupType";
+import { useTabParam } from "../../../hooks/useTabParam";
+import { RowActions, type RowAction } from "../../../components/RowActions";
+import { cancelBackup } from "../../../components/backups/cancelBackup";
+import {
+  DeleteOutlined,
+  CalendarCheckOutlined,
+  DownloadOutlined,
+  FileTextOutlined,
+  HardDriveUploadOutlined,
+  KeyOutlined,
+  PlusOutlined,
+  RotateCcwOutlined,
+  SaveOutlined,
+  SettingOutlined,
+  CloseOutlined,
+  LifeBuoyOutlined,
+} from "@icons";
+import { useEffect, useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+
+import { BackupStatusTag } from "../../../components/backups/BackupStatusTag";
+import { RunStatusSummary } from "../../../components/backups/RunStatusSummary";
+import {
+  backupArtifactEligibility,
+  isRestoreKind,
+  snapshotKnowledge,
+} from "../../../components/backups/backupArtifact";
+import { backupArtifactActions } from "../../../components/backups/backupArtifactActions";
+
+import { apiClient, type UploadedBackup } from "../../../apiClient";
+import { extractApiError } from "../../../apiErrors";
+import { useListQuery } from "../../../hooks/useQueries";
+import { BackupLogModal } from "./BackupLogModal";
+import { BackupLogsTab } from "./BackupLogsTab";
+import { BackupSettingsTab } from "./BackupSettingsTab";
+import { CreateBackupDrawer } from "./CreateBackupDrawer";
+import { RestoreFromUploadDrawer } from "./RestoreFromUploadDrawer";
+import { UPLOADED_BACKUPS_RESOURCE, UploadedBackupsTable } from "./UploadedBackupsTable";
+import { FullServerPackageModal } from "./FullServerPackageModal";
+import { RestoreFullServerDrawer } from "./RestoreFullServerDrawer";
+import { DestinationsTab } from "./DestinationsTab";
+import { EncryptionKeyCard } from "./EncryptionKeyCard";
+import { SchedulesTab } from "./SchedulesTab";
+import { RecoveryHandoffTab } from "./RecoveryHandoffTab";
+import { Timestamp } from "../../../components/Timestamp";
+
+interface BackupJob {
+  id: string;
+  user_id: string;
+  destination_id?: string;
+  kind: string;
+  content?: string;
+  status: string;
+  systemd_unit: string;
+  snapshot_id: string;
+  bytes_added: number;
+  bytes_total: number;
+  created_at: string;
+  finished_at?: string;
+  error_text?: string;
+  run_id?: string;
+}
+
+interface BackupRun {
+  run_id: string;
+  schedule_id?: string;
+  has_accounts?: boolean;
+  accounts?: number;
+  // GH #2089: the run's account when every job belongs to one ("system" for a
+  // system-only run), and its destination when every job shares one;
+  // destinations counts them, the implicit local repo included.
+  user_id?: string;
+  destination_id?: string;
+  destinations?: number;
+  kind: string;
+  content?: string;
+  total: number;
+  succeeded: number;
+  failed: number;
+  running: number;
+  queued: number;
+  cancelled: number;
+  partial: number;
+  bytes_added: number;
+  bytes_total: number;
+  started_at: string;
+  latest_updated: string;
+}
+
+interface RunsEnvelope {
+  data: BackupRun[];
+  manual: BackupJob[];
+  total: number;
+  manual_total: number;
+}
+
+interface RunRow {
+  rowKey: string;
+  isRun: true;
+  run: BackupRun;
+}
+interface ManualRow {
+  rowKey: string;
+  isRun: false;
+  job: BackupJob;
+}
+type TableRow = RunRow | ManualRow;
+
+type TabKey =
+  | "backups"
+  | "destinations"
+  | "schedules"
+  | "encryption"
+  | "settings"
+  | "logs"
+  | "recovery";
+
+const formatBytes = (n: number): string => {
+  if (!n) return "0 B";
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  let v = n;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v.toFixed(1)} ${units[i]}`;
+};
+
+// Short names for backup destination kinds (DestinationsTab's BackendKind).
+const DEST_KIND_LABEL: Record<string, string> = {
+  local: "Local",
+  sftp: "SFTP",
+  s3: "S3",
+  b2: "B2",
+  azure: "Azure",
+  gcs: "GCS",
+  rest: "REST",
+};
+
+export const AdminBackupsPage = () => {
+  const dl = useBackupDownloadPrepare("admin"); // GH #1408: prepare-then-download
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [uploadRestoreOpen, setUploadRestoreOpen] = useState(false);
+  // GH #1993: the kept upload being restored from the Uploaded backups table.
+  const [restoreKept, setRestoreKept] = useState<UploadedBackup | null>(null);
+  const qc = useQueryClient();
+  const [packageRunId, setPackageRunId] = useState<string | null>(null);
+  const [fullRestoreOpen, setFullRestoreOpen] = useState(false);
+  const [logJob, setLogJob] = useState<BackupJob | null>(null);
+  const [activeTab, setActiveTab] = useTabParam<TabKey>("backups");
+  const [runs, setRuns] = useState<BackupRun[]>([]);
+  const [manual, setManual] = useState<BackupJob[]>([]);
+  // GH #2505: the server's totals, not the loaded rows — the badge and the
+  // "showing newest" line count every backup even when the page holds fewer.
+  const [total, setTotal] = useState(0);
+  const [manualTotal, setManualTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [runJobs, setRunJobs] = useState<Record<string, BackupJob[]>>({});
+  // GH #502: control row expansion so the "Expand to manage" cell can toggle it
+  // (previously only the +/- icon did, which the text falsely implied was clickable).
+  const [expandedKeys, setExpandedKeys] = useState<string[]>([]);
+  // Mirror runJobs into a ref so the polling reload (whose closure
+  // captures state from effect-setup time) can read the LATEST set
+  // of expanded runs, not a stale snapshot.
+  const runJobsRef = useRef<Record<string, BackupJob[]>>({});
+  useEffect(() => {
+    runJobsRef.current = runJobs;
+  }, [runJobs]);
+
+  const usersQuery = useListQuery<{ id: string; username: string; email: string }>({
+    resource: "users",
+    params: { pageSize: 500 },
+    enabled: activeTab === "backups",
+  });
+  const usernameById = (id: string): string => {
+    if (id === "system") return "system";
+    const u = (usersQuery.items ?? []).find((x) => x.id === id);
+    return u?.username ?? id;
+  };
+  const destQuery = useListQuery<{ id: string; name: string; kind: string }>({
+    resource: "admin/backup-destinations",
+    params: { pageSize: 100 },
+    enabled: activeTab === "backups",
+  });
+  // GH #2089: say where a backup is stored. No destination_id is the implicit
+  // local repo for a backup, and an uploaded file for an account restore (a
+  // restore from an upload is the one created without a destination). An ID
+  // with no destination row means the destination was deleted.
+  const destLabel = (kind: string, id?: string): string => {
+    if (!id) {
+      if (kind === "account_restore") return "Uploaded file";
+      return kind === "system_restore" ? "—" : "Local";
+    }
+    const d = (destQuery.items ?? []).find((x) => x.id === id);
+    if (!d) return destQuery.isLoading ? "…" : "Deleted destination";
+    return `${d.name} (${DEST_KIND_LABEL[d.kind] ?? d.kind.toUpperCase()})`;
+  };
+  const runDestLabel = (r: BackupRun): string =>
+    (r.destinations ?? 1) > 1 ? "Several" : destLabel(r.kind, r.destination_id);
+  // GH #2089: whose backup a row is — the account, "System", or a run's scope
+  // when it spans accounts ("system + 12 accounts").
+  const ownerLabel = (kind: string, userID?: string): string =>
+    userID === "system" || kind === "system_backup" || kind === "system_restore"
+      ? "System"
+      : usernameById(userID ?? "");
+  const runOwnerLabel = (r: BackupRun): string =>
+    r.user_id ? ownerLabel(r.kind, r.user_id) : runScopeSummary(r.total, r.accounts ?? 0) || "System";
+
+  const reload = async () => {
+    setLoading(true);
+    try {
+      const resp = await apiClient.get<RunsEnvelope>(
+        "/admin/backup-runs?page_size=1000",
+      );
+      setRuns(resp.data.data ?? []);
+      setManual(resp.data.manual ?? []);
+      setTotal(resp.data.total ?? 0);
+      setManualTotal(resp.data.manual_total ?? 0);
+      // Refresh any currently-expanded run's child rows so polling
+      // surfaces queued -> running -> succeeded transitions on the
+      // child table without needing collapse/expand. Read the LATEST
+      // runJobs via ref — the interval's closure would otherwise see
+      // the empty {} from before the operator expanded anything.
+      const expanded = Object.keys(runJobsRef.current);
+      if (expanded.length > 0) {
+        const updates = await Promise.all(
+          expanded.map(async (id) => {
+            try {
+              const r = await apiClient.get<{ data: BackupJob[] }>(
+                `/admin/backup-runs/${id}/jobs`,
+              );
+              return [id, r.data.data ?? []] as const;
+            } catch {
+              return [id, runJobsRef.current[id]] as const;
+            }
+          }),
+        );
+        setRunJobs((m) => {
+          const next = { ...m };
+          for (const [id, jobs] of updates) {
+            next[id] = jobs;
+          }
+          return next;
+        });
+      }
+    } catch (err) {
+      feedback.message.error(extractApiError(err, "Load failed"));
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (activeTab === "backups") {
+      void reload();
+    }
+  }, [activeTab]);
+
+  const hasActive =
+    runs.some((r) => r.queued + r.running > 0) ||
+    manual.some((j) => j.status === "queued" || j.status === "running");
+  useEffect(() => {
+    if (activeTab !== "backups") return;
+    const interval = hasActive ? 3000 : 8000;
+    const t = window.setInterval(() => {
+      void reload();
+    }, interval);
+    return () => window.clearInterval(t);
+  }, [activeTab, hasActive]);
+
+  const expandRun = async (runID: string) => {
+    // No cache short-circuit: re-fetch on every expand so the child
+    // table reflects current state even after collapse/expand cycles
+    // while polling was paused (e.g. tab switch).
+    try {
+      const resp = await apiClient.get<{ data: BackupJob[] }>(
+        `/admin/backup-runs/${runID}/jobs`,
+      );
+      setRunJobs((m) => ({ ...m, [runID]: resp.data.data ?? [] }));
+    } catch (err) {
+      feedback.message.error(extractApiError(err, "Load run failed"));
+    }
+  };
+
+  // GH #502: toggle a row's expansion from anywhere (the +/- icon and the
+  // "Expand to manage" cell both call this). Lazy-loads a run's child jobs
+  // on open, mirroring the icon's previous onExpand behaviour.
+  const toggleRowExpand = (row: TableRow) => {
+    setExpandedKeys((keys) => {
+      if (keys.includes(row.rowKey)) {
+        return keys.filter((k) => k !== row.rowKey);
+      }
+      if (row.isRun) void expandRun(row.run.run_id);
+      return [...keys, row.rowKey];
+    });
+  };
+
+  const handleDownload = (row: BackupJob) => {
+    // GH #502: a `partial` backup has a valid snapshot too (a non-critical
+    // stage failed but the manifest was written) — allow downloading it.
+    if (row.status !== "succeeded" && row.status !== "partial") {
+      feedback.message.warning("Backup must complete before download");
+      return;
+    }
+    // GH #1408: prepare in the background (restic materialize takes minutes)
+    // then trigger the download, so the button isn't dead in the meantime.
+    dl.start(row.id);
+  };
+
+  const handleCancel = async (row: BackupJob) => {
+    await cancelBackup(`/admin/backups/${row.id}/cancel`);
+    void reload();
+  };
+
+  // GH #2245: one Cancel for every job row (a scheduled run's jobs and a
+  // standalone backup alike), shown wherever there is a backup to stop.
+  const cancelAction = (job: BackupJob): RowAction => ({
+    key: "cancel",
+    label: "Cancel",
+    icon: <CloseOutlined />,
+    danger: true,
+    hidden: (job.status !== "running" && job.status !== "queued") || isRestoreKind(job.kind),
+    onClick: () => handleCancel(job),
+    confirm: { title: "Stop this backup?", description: "The backup stops and is marked cancelled. Stopping can take a few seconds.", okText: "Stop backup" },
+  });
+
+  // Restore is account-only — system_backup snapshots are managed via
+  // `dotnext aide rebuild` / system_restore CLI flows, not the panel UI.
+  // Submits the BackupJob's snapshot_id (== manifest snapshot) to the
+  // existing POST /admin/backups/restore handler with overwrite=true,
+  // which queues an account_restore job and dispatches it to the agent.
+  const handleRestore = async (row: BackupJob) => {
+    try {
+      await apiClient.post(`/admin/backups/restore`, {
+        manifest_snapshot_id: row.snapshot_id,
+        target_user_id: row.user_id,
+        overwrite: true,
+        destination_id: row.destination_id,
+      });
+      feedback.message.success(`Restore queued for ${usernameById(row.user_id)}`);
+      void reload();
+    } catch (err) {
+      feedback.message.error(extractApiError(err, "Restore failed"));
+    }
+  };
+
+  // Delete forgets + prunes the job's restic snapshots, then drops the row
+  // (GH #294). Available for any status so failed/stale backups can be cleared.
+  const handleDelete = async (row: BackupJob) => {
+    try {
+      await apiClient.delete(`/admin/backups/${row.id}`);
+      feedback.message.success("Backup deleted");
+      void reload();
+    } catch (err) {
+      feedback.message.error(extractApiError(err, "Delete failed"));
+    }
+  };
+
+  // GH #502: delete EVERY deletable job of a run behind one confirmation —
+  // a Full Server run holds a job per account, and clearing hundreds of
+  // jobs one dialog at a time made cleanup impractical. Running/queued
+  // jobs are skipped server-side (cancel them first).
+  const handleDeleteRun = async (runID: string) => {
+    try {
+      const resp = await apiClient.delete<{ deleted: number; skipped_running: number; failed: number }>(
+        `/admin/backup-runs/${runID}/jobs`,
+      );
+      const { deleted, skipped_running, failed } = resp.data;
+      if (failed > 0 || skipped_running > 0) {
+        feedback.message.warning(
+          `Deleted ${deleted} job(s); ${skipped_running} running/queued skipped, ${failed} failed`,
+        );
+      } else {
+        feedback.message.success(`Deleted ${deleted} backup job(s)`);
+      }
+      void reload();
+    } catch (err) {
+      feedback.message.error(extractApiError(err, "Bulk delete failed"));
+    }
+  };
+
+  const tableRows: TableRow[] = [
+    ...runs.map<RunRow>((r) => ({ rowKey: `run:${r.run_id}`, isRun: true, run: r })),
+    ...manual.map<ManualRow>((j) => ({ rowKey: `job:${j.id}`, isRun: false, job: j })),
+  ].sort((a, b) => {
+    const aT = a.isRun ? a.run.latest_updated : a.job.created_at;
+    const bT = b.isRun ? b.run.latest_updated : b.job.created_at;
+    return aT < bT ? 1 : aT > bT ? -1 : 0;
+  });
+
+  // showUser is off under a single manual job: its row already names the
+  // account (GH #2089).
+  const renderChildJobs = (jobs: BackupJob[], showUser = true) => (
+    <Table<BackupJob>
+      rowKey="id"
+      dataSource={jobs}
+      pagination={false}
+      size="small"
+      scroll={{ x: "max-content" }}
+      columns={[
+        {
+          // GH #2089: the full ID, selectable and copyable, not a truncated tooltip.
+          title: "Job ID",
+          dataIndex: "id",
+          sorter: (a, b) => a.id.localeCompare(b.id),
+          render: (id: string) => (
+            <Typography.Text code copyable={{ text: id }}>
+              {id}
+            </Typography.Text>
+          ),
+        },
+        ...(showUser
+          ? [
+              {
+                title: "User",
+                dataIndex: "user_id",
+                sorter: (a: BackupJob, b: BackupJob) =>
+                  ownerLabel(a.kind, a.user_id).localeCompare(ownerLabel(b.kind, b.user_id)),
+                render: (_: string, row: BackupJob) => ownerLabel(row.kind, row.user_id),
+              },
+            ]
+          : []),
+        {
+          title: "Created",
+          dataIndex: "created_at",
+          sorter: (a, b) => +new Date(a.created_at) - +new Date(b.created_at),
+          render: (ts: string) => <Timestamp value={ts} />,
+        },
+        {
+          title: "Destination",
+          dataIndex: "destination_id",
+          sorter: (a, b) => destLabel(a.kind, a.destination_id).localeCompare(destLabel(b.kind, b.destination_id)),
+          render: (_: string | undefined, row: BackupJob) => destLabel(row.kind, row.destination_id),
+        },
+        {
+          title: "Status",
+          dataIndex: "status",
+          sorter: (a, b) => a.status.localeCompare(b.status),
+          render: (s: string) => <BackupStatusTag status={s} />,
+        },
+        {
+          title: "Added",
+          dataIndex: "bytes_added",
+          sorter: (a, b) => (a.bytes_added ?? 0) - (b.bytes_added ?? 0),
+          render: (n: number) => formatBytes(n),
+        },
+        {
+          title: "Size",
+          dataIndex: "bytes_total",
+          sorter: (a, b) => (a.bytes_total ?? 0) - (b.bytes_total ?? 0),
+          render: (n: number) => formatBytes(n),
+        },
+        {
+          title: "Actions",
+          render: (_: unknown, row: BackupJob) => {
+            // JAB-332: Download / Restore / Delete visibility comes from the
+            // shared eligibility matrix (mirrors the panel-api gates); Log and
+            // Cancel are admin-only and stay in this adapter.
+            const shared = backupArtifactActions(
+              backupArtifactEligibility({
+                status: row.status,
+                kind: row.kind,
+                snapshot: snapshotKnowledge(row.snapshot_id),
+              }),
+              {
+                download: { preparing: dl.preparingId === row.id, onClick: () => handleDownload(row) },
+                restore: {
+                  icon: <RotateCcwOutlined />,
+                  onClick: () => handleRestore(row),
+                  confirm: { title: `Restore ${usernameById(row.user_id)}?`, description: "Overwrites the account's current files, databases, and mailboxes.", okText: "Restore" },
+                },
+                delete: {
+                  icon: <DeleteOutlined />,
+                  label: "Delete",
+                  onClick: () => handleDelete(row),
+                  confirm: { title: "Delete this backup?", description: "Permanently removes this run's snapshots from the repository. Cannot be undone.", okText: "Delete" },
+                },
+              },
+            );
+            return (
+              <RowActions
+                actions={[
+                  // GH #502: Download is the most common action after a backup
+                  // completes — keep it primary (first, visible); Log + the rest
+                  // collapse into the overflow menu.
+                  shared.download,
+                  { key: "log", label: "Log", icon: <FileTextOutlined />, onClick: () => setLogJob(row) },
+                  shared.restore,
+                  cancelAction(row),
+                  shared.delete,
+                ]}
+              />
+            );
+          },
+        },
+      ]}
+    />
+  );
+
+  return (
+    <div>
+      <Space
+        wrap
+        align="center"
+        style={{ marginBottom: 16, width: "100%", justifyContent: "space-between" }}
+      >
+        <Typography.Title level={3} style={{ margin: 0 }}>
+          <SaveOutlined style={{ marginRight: 8 }} />
+          Backups
+        </Typography.Title>
+        {/* wrap: the three buttons are wider than a phone screen */}
+        <Space wrap>
+          <Button
+            icon={<HardDriveUploadOutlined />}
+            onClick={() => setUploadRestoreOpen(true)}
+          >
+            Restore from Upload
+          </Button>
+          <Button
+            icon={<HardDriveUploadOutlined />}
+            onClick={() => setFullRestoreOpen(true)}
+          >
+            Restore Full Server
+          </Button>
+          <Button
+            type="primary"
+            icon={<PlusOutlined />}
+            onClick={() => setDrawerOpen(true)}
+          >
+            Create Backup
+          </Button>
+        </Space>
+      </Space>
+
+      <Card
+        tabList={[
+          {
+            key: "backups",
+            tab: (
+              <Space size={6}>
+                <RotateCcwOutlined />
+                <span>Backups</span>
+                <Badge count={total + manualTotal} showZero color="#999" />
+              </Space>
+            ),
+          },
+          {
+            key: "destinations",
+            tab: (
+              <Space>
+                <HardDriveUploadOutlined />
+                Destinations
+              </Space>
+            ),
+          },
+          {
+            key: "schedules",
+            tab: (
+              <Space>
+                <CalendarCheckOutlined />
+                Schedules
+              </Space>
+            ),
+          },
+          {
+            key: "encryption",
+            tab: (
+              <Space>
+                <KeyOutlined />
+                Encryption key
+              </Space>
+            ),
+          },
+          {
+            key: "settings",
+            tab: (
+              <Space>
+                <SettingOutlined />
+                Settings
+              </Space>
+            ),
+          },
+          {
+            key: "logs",
+            tab: (
+              <Space>
+                <FileTextOutlined />
+                Logs
+              </Space>
+            ),
+          },
+          {
+            key: "recovery",
+            tab: (
+              <Space>
+                <LifeBuoyOutlined />
+                Recovery
+              </Space>
+            ),
+          },
+        ]}
+        activeTabKey={activeTab}
+        onTabChange={(k) => setActiveTab(k as TabKey)}
+      >
+        {activeTab === "backups" && <UploadedBackupsTable onRestore={setRestoreKept} />}
+        {activeTab === "backups" && (total > runs.length || manualTotal > manual.length) && (
+          <Typography.Text type="secondary" style={{ display: "block", marginBottom: 8 }}>
+            Showing the newest {runs.length + manual.length} of {total + manualTotal} backups.
+          </Typography.Text>
+        )}
+        {activeTab === "backups" && (
+          <Table<TableRow>
+            rowKey="rowKey"
+            loading={loading}
+            dataSource={tableRows}
+            pagination={{ defaultPageSize: 25 }}
+            scroll={{ x: "max-content" }}
+            expandable={{
+              expandedRowKeys: expandedKeys,
+              onExpand: (_expanded, row) => toggleRowExpand(row),
+              expandedRowRender: (row) =>
+                row.isRun ? (
+                  runJobs[row.run.run_id] ? (
+                    renderChildJobs(runJobs[row.run.run_id])
+                  ) : (
+                    <Typography.Text type="secondary">Loading…</Typography.Text>
+                  )
+                ) : (
+                  renderChildJobs([row.job], false)
+                ),
+            }}
+            columns={[
+              {
+                // GH #2089: whose backup it is, not a truncated ID (the full
+                // job ID is in the expanded row).
+                title: "User",
+                sorter: (a, b) =>
+                  (a.isRun ? runOwnerLabel(a.run) : ownerLabel(a.job.kind, a.job.user_id)).localeCompare(
+                    b.isRun ? runOwnerLabel(b.run) : ownerLabel(b.job.kind, b.job.user_id),
+                  ),
+                render: (_: unknown, row: TableRow) =>
+                  row.isRun ? runOwnerLabel(row.run) : ownerLabel(row.job.kind, row.job.user_id),
+              },
+              {
+                title: "Source",
+                // GH #502: manual vs scheduled is the run's schedule_id (set only
+                // by the scheduler) — NOT whether jobs are grouped into a run. A
+                // manual Full Server backup is a grouped run with no schedule_id,
+                // and was wrongly labelled "scheduled run" before.
+                sorter: (a, b) =>
+                  Number(a.isRun && !!a.run.schedule_id) - Number(b.isRun && !!b.run.schedule_id),
+                render: (_: unknown, row: TableRow) =>
+                  row.isRun && row.run.schedule_id ? (
+                    <Tag color="geekblue">scheduled run</Tag>
+                  ) : (
+                    <Tag>manual</Tag>
+                  ),
+              },
+              {
+                title: "Type",
+                sorter: (a, b) => (a.isRun ? a.run.kind : a.job.kind).localeCompare(b.isRun ? b.run.kind : b.job.kind),
+                render: (_: unknown, row: TableRow) => {
+                  const kind = row.isRun ? row.run.kind : row.job.kind;
+                  const content = row.isRun ? row.run.content : row.job.content;
+                  const hasAccounts = row.isRun ? row.run.has_accounts : false;
+                  // A run's scope ("system + 12 accounts") is in the User column.
+                  return <Tag color={backupTypeColor(kind, content)}>{backupTypeLabel(kind, content, hasAccounts)}</Tag>;
+                },
+              },
+              {
+                title: "Destination",
+                sorter: (a, b) =>
+                  (a.isRun ? runDestLabel(a.run) : destLabel(a.job.kind, a.job.destination_id)).localeCompare(
+                    b.isRun ? runDestLabel(b.run) : destLabel(b.job.kind, b.job.destination_id),
+                  ),
+                render: (_: unknown, row: TableRow) =>
+                  row.isRun ? runDestLabel(row.run) : destLabel(row.job.kind, row.job.destination_id),
+              },
+              {
+                title: "Status",
+                render: (_: unknown, row: TableRow) =>
+                  row.isRun ? (
+                    <RunStatusSummary run={row.run} />
+                  ) : (
+                    <BackupStatusTag status={row.job.status} />
+                  ),
+              },
+              {
+                title: "Added (dedup win)",
+                sorter: (a, b) => (a.isRun ? a.run.bytes_added : a.job.bytes_added) - (b.isRun ? b.run.bytes_added : b.job.bytes_added),
+                render: (_: unknown, row: TableRow) =>
+                  !row.isRun && isRestoreKind(row.job.kind)
+                    ? "—"
+                    : formatBytes(row.isRun ? row.run.bytes_added : row.job.bytes_added),
+              },
+              {
+                title: "Logical size",
+                sorter: (a, b) => (a.isRun ? a.run.bytes_total : a.job.bytes_total) - (b.isRun ? b.run.bytes_total : b.job.bytes_total),
+                render: (_: unknown, row: TableRow) =>
+                  !row.isRun && isRestoreKind(row.job.kind)
+                    ? "—"
+                    : formatBytes(row.isRun ? row.run.bytes_total : row.job.bytes_total),
+              },
+              {
+                title: "Started",
+                sorter: (a, b) =>
+                  ((a.isRun ? a.run.started_at : a.job.created_at) ? +new Date(a.isRun ? a.run.started_at : a.job.created_at) : 0) -
+                  ((b.isRun ? b.run.started_at : b.job.created_at) ? +new Date(b.isRun ? b.run.started_at : b.job.created_at) : 0),
+                render: (_: unknown, row: TableRow) => (
+                  <Timestamp value={row.isRun ? row.run.started_at : row.job.created_at} />
+                ),
+              },
+              {
+                title: "Actions",
+                render: (_: unknown, row: TableRow) =>
+                  row.isRun ? (
+                    <Space>
+                      <Typography.Link style={{ fontSize: 12 }} onClick={() => toggleRowExpand(row)}>
+                        {expandedKeys.includes(row.rowKey) ? "Collapse" : "Expand"}
+                      </Typography.Link>
+                      <RowActions
+                        actions={[
+                          // GH #1408: a Full Server run (has account jobs) can be
+                          // packaged into ONE downloadable container.
+                          {
+                            key: "package-full",
+                            label: "Download",
+                            icon: <DownloadOutlined />,
+                            hidden: !row.run.has_accounts,
+                            onClick: () => setPackageRunId(row.run.run_id),
+                          },
+                          {
+                            key: "delete-all",
+                            label: "Delete",
+                            icon: <DeleteOutlined />,
+                            danger: true,
+                            onClick: () => handleDeleteRun(row.run.run_id),
+                            confirm: {
+                              title: `Delete all ${row.run.total} job(s) of this run?`,
+                              description:
+                                "Permanently removes every finished job's snapshots from the repository. Running or queued jobs are skipped. Cannot be undone.",
+                              okText: "Delete all",
+                            },
+                          },
+                        ]}
+                      />
+                    </Space>
+                  ) : (
+                    <RowActions
+                      actions={[
+                        cancelAction(row.job),
+                        {
+                          key: "delete",
+                          label: "Delete",
+                          icon: <DeleteOutlined />,
+                          danger: true,
+                          // JAB-332: share the one canDelete gate (hidden while
+                          // running) rather than re-deriving `status === running`.
+                          hidden: !backupArtifactEligibility({ status: row.job.status }).canDelete,
+                          onClick: () => handleDelete(row.job),
+                          confirm: { title: "Delete this backup?", description: "Permanently removes this backup's snapshots from the repository. Cannot be undone.", okText: "Delete" },
+                        },
+                      ]}
+                    />
+                  ),
+              },
+            ]}
+          />
+        )}
+        {activeTab === "destinations" && <DestinationsTab />}
+        {activeTab === "schedules" && <SchedulesTab />}
+        {activeTab === "encryption" && <EncryptionKeyCard />}
+        {activeTab === "settings" && <BackupSettingsTab />}
+        {activeTab === "logs" && <BackupLogsTab />}
+        {activeTab === "recovery" && <RecoveryHandoffTab />}
+      </Card>
+
+      <CreateBackupDrawer
+        open={drawerOpen}
+        onClose={() => setDrawerOpen(false)}
+        onCreated={() => {
+          setDrawerOpen(false);
+          void reload();
+        }}
+      />
+
+      <BackupLogModal
+        job={logJob}
+        onClose={() => setLogJob(null)}
+      />
+
+      <RestoreFromUploadDrawer
+        open={uploadRestoreOpen || restoreKept !== null}
+        uploaded={restoreKept}
+        onClose={() => {
+          setUploadRestoreOpen(false);
+          setRestoreKept(null);
+        }}
+        onKeptChange={() => void qc.invalidateQueries({ queryKey: ["list", UPLOADED_BACKUPS_RESOURCE] })}
+      />
+
+      <FullServerPackageModal
+        runId={packageRunId}
+        open={packageRunId !== null}
+        onClose={() => setPackageRunId(null)}
+      />
+
+      <RestoreFullServerDrawer
+        open={fullRestoreOpen}
+        onClose={() => setFullRestoreOpen(false)}
+      />
+    </div>
+  );
+};

@@ -1,0 +1,189 @@
+# Backups
+
+Two backup kinds:
+
+- **account_full** — one user's entire account (home dir + DBs + mail + DNS + cron + apps).
+- **system_backup** — the whole panel host (panel DB × 3 + OS users + every site).
+
+Both are restic-backed (deduplicated, encrypted at rest, multi-destination).
+
+Beyond the scheduled restic snapshots, DotNext also supports **portable container
+backups** (a single downloadable archive) and **restore-from-upload**, so an
+account — or a whole server — can be rebuilt on a host that has no restic
+destination in common with the source. See
+[Full Server backup / restore](#full-server-backup--restore) and
+[Restore from an uploaded archive](#restore-from-an-uploaded-archive).
+
+## Destinations
+
+`/dotnext-admin/backups` → Destinations:
+
+| Type | Config |
+|---|---|
+| Local | filesystem path on the panel host |
+| SFTP | host, user, key path |
+| S3 | endpoint, bucket, access key + secret |
+| Backblaze B2 | account ID, application key |
+| Azure Blob | account name, key, container |
+| Google Cloud Storage | bucket, service-account JSON |
+| Restic REST server | URL, optional auth |
+
+Multiple destinations per backup are supported — restic writes to each.
+
+## Schedules
+
+`/dotnext-admin/backups` → Schedules:
+
+- Pick the backup kind, the user(s) (for `account_full`), the destination, the cron schedule, and the retention policy.
+- Schedules become `systemd` system timers managed by the agent.
+
+Retention policies use restic's `--keep-daily`, `--keep-weekly` and `--keep-monthly` rules, applied once a day to whole backups: a backup's snapshots are kept or forgotten together, so a restore point is never partial. See [Backup Schedules](./admin/backup-schedules.md#retention-application).
+
+The dispatcher runs jobs with a **per-destination slot cap and a circuit
+breaker**: one dead or unreachable destination can no longer starve
+the whole queue — its jobs are skipped-if-pending and retried on their own
+per-destination slots while other destinations keep draining, and a failing
+destination raises an alert instead of silently backing up.
+
+### Automatic daily local backups
+
+Admins can enable **opt-in automatic daily local backups for all users**
+(default **off**) under `/dotnext-admin/backups`. When on, every account
+is backed up daily to the local destination on a staggered window, giving a
+baseline safety net without configuring a per-user schedule.
+
+## system_backup contents
+
+7 stages:
+
+1. **panel_db × 3** — three rolling `mariabackup` dumps of the panel DB itself.
+2. **OS users** — `/etc/passwd`, `/etc/shadow`, `/etc/group`, `/etc/gshadow` snapshot.
+3. **Stalwart state** — Stalwart's internal data dir (mailboxes are inside).
+4. **Kratos state** — identity store.
+5. **Hosted sites** — every `/home/<user>` tree.
+6. **Config snapshot** — `/etc/nginx/`, `/etc/php/`, `/etc/powerdns/`, `/etc/letsencrypt/`, `/etc/dotnext/`, install-marker drop-ins.
+7. **Restic snapshot** — wraps all of the above into one restic snapshot per destination.
+
+## Restore
+
+### From a restic snapshot (admin)
+
+`/dotnext-admin/backups` → Restore tab:
+
+- Pick a destination, browse snapshots, pick one.
+- For `account_full`: choose target user (overwrite or new). The restore drawer
+  has a **Select all** toggle plus per-leg checkboxes, so you can
+  restore only the home dir, only the databases, only mail, and so on.
+- For `system_backup`: typically restored on a fresh host — the panel is
+  bootstrapped, then `dotnext-cli system restore` is run from the CLI.
+
+An `account_full` restore rebuilds the account's databases (MariaDB **and**
+PostgreSQL), mail, DNS, cron, apps, and **FTP/SFTP subaccounts** — the last with
+their original login password preserved through a root-only one-shot staging
+file. MariaDB **database users** come back with their MariaDB account,
+grants and original password, so sites keep connecting to their databases
+(see [Database users and their passwords](./admin/backup-restore.md#database-users-and-their-passwords)).
+The domains' custom DNS records are added once their zones exist, through the
+same checks as a record added under DNS (see
+[Backup & restore](./admin/backup-restore.md#dns-records)).
+
+### Tenant self-service restore-from-upload
+
+Tenants no longer need an admin for a restore. From the user Backups page a
+tenant can **upload a backup archive and restore selected legs** — files,
+databases, and mail — of their own account. A per-account download is
+prepared in the background with a live **"Preparing…"** indicator so a large
+account doesn't block the request. What the account already has is kept unless
+they check **Overwrite existing items with the backup**.
+A downloaded backup holds the account's SSL certificates and their private
+keys, so keep it private; an administrator's restore can install them on
+another server (see [SSL certificates](./admin/backup-restore.md#ssl-certificates)).
+
+### Restore a single domain's document root
+
+From a backup you can restore just **one domain's document root** without
+touching the rest of the account — useful for reverting a single site
+after a bad deploy. Every domain of the backup is offered, and each domain's
+DNS is listed too; a domain whose backup holds no custom DNS records is shown
+greyed out. By default the backup's files are written over the live
+ones and files added since are kept; **Delete files added since the backup**
+makes the domain's folder an exact copy of the backup instead. Other domains'
+folders are never touched.
+
+### Database restore from a file
+
+Both engines support **Restore from file** on the per-database row (see
+[Databases](./databases.md)):
+
+- The upload is **chunked and async** so it beats Cloudflare's ~100 MB / 524
+  origin limits, with an upload-progress modal.
+- **MariaDB** and **PostgreSQL** are both covered. PostgreSQL accepts plain-SQL
+  **and** pgAdmin's default custom / tar archive formats, and surfaces the real
+  loader error instead of a generic failure. The uploaded dump is
+  never loaded as a superuser — it runs through a per-database, non-superuser
+  scoped role, built in a throwaway staging database and swapped onto the real
+  name only on success, so a bad upload never wipes the live database.
+
+Round-trip is live-verified on the test fleet.
+
+## Full Server backup / restore
+
+A **Full Server backup** packages one backup run into a single downloadable
+**container archive** — everything needed to reconstruct the
+host, in one file you can move anywhere.
+
+Restoring from an uploaded container (`dotnext-cli system restore --from-tar`):
+
+- Rebuilds the **system leg** and every hosted account.
+- **Creates missing OS users** and rebuilds per-user metadata, so the target
+  host does not have to already know the accounts.
+- Can **create-from-manifest** — restore an account into a user that does not yet
+  exist on the target.
+
+This is the path for moving a whole server to new hardware when the source and
+target share no restic destination.
+
+## Restore from an uploaded archive
+
+Both the account and full-server flows accept a backup **archive you upload**
+directly, rather than one reached through a configured restic destination — the
+portable counterpart to snapshot restore for cross-host moves and disaster
+recovery.
+
+An uploaded archive restores into the target account only: its own databases,
+mail domains and docker apps, or new ones. See
+[what an uploaded archive can't restore](./admin/backup-restore.md#what-an-uploaded-archive-cant-restore).
+
+By default it adds only what the account is missing: files, databases and
+Docker apps already there are kept. Check **Overwrite existing items with the
+backup** to replace them with the backup's. See
+[keep or overwrite](./admin/backup-restore.md#keep-or-overwrite-what-is-already-there).
+
+## CLI
+
+```bash
+dotnext-cli backup destination list
+dotnext-cli backup destination create --kind sftp --name daily-offsite --url sftp:backups@backup.example.com:/srv/restic
+dotnext-cli backup destination test daily-offsite
+
+dotnext-cli backup schedule list
+dotnext-cli backup schedule create --kind account_full --user <id> --destination daily-offsite --cron "0 3 * * *" --keep-daily 7 --keep-weekly 4
+dotnext-cli backup schedule run-now <id>
+
+# Restore one account from a snapshot (--apply=false only stages it)
+dotnext-cli backup account-restore --user <name> --destination daily-offsite --snapshot <id> --force
+
+# System restore from a restic repository
+dotnext-cli system restore --remote-url sftp:backups@backup.example.com:/srv/restic --snapshot latest --force
+# …or from a Full Server container archive (no shared restic destination needed; run as root):
+dotnext-cli system restore --from-tar /path/to/full-server-backup.tar --force
+```
+
+See [`platform/cli-reference.md`](./platform/cli-reference.md) for the complete,
+generated flag reference.
+
+## What you don't get
+
+- **Bare-metal disk image** — not in scope. Use your hypervisor's snapshot tools for that.
+- **Application-aware restore for non-WP apps** — restic restores the files + DB; you may need to update site URLs by hand if the FQDN changes.
+- **Continuous (WAL-style) DB shipping** — only periodic snapshots. For sub-minute RPO you need a separate replication setup.

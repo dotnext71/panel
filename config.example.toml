@@ -1,0 +1,45 @@
+# dotNext Panel — example configuration.
+# Copy to /etc/dotnext/config.toml and edit. Environment variables override
+# anything set here.
+
+# [server] is populated by install.sh on first install. It combines runtime
+# listen settings and server identity (hostname, public IPs, nameservers).
+#
+# Example populated block:
+#   [server]
+#   addr        = "unix:/run/dotnext-panel/api.sock"
+#   env         = "production"        # development | production
+#   hostname    = "panel.example.com"
+#   public_ipv4 = "203.0.113.10"
+#   public_ipv6 = "2001:db8::10"
+#   ns1_name    = "ns1.example.com"
+#   ns1_ipv4    = "203.0.113.10"
+#   ns2_name    = "ns2.example.com"
+#   ns2_ipv4    = "203.0.113.11"
+
+[log]
+# debug | info | warn | error
+level = "info"
+
+# text | json. In production this is auto-upgraded to "json" unless you
+# explicitly set LOG_FORMAT=text.
+format = "text"
+
+[database]
+# url = "dotnext_panel:CHANGE_ME@unix(/var/run/mysqld/mysqld.sock)/dotnext_panel?parseTime=true&charset=utf8mb4&loc=UTC"
+# url = "mysql://dotnext_panel:CHANGE_ME@tcp(127.0.0.1:3306)/dotnext_panel?parseTime=true&charset=utf8mb4&loc=UTC"
+url = ""
+
+[auth.kratos]
+public_url = "unix:/run/dotnext-kratos/public.sock"
+admin_url = "unix:/run/dotnext-kratos/admin.sock"
+
+[agent]
+# Path to the dotnext-agent Unix socket. The dotnext user/group needs read+write access.
+socket_path = "/run/dotnext/agent.sock"
+timeout     = "30s"
+
+[cors]
+# Origins allowed to hit the API from a browser. Empty = no CORS. Add your
+# SPA host here when the frontend ships (Phase 8).
+allowed_origins = []

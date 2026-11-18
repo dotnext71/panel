@@ -1,0 +1,71 @@
+slug: plausible
+popularity: 65
+name: Plausible Analytics
+tags: ["Analytics"]
+version: "3.2.1"
+description: |
+  Lightweight, open-source, privacy-focused web analytics. Three
+  services in this catalog entry: the Plausible Elixir app, a
+  PostgreSQL row store, and a ClickHouse columnar event store.
+  No marketing cookies; GDPR-friendly by default.
+icon: icon.svg
+upstream: https://github.com/plausible/community-edition
+documentation: https://plausible.io/docs
+
+image_channel: ghcr.io/plausible/community-edition:v3.2.1@sha256:33e60bfb40f2df5da00f8753b76fad04f67dba3abe6d73eb516e440e3fb62985
+update_mode: manual
+
+resources:
+  cpu: "2.0"
+  memory: "2g"
+  # The limit applies to each service. ClickHouse runs about 670 threads
+  # when idle and reached 923 under parallel queries on a test host; a
+  # limit of 500 crashed it at start (exit 139).
+  pids: 2048
+
+volumes:
+  - name: postgres
+    container_path: /var/lib/postgresql/data
+  - name: clickhouse
+    container_path: /var/lib/clickhouse
+  - name: clickhouse-logs
+    container_path: /var/log/clickhouse-server
+    rotate:
+      retention_days: 14
+      max_size: 50M
+      mode: copytruncate
+
+ports:
+  - name: http
+    container_port: 8000
+    protocol: tcp
+    default_enabled: true
+    default_bind: loopback
+    default_reverse_proxy: true
+    health_path: /api/health
+
+env:
+  - name: BASE_URL
+    value: ""
+  - name: SECRET_KEY_BASE
+    secret: true
+    generate: password64
+  - name: TOTP_VAULT_KEY
+    secret: true
+    # Plausible refuses to start unless this is standard base64 of exactly
+    # 32 bytes ("TOTP_VAULT_KEY must be Base64 encoded 32 bytes").
+    generate: base64_32
+  - name: DATABASE_URL
+    value: ""
+  - name: CLICKHOUSE_DATABASE_URL
+    value: ""
+  - name: POSTGRES_PASSWORD
+    secret: true
+    generate: password32
+  - name: CLICKHOUSE_PASSWORD
+    secret: true
+    generate: password32
+
+# Operator-supplied SMTP (GH #322): auto-injects standard SMTP_* install fields;
+# compose maps them to this app's SMTP env.
+smtp: true

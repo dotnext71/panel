@@ -1,0 +1,8 @@
+# DotNext Snuffleupagus -- Magento overlay (M41, ADR-0088).
+
+# pub/static is served as static assets; tenant PHP should never write
+# .php here at runtime.
+sp.disable_function.function("file_put_contents").filename_r("/pub/static/.*\\.php$").drop();
+
+# unserialize() PoP chain: Magento has a long history of these. HMAC-
+# protected sessions handled by base sp.unserialize_hmac.enable().

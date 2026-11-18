@@ -1,0 +1,62 @@
+services:
+  joplin:
+    image: {{ .ImageChannel }}
+    container_name: dotnext-app-{{ .Slug }}
+    restart: unless-stopped
+    depends_on:
+      - db
+    environment:
+{{- if (index .Env "SMTP_HOST") }}
+      # Operator-supplied SMTP (GH #322) — values q-escaped so special chars
+      # (e.g. API-key passwords) can't break the rendered compose YAML.
+      MAILER_ENABLED: "true"
+      MAILER_HOST: {{ q (index .Env "SMTP_HOST") }}
+      MAILER_PORT: {{ q (or (index .Env "SMTP_PORT") "587") }}
+      MAILER_SECURITY: "{{ if eq (index .Env "SMTP_PORT") "465" }}tls{{ else }}starttls{{ end }}"
+      MAILER_AUTH_USER: {{ q (index .Env "SMTP_USER") }}
+      MAILER_AUTH_PASSWORD: {{ q (index .Env "SMTP_PASSWORD") }}
+      MAILER_NOREPLY_NAME: {{ q (or (index .Env "SMTP_FROM_NAME") "Joplin Server") }}
+      MAILER_NOREPLY_EMAIL: {{ q (or (index .Env "SMTP_FROM") (printf "joplin@%s" .Domain)) }}
+{{- end }}
+      APP_BASE_URL: "{{ if .Domain }}https://{{ .Domain }}{{ else }}http://localhost{{ end }}"
+      APP_PORT: "22300"
+      DB_CLIENT: "pg"
+      POSTGRES_PASSWORD: {{ q (index .Env "POSTGRES_PASSWORD") }}
+      POSTGRES_DATABASE: "joplin"
+      POSTGRES_USER: "joplin"
+      POSTGRES_PORT: "5432"
+      POSTGRES_HOST: "db"
+    ports:
+{{- with index .Ports "http" }}
+      - "{{ .BindInterface }}:{{ .HostPort }}:{{ .ContainerPort }}/{{ .Protocol }}"
+{{- end }}
+    deploy:
+      resources:
+        limits:
+          cpus: "{{ .CPULimit }}"
+          memory: {{ .MemoryLimit }}
+    healthcheck:
+      # The image has no wget or curl, only Node. Joplin answers 404 "Invalid
+      # origin" unless the Host is APP_BASE_URL's.
+      test: ["CMD", "node", "-e", "require('http').get({host: '127.0.0.1', port: 22300, path: '/api/ping', headers: {Host: '{{ if .Domain }}{{ .Domain }}{{ else }}localhost{{ end }}'}}, r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  db:
+    image: postgres:17-alpine@sha256:dc17045ccfd343b49600570ea734b9c4991cf1c3f3302e67df51e3b402dd55c4
+    container_name: dotnext-app-{{ .Slug }}-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: {{ q (index .Env "POSTGRES_PASSWORD") }}
+      POSTGRES_USER: "joplin"
+      POSTGRES_DB: "joplin"
+    volumes:
+      - {{ .DataRoot }}/db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U joplin"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s

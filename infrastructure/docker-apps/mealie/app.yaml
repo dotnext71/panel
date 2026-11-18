@@ -1,0 +1,45 @@
+slug: mealie
+popularity: 60
+tenant_installable: true
+name: Mealie
+tags: ["Productivity"]
+version: "3.30.0"
+description: |
+  Self-hosted recipe manager and meal planner. Single container,
+  SQLite-backed by default.
+icon: icon.svg
+upstream: https://github.com/mealie-recipes/mealie
+documentation: https://docs.mealie.io/
+
+image_channel: ghcr.io/mealie-recipes/mealie:v3.30.0@sha256:90f83da6f3ab0a421efc827118a556168573930105f13fa3321768f42163d784
+update_mode: manual
+
+resources:
+  cpu: "1.0"
+  memory: "512m"
+  pids: 200
+
+volumes:
+  - name: data
+    container_path: /app/data
+
+ports:
+  - name: http
+    container_port: 9000
+    protocol: tcp
+    default_enabled: true
+    default_bind: loopback
+    default_reverse_proxy: true
+    health_path: /api/app/about
+
+env:
+  - name: ALLOW_SIGNUP
+    value: "false"
+  - name: TZ
+    value: "UTC"
+  - name: BASE_URL
+    value: ""
+
+# Operator-supplied SMTP (GH #322): auto-injects standard SMTP_* install fields;
+# compose maps them to this app's SMTP env.
+smtp: true

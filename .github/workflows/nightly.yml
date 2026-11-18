@@ -1,0 +1,147 @@
+# Nightly full-suite run — the daily safety net for the PR gate. Runs the whole
+# suite unconditionally + the slow/advisory checks kept off the PR path
+# (npm audit). Ported to GitHub Actions with the source-of-truth move.
+
+name: Nightly
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+
+# JAB-247 follow-up: nightly only builds/tests and uploads artifacts —
+# read-only token is sufficient.
+permissions:
+  contents: read
+
+env:
+  GO_VERSION: "1.27.3"
+  NODE_VERSION: "20"
+
+jobs:
+  go:
+    name: Go tests + vet (race)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - run: make vet
+      - run: make test
+
+  ui-unit:
+    name: frontend unit tests (vitest)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: cd frontend && npm ci --no-audit --no-fund --prefer-offline
+      - run: cd frontend && npm run lint
+      - run: cd frontend && npm test
+
+  e2e:
+    name: Playwright E2E (full)
+    runs-on: ubuntu-latest
+    concurrency:
+      group: e2e-port-4173
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: cd frontend && npm ci --no-audit --no-fund --prefer-offline
+      - run: cd frontend && npx playwright install chromium
+      - run: cd frontend && npm run build
+      - name: Free port 4173
+        run: |
+          pkill -9 -f "vite preview" 2>/dev/null || true
+          for i in $(seq 1 10); do
+            ss -tln | grep -q ":4173 " || break
+            sleep 1
+          done
+          if ss -tln | grep -q ":4173 "; then
+            echo "ERROR: port 4173 still in use after kill + 10s wait"
+            exit 1
+          fi
+      - run: cd frontend && npx playwright test --project=chromium --reporter=list
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nightly-playwright-report
+          path: |
+            frontend/test-results/
+            frontend/playwright-report/
+          retention-days: 7
+
+  audit:
+    name: npm audit (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: npm audit
+        continue-on-error: true
+        run: cd frontend && npm audit --omit=dev || true
+
+  # Failure notification — closes the blind spot that let nine red nights pass
+  # silently (Nightly had no alert step, only a Playwright-artifact upload).
+  # Fires on any job failure OR cancellation (always() so a cancelled job still
+  # alerts). Sends through the project mailbox's SMTP submission endpoint
+  # (mx1.reeva.me:465); the ONLY secret is the webmaster mailbox password
+  # (NIGHTLY_SMTP_PASSWORD) — host and address are non-sensitive. No third-party
+  # action, so the supply-chain surface stays at zero (cf. release.yml). If
+  # this job itself fails (for example, the mail server is unreachable),
+  # GitHub's built-in Actions failure email is the backstop.
+  notify:
+    name: Email on failure
+    needs: [go, ui-unit, e2e, audit]
+    if: ${{ always() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled')) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send failure email
+        env:
+          SMTP_PASSWORD: ${{ secrets.NIGHTLY_SMTP_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "${SMTP_PASSWORD:-}" ]; then
+            echo "NIGHTLY_SMTP_PASSWORD not set — skipping email. Set the secret to enable alerts."
+            exit 0
+          fi
+          from="webmaster@dotnext-panel.com"
+          to="webmaster@dotnext-panel.com"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          {
+            printf 'From: DotNext CI <%s>\r\n' "$from"
+            printf 'To: %s\r\n' "$to"
+            printf 'Subject: [Nightly FAILED] %s @ %s\r\n' "$GITHUB_REPOSITORY" "${GITHUB_SHA:0:8}"
+            printf 'Date: %s\r\n' "$(date -R)"
+            printf '\r\n'
+            printf 'The Nightly workflow failed.\r\n\r\n'
+            printf 'Results: go=%s  ui-unit=%s  e2e=%s  audit=%s\r\n' \
+              '${{ needs.go.result }}' '${{ needs.ui-unit.result }}' '${{ needs.e2e.result }}' '${{ needs.audit.result }}'
+            printf 'Commit:  %s\r\n' "$GITHUB_SHA"
+            printf 'Run:     %s\r\n' "$run_url"
+          } > msg.txt
+          # Credentials via a 0600 config file, never argv (no `ps` exposure).
+          umask 077
+          printf 'user = "%s:%s"\n' "$from" "$SMTP_PASSWORD" > curlrc
+          trap 'rm -f curlrc' EXIT
+          curl --fail --show-error --silent --ssl-reqd \
+            --url "smtps://mx1.reeva.me:465" \
+            --config curlrc \
+            --mail-from "$from" \
+            --mail-rcpt "$to" \
+            --upload-file msg.txt
+          echo "Failure email sent to $to"

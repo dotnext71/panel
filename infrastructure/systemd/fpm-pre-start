@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# dotnext FPM pre-start: validates per-user state exists before FPM starts.
+set -euo pipefail
+
+user="${1:?usage: fpm-pre-start <user>}"
+verfile="/etc/dotnext/user-phpver/${user}"
+userfpmconf="/etc/dotnext/fpm/${user}.conf"
+
+[[ -r "$verfile" ]] || { echo "fpm-pre-start: missing version pin $verfile" >&2; exit 1; }
+ver=$(cat "$verfile")
+# Basic format guard — agent writes X.Y, but defend against a stray file.
+[[ "$ver" =~ ^[0-9]+\.[0-9]+$ ]] || { echo "fpm-pre-start: malformed version '$ver' in $verfile" >&2; exit 1; }
+
+ver_short="${ver//./}"
+poolfile="/etc/php/${ver}/fpm/pool.d/dotnext-${user}.conf"
+if [[ ! -r "$poolfile" ]]; then
+  remi_poolfile="/etc/opt/remi/php${ver_short}/php-fpm.d/dotnext-${user}.conf"
+  if [[ -r "$remi_poolfile" ]]; then
+    poolfile="$remi_poolfile"
+  fi
+fi
+[[ -r "$poolfile" ]] || { echo "fpm-pre-start: missing pool config $poolfile" >&2; exit 1; }
+
+[[ -r "$userfpmconf" ]] || { echo "fpm-pre-start: missing per-user config $userfpmconf" >&2; exit 1; }
+
+# Derive the effective OS user/group from the pool config. For hosting
+# users the instance name equals the OS user, but system pools like
+# dotnext-pma run as www-data while keeping a distinct instance name
+# (so paths remain /run/php/dotnext-pma/...). Parse "user = X" and
+# "group = X" from the pool conf; fall back to the instance name.
+os_user=$(awk -F= '/^[[:space:]]*user[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$poolfile")
+os_group=$(awk -F= '/^[[:space:]]*group[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' "$poolfile")
+: "${os_user:=$user}"
+: "${os_group:=$os_user}"
+id -u "$os_user" >/dev/null 2>&1 || { echo "fpm-pre-start: OS user '$os_user' (from $poolfile) does not exist" >&2; exit 1; }
+
+# The unit's RuntimeDirectory-less setup means we're responsible for
+# /run/php existing with the expected perms. Sury's php-fpm package
+# creates it at package install time as root:root 0755.
+mkdir -p /run/php
+chmod 0755 /run/php
+
+# Per-user FPM runtime dir. FPM (after dropping to User=<os_user>) cannot
+# write to /run/php itself (www-data-owned), so we give it a user-owned
+# subdirectory to create its socket in. Group=www-data + mode=0750 lets
+# nginx traverse the dir to reach the socket but keeps it unreadable to
+# other hosting users.
+userrundir="/run/php/dotnext-${user}"
+mkdir -p "$userrundir"
+chown "${os_user}:www-data" "$userrundir"
+chmod 0750 "$userrundir"
+
+# Default ACL on the runtime dir so any socket FPM bind()s here inherits
+# nginx (www-data) rw access at creation time (#437). This closes the
+# sub-second window on an FPM RESTART between bind() and fpm-post-start
+# re-applying the ACL, during which nginx got "(13: Permission denied)" ->
+# a brief 502. fpm-post-start stays as the steady-state guarantee (and the
+# fallback on filesystems/kernels where default ACLs don't take). The mask
+# stays rw-effective for www-data after FPM's post-bind chmod 0660.
+# Best-effort: a host without ACL support just keeps the post-start path.
+setfacl -d -m u:www-data:rwx "$userrundir" 2>/dev/null || true
+
+# Publish the resolved PHP version into the per-user runtime dir so the
+# unprivileged ExecStart (fpm-exec) never has to read it back out of
+# /etc/dotnext/user-phpver/<user>. That parent is root:dotnext and
+# a single mis-set mode (0750) there used to crash-loop this unit for
+# every hosting user. This shim runs as root (ExecStartPre "+") and can
+# always read the pin; fpm-exec then only reads this user-owned file.
+printf '%s' "$ver" > "$userrundir/phpver"
+chown "${os_user}:${os_group}" "$userrundir/phpver"
+chmod 0440 "$userrundir/phpver"
+
+# Pre-create the FPM error log owned by the effective OS user. The
+# per-user config writes error_log to /var/log/php-fpm-<user>.log but
+# /var/log is root-owned, so FPM (which drops to User=<os_user> after
+# starting) cannot create the file itself. This shim runs as root (via
+# "+" prefix on ExecStartPre) so it can create+chown the file once.
+logfile="/var/log/php-fpm-${user}.log"
+if [[ ! -e "$logfile" ]]; then
+  install -m 0640 -o "$os_user" -g "$os_group" /dev/null "$logfile"
+else
+  # File already exists (e.g. left over from an older root-owned run).
+  # Ensure ownership/mode so FPM can open it for append when it drops
+  # to the hosting user after startup.
+  chown "$os_user:$os_group" "$logfile"
+  chmod 0640 "$logfile"
+fi

@@ -1,0 +1,392 @@
+package panelcmd
+
+import (
+	"bufio"
+	"context"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+	"gorm.io/gorm"
+
+	"github.com/dotnext-panel/dotnext/internal/agent"
+	"github.com/dotnext-panel/dotnext/internal/api"
+	"github.com/dotnext-panel/dotnext/internal/config"
+	"github.com/dotnext-panel/dotnext/internal/db"
+	"github.com/dotnext-panel/dotnext/internal/logger"
+	"github.com/dotnext-panel/dotnext/internal/paneltime"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+	"github.com/dotnext-panel/dotnext/pkg/paths"
+)
+
+// defaultEnvFile is a var only so tests can point it at a file of their own.
+var defaultEnvFile = paths.EnvFile
+
+// cliVersionString feeds cobra's --version output. Reuses the link-time
+// Version baked into panel-api/internal/api/health.go so HTTP /health
+// and the CLI report the same string. Empty `Version=dev` is the
+// untagged-build placeholder; install.sh sets it via -ldflags.
+func cliVersionString() string {
+	return api.Version
+}
+
+// Shared state populated by initConfig / initDB / initAgent helpers.
+// Subcommands call these in their own PreRunE so `dotnext help` stays fast.
+var (
+	cfgPath    string
+	jsonOutput bool
+
+	sharedCfg   *config.Config
+	sharedLog   *slog.Logger
+	sharedDB    *gorm.DB
+	sharedAgent *agent.Client
+)
+
+// rejectUnknownSubcommands makes every grouping command (one with
+// subcommands but no Run/RunE of its own) FAIL with a non-zero exit on an
+// unknown/typo'd subcommand, instead of cobra's default of printing the
+// parent's help and exiting 0 (QA 2026-06-22 #4: `dotnext backup list --json`
+// looked like success to automation). Bare `dotnext <group>` still prints help
+// and exits 0. A real subcommand is dispatched before the parent RunE runs.
+func rejectUnknownSubcommands(cmd *cobra.Command) {
+	for _, c := range cmd.Commands() {
+		rejectUnknownSubcommands(c)
+	}
+	if cmd.Runnable() || !cmd.HasSubCommands() {
+		return
+	}
+	cmd.RunE = func(c *cobra.Command, args []string) error {
+		if len(args) > 0 {
+			return fmt.Errorf("unknown subcommand %q for %q (run with --help for available subcommands)", args[0], c.CommandPath())
+		}
+		return c.Help()
+	}
+	cmd.SilenceUsage = true
+}
+
+func newRootCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "dotnext-cli",
+		Version: cliVersionString(),
+		Short:   "dotNext Panel — web hosting control panel",
+		Long:    "dotNext Panel CLI. Use subcommands to manage users, view system status, or start the panel server.",
+		// Usage is shown on error by default. This matters most when a
+		// caller forgets a required flag (e.g. `dotnext app install`):
+		// Cobra emits "Error: required flag(s) not set" AND the command's
+		// full usage, so the operator sees which flags to add without a
+		// second invocation. Operational errors (server down, 500 from
+		// panel) show usage too — slightly noisier, but the usage output
+		// is never misleading, and for a CLI this size the extra context
+		// is worth it. Individual commands can set SilenceUsage=true
+		// locally if their error paths are already self-explanatory.
+		SilenceUsage: false,
+		// main prints the error. Cobra printing it too showed every error
+		// twice (GH #2093).
+		SilenceErrors: true,
+	}
+
+	cmd.PersistentFlags().StringVar(&cfgPath, "config", "", "config file path (default: "+paths.ConfigFile+")")
+	cmd.PersistentFlags().BoolVar(&jsonOutput, "json", false, "output as JSON")
+
+	// `dotnext admin` is a grouping command for operator-only subcommands.
+	// M5b (admin-login) and M5c (disable-2fa) were removed by M20 — 2FA
+	// now lives in Kratos and is managed via `kratos identities patch
+	// <id> --clear-totp`. Slice-cutover stays because it's filesystem
+	// migration, not auth.
+	adminCmd := &cobra.Command{
+		Use:   "admin",
+		Short: "Operator-only administrative subcommands",
+	}
+	adminCmd.AddCommand(newAdminSliceCutoverCmd())
+	adminCmd.AddCommand(newAdminRebuildKratosCmd())
+	adminCmd.AddCommand(newAdminBackfillUsernamesCmd())
+	adminCmd.AddCommand(newAdminRelabelIdentifiersCmd())
+	adminCmd.AddCommand(newAdminPurgeOrphanIdentitiesCmd())
+
+	cmd.AddCommand(
+		newServeCmd(),
+		newVersionCmd(),
+		newUserCmd(),
+		newSessionCmd(),
+		newPackageCmd(),
+		newDomainCmd(),
+		newAppCmd(),
+		newSystemCmd(),
+		newMigrateCmd(),
+		newMigrateFromDotNextCmd(),
+		newUpdateCmd(),
+		newReleaseCmd(),
+		newSecurityCmd(),
+		newLimitsCmd(),
+		newMailboxCmd(),
+		newSharedResourceCmd(),
+		newPdnsCmd(),
+		newDNSCmd(),
+		newPanelPrimaryCmd(),
+		newNspawnCmd(),
+		adminCmd,
+		newSSOCmd(),
+		newSSOReapCmd(),
+		newMalwarePurgeCmd(),
+		newRetentionSweepCmd(),
+		newBackupCmd(),
+		newRepairCmd(),
+		newDockerCmd(),
+		newPerUserEgressCmd(),
+		newAppSecCmd(),
+		newAppArmorCmd(),
+		newAideCmd(),
+		newUfwCmd(),
+		newSSLCmd(),
+		newSSHKeyCmd(),
+		newPHPCmd(),
+		newCronCmd(),
+		newDBCmd(),
+		newAuditCmd(),
+		newDockerAppCmd(),
+		newAutomationTokenCmd(),
+		newPythonAppCmd(),
+		newSettingsCmd(),
+		newCrowdsecCmd(),
+		newMalwareCmd(),
+		newPhpDefenseCmd(),
+		newPageTemplateCmd(),
+		newActiveTasksCmd(),
+		newPanelCertCmd(),
+		newMailCertCmd(),
+		newMailGroupCmd(),
+		newUserTokenCmd(),
+		newImpersonationCmd(),
+		newLogCmd(),
+		newDiskUsageCmd(),
+		newNotificationCmd(),
+		newFilesCmd(),
+		newIPManagerCmd(),
+		newServiceCmd(),
+		newMailAdminCmd(),
+		newDRCmd(),
+		newSecretsCmd(),
+	)
+	rejectUnknownSubcommands(cmd)
+
+	// `dotnext reconcile` was removed by M20 — the reconciler already ticks
+	// every cfg.Agent.ReconcilerInterval (default 60s), and the CLI's
+	// manual-trigger path relied on legacy JWT that the Kratos-era
+	// middleware ignores. Operators who need an immediate tick can restart
+	// dotnext-api (`systemctl restart dotnext-api`) which re-runs every
+	// reconcile loop on boot.
+
+	return cmd
+}
+
+// initConfig loads config + sets up the logger. Called by subcommands that
+// need configuration. Idempotent — safe to call multiple times.
+//
+// When running outside systemd (CLI commands), env vars like DATABASE_URL
+// aren't set. We auto-load /etc/dotnext/panel.env if it exists so the CLI
+// has the same config as the service without manual `source`.
+func initConfig() error {
+	if sharedCfg != nil {
+		return nil
+	}
+
+	// Load the systemd env file so CLI commands see DATABASE_URL, JWT_SECRET, etc.
+	envFileErr = loadEnvFile(defaultEnvFile)
+
+	path := cfgPath
+	if path == "" {
+		path = os.Getenv("DOTNEXT_CONFIG")
+	}
+	if path == "" {
+		path = defaultConfigPath
+	}
+
+	cfg, err := config.Load(path)
+	if err != nil {
+		return needsRoot(fmt.Errorf("load config: %w", err))
+	}
+	if err := cfg.Validate(); err != nil {
+		return needsRoot(fmt.Errorf("validate config: %w", err))
+	}
+
+	sharedCfg = cfg
+	sharedLog = logger.New(cfg.Log, os.Stdout)
+	slog.SetDefault(sharedLog)
+	return nil
+}
+
+// envFileErr is set when defaultEnvFile exists but this user may not read
+// it, as when a hosting account runs dotnext (GH #2093). A command that then
+// fails for want of what the file holds says it needs root, instead of
+// naming the missing setting.
+var envFileErr error
+
+// runAsRootError says the dotnext command needs root: it could not read the
+// file at Path.
+type runAsRootError struct {
+	Path string
+	Err  error
+}
+
+func (e *runAsRootError) Error() string {
+	return "dotnext is the server's administration command and must run as root: cannot read " +
+		e.Path + " (permission denied). Hosting accounts manage their own cron jobs, websites and mail in the panel."
+}
+
+func (e *runAsRootError) Unwrap() error { return e.Err }
+
+// needsRoot returns a runAsRootError when err comes from a file this user may
+// not read, or when the env file was one. Any other error comes back as is.
+func needsRoot(err error) error {
+	var pe *fs.PathError
+	if errors.Is(err, fs.ErrPermission) && errors.As(err, &pe) {
+		return &runAsRootError{Path: pe.Path, Err: err}
+	}
+	if errors.As(envFileErr, &pe) {
+		return &runAsRootError{Path: pe.Path, Err: envFileErr}
+	}
+	return err
+}
+
+// loadEnvFile reads a KEY=VALUE file (like systemd EnvironmentFile) and
+// sets each pair via os.Setenv. Existing env vars are NOT overwritten so
+// explicit exports still win. Silently skips if the file doesn't exist.
+// It returns an error only when the file exists but this user may not read
+// it; the caller carries on without it, as before.
+func loadEnvFile(path string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrPermission) {
+			return err
+		}
+		return nil
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || line[0] == '#' {
+			continue
+		}
+		k, v, ok := strings.Cut(line, "=")
+		if !ok {
+			continue
+		}
+		k = strings.TrimSpace(k)
+		v = strings.TrimSpace(v)
+		// Don't overwrite — explicit env wins over file.
+		if _, exists := os.LookupEnv(k); !exists {
+			os.Setenv(k, v)
+		}
+	}
+	return nil
+}
+
+// initDB opens the database. Requires initConfig first.
+func initDB() error {
+	if sharedDB != nil {
+		return nil
+	}
+	if sharedCfg == nil {
+		return fmt.Errorf("initDB: config not loaded")
+	}
+	if sharedCfg.Database.URL == "" || sharedCfg.Database.URL == "placeholder-until-phase-3" {
+		return needsRoot(fmt.Errorf("DATABASE_URL not configured"))
+	}
+
+	gdb, err := db.Open(db.Options{
+		DSN:    sharedCfg.Database.URL,
+		Silent: sharedCfg.Server.Env == config.EnvProduction,
+	})
+	if err != nil {
+		return fmt.Errorf("open db: %w", err)
+	}
+	if err := db.Ping(gdb); err != nil {
+		return fmt.Errorf("ping db: %w", err)
+	}
+	sharedDB = gdb
+	setPanelClock(gdb)
+	return nil
+}
+
+// setPanelClock sets the panel clock from Server Settings (GH #2164), so the
+// server and every CLI command read backup crons in the same zone the panel
+// shows times in. An unreadable row leaves the OS zone, then UTC.
+func setPanelClock(gdb *gorm.DB) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	tz := ""
+	if st, err := repository.NewServerSettingsRepository(gdb).Get(ctx); err == nil && st != nil {
+		tz = st.Timezone
+	}
+	paneltime.Set(tz)
+}
+
+// initAgent sets up the agent client. Requires initConfig first.
+func initAgent() error {
+	if sharedAgent != nil {
+		return nil
+	}
+	if sharedCfg == nil {
+		return fmt.Errorf("initAgent: config not loaded")
+	}
+	sharedAgent = agent.NewClient(agent.Config{
+		SocketPath: sharedCfg.Agent.SocketPath,
+		Timeout:    sharedCfg.Agent.Timeout,
+	})
+	return nil
+}
+
+// userRepo is a convenience that returns a UserRepository from the shared DB.
+func userRepo() repository.UserRepository {
+	return repository.NewUserRepository(sharedDB)
+}
+
+// packageRepo is a convenience that returns a PackageRepository from the shared DB.
+func packageRepoFromDB() repository.PackageRepository {
+	return repository.NewPackageRepository(sharedDB)
+}
+
+// domainRepoFromDB returns a DomainRepository from the shared DB.
+func domainRepoFromDB() repository.DomainRepository {
+	return repository.NewDomainRepository(sharedDB)
+}
+
+// databaseRepoFromDB returns a DatabaseRepository from the shared DB.
+func databaseRepoFromDB() repository.DatabaseRepository {
+	return repository.NewDatabaseRepository(sharedDB)
+}
+
+// databaseUserRepoFromDB returns a DatabaseUserRepository from the shared DB.
+func databaseUserRepoFromDB() repository.DatabaseUserRepository {
+	return repository.NewDatabaseUserRepository(sharedDB)
+}
+
+// requireConfig initializes config only (no DB or agent).
+// Used by CLI commands that only need to read config.
+func requireConfig(cmd *cobra.Command, args []string) error {
+	return initConfig()
+}
+
+func requireDBAndAgent(cmd *cobra.Command, args []string) error {
+	if err := initConfig(); err != nil {
+		return err
+	}
+	if err := initDB(); err != nil {
+		return err
+	}
+	return initAgent()
+}
+
+func requireDB(cmd *cobra.Command, args []string) error {
+	if err := initConfig(); err != nil {
+		return err
+	}
+	return initDB()
+}

@@ -1,0 +1,30 @@
+services:
+  freshrss:
+    image: {{ .ImageChannel }}
+    container_name: dotnext-app-{{ .Slug }}
+    restart: unless-stopped
+    environment:
+{{- range $name, $val := .Env }}
+{{- if not (hasPrefix $name "SMTP_") }}
+      {{ $name }}: {{ q $val }}
+{{- end }}
+{{- end }}
+    volumes:
+      - {{ .DataRoot }}/data:/var/www/FreshRSS/data
+      - {{ .DataRoot }}/extensions:/var/www/FreshRSS/extensions
+    ports:
+{{- with index .Ports "http" }}
+      - "{{ .BindInterface }}:{{ .HostPort }}:{{ .ContainerPort }}/{{ .Protocol }}"
+{{- end }}
+    deploy:
+      resources:
+        limits:
+          cpus: "{{ .CPULimit }}"
+          memory: {{ .MemoryLimit }}
+    healthcheck:
+      # The image has no wget or curl; FreshRSS ships its own probe.
+      test: ["CMD", "php", "/var/www/FreshRSS/cli/health.php"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s

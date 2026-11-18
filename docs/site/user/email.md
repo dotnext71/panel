@@ -1,0 +1,129 @@
+# Email
+
+`/dotnext-api/mail-domains`, then a domain: tabs Accounts, Forwarders, Distribution lists, Groups, Shared Folders, Shared Resources, Settings, Logs and Statistics. The mail surface for your domains.
+
+## Tabs
+
+- [Mailboxes](./mailboxes.md) — create, change password, set quota, delete mail accounts.
+- [Forwarders](./forwarders.md) — forward an address to one or more external destinations.
+- [Autoresponders](./autoresponders.md) — vacation responder per mailbox with start and end window.
+- [Catch-all](./catch-all.md) — what happens to mail addressed to a recipient that does not exist.
+- [Disclaimer](./disclaimer.md) — append a server-side disclaimer to outbound mail.
+- **Settings** — per-domain mail options: the webmail switch and the webmail branding (see below), the catch-all and the disclaimer.
+- [Shared Folders](./shared-folders.md) — IMAP shared folders for team mailboxes.
+- **Distribution lists** — each member gets a copy; a list can also deliver to outside addresses, a Gmail address for example. See [Outside addresses on a distribution list](../mail.md#outside-addresses-on-a-distribution-list).
+- **Groups** — shared workspaces (one shared inbox, calendar, contacts and files). See [Mail groups](../mail.md#mail-groups).
+- **Shared Resources** — a shared calendar, address book or Files folder, granted to mailboxes and groups. A Files folder can take scans from a network scanner by FTP or SFTP; see [Scanner uploads to a shared Files folder](../mail.md#scanner-uploads-to-a-shared-files-folder).
+- [Email Logs](./email-logs.md) — live tail of inbound and outbound mail for your domains.
+
+## Webmail
+
+`https://mail.<domain>/` provides **Bulwark** (Next.js JMAP) webmail. The Mailboxes tab has a one-click **Open Webmail** button per mailbox that authenticates you via a single-use self-deleting SSO file.
+
+The **Settings** tab has a per-domain webmail switch. Turning it off removes webmail from `mail.<domain>` for that domain. IMAP, SMTP and mail delivery are unaffected, and mail apps still set themselves up and sync calendars and contacts through `mail.<domain>` (autoconfig/autodiscover, CalDAV/CardDAV, JMAP). Webmail also has to be enabled in your hosting plan, so turning it on here has no effect while your plan has webmail off. The change applies on the next reconcile.
+
+When your administrator has set a document editor, office files in webmail's **Files** view open in it for editing, right in the browser. Ask your administrator if you need it turned on.
+
+### Webmail branding
+
+When your hosting plan includes webmail branding, the **Settings** tab has a **Webmail branding** card. It sets what webmail shows on `mail.<domain>`:
+
+- **Name** — the webmail's name, in the browser tab and on the login page.
+- **Company name** — on the login page.
+- **Website**, **privacy policy** and **imprint** links — on the login page; `https://` or `http://` links only.
+- **Logo**, **logo for the dark theme** and **favicon** — PNG or JPEG, at most 512 KB and 1024 × 1024 pixels. The panel converts them to PNG. Without a dark-theme logo, webmail uses the logo in both themes.
+
+Empty fields keep the server-wide branding. A change reaches webmail at once, and webmail restarts for a few seconds when it does; signed-in users stay signed in. Webmail restarts for its branding at most every five minutes, so a change made within five minutes of the last one shows when those five minutes are up; the message after saving says when. **Remove branding** deletes it all and goes back to the server-wide branding.
+
+Without the switch in your plan, the card says so; ask your administrator. An administrator can also brand your domain's webmail, and you then see that your provider set it.
+
+## The domain directory
+
+Each domain whose mail DotNext hosts gets a read-only address book, the
+domain directory. It lists the domain's mailboxes by name and address, and
+every mailbox it lists can read it.
+
+- **Webmail** uses it for recipient suggestions: typing a colleague's name or
+  address in the To field finds them. Under **Contacts** it appears as a
+  shared address book, **Shared: dotnext-directory@<domain>**.
+- Webmail loads the directory when you sign in. A mailbox added while you are
+  signed in shows up in suggestions after you sign in again.
+- **Mail apps that sync contacts over CardDAV** do not find the directory on
+  their own. Add it as an address book at
+  `https://mail.<domain>/dav/card/dotnext-directory%40<domain>/default/` and
+  sign in with your mailbox address and password.
+
+- The directory lists only your domain's own mailboxes. It never shows other
+  domains on the server.
+- It lists mailboxes people use. System relays, the panel's notification
+  sender, send-only accounts and disabled mailboxes are left out. A disabled mailbox also loses access to
+  the directory until you enable it again.
+- The name shown is the mailbox's display name.
+- Nobody can edit the directory from webmail or a mail app. DotNext rebuilds
+  it from the mailbox list, normally within a minute of a change.
+- The address `dotnext-directory@<domain>` belongs to the directory. You
+  cannot use it for a mailbox, group or shared resource, and it does not
+  receive mail.
+
+## The postmaster address
+
+Mail to `postmaster@<domain>` goes to the server administrator, as for every
+domain on the server. It carries the reports other mail servers send about
+mail from your domain, and messages from people who have a problem with it.
+
+You cannot make a mailbox, alias, group or shared resource at
+`postmaster@<domain>`. A postmaster address made before this rule keeps
+working and still gets the domain's postmaster mail. A migration or a backup
+restore makes new addresses, so it skips a postmaster address and lists it
+in its report.
+
+## IMAP and SMTP submission
+
+- **IMAP**: `imap.<panel-hostname>:993` with TLS, username is the full email address, password is the mailbox password.
+- **SMTP submission**: `smtp.<panel-hostname>:587` (STARTTLS) or `:465` (TLS), same credentials.
+
+## Autoconfig
+
+Major mail clients can configure your account automatically:
+
+- **Thunderbird, K-9, mainstream clients**: enter your email address and password; the client finds settings via the `autoconfig.<domain>` endpoint.
+- **Outlook**: the same pattern using `autodiscover.<domain>`.
+- **Apple Mail, iOS**: install the `.mobileconfig` profile served by the panel at `https://<panel-hostname>/.well-known/mobileconfig?email=<address>`.
+
+## Calendar and contacts
+
+Each mailbox has a calendar (CalDAV) and contacts (CardDAV). Apps that look
+them up, such as Thunderbird and DAVx⁵, find them on their own: add the
+account with the full email address and the mailbox password, and the app
+offers the calendars and address books too. They use the domain's
+`_caldavs._tcp` and `_carddavs._tcp` DNS records, which point at
+`mail.<domain>`.
+
+On an iPhone or a Mac, add a CalDAV account for the calendar and a CardDAV
+account for contacts. Use the server `mail.<domain>`, the full email address
+and the mailbox password.
+
+- When the panel hosts the domain's DNS, it publishes these records for you.
+- When the DNS is hosted elsewhere, add them at your DNS provider. They are in
+  the list under **DNS records** on the Mail Domains page, with the other mail
+  records.
+- An app that cannot look them up needs the addresses typed in. The calendar
+  is at `https://mail.<domain>/dav/cal/<address>/` and the contacts are at
+  `https://mail.<domain>/dav/card/<address>/`, where `<address>` is the full
+  email address.
+- The shared domain directory is the one address book an app does not find on
+  its own. See [The domain directory](#the-domain-directory) to add it by
+  URL.
+
+## What is and is not included
+
+The mail stack is **Stalwart** ([why](../mail.md)). It handles SMTP, IMAP, JMAP, mailbox storage, and per-user spam scoring. The panel ships:
+
+- DKIM auto-key generation and rotation per domain.
+- SPF and DMARC record templates.
+- Per-domain MTA-STS policy.
+
+Outside scope:
+
+- Mailing lists (Mailman) — not currently shipped.
+- POP3 — disabled by default; the operator may enable it server-wide.

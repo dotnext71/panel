@@ -1,0 +1,477 @@
+package panelcmd
+
+import (
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/require"
+
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/packageops"
+	"github.com/dotnext-panel/dotnext/internal/phppoolops"
+)
+
+// packageFieldFlag maps each operator-editable hosting_packages field (by its
+// json tag — the wire name the REST create/update request uses) to the CLI flag
+// that sets it. This is the concrete form of JAB-306 AC3 ("new entitlement
+// fields cannot be omitted by one adapter"): the parity test below requires
+// every editable model field to appear here AND every flag to be registered on
+// both `package create` and `package edit`.
+var packageFieldFlag = map[string]string{
+	"name":                             "name",
+	"disk_quota_mb":                    "disk-mb",
+	"cpu_quota_percent":                "cpu",
+	"memory_limit_mb":                  "memory-mb",
+	"io_read_mbps":                     "io-read-mbps",
+	"io_write_mbps":                    "io-write-mbps",
+	"max_tasks":                        "max-tasks",
+	"bandwidth_quota_mb":               "bw-mb",
+	"max_domains":                      "domains",
+	"max_email_accounts":               "emails",
+	"max_databases":                    "databases",
+	"max_database_users":               "max-db-users",
+	"max_docker_apps":                  "max-docker-apps",
+	"max_python_apps":                  "max-python-apps",
+	"max_ftp_accounts":                 "max-ftp-accounts",
+	"max_backups":                      "max-backups",
+	"scheduled_backups_enabled":        "scheduled-backups",
+	"max_backup_schedules":             "max-backup-schedules",
+	"allowed_backup_destination_kinds": "backup-kinds",
+	"backup_retention_policy":          "backup-retention",
+	"ssh_enabled":                      "ssh",
+	"cgi_enabled":                      "cgi",
+	"php_exec_enabled":                 "php-exec",
+	"egress_ssh_out":                   "egress-ssh-out",       // GH #1798
+	"egress_ssh_out_cidrs":             "egress-ssh-out-cidrs", // GH #1798
+	"egress_icmp":                      "egress-icmp",          // GH #1798
+	"webmail_enabled":                  "webmail",              // GH #1628
+	"website_sends_email":              "website-mail",         // GH #2056
+	"composer_enabled":                 "composer",             // GH #2276
+	"git_deploy_enabled":               "git-deploy",           // GH #2277
+	"webmail_branding_enabled":         "webmail-branding",     // GH #2502
+	"redis_keys_per_call":              "redis-keys-per-call",  // GH #2165
+	"fpm_max_children_cap":             "fpm-max-children",
+	"fpm_worker_mem_mb":                "fpm-worker-mem-mb",
+	"fpm_user_can_edit":                "fpm-user-can-edit",
+	"fpm_advanced_mode":                "fpm-advanced",
+	"fpm_version_defaults":             "fpm-version-defaults",
+	"docker_app_slugs":                 "docker-app-slugs",
+	"nspawn_image_version":             "nspawn-image",
+	"php_settings_policy":              "php-settings-policy",    // GH #1701
+	"php_disabled_functions":           "php-disabled-functions", // GH #1701
+}
+
+// packageNonEditableJSON are hosting_packages columns that are identity /
+// bookkeeping, not operator-editable entitlements — they legitimately have no
+// CLI flag.
+var packageNonEditableJSON = map[string]bool{
+	"id":         true,
+	"created_at": true,
+	"updated_at": true,
+}
+
+// TestPackageCLI_EntitlementFlagParity is the AC3 guarantee: the operator CLI
+// exposes every hosting_packages entitlement the REST adapter does, so a field
+// can never be set through one adapter but silently defaulted through the other.
+// It is grounded in the model struct (the source of truth), so a new column
+// added without a matching create/edit flag fails here.
+func TestPackageCLI_EntitlementFlagParity(t *testing.T) {
+	// 1. Every editable model field maps to a flag (catches a new column with no
+	//    CLI flag mapping).
+	rt := reflect.TypeOf(models.HostingPackage{})
+	for i := 0; i < rt.NumField(); i++ {
+		tag := strings.Split(rt.Field(i).Tag.Get("json"), ",")[0]
+		if tag == "" || tag == "-" || packageNonEditableJSON[tag] {
+			continue
+		}
+		if _, ok := packageFieldFlag[tag]; !ok {
+			t.Errorf("hosting_packages.%s has no CLI flag — add one to package create/edit (JAB-306 AC3), or mark it non-editable", tag)
+		}
+	}
+
+	// 2. Every mapped flag is registered on BOTH create and edit (catches a
+	//    dropped flag registration in either adapter).
+	create := newPackageCreateCmd()
+	edit := newPackageEditCmd()
+	for tag, flag := range packageFieldFlag {
+		if create.Flags().Lookup(flag) == nil {
+			t.Errorf("create: field %q → --%s not registered", tag, flag)
+		}
+		if edit.Flags().Lookup(flag) == nil {
+			t.Errorf("edit: field %q → --%s not registered", tag, flag)
+		}
+	}
+}
+
+// GH #1628: webmail defaults ON, so `package create` must default --webmail to
+// true — matching the REST create handler, which treats an omitted
+// webmail_enabled as ON. A false default here would silently withhold webmail
+// from every CLI-created package.
+func TestPackageCLI_WebmailCreateFlagDefaultsOn(t *testing.T) {
+	create := newPackageCreateCmd()
+	fl := create.Flags().Lookup("webmail")
+	require.NotNil(t, fl, "create --webmail flag must be registered")
+	require.Equal(t, "true", fl.DefValue, "create --webmail must default ON (GH #1628)")
+
+	p, err := buildPackageFromCreateFlags(packageCreateFlags{name: "x", webmailEnabled: true})
+	require.NoError(t, err)
+	require.True(t, p.WebmailEnabled, "webmailEnabled flows onto the built row")
+}
+
+// --- create builder transforms (mirror internal/api/packages.go create) ---
+
+func TestBuildPackageFromCreateFlags_AppliesFpmAndRetentionDefaults(t *testing.T) {
+	p, err := buildPackageFromCreateFlags(packageCreateFlags{name: "x"})
+	require.NoError(t, err)
+	require.Equal(t, uint32(20), p.FpmMaxChildrenCap, "unset FPM cap defaults to 20")
+	require.Equal(t, uint32(64), p.FpmWorkerMemMb, "unset FPM worker mem defaults to 64")
+	require.Equal(t, "{}", p.FpmVersionDefaults, "unset FPM version defaults to {}")
+	require.Equal(t, models.BackupRetentionReject, p.BackupRetentionPolicy, "unset retention defaults to reject")
+	require.Nil(t, p.NspawnImageVersion, "unset nspawn image stays NULL (server default)")
+}
+
+func TestBuildPackageFromCreateFlags_AdvancedImpliesCanEdit(t *testing.T) {
+	p, err := buildPackageFromCreateFlags(packageCreateFlags{name: "x", fpmAdvanced: true})
+	require.NoError(t, err)
+	require.True(t, p.FpmUserCanEdit, "--fpm-advanced must imply --fpm-user-can-edit")
+}
+
+func TestBuildPackageFromCreateFlags_NormalizesBackupKinds(t *testing.T) {
+	p, err := buildPackageFromCreateFlags(packageCreateFlags{name: "x", backupKinds: " s3 , S3 , local "})
+	require.NoError(t, err)
+	require.Equal(t, "s3,local", p.AllowedBackupDestinationKinds, "kinds are lower-cased, trimmed, deduped, order-preserving")
+}
+
+func TestBuildPackageFromCreateFlags_PinsNspawnImage(t *testing.T) {
+	p, err := buildPackageFromCreateFlags(packageCreateFlags{name: "x", nspawnImage: "  debian-12  "})
+	require.NoError(t, err)
+	require.NotNil(t, p.NspawnImageVersion)
+	require.Equal(t, "debian-12", *p.NspawnImageVersion, "nspawn image is trimmed and pinned")
+}
+
+// The four Validate branches the prior slice noted were "not settable from CLI
+// today" are now reachable from live CLI input — prove each rejects.
+
+func TestBuildPackageFromCreateFlags_ValidateRejectsFpmCapOverMax(t *testing.T) {
+	p, err := buildPackageFromCreateFlags(packageCreateFlags{name: "x", fpmMaxChildren: phppoolops.AdminMaxChildrenCap + 1})
+	require.NoError(t, err)
+	require.ErrorIs(t, packageops.Validate(p), packageops.ErrFpmCapTooHigh)
+}
+
+func TestBuildPackageFromCreateFlags_RejectsUnknownBackupKind(t *testing.T) {
+	_, err := buildPackageFromCreateFlags(packageCreateFlags{name: "x", backupKinds: "not-a-real-kind"})
+	require.Error(t, err, "an unknown backup kind is rejected at build time")
+}
+
+func TestBuildPackageFromCreateFlags_ValidateRejectsBadRetention(t *testing.T) {
+	p, err := buildPackageFromCreateFlags(packageCreateFlags{name: "x", backupRetention: "delete-everything"})
+	require.NoError(t, err)
+	require.ErrorIs(t, packageops.Validate(p), packageops.ErrInvalidBackupRetentionPolicy)
+}
+
+func TestBuildPackageFromCreateFlags_ValidateRejectsBadNspawn(t *testing.T) {
+	p, err := buildPackageFromCreateFlags(packageCreateFlags{name: "x", nspawnImage: "Bad/Image!"})
+	require.NoError(t, err)
+	require.ErrorIs(t, packageops.Validate(p), packageops.ErrInvalidNspawnImage)
+}
+
+// --- edit builder transforms (mirror internal/api/packages.go update) ---
+
+// changedSet returns a cmd.Flags().Changed stand-in that reports the named flags
+// as set — lets us drive applyPackageEditFlags without cobra/DB plumbing.
+func changedSet(flags ...string) func(string) bool {
+	set := map[string]bool{}
+	for _, f := range flags {
+		set[f] = true
+	}
+	return func(s string) bool { return set[s] }
+}
+
+func TestApplyPackageEditFlags_OnlyNamedFieldsChange(t *testing.T) {
+	// A field the operator did not name must never be healed — the trap the
+	// per-field gating exists to avoid.
+	p := &models.HostingPackage{MaxDomains: 5, BackupRetentionPolicy: "prune"}
+	changed, err := applyPackageEditFlags(changedSet("disk-mb"), p, packageEditFlags{diskMB: 100})
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, uint32(100), p.DiskQuotaMB)
+	require.Equal(t, uint32(5), p.MaxDomains, "unnamed field must not change")
+	require.Equal(t, "prune", p.BackupRetentionPolicy, "unnamed retention must not be healed to reject")
+}
+
+func TestApplyPackageEditFlags_NoFlagsIsNoChange(t *testing.T) {
+	p := &models.HostingPackage{}
+	changed, err := applyPackageEditFlags(changedSet(), p, packageEditFlags{})
+	require.NoError(t, err)
+	require.False(t, changed, "no flags named ⇒ no change")
+}
+
+func TestApplyPackageEditFlags_AdvancedImpliesCanEdit(t *testing.T) {
+	p := &models.HostingPackage{FpmUserCanEdit: false}
+	changed, err := applyPackageEditFlags(changedSet(), p, packageEditFlags{fpmAdvanced: "true"})
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.True(t, p.FpmAdvancedMode)
+	require.True(t, p.FpmUserCanEdit, "--fpm-advanced=true implies can-edit on edit too")
+}
+
+func TestApplyPackageEditFlags_NspawnEmptyClearsPin(t *testing.T) {
+	v := "debian-12"
+	p := &models.HostingPackage{NspawnImageVersion: &v}
+	changed, err := applyPackageEditFlags(changedSet("nspawn-image"), p, packageEditFlags{nspawnImage: ""})
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Nil(t, p.NspawnImageVersion, "empty --nspawn-image clears the pin (back to server default)")
+}
+
+func TestApplyPackageEditFlags_NormalizesBackupKinds(t *testing.T) {
+	p := &models.HostingPackage{}
+	changed, err := applyPackageEditFlags(changedSet("backup-kinds"), p, packageEditFlags{backupKinds: " GCS , gcs , b2 "})
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, "gcs,b2", p.AllowedBackupDestinationKinds)
+}
+
+func TestApplyPackageEditFlags_RejectsUnknownBackupKind(t *testing.T) {
+	p := &models.HostingPackage{}
+	_, err := applyPackageEditFlags(changedSet("backup-kinds"), p, packageEditFlags{backupKinds: "nope"})
+	require.Error(t, err)
+}
+
+func TestApplyPackageEditFlags_TriStateFalseClearsToggle(t *testing.T) {
+	p := &models.HostingPackage{SSHEnabled: true}
+	changed, err := applyPackageEditFlags(changedSet(), p, packageEditFlags{sshEnabled: "false"})
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.False(t, p.SSHEnabled, "--ssh=false disables")
+}
+
+func TestApplyPackageEditFlags_TriStateGarbageIsError(t *testing.T) {
+	// A garbage toggle value fails loud instead of silently no-opping a security
+	// toggle (php-exec here) — and nothing is persisted.
+	p := &models.HostingPackage{PHPExecEnabled: false}
+	changed, err := applyPackageEditFlags(changedSet(), p, packageEditFlags{phpExec: "yes"})
+	require.Error(t, err)
+	require.False(t, changed)
+	require.False(t, p.PHPExecEnabled, "row untouched on a bad toggle value")
+}
+
+// GH #1798: the per-package egress allowances through the CLI.
+
+func TestBuildPackageFromCreateFlags_EgressAllowances(t *testing.T) {
+	p, err := buildPackageFromCreateFlags(packageCreateFlags{
+		name:              "x",
+		webmailEnabled:    true,
+		egressSSHOut:      true,
+		egressSSHOutCIDRs: `[" 140.82.112.0/20 "]`,
+		egressICMP:        true,
+	})
+	require.NoError(t, err)
+	require.True(t, p.EgressSSHOut)
+	require.True(t, p.EgressICMP)
+	require.Equal(t, `["140.82.112.0/20"]`, p.EgressSSHOutCIDRs, "CIDRs canonicalised")
+}
+
+func TestBuildPackageFromCreateFlags_EgressBadCIDRIsError(t *testing.T) {
+	_, err := buildPackageFromCreateFlags(packageCreateFlags{
+		name: "x", egressSSHOut: true, egressSSHOutCIDRs: `["nope"]`,
+	})
+	require.Error(t, err)
+}
+
+func TestApplyPackageEditFlags_EgressTriState(t *testing.T) {
+	// Off → on for a security allowance must persist; an unset flag must not.
+	p := &models.HostingPackage{EgressSSHOut: false, EgressICMP: false}
+	changed, err := applyPackageEditFlags(
+		changedSet("egress-ssh-out", "egress-icmp"),
+		p,
+		packageEditFlags{egressSSHOut: "true", egressICMP: "true"},
+	)
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.True(t, p.EgressSSHOut, "--egress-ssh-out=true enables")
+	require.True(t, p.EgressICMP, "--egress-icmp=true enables")
+
+	// Unset leaves an existing allowance untouched.
+	q := &models.HostingPackage{EgressSSHOut: true}
+	changed, err = applyPackageEditFlags(changedSet(), q, packageEditFlags{})
+	require.NoError(t, err)
+	require.False(t, changed)
+	require.True(t, q.EgressSSHOut, "omitted flag never heals the field")
+}
+
+func TestApplyPackageEditFlags_EgressBadCIDRIsError(t *testing.T) {
+	p := &models.HostingPackage{}
+	_, err := applyPackageEditFlags(
+		changedSet("egress-ssh-out-cidrs"), p,
+		packageEditFlags{egressSSHOutCIDRs: `["bad"]`},
+	)
+	require.Error(t, err)
+}
+
+func TestApplyPackageEditFlags_EgressTriStateGarbageIsError(t *testing.T) {
+	// A garbage value on a security allowance must fail loud, not silently
+	// no-op — same guard as php-exec, applied to the new egress toggle.
+	p := &models.HostingPackage{EgressSSHOut: false}
+	changed, err := applyPackageEditFlags(changedSet(), p, packageEditFlags{egressSSHOut: "yes"})
+	require.Error(t, err)
+	require.False(t, changed)
+	require.False(t, p.EgressSSHOut, "row untouched on a bad toggle value")
+}
+
+// GH #1701: the CLI stores the same canonical PHP settings policy the REST
+// path does, and refuses the same invalid ones.
+func TestBuildPackageFromCreateFlags_NormalizesPHPSettingsPolicy(t *testing.T) {
+	p, err := buildPackageFromCreateFlags(packageCreateFlags{name: "x", phpSettingsPolicy: `{"post_max_size":"admin_only","memory_limit":"admin_only"}`})
+	require.NoError(t, err)
+	require.Equal(t, `{"memory_limit":"admin_only","post_max_size":"admin_only"}`, p.PHPSettingsPolicy)
+
+	_, err = buildPackageFromCreateFlags(packageCreateFlags{name: "x", phpSettingsPolicy: `{"disable_functions":"tenant_allowed"}`})
+	require.Error(t, err, "a sensitive directive can never be tenant_allowed")
+}
+
+func TestApplyPackageEditFlags_PHPSettingsPolicy(t *testing.T) {
+	p := &models.HostingPackage{PHPSettingsPolicy: `{"memory_limit":"admin_only"}`}
+	changed, err := applyPackageEditFlags(changedSet("disk-mb"), p, packageEditFlags{diskMB: 1})
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, `{"memory_limit":"admin_only"}`, p.PHPSettingsPolicy, "an unnamed policy must not change")
+
+	changed, err = applyPackageEditFlags(changedSet("php-settings-policy"), p, packageEditFlags{phpSettingsPolicy: ""})
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, "", p.PHPSettingsPolicy, "an empty --php-settings-policy resets to the defaults")
+
+	_, err = applyPackageEditFlags(changedSet("php-settings-policy"), p, packageEditFlags{phpSettingsPolicy: `{"nope":"admin_only"}`})
+	require.Error(t, err)
+}
+
+// GH #1701: the disabled-functions list through the CLI, mirroring the REST
+// handler: the list wins over --php-exec, and --php-exec keeps extra entries.
+
+func TestBuildPackageFromCreateFlags_PHPDisabledFunctions(t *testing.T) {
+	p, err := buildPackageFromCreateFlags(packageCreateFlags{name: "a", webmailEnabled: true})
+	require.NoError(t, err)
+	require.Nil(t, p.PHPDisabledFunctions, "no flag = the lockdown default")
+	require.False(t, p.PHPExecEnabled)
+
+	p, err = buildPackageFromCreateFlags(packageCreateFlags{name: "b", webmailEnabled: true, phpExec: true})
+	require.NoError(t, err)
+	require.NotNil(t, p.PHPDisabledFunctions)
+	require.Equal(t, "", *p.PHPDisabledFunctions)
+	require.True(t, p.PHPExecEnabled)
+
+	p, err = buildPackageFromCreateFlags(packageCreateFlags{name: "c", webmailEnabled: true, phpExec: true, phpDisabledFunctions: "mail,EXEC"})
+	require.NoError(t, err)
+	require.Equal(t, "exec,mail", *p.PHPDisabledFunctions)
+	require.False(t, p.PHPExecEnabled, "the list wins over --php-exec")
+
+	_, err = buildPackageFromCreateFlags(packageCreateFlags{name: "d", webmailEnabled: true, phpDisabledFunctions: "exec;id"})
+	require.Error(t, err)
+}
+
+func TestApplyPackageEditFlags_PHPDisabledFunctions(t *testing.T) {
+	p := &models.HostingPackage{}
+	changed, err := applyPackageEditFlags(changedSet("php-disabled-functions"), p, packageEditFlags{phpDisabledFunctions: "none"})
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, "", *p.PHPDisabledFunctions)
+	require.True(t, p.PHPExecEnabled)
+
+	_, err = applyPackageEditFlags(changedSet("php-disabled-functions"), p, packageEditFlags{phpDisabledFunctions: "default"})
+	require.NoError(t, err)
+	require.Nil(t, p.PHPDisabledFunctions)
+	require.False(t, p.PHPExecEnabled)
+
+	// --php-exec true keeps the admin's extra functions.
+	extra := "exec,mail"
+	p.PHPDisabledFunctions = &extra
+	_, err = applyPackageEditFlags(changedSet("php-exec"), p, packageEditFlags{phpExec: "true"})
+	require.NoError(t, err)
+	require.Equal(t, "mail", *p.PHPDisabledFunctions)
+	require.True(t, p.PHPExecEnabled)
+
+	// The list wins when both are named.
+	_, err = applyPackageEditFlags(changedSet("php-exec", "php-disabled-functions"), p, packageEditFlags{phpExec: "true", phpDisabledFunctions: "dl"})
+	require.NoError(t, err)
+	require.Equal(t, "dl", *p.PHPDisabledFunctions)
+	require.False(t, p.PHPExecEnabled)
+
+	for _, bad := range []string{"", "exec;id"} {
+		_, err = applyPackageEditFlags(changedSet("php-disabled-functions"), p, packageEditFlags{phpDisabledFunctions: bad})
+		require.Error(t, err, bad)
+	}
+}
+
+// GH #2056: a new package's sites can't send mail unless the admin asks, so
+// `package create --website-mail` defaults off, like the REST create.
+func TestPackageCLI_WebsiteMailCreateFlagDefaultsOff(t *testing.T) {
+	create := newPackageCreateCmd()
+	fl := create.Flags().Lookup("website-mail")
+	require.NotNil(t, fl, "create --website-mail flag must be registered")
+	require.Equal(t, "false", fl.DefValue, "create --website-mail must default off (GH #2056)")
+
+	p, err := buildPackageFromCreateFlags(packageCreateFlags{name: "x", webmailEnabled: true, websiteSendsEmail: true})
+	require.NoError(t, err)
+	require.True(t, p.WebsiteSendsEmail, "websiteSendsEmail flows onto the built row")
+}
+
+// GH #2165: `package create` defaults --redis-keys-per-call to 500, like the
+// REST create; edit changes it only when named; Validate bounds both.
+func TestPackageCLI_RedisKeysPerCall(t *testing.T) {
+	create := newPackageCreateCmd()
+	fl := create.Flags().Lookup("redis-keys-per-call")
+	require.NotNil(t, fl)
+	require.Equal(t, "500", fl.DefValue, "create defaults to what every package had before")
+
+	p, err := buildPackageFromCreateFlags(packageCreateFlags{name: "x", redisKeysPerCall: 2000})
+	require.NoError(t, err)
+	require.Equal(t, 2000, p.RedisKeysPerCall)
+	require.NoError(t, packageops.Validate(p))
+
+	p, err = buildPackageFromCreateFlags(packageCreateFlags{name: "x", redisKeysPerCall: 0})
+	require.NoError(t, err)
+	require.ErrorIs(t, packageops.Validate(p), packageops.ErrInvalidRedisKeysPerCall, "0 is not unlimited")
+
+	p = &models.HostingPackage{RedisKeysPerCall: 1500}
+	changed, err := applyPackageEditFlags(changedSet("disk-mb"), p, packageEditFlags{diskMB: 1, redisKeysPerCall: 0})
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, 1500, p.RedisKeysPerCall, "an unnamed --redis-keys-per-call never changes")
+
+	changed, err = applyPackageEditFlags(changedSet("redis-keys-per-call"), p, packageEditFlags{redisKeysPerCall: 3000})
+	require.NoError(t, err)
+	require.True(t, changed)
+	require.Equal(t, 3000, p.RedisKeysPerCall)
+
+	_, err = applyPackageEditFlags(changedSet("redis-keys-per-call"), p, packageEditFlags{redisKeysPerCall: 50})
+	require.NoError(t, err)
+	require.ErrorIs(t, packageops.Validate(p), packageops.ErrInvalidRedisKeysPerCall)
+}
+
+// GH #2276: a Composer run executes the user's composer.json scripts, so a
+// new package can't run Composer unless the admin asks, like the REST create.
+func TestPackageCLI_ComposerCreateFlagDefaultsOff(t *testing.T) {
+	create := newPackageCreateCmd()
+	fl := create.Flags().Lookup("composer")
+	require.NotNil(t, fl, "create --composer flag must be registered")
+	require.Equal(t, "false", fl.DefValue, "create --composer must default off (GH #2276)")
+
+	p, err := buildPackageFromCreateFlags(packageCreateFlags{name: "x", webmailEnabled: true, composerEnabled: true})
+	require.NoError(t, err)
+	require.True(t, p.ComposerEnabled, "composerEnabled flows onto the built row")
+}
+
+// GH #2277: a new package can't deploy from Git unless the admin asks, like
+// the REST create.
+func TestPackageCLI_GitDeployCreateFlagDefaultsOff(t *testing.T) {
+	create := newPackageCreateCmd()
+	fl := create.Flags().Lookup("git-deploy")
+	require.NotNil(t, fl, "create --git-deploy flag must be registered")
+	require.Equal(t, "false", fl.DefValue, "create --git-deploy must default off (GH #2277)")
+
+	p, err := buildPackageFromCreateFlags(packageCreateFlags{name: "x", webmailEnabled: true, gitDeployEnabled: true})
+	require.NoError(t, err)
+	require.True(t, p.GitDeployEnabled, "gitDeployEnabled flows onto the built row")
+}

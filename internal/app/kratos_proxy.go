@@ -1,0 +1,82 @@
+package app
+
+import (
+	"net/http"
+	"net/http/httputil"
+	"net/url"
+	"strings"
+
+	"log/slog"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/dotnext-panel/dotnext/internal/kratosclient"
+	"github.com/dotnext-panel/dotnext/internal/middleware"
+)
+
+// RegisterKratosProxy wires a same-origin reverse proxy at /.ory/* that
+// forwards to the Kratos public HTTP API (cfg.Auth.Kratos.PublicURL).
+//
+// Why this exists: panel-api binds :8443 directly and serves the SPA from
+// that port. The browser issues axios.get("/.ory/self-service/login/browser")
+// as a relative URL, which resolves to https://<host>:8443/.ory/... On that
+// port there is no nginx in front, so without this proxy the path falls
+// through NoRoute and the SPA static handler returns index.html — axios then
+// tries to JSON-parse the HTML and `flow.ui` ends up undefined, crashing
+// the login page with "e.ui is undefined" before the user can even type.
+//
+// The proxy is same-origin on purpose: Kratos sets cookies (csrf_token,
+// ory_kratos_session) with the host-only default — those cookies travel
+// on any port of the panel hostname, so we don't need to stamp Domain.
+// Path is preserved as-is (Kratos expects `/self-service/login/browser`,
+// so we strip the `/.ory` prefix on the way through).
+//
+// upstream is either a complete HTTP/HTTPS URL (http://127.0.0.1:4433) OR
+// the M25-style unix-socket form (unix:/run/dotnext-kratos/public.sock).
+// kratosclient.NewReverseProxyTransport handles the rewrite either way:
+// for unix URLs it returns a synthetic http://<host> URL that drives the
+// reverse-proxy's Director correctly, plus a Transport whose DialContext
+// dials the configured socket. For HTTP/HTTPS URLs it returns the input
+// unchanged plus a fresh default transport. Returns an error only if
+// upstream is unparseable — panics stay out of the web request path.
+func RegisterKratosProxy(r *gin.Engine, upstream string, rl *middleware.RateLimiter, log *slog.Logger) error {
+	rewritten, transport, err := kratosclient.NewReverseProxyTransport(upstream)
+	if err != nil {
+		return err
+	}
+	target, err := url.Parse(rewritten)
+	if err != nil {
+		return err
+	}
+
+	// httputil.NewSingleHostReverseProxy handles scheme/host/port rewriting
+	// and copies request/response headers. We layer a Director wrapper on
+	// top so we can trim the `/.ory` prefix from the path — without this,
+	// Kratos would see /.ory/self-service/login/browser and 404.
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	// Override the default transport so unix-socket upstreams actually dial
+	// their socket instead of attempting a TCP connect to the synthetic host.
+	proxy.Transport = transport
+	origDirector := proxy.Director
+	proxy.Director = func(req *http.Request) {
+		origDirector(req)
+		req.URL.Path = strings.TrimPrefix(req.URL.Path, "/.ory")
+		if req.URL.Path == "" {
+			req.URL.Path = "/"
+		}
+		// Force Host to the upstream so nginx-less setups don't confuse
+		// Kratos about which vhost is talking to it. NewSingleHostReverseProxy
+		// already sets req.URL.Host but not req.Host when the caller's Host
+		// header differs from target.
+		req.Host = target.Host
+	}
+
+	// Any method; Kratos endpoints include GET (flow init), POST (submit),
+	// and DELETE (logout). Gin's Any() is the idiomatic wildcard.
+	// JAB-4: rate-limit the credential POSTs (login/recovery) per client IP
+	// BEFORE the proxy forwards to Kratos. Flow-init GETs + CSRF pass through.
+	r.Any("/.ory/*proxyPath", rl.KratosFlows(log), func(c *gin.Context) {
+		proxy.ServeHTTP(c.Writer, c.Request)
+	})
+	return nil
+}

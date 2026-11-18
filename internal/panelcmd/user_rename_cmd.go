@@ -1,0 +1,97 @@
+package panelcmd
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/dotnext-panel/dotnext/internal/kratosclient"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+	"github.com/dotnext-panel/dotnext/internal/userops"
+)
+
+// cliRenameDeps wires userops.Deps for `user rename` from the CLI singletons.
+func cliRenameDeps() userops.Deps {
+	var kc *kratosclient.Client
+	if sharedCfg != nil {
+		kc = kratosclient.NewClient(sharedCfg.Auth.Kratos.PublicURL, sharedCfg.Auth.Kratos.AdminURL)
+	}
+	d := userops.Deps{
+		Users:        userRepo(),
+		Domains:      domainRepoFromDB(),
+		KratosClient: kc,
+		Log:          slog.Default(),
+	}
+	if sharedAgent != nil {
+		d.Agent = sharedAgent
+	}
+	return d
+}
+
+func newUserRenameCmd() *cobra.Command {
+	var yes bool
+	cmd := &cobra.Command{
+		Use:   "rename <email|username|user-id> <new-username>",
+		Short: "Rename a tenant's Linux/login username in place",
+		Long: `Rename a tenant's Linux account (and Kratos login identifier) in place.
+
+The uid is preserved, so file ownership is unchanged; the account name and the
+home directory (/home/<old> -> /home/<new>) move, and every owned domain's docroot
+is repointed and re-rendered.
+
+v1 refuses the rename when the tenant has FTP/SFTP subaccounts or Python apps
+(their jails/app-roots need move handling a later version adds). Their databases
+and DB SSO shadow roles keep the old-username prefix (the panel keys them by id).`,
+		Args:    cobra.ExactArgs(2),
+		PreRunE: requireDBAndAgent,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Minute)
+			defer cancel()
+
+			target, err := resolveUser(ctx, args[0])
+			if err != nil {
+				return err
+			}
+			newName := args[1]
+			old := ""
+			if target.Username != nil {
+				old = *target.Username
+			}
+
+			if !yes {
+				ok, cerr := confirm(fmt.Sprintf(
+					"Rename user %q -> %q? This renames the Linux account, moves /home/%s -> /home/%s, re-renders their sites, and re-prefixes their MariaDB databases + DB users (%s_* -> %s_*). App config files (wp-config.php etc.) that reference the old database name/user must be updated by hand afterwards.",
+					old, newName, old, newName, old, newName))
+				if cerr != nil {
+					return cerr
+				}
+				if !ok {
+					return notConfirmed(cmd, "--yes")
+				}
+			}
+
+			rd := userops.RenameDeps{
+				FtpAccounts: repository.NewFtpAccountRepository(sharedDB),
+				PythonApps:  pythonAppRepoFromDB(),
+				// GH #1238: re-prefix the tenant's MariaDB artifacts on rename.
+				Databases:     repository.NewDatabaseRepository(sharedDB),
+				DatabaseUsers: repository.NewDatabaseUserRepository(sharedDB),
+				DBUserGrants:  repository.NewDatabaseUserGrantRepository(sharedDB),
+				// Reconciler is nil: the CLI is a separate process, so the running
+				// panel's periodic reconcile re-renders the owned domains.
+			}
+			if err := userops.RenameUser(ctx, cliRenameDeps(), rd, target, newName); err != nil {
+				cliAuditErr(ctx, "user.rename", "user", target.ID, &target.ID)
+				return err
+			}
+			cliAuditOK(ctx, "user.rename", "user", target.ID, &target.ID)
+			fmt.Printf("Renamed %q -> %q.\nTheir MariaDB databases + DB users were re-prefixed to %s_*. Update any app config (wp-config.php etc.) that still points at the old database name/user.\nThe reconciler re-renders their sites within ~a minute; verify with a page load or `dotnext domain list`.\n", old, newName, newName)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&yes, "yes", false, "skip the confirmation prompt")
+	return cmd
+}

@@ -1,0 +1,48 @@
+slug: vaultwarden
+popularity: 90
+tenant_installable: true
+name: Vaultwarden
+tags: ["Security"]
+version: "1.37.4"
+description: |
+  Self-hosted password manager, Bitwarden-compatible API. Rust rewrite
+  of the official Bitwarden server. Small memory footprint, single
+  container, SQLite by default.
+icon: icon.svg
+upstream: https://github.com/dani-garcia/vaultwarden
+documentation: https://github.com/dani-garcia/vaultwarden/wiki
+
+image_channel: vaultwarden/server:1.37.4@sha256:efb3cde962015fcc036b2ea625242248611943b27212ebf4392841fb30fad055
+update_mode: manual
+# Builds its public URL from the install's domain and does not start
+# without one.
+requires_domain: true
+
+resources:
+  cpu: "0.5"
+  memory: "256m"
+  pids: 100
+
+volumes:
+  - name: data
+    container_path: /data
+
+ports:
+  - name: http
+    container_port: 80
+    protocol: tcp
+    default_enabled: true
+    default_bind: loopback
+    default_reverse_proxy: true
+    health_path: /alive
+
+env:
+  - name: SIGNUPS_ALLOWED
+    value: "false"
+  - name: ADMIN_TOKEN
+    secret: true
+    generate: password64
+
+# Operator-supplied SMTP (GH #322): auto-injects standard SMTP_* install fields;
+# compose maps them to this app's SMTP env.
+smtp: true

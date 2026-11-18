@@ -1,0 +1,2092 @@
+// Package app wires HTTP routes, middleware and lifecycle together.
+// Downstream packages (handlers, middleware, repositories) plug in here.
+package app
+
+import (
+	"log/slog"
+	"os"
+	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
+	"golang.org/x/time/rate"
+	"gorm.io/gorm"
+
+	modsystem "github.com/dotnext-panel/dotnext/core/monitoring"
+	"github.com/dotnext-panel/dotnext/frontend"
+	"github.com/dotnext-panel/dotnext/internal/agent"
+	"github.com/dotnext-panel/dotnext/internal/api"
+	"github.com/dotnext-panel/dotnext/internal/apps"
+	"github.com/dotnext-panel/dotnext/internal/audit"
+	"github.com/dotnext-panel/dotnext/internal/config"
+	"github.com/dotnext-panel/dotnext/internal/dockerapp"
+	"github.com/dotnext-panel/dotnext/internal/eventsources"
+	"github.com/dotnext-panel/dotnext/internal/gitdeploy"
+	"github.com/dotnext-panel/dotnext/internal/ioncube"
+	"github.com/dotnext-panel/dotnext/internal/kratosclient"
+	"github.com/dotnext-panel/dotnext/internal/limitsync"
+	"github.com/dotnext-panel/dotnext/internal/middleware"
+	"github.com/dotnext-panel/dotnext/internal/notifications"
+	"github.com/dotnext-panel/dotnext/internal/ownershipops"
+	"github.com/dotnext-panel/dotnext/internal/platform/jobs"
+	"github.com/dotnext-panel/dotnext/internal/pyframeworks"
+	"github.com/dotnext-panel/dotnext/internal/reconciler"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+	"github.com/dotnext-panel/dotnext/internal/scandrops"
+	"github.com/dotnext-panel/dotnext/internal/sendasops"
+	"github.com/dotnext-panel/dotnext/internal/sso"
+	"github.com/dotnext-panel/dotnext/internal/ssokey"
+	"github.com/dotnext-panel/dotnext/internal/userops"
+	"github.com/dotnext-panel/dotnext/internal/webmailsso"
+	"github.com/dotnext-panel/dotnext/internal/webui"
+)
+
+// Deps bundles the collaborators NewWithDeps needs so main.go keeps its
+// argument list short. Anything a handler family needs — Kratos client,
+// repositories — plugs in here.
+type Deps struct {
+	KratosClient *kratosclient.Client
+	Users        repository.UserRepository
+	Packages     repository.PackageRepository
+	Domains      repository.DomainRepository
+	// DomainTeardowns persists the JAB-236 tombstones for durable domain
+	// deletion (REST + billing cascade + reconciler retry sweep).
+	DomainTeardowns     repository.DomainTeardownRepository
+	Databases           repository.DatabaseRepository
+	DatabaseUsers       repository.DatabaseUserRepository
+	DatabaseUserGrants  repository.DatabaseUserGrantRepository
+	DBAdmin             repository.DBAdminRepository
+	Mailboxes           repository.MailboxRepository
+	MailGroups          repository.MailGroupRepository
+	MailboxSSOTokens    repository.MailboxSSOTokenRepository
+	PhpMyAdminSSOTokens repository.PhpMyAdminSSOTokenRepository
+	// M37 Phase 4: Adminer SSO bridge for both engines.
+	AdminerSSOTokens          repository.AdminerSSOTokenRepository
+	AdminerSSO                *sso.AdminerService
+	LogAccessStreams          repository.LogAccessStreamRepository
+	TerminalSessions          repository.TerminalSessionRepository
+	Agent                     agent.AgentInterface
+	Reconciler                *reconciler.Reconciler
+	ServerSettings            repository.ServerSettingsRepository
+	PageTemplates             repository.PageTemplateRepository
+	AccountSkeleton           repository.AccountSkeletonRepository
+	NotificationEventSettings repository.NotificationEventSettingRepository
+	DNSZones                  repository.DNSZoneRepository
+	DNSRecords                repository.DNSRecordRepository
+	DNSTemplates              repository.DNSTemplateRepository
+	WebTemplates              repository.WebTemplateRepository
+	SSLCerts                  repository.SSLCertificateRepository
+	SharedCerts               repository.SharedCertificateRepository
+	// MailRBLStates (M47 Wave 5) backs the curated-RBL eventsource
+	// that probes the server's outbound IPv4 against a free RBL
+	// baseline and fires mail.rbl.{listed,cleared} on transitions.
+	MailRBLStates repository.MailRBLStateRepository
+	// M47 Wave 4/6/8 ingest sources.
+	StalwartAdmin   eventsources.StalwartReportClient
+	DMARCAggregate  repository.DMARCAggregateRepository
+	TLSRPTAggregate repository.TLSRPTAggregateRepository
+	ARFReports      repository.ARFReportRepository
+	// M47 Wave 3 outbound throttle config. MailThrottles is
+	// stalwartadmin.Throttles.
+	MailOutboundPolicies repository.MailOutboundPolicyRepository
+	MailThrottles        api.ThrottleDispatcher
+	// MailAddresses clears addresses from Stalwart's registry before a
+	// mailbox or alias takes them (mailaddrowner.Releaser). Mailbox creates
+	// refuse without it.
+	MailAddresses api.MailAddressReleaser
+	// MailCredentials removes the mail server's app passwords and API keys a
+	// mailbox may no longer use (mailcreds.Sweeper) when the panel changes a
+	// password, disables a mailbox or suspends its owner.
+	MailCredentials userops.MailCredentialSweeper
+	BWDaily         repository.BWDailyRepository
+	DomainIPACLs    repository.DomainIPACLRepository
+	// GH #2328 — paths of a domain that skip the bot-detection challenge.
+	BotChallengeExclusions repository.BotChallengeExclusionRepository
+	// GH #1625 — additional hostnames served from a web domain's vhost.
+	WebDomainAliases repository.WebDomainAliasRepository
+	// M6.6 — per-domain mail TLS rows.
+	MailCerts              repository.MailCertificateRepository
+	DomainDirectoryPrivacy repository.DomainDirectoryPrivacyRepository
+	MigrationJobs          repository.MigrationJobRepository
+	MigrationSizeCache     repository.MigrationAccountSizeCacheRepository
+	AutomationTokens       repository.AutomationTokenRepository
+	// UserAPITokens — M51 per-user Bearer token persistence. Used
+	// by the auth middleware (token validation) AND the user-
+	// facing /me/api-tokens management endpoints.
+	UserAPITokens       repository.UserAPITokenRepository
+	PHPPools            repository.PHPPoolRepository
+	PHPPoolIniOverrides repository.PHPPoolIniOverrideRepository
+	PHPPerformanceModes repository.PHPPerformanceModeRepository
+	WordPressInstalls   repository.WordPressInstallRepository
+	// ManagedIPs is the M24 IP-pool repo. NewWithDeps registers
+	// /admin/ips + /user/ips + /internal/agent/managed-ips when set;
+	// nil keeps the routes off (lets existing test harnesses pass).
+	ManagedIPs repository.ManagedIPRepository
+	// Apps is the M19 application registry — descriptors for every
+	// installable app (WordPress, future DokuWiki, etc.). Step 3 will
+	// hand this to the generic /applications handlers. NewWithDeps
+	// builds a default-populated registry when this is nil so the
+	// existing test wiring (`Deps{}`) keeps working without each
+	// caller knowing about the registry.
+	Apps          *apps.Registry
+	CronJobs      repository.CronJobRepository
+	DockerApps    repository.DockerAppRepository
+	PythonApps    repository.PythonAppRepository
+	DockerCatalog *dockerapp.Catalog
+	PyFrameworks  *pyframeworks.Catalog
+	SSHKeys       repository.SSHKeyRepository
+	// FtpAccounts backs the tenant FTP/SFTP subaccount routes (GH #1053).
+	FtpAccounts    repository.FtpAccountRepository
+	LimitOverrides repository.UserLimitOverrideRepository
+	// M6.5 email feature repositories. Autoresponders/Forwarders/MailboxShares
+	// reconcile dotnext intent → Stalwart via the phase registry (ADR-0051).
+	Autoresponders repository.EmailAutoresponderRepository
+	Forwarders     repository.EmailForwarderRepository
+	MailboxShares  repository.MailboxShareRepository
+	// MailboxTrustedSenders: the senders each mailbox trusts (GH #2017).
+	MailboxTrustedSenders repository.MailboxTrustedSenderRepository
+	// DNSSECKeys caches DNSSEC public-key metadata (ADR-0076).
+	DNSSECKeys repository.DNSSECKeyRepository
+	// PanelCerts is the M32 singleton panel_certificate repo. NewWithDeps
+	// registers /admin/panel-certificate when set; nil keeps the routes
+	// off (lab installs / older test wiring).
+	PanelCerts repository.PanelCertificateRepository
+	// MailHostSwitchover is the JAB-390 shared mail hostname switchover
+	// request. With PanelCerts it mounts the Settings → Email mail-hostname
+	// setter; nil keeps the setter off.
+	MailHostSwitchover repository.MailHostnameSwitchoverRepository
+	// M53 Updates Center (ADR-0118). UpdateState + UpdateHistory drive the
+	// stateful Updates page; UpdateAutoupdate is the auto-update desired
+	// state the autoupdate reconciler converges. Nil keeps the M29 thin
+	// proxy behaviour (no persistence, no /state /history endpoints).
+	UpdateState      repository.UpdateStateRepository
+	UpdateHistory    repository.UpdateHistoryRepository
+	UpdateAutoupdate repository.UpdateAutoupdateConfigRepository
+	// M33 malware detection repos (ADR-0072). All five are wired
+	// together — nil on any disables RegisterSecurityMalwareRoutes.
+	// M30 backup-restore (ADR-0075). Nil disables the /admin/backups
+	// + /me/backups routes; UI surfaces an empty state.
+	BackupJobs repository.BackupJobRepository
+	// GH #1993: account backups uploaded from another server, kept on this
+	// one. Nil leaves the /admin/uploaded-backups routes out.
+	UploadedBackups repository.UploadedBackupRepository
+	// M30.1 backup destinations + schedules (ADR-0078). All three nil
+	// disables the /admin/backup-destinations + /admin/backup-schedules
+	// routes (UI tabs hidden) and the in-process scheduler / copy
+	// worker / finalizer goroutines.
+	BackupDestinations repository.BackupDestinationRepository
+	BackupSchedules    repository.BackupScheduleRepository
+	MalwareQuarantine  repository.MalwareQuarantineRepository
+	MalwareEvents      repository.MalwareEventRepository
+	YARARules          repository.YARACustomRuleRepository
+	MalwareSettings    repository.MalwareSettingsRepository
+	// M33.2 mail YARA scanner — async tick walks Stalwart mailboxes via
+	// JMAP, scans attachments with yr, quarantines hits. Off by default;
+	// enabled via malware_settings.mail_scan_enabled. ADR-0079.
+	MailScanState    repository.MailScanStateRepository
+	MailScanFailures repository.MailScanFailureRepository
+	// MalwareUserScans tracks per-user manual-scan jobs (mig 000097).
+	// Upserted at scan start by the panel-api startScan handler;
+	// finalised by the post-scan-hook ingest path. Drives the Manual
+	// Scan UI's Last scanned + Status columns.
+	MalwareUserScans repository.MalwareUserScanRepository
+	// M34 per-user PHP-FPM egress firewall. Two repos backing the
+	// nftables socket-cgroupv2 reconciler + admin/user request flow
+	// (migrations 000100/000101, ADR-0084).
+	UserEgressPolicies    repository.UserEgressPolicyRepository
+	UserEgressRequests    repository.UserEgressRequestRepository
+	UserEgressDropSamples repository.UserEgressDropSampleRepository
+	// QuotaMount is the filesystem mount path /home lives on — passed
+	// on every M18 user.limits.{apply,clear,report} agent call so the
+	// agent can resolve `setquota -u <user> ... <mount>` without ever
+	// defaulting to the disruptive `-a` flag. Resolved at startup via
+	// internal/limits.QuotaMountFor("/home"); empty string disables
+	// the disk-quota half of the limits pipeline (dev boxes).
+	QuotaMount string
+	SSO        *sso.Service
+	SSOKey     *ssokey.Key
+	// UserCloudflareTokens holds tenants' own Cloudflare DNS-01 tokens
+	// (GH #2032). Nil leaves /me/cloudflare-token unmounted.
+	UserCloudflareTokens repository.UserCloudflareTokenRepository
+	// WebmailSSOMinter signs the JWT consumed by Bulwark's
+	// /api/auth/impersonate endpoint (M6.6). Nil disables /sso/webmail
+	// — handler surfaces 503 in that case. Loaded by serve.go from
+	// /etc/dotnext/bulwark-jwt-auth.secret at boot.
+	WebmailSSOMinter *webmailsso.Minter
+	// SendAs pushes the send-as grants to Stalwart (GH #2267). serve.go
+	// builds it and runs its background check; the Send As routes share it.
+	SendAs *sendasops.Syncer
+	// Scanners is the GH #2503 scanner lifecycle (shared Files resources fed
+	// by an FTP/SFTP drop folder). serve.go builds it and runs its ingest
+	// loop; the scanner routes share it. Nil leaves the routes off.
+	Scanners *scandrops.Deps
+	Log      *slog.Logger
+	// Redis is the shared *redis.Client for the notification dispatcher
+	// (ADR-0056) and future WordPress object-cache (ADR-0059). Wired in
+	// serve.go against cfg.Redis.URL; nil when Redis is disabled (tests,
+	// or an operator who set Redis.URL=""). Handlers that need it must
+	// guard for nil and return 503 rather than panic.
+	Redis *redis.Client
+	// M14 notification repos. Wired by serve.go when sharedDB is set;
+	// used by both the /admin/notifications admin API (added later) and
+	// the dispatcher goroutine that drains the Redis stream.
+	NotificationChannels repository.NotificationChannelRepository
+	NotificationHistory  repository.NotificationHistoryRepository
+	// UserNotificationRoutes powers per-user event routing (JAB-171): a
+	// user-scoped envelope also reaches the recipient's own routed channels.
+	UserNotificationRoutes repository.UserNotificationRouteRepository
+	WebhookEndpoints       repository.WebhookEndpointRepository
+	WebPushSubs            repository.WebPushSubscriptionRepository
+	// NotificationQueue is the dispatcher's publish end — the internal
+	// enqueue endpoint (RequireLocalhost) and in-process event sources
+	// write to this Queue. Nil when Redis is not configured; handlers
+	// must 503 rather than panic.
+	NotificationQueue *notifications.Queue
+
+	// OwnershipService runs the GH #1816 / ADR-0170 ownership-proof actions
+	// (verify now, admin approve/revoke) for the API; serve.go also runs its
+	// ticker. Nil disables those routes.
+	OwnershipService *ownershipops.Service
+
+	// NotificationRegistry maps channel kinds to their senders. Built once in
+	// serve.go (with the provisioned notify-mailbox creds) and shared by the
+	// dispatcher and the channels handler's synchronous "Send test" (GH #322).
+	NotificationRegistry *notifications.Registry
+	// AuditRecorder is the M49 one-write-path into the unified audit
+	// log (ADR-0106): the recorder middleware + domain emitters call
+	// Record(). Nil when Redis is not configured (same posture as
+	// NotificationQueue); middleware.AuditRecord no-ops on nil.
+	AuditRecorder audit.Recorder
+	// AuditConsumer is the single-writer hash-chain consumer of
+	// dotnext:audit:queue. serve.go starts it as a goroutine alongside
+	// the reconciler; nil without Redis.
+	AuditConsumer *audit.Consumer
+	// DB is the raw GORM handle. Most handlers go through typed repos
+	// — this is only here for tiny one-off endpoints that need a
+	// COUNT(*) across multiple tables (e.g. /admin/counts on the
+	// admin Dashboard) where adding a CountAll method to every repo
+	// would be more code than the call site.
+	// M41 Snuffleupagus PHP hardening — repository + reconciler + rules path
+	Snuffleupagus           repository.SnuffleupagusRepository
+	SnuffleupagusReconciler *reconciler.SnuffleupagusReconciler
+	SnuffleupagusBundleDir  string
+	DB                      *gorm.DB
+	Supervisor              *jobs.Supervisor
+}
+
+// Default tier: chosen so a reasonable SPA (polling, a few concurrent
+// tabs) never notices, but a misbehaving client does. Tunable later via
+// config if we hit real-world ceilings.
+const (
+	rateDefaultPerSec = 10.0
+	rateDefaultBurst  = 40
+
+	// Strict tier: credential endpoints. 5 req/min with a burst of 5
+	// permits a typo-and-retry session without opening the door to
+	// brute force from a single IP.
+	rateStrictPerSec = 5.0 / 60.0
+	rateStrictBurst  = 5
+
+	// Kratos credential-flow tier: /.ory self-service login + recovery POSTs.
+	// 15 req/min sustained with a burst of 10 leaves ample room for a real
+	// login (init + submit, optional 2FA + typo retries) while throttling
+	// single-IP online guessing / recovery enumeration below Kratos defaults.
+	rateKratosPerSec = 15.0 / 60.0
+	rateKratosBurst  = 10
+
+	// Scan tier: per-user routes that walk the shared Redis keyspace (GH #2165,
+	// the tenant key browser). One call a second sustained with a burst of 20
+	// lets a tenant page through and search their keys; every call is bounded
+	// to a fixed number of SCANs.
+	rateScanPerSec = 1.0
+	rateScanBurst  = 20
+
+	// SSO tier: per-user routes that mint a one-time sign-in link (phpMyAdmin,
+	// Adminer, webmail, app logins), one budget across all of them. Ten at
+	// once covers opening a handful of consoles and mailboxes in a row; then
+	// one every six seconds.
+	rateSSOPerSec = 10.0 / 60.0
+	rateSSOBurst  = 10
+
+	rateLimiterIdleCleanup = 10 * time.Minute
+	rateLimiterSweepEvery  = 5 * time.Minute
+)
+
+// New returns a Gin engine configured with development defaults — no auth,
+// no DB. Used by tests and any caller that doesn't need downstream deps.
+// Production callers should use NewWithDeps so auth routes are mounted.
+func New() *gin.Engine {
+	return NewWithDeps(config.Defaults(), Deps{})
+}
+
+// NewWithDeps is the canonical constructor for the server. Handlers that
+// depend on external collaborators (auth service, JWT issuer) are mounted
+// only when their dep is non-nil, so early-phase deployments can still boot
+// with a partial Deps.
+func NewWithDeps(cfg *config.Config, deps Deps) *gin.Engine {
+	if cfg.Server.Env == config.EnvProduction {
+		gin.SetMode(gin.ReleaseMode)
+	} else {
+		gin.SetMode(gin.DebugMode)
+	}
+
+	// JAB-179: turn on demo GET redaction when running the public demo so
+	// sensitive reads (visitor session IPs, host fingerprint, infra paths)
+	// are masked. No-op in production (Demo.Enabled=false).
+	api.SetDemoRedaction(cfg.Demo.Enabled)
+
+	// Apps registry. Built once per server. RegisterDefaults panics on
+	// programmer error (duplicate name, bad ParamSpec) — those are
+	// startup conditions we want surfaced loudly, not eaten by a
+	// silent boot.
+	if deps.Apps == nil {
+		deps.Apps = apps.New()
+		if err := apps.RegisterDefaults(deps.Apps); err != nil {
+			panic("apps.RegisterDefaults: " + err.Error())
+		}
+	}
+
+	// GH #2078: AppArmor profiles acknowledged in complain mode, read by the
+	// AppArmor routes and by the Server Status alert. Nil without a database.
+	var appArmorAcks repository.AppArmorModeAckRepository
+	if deps.DB != nil {
+		appArmorAcks = repository.NewAppArmorModeAckRepository(deps.DB)
+	}
+
+	r := gin.New()
+	r.HandleMethodNotAllowed = true
+
+	// Global middleware. Order matters:
+	//   1. Recovery so a panic never leaves a connection open.
+	//   2. RequestID so all subsequent log lines (including panics) carry it.
+	//   3. CORS so preflights short-circuit before rate limit consumes tokens.
+	r.Use(gin.Recovery())
+	r.Use(middleware.RequestID())
+	r.Use(middleware.CORS(cfg.CORS.AllowedOrigins))
+
+	// Rate limiter — shared across handler mounts so both tiers count against
+	// the same per-IP state. A background goroutine reaps idle buckets.
+	rl := middleware.NewRateLimiter(middleware.RateLimiterConfig{
+		DefaultRate:  rate.Limit(rateDefaultPerSec),
+		DefaultBurst: rateDefaultBurst,
+		StrictRate:   rate.Limit(rateStrictPerSec),
+		StrictBurst:  rateStrictBurst,
+		KratosRate:   rate.Limit(rateKratosPerSec),
+		KratosBurst:  rateKratosBurst,
+		ScanRate:     rate.Limit(rateScanPerSec),
+		ScanBurst:    rateScanBurst,
+		SSORate:      rate.Limit(rateSSOPerSec),
+		SSOBurst:     rateSSOBurst,
+	})
+	startRateLimiterSweeper(rl)
+	r.Use(rl.Default())
+
+	// Tag every /api/v1/* response with Cache-Control: no-store. Without
+	// this, Firefox's Opaque-Response-Blocking decision cache can replay
+	// a prior 401 with status=0ms, leaving the SPA stuck on a blank page
+	// after token expiry.
+	r.Use(middleware.NoCacheAPI())
+	r.Use(middleware.RequireContentType())
+	r.Use(middleware.BodyLimit(middleware.DefaultBodyLimitBytes, bodyLimitExemptRoutes))
+
+	// /info registration + the demo write-gate live behind a build tag (JAB-159):
+	// in a production build this just registers the base /info; in a `-tags demo`
+	// build it mounts the write-block middleware and the credential-carrying /info
+	// when cfg.Demo.Enabled. See app/demo_off.go and app/demo_on.go.
+	setupDemoAndInfo(r, cfg)
+	api.RegisterHealthRoutes(r)
+	if deps.Agent != nil {
+		api.RegisterAgentHealthRoute(r, deps.Agent)
+	}
+
+	// M14 internal enqueue — /api/v1/internal/notifications/enqueue
+	// bypasses the Kratos authMiddleware because the caller is the
+	// agent (or an in-process event source) talking to us over the M25
+	// loopback socket. RequireLocalhost inside the route is the sole
+	// gate. Registered off the root router (not v1) so it doesn't pick
+	// up RequireKratosSession.
+	api.RegisterNotificationsInternalRoutes(r.Group("/api/v1"), deps.NotificationQueue)
+
+	// M33 internal malware ingest — /api/v1/admin/security/malware/event.
+	// Mounted off the root router (not v1) so it bypasses the Kratos
+	// authMiddleware. Caller is the agent over the M25 unix socket;
+	// RequireLocalhost inside the route is the sole gate. Matches the
+	// RegisterNotificationsInternalRoutes pattern above.
+	if deps.MalwareQuarantine != nil && deps.MalwareEvents != nil &&
+		deps.MalwareSettings != nil && deps.YARARules != nil &&
+		deps.Agent != nil {
+		api.RegisterSecurityMalwareInternalRoutes(r.Group("/api/v1"), api.SecurityMalwareHandlerConfig{
+			Agent:      deps.Agent,
+			Quarantine: deps.MalwareQuarantine,
+			Events:     deps.MalwareEvents,
+			Settings:   deps.MalwareSettings,
+			YARARules:  deps.YARARules,
+			Users:      deps.Users,
+			UserScans:  deps.MalwareUserScans,
+			Log:        deps.Log,
+		})
+	}
+
+	// M28 — public branding endpoints (logo file + brand text). Lives
+	// off the root API group with NO auth so the pre-login page can
+	// render the operator's logo + brand text.
+	if deps.ServerSettings != nil {
+		api.RegisterPublicBrandingRoutes(r.Group("/api/v1"), api.BrandingHandlerConfig{
+			Repo: deps.ServerSettings,
+			Log:  deps.Log,
+		})
+	}
+
+	// Webmail SSO landing (M6 Step 8 Phase B). Lives at /sso/webmail on
+	// the engine root, not /api/v1, because it's served from
+	// mail.<domain> (via nginx location /sso) where the SPA + Kratos
+	// prefix doesn't apply. Handler does its own token auth (consume +
+	// hash match) so no Kratos cookie is required.
+	if deps.Mailboxes != nil && deps.Domains != nil && deps.SSOKey != nil && deps.MailboxSSOTokens != nil && deps.Packages != nil {
+		api.RegisterWebmailSSORoutes(r, api.WebmailSSOHandlerConfig{
+			Mailboxes: deps.Mailboxes,
+			Domains:   deps.Domains,
+			SSOKey:    deps.SSOKey,
+			SSOTokens: deps.MailboxSSOTokens,
+			Users:     deps.Users,
+			Packages:  deps.Packages, // GH #1628 slice 3: package webmail entitlement gate
+			Minter:    deps.WebmailSSOMinter,
+			Log:       deps.Log,
+		})
+	}
+
+	// Mail-client autoconfiguration (GH #1039). Served from the mail vhost
+	// (autoconfig./autodiscover.<domain>) which proxies /mail/config-v1.1.xml
+	// and /autodiscover/autodiscover.xml here. Public, like the branding +
+	// webmail-SSO endpoints — a mail client has no session when it first probes.
+	if deps.Domains != nil {
+		api.RegisterMailAutoconfigRoutes(r, api.MailAutoconfigHandlerConfig{
+			Domains: deps.Domains,
+			Log:     deps.Log,
+		})
+	}
+
+	// Instantiate Kratos client + same-origin reverse proxy for /.ory/*.
+	// The SPA fetches relative Kratos self-service endpoints and panel-api
+	// binds :8443 directly (no nginx in front on that port), so we proxy
+	// in-process. See kratos_proxy.go for the full rationale.
+	if cfg.Auth.Kratos.PublicURL != "" {
+		deps.KratosClient = kratosclient.NewClient(cfg.Auth.Kratos.PublicURL, cfg.Auth.Kratos.AdminURL)
+
+		if err := RegisterKratosProxy(r, cfg.Auth.Kratos.PublicURL, rl, deps.Log); err != nil {
+			deps.Log.Error("registering Kratos reverse proxy failed; login will be broken",
+				"err", err, "public_url", cfg.Auth.Kratos.PublicURL)
+		}
+	}
+
+	if deps.KratosClient != nil {
+		// Protected API group — everything under /api/v1/* flows through
+		// RequireKratosSession, which resolves Kratos identity UUIDs →
+		// panel user rows so claims.UserID carries the ULID every
+		// ownership check in the API expects.
+		authMiddleware := middleware.RequireKratosSession(deps.KratosClient, deps.Users)
+
+		// M44 Automation API public routes mount OUTSIDE the Kratos
+		// session middleware — HMAC is the only auth on
+		// /api/v1/automation/*. Mount BEFORE the auth-protected v1
+		// group so the path matcher hits the unauth group first.
+		if deps.AutomationTokens != nil && deps.SSOKey != nil {
+			autoGroup := r.Group("/api/v1")
+			// GH #331: the Automation API is a headless write path that mounts
+			// OUTSIDE the v1 group, so it needs its own DR-standby guard — a
+			// standby's DB is a replica, and an automation-driven provisioning
+			// write here would diverge from the primary and be discarded by the
+			// next sync. Reads (read:status/read:mail) stay allowed (the guard
+			// only blocks mutating methods). Nil ServerSettings (tests) → ungated.
+			if deps.ServerSettings != nil {
+				autoGroup.Use(middleware.StandbyReadOnly(deps.ServerSettings, deps.Log))
+			}
+			api.RegisterAutomation(autoGroup, api.AutomationConfig{
+				AutomationTokens: deps.AutomationTokens,
+				Key:              deps.SSOKey,
+				// M44 replay defense — Redis SETNX gate against
+				// captured-request replay. Required in production.
+				Redis:        deps.Redis,
+				Domains:      deps.Domains,
+				Users:        deps.Users,
+				Applications: deps.WordPressInstalls,
+				Agent:        deps.Agent, // JAB-75: powers read:status metrics
+				// JAB-77: read:mail mail-stack inventory.
+				Mailboxes:      deps.Mailboxes,
+				MailGroups:     deps.MailGroups,
+				Forwarders:     deps.Forwarders,
+				Autoresponders: deps.Autoresponders,
+				// JAB-140 write layer: async-op tracker + write audit + M30 backup path.
+				Operations:  automationOps(deps.DB),
+				Audits:      automationAudits(deps.DB),
+				BackupJobs:  automationBackupJobs(deps.DB),
+				BackupDests: automationBackupDests(deps.DB),
+				Notify:      automationNotifier(deps.NotificationQueue),
+				// ADR-0164 billing endpoints: account lifecycle shares the
+				// userops write path with the GUI handlers; usage reads stay
+				// snapshot/bw_daily-only (never the agent).
+				Packages:         deps.Packages,
+				Databases:        deps.Databases,
+				DatabaseUsers:    deps.DatabaseUsers,
+				FtpAccounts:      deps.FtpAccounts,
+				DockerApps:       deps.DockerApps,
+				KratosClient:     deps.KratosClient,
+				LimitsReconciler: automationLimitsReconciler(deps.Reconciler),
+				DomainTeardowns:  deps.DomainTeardowns,
+				PortAllocations:  repository.NewPortAllocationRepository(deps.DB),
+				DiskSnapshots:    repository.NewDiskUsageSnapshotRepository(deps.DB),
+				BWDaily:          deps.BWDaily,
+				Log:              deps.Log,
+				// Suspend removes the user's mail app passwords at once.
+				MailCredentials: deps.MailCredentials,
+				// JAB-233: the exact deps the GUI domain handler uses (mirrors
+				// the DomainHandlerConfig below), so account-create with a
+				// `domain` runs createDomainOp with identical semantics.
+				DomainCreate: api.DomainHandlerConfig{
+					Domains: deps.Domains,
+					// GH #1816: automation creates are pending unless the token
+					// holds assert:domain_ownership.
+					DomainOwnership: repository.NewDomainOwnershipRepository(deps.DB),
+					PortAllocations: repository.NewPortAllocationRepository(deps.DB),
+					Users:           deps.Users,
+					Packages:        deps.Packages,
+					Agent:           deps.Agent,
+					Reconciler:      deps.Reconciler,
+					SSLCerts:        deps.SSLCerts,
+					SharedCerts:     deps.SharedCerts,
+					DNSZones:        deps.DNSZones,
+					DNSRecords:      deps.DNSRecords,
+					// GH #1627: resolve a tenant-selected custom DNS template on
+					// the JAB-233 automation create path (same as GUI create).
+					DNSTemplates:   deps.DNSTemplates,
+					WebTemplates:   deps.WebTemplates, // GH #1624 Phase 3 (admin-only apply at create)
+					ManagedIPs:     deps.ManagedIPs,
+					ServerSettings: deps.ServerSettings,
+					BWDaily:        deps.BWDaily,
+					// GH #1625: arms the cross-tenant hijack guard on the
+					// JAB-233 automation create path (same as the GUI create).
+					WebDomainAliases: deps.WebDomainAliases,
+				},
+			})
+		}
+
+		// GH #2277 (ADR-0178): Git hosts post pushes here. Like the
+		// automation API it mounts OUTSIDE the session middleware and the
+		// CSRF guard: a delivery is believed only by its signature. A
+		// delivery starts a deployment, a write, so a DR standby refuses it
+		// (GH #331).
+		if deps.Agent != nil && deps.Domains != nil && deps.Users != nil && deps.Packages != nil && deps.DB != nil {
+			hookGroup := r.Group("/api/v1")
+			if deps.ServerSettings != nil {
+				hookGroup.Use(middleware.StandbyReadOnly(deps.ServerSettings, deps.Log))
+			}
+			hookCfg := api.GitWebhookConfig{
+				Webhooks: repository.NewDomainGitWebhookRepository(deps.DB),
+				Domains:  deps.Domains,
+				Users:    deps.Users,
+				Deployer: &gitdeploy.Deployer{
+					Agent:       deps.Agent,
+					Packages:    deps.Packages,
+					Repos:       repository.NewDomainGitRepoRepository(deps.DB),
+					Deployments: repository.NewDomainGitDeploymentRepository(deps.DB),
+					SSOKey:      deps.SSOKey,
+				},
+			}
+			// Each only when set: a nil pointer in an interface is not nil.
+			if deps.Reconciler != nil {
+				hookCfg.Reconciler = deps.Reconciler
+			}
+			if deps.Redis != nil {
+				hookCfg.Deliveries = deps.Redis
+			}
+			api.RegisterGitWebhookRoutes(hookGroup, hookCfg)
+		}
+
+		// M51: chain bearer-token auth in front of the Kratos cookie
+		// path. Token-authed callers populate claims the same way Kratos
+		// does, so every ownership check downstream Just Works.
+		combinedAuth := middleware.RequireUserAuth(deps.UserAPITokens, deps.Users, authMiddleware)
+		// GH #245: scope-restricted API tokens are fail-closed here; full
+		// tokens + browser sessions pass through.
+		// CSRF: same-origin guard for cookie-authenticated mutations (GH #460),
+		// before scope enforcement. Bearer/automation auth is exempt inside it.
+		v1 := r.Group("/api/v1", combinedAuth, api.EnforceSameOriginForCookieMutations(), api.EnforceUserTokenScopes())
+		// Routes go on v1 only after the last v1.Use below: gin gives a route
+		// the group's middleware as it is when the route is registered, so a
+		// route registered here would miss ResolveImpersonation, the audit and
+		// the standby guard (GH #2159).
+
+		// API docs (OpenAPI spec). Mounts at /api/v1/_meta/openapi.{json,yaml}
+		// under the engine root, NOT inside the auth-protected v1 group —
+		// the spec describes the public API surface, contains no secrets,
+		// and is served to the docs UI page without requiring login. Per-
+		// endpoint auth requirements are declared inside the spec itself.
+		api.RegisterAPIDocsRoutes(r.Group("/api/v1"))
+
+		// DDNS-protocol shim (GH #123). Mounts /nic/update at the
+		// engine root (NOT under /api/v1 — every router firmware
+		// hardcodes that path). Basic-auth wraps the same user API
+		// token; the shim parses out the password and reuses the
+		// hash lookup the bearer middleware does. Open path, no
+		// auth middleware in front — Basic auth is the only gate.
+		api.RegisterDDNSRoutes(r, api.DDNSConfig{
+			Tokens:     deps.UserAPITokens,
+			Domains:    deps.Domains,
+			Zones:      deps.DNSZones,
+			Records:    deps.DNSRecords,
+			Reconciler: deps.Reconciler,
+		})
+		// ADR-0128 — admin act-as override. Runs after RequireKratosSession
+		// (claims populated) and BEFORE AuditRecord so the audit records the
+		// REAL admin as actor. No-op unless the X-DotNext-Act-As header is set
+		// by a real admin presenting a valid grant.
+		if deps.Users != nil && deps.DB != nil {
+			v1.Use(middleware.ResolveImpersonation(
+				repository.NewImpersonationGrantRepository(deps.DB), deps.Users, nil))
+		}
+		// M14 — fire one admin.login envelope per Kratos session.
+		// Redis SETNX dedupes; downgrades to no-op without Redis/queue.
+		v1.Use(middleware.TrackAdminLogin(deps.Redis, deps.NotificationQueue, deps.Log))
+		// Auto-whitelist a logged-in user's IP in CrowdSec (time-boxed, all
+		// users) so active sessions are never bounced from their own IP.
+		if deps.Agent != nil {
+			v1.Use(middleware.WhitelistLoginIP(deps.Redis, deps.Agent, deps.ServerSettings, deps.Log))
+		}
+		// M49 — record one audit event per mutating request (never
+		// the body). No-op when AuditRecorder is nil (no Redis).
+		v1.Use(middleware.AuditRecord(deps.AuditRecorder))
+
+		// GH #331 — DR standby read-only guard. When this box is a standby its
+		// panel DB is a replica; refuse tenant-mutating writes (they'd diverge
+		// and be overwritten by the next sync). No-op on a primary (the default),
+		// so every normal install is unaffected.
+		if deps.ServerSettings != nil {
+			v1.Use(middleware.StandbyReadOnly(deps.ServerSettings, deps.Log))
+		}
+
+		// Register the user-facing token management endpoints. These
+		// reject token-auth callers themselves (you can't mint new
+		// tokens from a token), so even though v1 accepts both auth
+		// modes, the /me/api-tokens routes are Kratos-only at the
+		// handler level. GH #2159: registered after the middleware above,
+		// so an admin acting as a user (ADR-0128) manages that user's
+		// tokens, audited with the admin as actor, never the admin's own.
+		api.RegisterMeAPITokensRoutes(v1, api.MeAPITokensConfig{Tokens: deps.UserAPITokens})
+
+		// M353 Phase 1 (GH #353): module guards. A disabled module's routes must
+		// 409, not just be hidden in the UI. Build one guard factory (shared TTL
+		// cache) and mount each module's routes on a guarded sub-group. Fails
+		// open (module on) when settings can't be read, so a DB blip never locks
+		// a live feature out. Nil ServerSettings (tests) → unguarded plain v1.
+		mailGroup, dnsGroup, securityGroup := v1, v1, v1
+		if deps.ServerSettings != nil {
+			guard := middleware.NewModuleGuard(deps.ServerSettings)
+			mailGroup = v1.Group("", guard(middleware.ModuleMail, "mail"))
+			dnsGroup = v1.Group("", guard(middleware.ModuleDNS, "dns"))
+			securityGroup = v1.Group("", guard(middleware.ModuleSecurity, "security"))
+		}
+		api.RegisterMeRoutes(v1, api.MeHandlerConfig{
+			Users:          deps.Users,
+			Packages:       deps.Packages,
+			ServerSettings: deps.ServerSettings,
+			UIPrefs:        repository.NewUserUIPrefRepository(deps.DB),
+			DemoEnabled:    cfg.Demo.Enabled, // JAB-176: mask real IPs in demo
+			Agent:          deps.Agent,       // GH #1171: probe isolated-FTP availability
+			QuotaMount:     deps.QuotaMount,
+		})
+		// GH #256: per-user CLI default PHP version (self-service).
+		api.RegisterMePhpCliRoutes(v1, api.MePhpCliConfig{
+			Users: deps.Users,
+			Agent: deps.Agent,
+		})
+		// GH #1332 item 13: per-user Composer version channel.
+		api.RegisterMeComposerRoutes(v1, api.MeComposerConfig{
+			Users: deps.Users,
+			Agent: deps.Agent,
+		})
+		// Per-user disk-usage breakdown (files + email + databases).
+		api.RegisterMeDiskUsageRoutes(v1, api.DiskUsageConfig{
+			Users:      deps.Users,
+			Domains:    deps.Domains,
+			Mailboxes:  deps.Mailboxes,
+			Databases:  deps.Databases,
+			Agent:      deps.Agent,
+			QuotaMount: deps.QuotaMount,
+			Snapshots:  repository.NewDiskUsageSnapshotRepository(deps.DB),
+		})
+		// GH #1387: per-domain mail summary (Mail Domains list) + best-effort
+		// per-domain queue count (v2).
+		api.RegisterMeMailDomainsRoutes(v1, api.MeMailDomainsConfig{
+			Domains:   deps.Domains,
+			Mailboxes: deps.Mailboxes,
+			MailStats: repository.NewMailStatsRepository(deps.DB),
+			Agent:     deps.Agent,
+		})
+		// GH #1478: side-nav badge counts — GET /me/nav-counts (tenant) +
+		// GET /admin/nav-counts (admin). One aggregate call per side.
+		api.RegisterNavCountsRoutes(v1, api.NavCountsConfig{
+			Counts: repository.NewNavCountsRepository(deps.DB),
+		})
+		// JAB-171 phase 3b — tenant-facing notification channels + routing.
+		// Gated behind ServerSettings.TenantNotificationsEnabled (default OFF,
+		// no admin toggle until phase 4 lands the SSRF guard + email-verify),
+		// so registering the routes here does not expose them to tenants yet.
+		api.RegisterMeNotificationsRoutes(v1, api.MeNotificationsConfig{
+			Channels:       deps.NotificationChannels,
+			Routes:         deps.UserNotificationRoutes,
+			ServerSettings: deps.ServerSettings,
+			Registry:       deps.NotificationRegistry,
+			SSOKey:         deps.SSOKey,
+			Users:          deps.Users,
+			Log:            deps.Log,
+		})
+
+		// ADR-0128 — admin act-as grant management (GH #183). Mounted on v1;
+		// ResolveImpersonation skips this path so it always runs as the real
+		// admin (an admin can exit even while a header is set).
+		if deps.Users != nil && deps.DB != nil {
+			api.RegisterImpersonationRoutes(v1, api.ImpersonationHandlerConfig{
+				Grants: repository.NewImpersonationGrantRepository(deps.DB),
+				Users:  deps.Users,
+			})
+		}
+
+		// M49 — unified audit log read surface (ADR-0106):
+		// /admin/audit (RequireAdmin) + /me/activity (subject-scoped).
+		if deps.DB != nil {
+			api.RegisterAuditRoutes(v1, api.AuditHandlerConfig{
+				Repo:  repository.NewAuditEventRepository(deps.DB),
+				Users: deps.Users, // optional: resolves actor/subject IDs → name
+				Log:   deps.Log,
+			})
+			// GH #575 — admin SSO maintenance (prune expired tokens).
+			api.RegisterSSOAdminRoutes(v1, api.SSOAdminHandlerConfig{
+				Tokens: repository.NewPhpMyAdminSSOTokenRepository(deps.DB),
+			})
+		}
+
+		if deps.Users != nil {
+			api.RegisterUserRoutes(v1, api.UserHandlerConfig{
+				Repo:            deps.Users,
+				Agent:           deps.Agent,
+				StrictRateLimit: rl.Strict(),
+				Domains:         deps.Domains,
+				Databases:       deps.Databases,
+				DatabaseUsers:   deps.DatabaseUsers,
+				// GH #1238: grant re-point on rename.
+				DBUserGrants: repository.NewDatabaseUserGrantRepository(deps.DB),
+				// GH #1242: at-a-glance per-user counts + monthly bandwidth.
+				ResourceStats: repository.NewUserResourceStatsRepository(deps.DB),
+				FtpAccounts:   deps.FtpAccounts,
+				// GH #1238: the rename preflight refuses a tenant with Python apps.
+				PythonApps:      repository.NewPythonAppRepository(deps.DB),
+				DockerApps:      deps.DockerApps,
+				DomainTeardowns: deps.DomainTeardowns,
+				PortAllocations: repository.NewPortAllocationRepository(deps.DB),
+				Mailboxes:       deps.Mailboxes,
+				Packages:        deps.Packages,
+				Reconciler:      deps.Reconciler,
+				Log:             deps.Log,
+				Redis:           deps.Redis,
+				// GH #1229: audit the admin SSH-forwarding toggle.
+				AuditEvents: repository.NewAuditEventRepository(deps.DB),
+				// M20: atomic Kratos identity creation on POST /users.
+				KratosClient: deps.KratosClient,
+				// Suspend removes the user's mail app passwords at once.
+				MailCredentials: deps.MailCredentials,
+			})
+		}
+		if deps.Packages != nil {
+			api.RegisterPackageRoutes(v1, api.PackageHandlerConfig{
+				Repo:       deps.Packages,
+				Users:      deps.Users,
+				Reconciler: deps.Reconciler,
+				Log:        deps.Log,
+			})
+		}
+		// M18 user-limits endpoints. Mount only when all deps are
+		// present — a pre-M18 deployment with no LimitOverrides repo
+		// simply won't expose the endpoints.
+		if deps.Users != nil && deps.Packages != nil && deps.LimitOverrides != nil {
+			api.RegisterUserLimitsRoutes(v1, api.UserLimitsHandlerConfig{
+				Users:          deps.Users,
+				Packages:       deps.Packages,
+				LimitOverrides: deps.LimitOverrides,
+				Agent:          deps.Agent,
+				QuotaMount:     deps.QuotaMount,
+				// Lets the dashboard usage card prefer the Disk Usage page's
+				// `du` figure over the POSIX quota for the disk metric (GH #1439).
+				DiskSnapshots: repository.NewDiskUsageSnapshotRepository(deps.DB),
+			})
+		}
+		if deps.Domains != nil {
+			api.RegisterDomainRoutes(v1, api.DomainHandlerConfig{
+				Domains: deps.Domains,
+				// GH #1816 / ADR-0170: the proof-required switch and the
+				// ownership state writes.
+				DomainOwnership: repository.NewDomainOwnershipRepository(deps.DB),
+				PortAllocations: repository.NewPortAllocationRepository(deps.DB),
+				// JAB-236: durable delete — tombstone before the row goes.
+				DomainTeardowns: deps.DomainTeardowns,
+				Users:           deps.Users,
+				Packages:        deps.Packages,
+				Agent:           deps.Agent,
+				Reconciler:      deps.Reconciler,
+				SSLCerts:        deps.SSLCerts,
+				SharedCerts:     deps.SharedCerts,
+				// GH #1579 rename: re-queues the per-domain mail cert for mail.<new>.
+				MailCerts: deps.MailCerts,
+				// GH #1603 facet-preserving delete: purge mailbox rows when the
+				// caller opts to also delete the Mail Domain.
+				Mailboxes: deps.Mailboxes,
+				// GH #1579 rename: refuses when an FTP/SFTP subaccount is homed
+				// under the docroot being moved (its jail/chroot is not moved).
+				FtpAccounts: deps.FtpAccounts,
+				// GH #1579 rename: moves the domain's DMARC + TLS-RPT report
+				// history onto the new name so those dashboards are not orphaned.
+				DMARCAggregate:  deps.DMARCAggregate,
+				TLSRPTAggregate: deps.TLSRPTAggregate,
+				// GH #1579 rename: rewrites alias forwarder targets to the new name.
+				Forwarders: deps.Forwarders,
+				// DNS repos feed the auto-enable-email path in create.
+				// Panel profiles without PowerDNS leave these nil and
+				// create still works — auto-enable is skipped cleanly.
+				DNSZones:   deps.DNSZones,
+				DNSRecords: deps.DNSRecords,
+				// GH #1627: resolves a tenant-selected custom DNS template at create.
+				DNSTemplates: deps.DNSTemplates,
+				WebTemplates: deps.WebTemplates, // GH #1624 Phase 3 (admin-only apply at create)
+				BWDaily:      deps.BWDaily,
+				// M24: lets PATCH listen_ipv*_id resolve FK + family + the
+				// is_user_selectable check, and lets GET denormalize
+				// listen_ipv4 / listen_ipv6 onto each row. Optional —
+				// when unset, the listen-IP fields are 503 on PATCH and
+				// dropped from GET.
+				ManagedIPs:     deps.ManagedIPs,
+				ServerSettings: deps.ServerSettings,
+				// GH #1625: arms the reverse cross-tenant hijack guard so create
+				// AND rename reject a name already claimed by another domain's alias.
+				WebDomainAliases: deps.WebDomainAliases,
+				// GH #1238 change-owner (admin, JAB-380 step-up): AppInstalls
+				// arms the cross-tenant-credential refusal, AuditEvents records
+				// it, KratosClient gates the step-up.
+				AppInstalls:  deps.WordPressInstalls,
+				AuditEvents:  repository.NewAuditEventRepository(deps.DB),
+				KratosClient: deps.KratosClient,
+				// GH #2289: change-owner stops the units of the Python apps it deletes.
+				PythonApps: deps.PythonApps,
+			})
+		}
+		// M36 — per-domain IP allow/deny lists.
+		if deps.Domains != nil && deps.DomainIPACLs != nil {
+			var schedule func(string)
+			if deps.Reconciler != nil {
+				rec := deps.Reconciler
+				schedule = func(id string) { rec.Schedule(id) }
+			}
+			api.RegisterDomainIPACLRoutes(v1, api.DomainIPACLHandlerConfig{
+				Domains:   deps.Domains,
+				ACLs:      deps.DomainIPACLs,
+				Reconcile: schedule,
+			})
+		}
+		// GH #2328 — paths of a domain that skip the bot-detection
+		// challenge (admin only). The reconciler applies them every pass.
+		if deps.Domains != nil && deps.BotChallengeExclusions != nil {
+			api.RegisterBotChallengeExclusionRoutes(v1, api.BotChallengeExclusionHandlerConfig{
+				Domains:    deps.Domains,
+				Exclusions: deps.BotChallengeExclusions,
+			})
+		}
+		// GH #1625 — web domain aliases (extra server_name + cert SANs).
+		if deps.Domains != nil && deps.WebDomainAliases != nil {
+			var schedule func(string)
+			if deps.Reconciler != nil {
+				rec := deps.Reconciler
+				schedule = func(id string) { rec.Schedule(id) }
+			}
+			api.RegisterDomainAliasRoutes(v1, api.DomainAliasHandlerConfig{
+				Domains:   deps.Domains,
+				Aliases:   deps.WebDomainAliases,
+				Certs:     deps.SSLCerts,
+				Settings:  deps.ServerSettings,
+				Reconcile: schedule,
+				Ownership: repository.NewDomainOwnershipRepository(deps.DB), // GH #1816
+			})
+		}
+		// GH #1816 / ADR-0170 — ownership proof: Verify now, and the admin
+		// pending list, approve/revoke and the proof-required switch. The
+		// service pointer is assigned only when set: a nil pointer inside
+		// the interface would register routes that panic.
+		if deps.Domains != nil && deps.OwnershipService != nil {
+			cfg := api.DomainOwnershipHandlerConfig{
+				Domains: deps.Domains,
+				Aliases: deps.WebDomainAliases,
+				Store:   repository.NewDomainOwnershipRepository(deps.DB),
+				Actions: deps.OwnershipService,
+				Users:   deps.Users,
+			}
+			if deps.AuditRecorder != nil {
+				cfg.Audit = deps.AuditRecorder
+			}
+			api.RegisterDomainOwnershipRoutes(v1, cfg)
+		}
+		// M6.6 — per-domain mail TLS opt-in + status.
+		if deps.Domains != nil && deps.MailCerts != nil {
+			var schedule func(string)
+			if deps.Reconciler != nil {
+				rec := deps.Reconciler
+				schedule = func(id string) { rec.Schedule(id) }
+			}
+			api.RegisterDomainMailCertificateRoutes(v1, api.DomainMailCertHandlerConfig{
+				Domains:   deps.Domains,
+				MailCerts: deps.MailCerts,
+				Reconcile: schedule,
+			})
+		}
+		// M50 — per-directory password protection.
+		if deps.Domains != nil && deps.DomainDirectoryPrivacy != nil {
+			var schedule func(string)
+			if deps.Reconciler != nil {
+				rec := deps.Reconciler
+				schedule = func(id string) { rec.Schedule(id) }
+			}
+			api.RegisterDomainDirectoryPrivacyRoutes(v1, api.DomainDirectoryPrivacyHandlerConfig{
+				Domains:   deps.Domains,
+				Privacy:   deps.DomainDirectoryPrivacy,
+				Reconcile: schedule,
+			})
+		}
+		// Per-domain docroot folder browser — powers the Directory
+		// Privacy path picker. Reuses the M11 files.list agent call,
+		// scoped to the domain owner + docroot.
+		if deps.Domains != nil && deps.Users != nil && deps.Agent != nil {
+			api.RegisterDomainPathBrowseRoutes(v1, api.DomainPathBrowseConfig{
+				Domains: deps.Domains,
+				Users:   deps.Users,
+				Agent:   deps.Agent,
+			})
+		}
+		if deps.Databases != nil && deps.DatabaseUsers != nil {
+			api.RegisterDatabaseRoutes(v1, api.DatabaseHandlerConfig{
+				Databases:         deps.Databases,
+				DatabaseUsers:     deps.DatabaseUsers,
+				DatabaseGrants:    deps.DatabaseUserGrants,
+				WordPressInstalls: deps.WordPressInstalls,
+				Users:             deps.Users,
+				Packages:          deps.Packages,
+				ServerSettings:    deps.ServerSettings,
+				Agent:             deps.Agent,
+				// GH #1609 admin database chown deps.
+				Installs:     deps.WordPressInstalls,
+				AuditEvents:  repository.NewAuditEventRepository(deps.DB),
+				KratosClient: deps.KratosClient,
+			})
+		}
+		if deps.DatabaseUsers != nil && deps.DatabaseUserGrants != nil {
+			api.RegisterDatabaseUserRoutes(v1, api.DatabaseUserHandlerConfig{
+				Databases:      deps.Databases,
+				DatabaseUsers:  deps.DatabaseUsers,
+				DatabaseGrants: deps.DatabaseUserGrants,
+				Users:          deps.Users,
+				Packages:       deps.Packages,
+				ServerSettings: deps.ServerSettings,
+				Agent:          deps.Agent,
+			})
+		}
+		if deps.Mailboxes != nil && deps.Domains != nil {
+			api.RegisterMailboxRoutes(mailGroup, api.MailboxHandlerConfig{
+				Mailboxes: deps.Mailboxes,
+				Domains:   deps.Domains,
+				Agent:     deps.Agent,
+				SSOKey:    deps.SSOKey,
+				SSOTokens: deps.MailboxSSOTokens,
+				Addresses: deps.MailAddresses,
+				// A password change or disable removes the mailbox's app
+				// passwords at once.
+				MailCredentials: deps.MailCredentials,
+				SSORateLimit:    rl.SSOPerActor(),
+				// The domain owner's package limit on email accounts.
+				Users:    deps.Users,
+				Packages: deps.Packages,
+			})
+		}
+		if deps.MailGroups != nil && deps.Mailboxes != nil && deps.Domains != nil {
+			api.RegisterMailGroupRoutes(mailGroup, api.MailGroupHandlerConfig{
+				Groups:    deps.MailGroups,
+				Mailboxes: deps.Mailboxes,
+				Domains:   deps.Domains,
+				Agent:     deps.Agent,
+				Settings:  deps.ServerSettings,
+			})
+		}
+		if deps.Domains != nil {
+			api.RegisterDomainEmailRoutes(mailGroup, api.DomainEmailHandlerConfig{
+				Domains:        deps.Domains,
+				Agent:          deps.Agent,
+				DNSZones:       deps.DNSZones,
+				DNSRecords:     deps.DNSRecords,
+				ServerSettings: deps.ServerSettings,
+				SSLCerts:       deps.SSLCerts,
+				SSLReconciler:  deps.Reconciler,
+			})
+			// GH #2502: the domain's webmail branding on mail.<domain>.
+			if deps.DB != nil && deps.Users != nil {
+				api.RegisterDomainWebmailBrandingRoutes(mailGroup, api.DomainWebmailBrandingHandlerConfig{
+					Domains:         deps.Domains,
+					Users:           deps.Users,
+					Packages:        deps.Packages,
+					Branding:        repository.NewDomainWebmailBrandingRepository(deps.DB),
+					StrictRateLimit: rl.StrictPerActor(),
+					Webmail:         webmailBrandingSender(deps.Reconciler),
+				})
+			}
+			// GH #1387: mail-only domain delete (destructive teardown that keeps
+			// the web domain + DNS zone). Distinct route from the soft disable.
+			api.RegisterDomainMailPurgeRoutes(mailGroup, api.DomainMailPurgeHandlerConfig{
+				Domains:        deps.Domains,
+				Mailboxes:      deps.Mailboxes,
+				MailCerts:      deps.MailCerts,
+				Agent:          deps.Agent,
+				DNSZones:       deps.DNSZones,
+				DNSRecords:     deps.DNSRecords,
+				ServerSettings: deps.ServerSettings,
+			})
+		}
+		// M6.5 Email features: forwarders, autoresponders, catch-all, disclaimer,
+		// shared folders, logs. All sub-routes live in routes_m65.go and are
+		// filled in by Wave B/C steps (ADR-0051).
+		var srRepo repository.SharedResourceRepository
+		if deps.DB != nil {
+			srRepo = repository.NewSharedResourceRepository(deps.DB)
+		}
+		var sendDelegRepo repository.MailboxSendDelegationRepository
+		var trustedSendersRepo repository.MailboxTrustedSenderRepository
+		if deps.DB != nil {
+			sendDelegRepo = repository.NewMailboxSendDelegationRepository(deps.DB)
+			trustedSendersRepo = repository.NewMailboxTrustedSenderRepository(deps.DB)
+		}
+		api.RegisterM65Routes(mailGroup, api.M65RouteDeps{
+			Agent:           deps.Agent,
+			Domains:         deps.Domains,
+			Mailboxes:       deps.Mailboxes,
+			MailGroups:      deps.MailGroups,
+			Autoresponders:  deps.Autoresponders,
+			Forwarders:      deps.Forwarders,
+			MailboxShares:   deps.MailboxShares,
+			SharedResources: srRepo,
+			SendDelegations: sendDelegRepo,
+			SendAs:          deps.SendAs,
+			TrustedSenders:  trustedSendersRepo,
+			Addresses:       deps.MailAddresses,
+
+			Scanners:         deps.Scanners,
+			ScannerRateLimit: rl.Strict(),
+		})
+		// GH #873 round 4 — tenant-scoped mail traffic (own domains only).
+		if deps.DB != nil {
+			api.RegisterTenantMailStatsRoutes(mailGroup, api.TenantMailStatsHandlerConfig{
+				Stats: repository.NewMailStatsRepository(deps.DB),
+			})
+		}
+		// DNSSEC per-domain (ADR-0076). Standalone mount; not part of M6.5.
+		api.RegisterDomainDNSSECRoutes(v1, api.DomainDNSSECHandlerConfig{
+			Agent:   deps.Agent,
+			Domains: deps.Domains,
+			Keys:    deps.DNSSECKeys,
+		})
+		// Domain WHOIS lookup backing the admin "Information" modal (GH #254).
+		api.RegisterDomainWhoisRoutes(v1, api.DomainWhoisHandlerConfig{
+			Agent:   deps.Agent,
+			Domains: deps.Domains,
+		})
+		// Per-domain nginx FastCGI micro-cache toggle (ADR-0108).
+		api.RegisterDomainCacheRoutes(v1, api.DomainCacheHandlerConfig{
+			Agent:      deps.Agent,
+			Domains:    deps.Domains,
+			Reconciler: deps.Reconciler,
+		})
+		// Per-domain SAN auto-add opt-out (M50 SSL ergonomics).
+		api.RegisterDomainSkipAutoSANRoutes(v1, api.DomainSkipAutoSANConfig{
+			Domains:    deps.Domains,
+			Reconciler: deps.Reconciler,
+		})
+		// Per-domain MTA-STS toggle (M47 Wave 7b, ADR-0109).
+		api.RegisterDomainMTAStsRoutes(v1, api.DomainMTAStsHandlerConfig{
+			Agent:          deps.Agent,
+			Domains:        deps.Domains,
+			DNSZones:       deps.DNSZones,
+			DNSRecords:     deps.DNSRecords,
+			ServerSettings: deps.ServerSettings,
+			Reconciler:     deps.Reconciler,
+		})
+		// Admin: System Updates (M29). Thin proxy to agent's system.* commands.
+		api.RegisterAdminUpdatesRoutes(v1, api.AdminUpdatesHandlerConfig{
+			Agent:          deps.Agent,
+			State:          deps.UpdateState,
+			History:        deps.UpdateHistory,
+			Autoupdate:     deps.UpdateAutoupdate,
+			ServerSettings: deps.ServerSettings,
+		})
+		// Tasks indicator: running update/backup/malware tasks for the top bar.
+		api.RegisterAdminActiveTasksRoutes(v1, api.AdminActiveTasksConfig{
+			Updates:    deps.UpdateHistory,
+			BackupJobs: deps.BackupJobs,
+			Agent:      deps.Agent,
+		})
+		// Admin: Support diagnostic report (M29, ADR-0064).
+		api.RegisterAdminSupportRoutes(v1, api.AdminSupportHandlerConfig{
+			Agent: deps.Agent,
+		})
+		// Admin: Server Status aggregator (M31, ADR-0065).
+		api.RegisterAdminServerStatusRoutes(v1, api.AdminServerStatusHandlerConfig{
+			Agent:          deps.Agent,
+			Redis:          deps.Redis,
+			ServerSettings: deps.ServerSettings,
+			AppArmorAcks:   appArmorAcks,
+		})
+		// Admin: connection Speed Test endpoints backing the Server Status
+		// card (GH #252). No deps — pure HTTP, RequireAdmin-gated.
+		api.RegisterAdminSpeedtestRoutes(v1)
+		// Admin: Service controls (M31). Mounts POST /admin/services/:name/:action.
+		api.RegisterAdminServicesRoutes(v1, api.AdminServicesHandlerConfig{
+			Agent: deps.Agent,
+		})
+		// Admin: System jobs under Cron Jobs (GH #1686) — the scheduled jobs
+		// DotNext installs, with Run now and their log.
+		api.RegisterAdminSystemJobsRoutes(v1, api.AdminSystemJobsHandlerConfig{
+			Agent:        deps.Agent,
+			Schedules:    deps.BackupSchedules,
+			RunRateLimit: rl.StrictPerActor(),
+		})
+		// M47 Wave 9 — admin Mail deliverability score card.
+		api.RegisterAdminMailDeliverabilityRoutes(v1, api.AdminMailDeliverabilityHandlerConfig{
+			MailRBLStates:   deps.MailRBLStates,
+			DMARCAggregate:  deps.DMARCAggregate,
+			TLSRPTAggregate: deps.TLSRPTAggregate,
+			ARFReports:      deps.ARFReports,
+			ServerSettings:  deps.ServerSettings,
+		})
+		// GH #873 — admin mail statistics (history + storage drilldown).
+		if deps.DB != nil {
+			api.RegisterAdminMailStatsRoutes(v1, api.AdminMailStatsHandlerConfig{
+				Stats: repository.NewMailStatsRepository(deps.DB),
+			})
+		}
+		// M47 Wave 3 — admin outbound-throttle CRUD.
+		api.RegisterAdminMailThrottlesRoutes(v1, api.AdminMailThrottlesHandlerConfig{
+			Policies:       deps.MailOutboundPolicies,
+			ThrottleClient: deps.MailThrottles,
+		})
+		// M47: admin mail-queue (ADR-0103) over the Wave-1 agent.
+		api.RegisterAdminMailQueueRoutes(v1, deps.Agent)
+		// Admin: process kill (Server Status page). POST /admin/processes/:pid/kill.
+		api.RegisterAdminProcessesRoutes(v1, api.AdminProcessesHandlerConfig{
+			Agent: deps.Agent,
+		})
+		// Admin: dashboard counts (one-shot users/domains/mailboxes totals).
+		api.RegisterAdminCountsRoutes(v1, api.AdminCountsHandlerConfig{
+			DB: deps.DB,
+		})
+		// Admin: Panel SSL certificate (M32, ADR-0066). Skipped when
+		// PanelCerts isn't wired (legacy test fixtures).
+		if deps.PanelCerts != nil && deps.ServerSettings != nil {
+			api.RegisterAdminPanelCertificateRoutes(v1, api.AdminPanelCertificateHandlerConfig{
+				PanelCerts:     deps.PanelCerts,
+				ServerSettings: deps.ServerSettings,
+				Agent:          deps.Agent,
+			})
+		}
+		if deps.Domains != nil && deps.DNSZones != nil && deps.DNSRecords != nil {
+			api.RegisterDNSRoutes(dnsGroup, api.DNSHandlerConfig{
+				Domains:        deps.Domains,
+				Zones:          deps.DNSZones,
+				Records:        deps.DNSRecords,
+				ServerSettings: deps.ServerSettings,
+				Users:          deps.Users,
+				Reconciler:     deps.Reconciler,
+				Agent:          deps.Agent, // GH #1611: DNS-zone delete teardown
+			})
+		}
+		if deps.Domains != nil && deps.SSLCerts != nil {
+			api.RegisterSSLRoutes(v1, api.SSLHandlerConfig{
+				Domains:          deps.Domains,
+				SSLCerts:         deps.SSLCerts,
+				SharedCerts:      deps.SharedCerts,
+				DNSZones:         deps.DNSZones,
+				Agent:            deps.Agent,
+				PanelCerts:       deps.PanelCerts,
+				MailCerts:        deps.MailCerts,
+				ServerSettings:   deps.ServerSettings,
+				WebDomainAliases: deps.WebDomainAliases,
+				Reconciler:       deps.Reconciler,
+				Config:           cfg,
+			})
+		}
+		if deps.ServerSettings != nil {
+			api.RegisterServerSettingsRoutes(v1, api.ServerSettingsHandlerConfig{
+				Repo:    deps.ServerSettings,
+				Agent:   deps.Agent,
+				Log:     deps.Log,
+				SSOKey:  deps.SSOKey,
+				Webmail: webmailBrandingSender(deps.Reconciler),
+			})
+			// GH #2056: website mail through the local mail server or a smarthost.
+			api.RegisterWebsiteMailRoutes(v1, api.WebsiteMailHandlerConfig{
+				Repo:            deps.ServerSettings,
+				SSOKey:          deps.SSOKey,
+				Recorder:        deps.AuditRecorder,
+				StrictRateLimit: rl.StrictPerActor(),
+				Log:             deps.Log,
+				Agent:           deps.Agent,
+				Users:           deps.Users,
+				Domains:         deps.Domains,
+				Packages:        deps.Packages,
+			})
+			// M28 — admin logo upload/delete. Public GET lives on the
+			// root router above so it's reachable pre-auth.
+			api.RegisterBrandingRoutes(v1, api.BrandingHandlerConfig{
+				Repo:    deps.ServerSettings,
+				Log:     deps.Log,
+				Webmail: webmailBrandingSender(deps.Reconciler),
+			})
+		}
+		// M37 Phase 4: Postgres lifecycle admin endpoints (status +
+		// destructive uninstall). The toggle itself rides PATCH
+		// /admin/settings; these endpoints expose what the toggle
+		// alone can't reveal.
+		if deps.Agent != nil {
+			api.RegisterPostgresAdminRoutes(v1, api.PostgresAdminHandlerConfig{
+				Agent: deps.Agent,
+				Log:   deps.Log,
+			})
+		}
+		// M46: database server admin ops (root pw, config, maintenance,
+		// processes, admin SSO). Lives in the existing Databases tab.
+		if deps.DBAdmin != nil {
+			api.RegisterDatabaseAdminOpsRoutes(v1, api.DatabaseAdminOpsHandlerConfig{
+				Agent:        deps.Agent,
+				DBAdmin:      deps.DBAdmin,
+				Log:          deps.Log,
+				Queue:        deps.NotificationQueue,
+				SSO:          deps.SSO,
+				AdminerSSO:   deps.AdminerSSO,
+				Recorder:     deps.AuditRecorder,
+				SSORateLimit: rl.SSOPerActor(),
+			})
+		}
+		if deps.PageTemplates != nil {
+			api.RegisterPageTemplatesRoutes(v1, api.PageTemplatesHandlerConfig{
+				Repo: deps.PageTemplates,
+				Log:  deps.Log,
+			})
+		}
+		if deps.AccountSkeleton != nil {
+			api.RegisterAccountSkeletonRoutes(v1, api.AccountSkeletonHandlerConfig{
+				Repo: deps.AccountSkeleton,
+				Log:  deps.Log,
+			})
+		}
+		if deps.NotificationEventSettings != nil {
+			api.RegisterNotificationEventSettingsRoutes(v1, api.NotificationEventSettingsHandlerConfig{
+				Repo: deps.NotificationEventSettings,
+				Log:  deps.Log,
+			})
+		}
+		// GH #1310-adjacent ("drfeed spam"): per-account ssh.login ignore list.
+		if deps.ServerSettings != nil {
+			api.RegisterSSHLoginIgnoreRoutes(v1, api.SSHLoginIgnoreHandlerConfig{
+				Settings: deps.ServerSettings,
+				Log:      deps.Log,
+			})
+		}
+		// M6.4 Settings → Email: read-only panel-primary domain card.
+		// ServerSettings carries the applied mail hostname (JAB-390).
+		if deps.Domains != nil && deps.ServerSettings != nil {
+			api.RegisterSettingsEmailRoutes(v1, api.SettingsEmailHandlerConfig{
+				Domains:          deps.Domains,
+				ServerSettings:   deps.ServerSettings,
+				PanelCerts:       deps.PanelCerts,
+				WebDomainAliases: deps.WebDomainAliases,
+				Switchover:       deps.MailHostSwitchover,
+				Recorder:         deps.AuditRecorder,
+				StrictRateLimit:  rl.StrictPerActor(),
+				Log:              deps.Log,
+			})
+		}
+		if deps.ManagedIPs != nil {
+			// Step 4 flips AgentIPCommandsEnabled on: CRUD round-trips
+			// through the agent's ip.bind / ip.unbind commands, and the
+			// reconciler's managed-ip pass rebinds any DB-bound rows
+			// the kernel has lost (host reboot between missing netplan
+			// persistence and agent recovery).
+			api.RegisterIPRoutes(v1, api.IPHandlerConfig{
+				Repo:                   deps.ManagedIPs,
+				Domains:                deps.Domains,
+				Agent:                  deps.Agent,
+				AgentIPCommandsEnabled: deps.Agent != nil,
+				Log:                    deps.Log,
+			})
+		}
+
+		// M14 Step 5 — admin channel CRUD + broadcast/test.
+		if deps.NotificationChannels != nil {
+			api.RegisterNotificationsChannelsRoutes(v1, api.NotificationsChannelsHandlerConfig{
+				Channels:        deps.NotificationChannels,
+				Webhooks:        deps.WebhookEndpoints,
+				Queue:           deps.NotificationQueue,
+				Registry:        deps.NotificationRegistry,
+				Log:             deps.Log,
+				StrictRateLimit: rl.Strict(),
+				SSOKey:          deps.SSOKey,
+				Users:           deps.Users,
+			})
+		}
+		// M31.1 follow-up — DLQ inspector (list / replay / drop / clear).
+		api.RegisterNotificationsDLQRoutes(v1, api.NotificationsDLQHandlerConfig{
+			Redis: deps.Redis,
+			Log:   deps.Log,
+		})
+		// M14 Step 5 — authenticated-user bell dropdown.
+		if deps.NotificationHistory != nil {
+			api.RegisterNotificationsInboxRoutes(v1, api.NotificationsInboxHandlerConfig{
+				History: deps.NotificationHistory,
+				Redis:   deps.Redis,
+				Log:     deps.Log,
+			})
+		}
+		// M14 Step 5 — Web Push enrolment.
+		if deps.WebPushSubs != nil && deps.ServerSettings != nil {
+			api.RegisterNotificationsWebPushRoutes(v1, api.NotificationsWebPushHandlerConfig{
+				ServerSettings: deps.ServerSettings,
+				Subs:           deps.WebPushSubs,
+				Channels:       deps.NotificationChannels,
+				Log:            deps.Log,
+			})
+		}
+		if deps.Agent != nil {
+			api.RegisterSystemRoutes(v1, deps.Agent, deps.KratosClient)
+			api.RegisterPHPVersionRoutes(v1, deps.Agent)
+			// M26 Step 4 — admin Security tab. CrowdSec + UFW are pure
+			// agent passthroughs. ModSecurity removed 2026-04-26 (ADR-0055
+			// SUPERSEDED) — CrowdSec AppSec covers the WAF role.
+			api.RegisterSecurityCrowdSecRoutes(securityGroup, deps.Agent, deps.ServerSettings)
+			api.RegisterSecurityAppSecRoutes(securityGroup, deps.Agent, deps.ServerSettings)
+			// GH #1649: AppSec FP triage + operator CRS exclusions, applied live.
+			appsecExclCfg := api.SecurityAppSecExclusionConfig{Agent: deps.Agent}
+			if deps.DB != nil {
+				appsecExclCfg.Exclusions = repository.NewCRSRuleExclusionRepository(deps.DB)
+				appsecExclCfg.HostModes = repository.NewCRSHostModeRepository(deps.DB)
+			}
+			api.RegisterSecurityAppSecExclusionRoutes(securityGroup, appsecExclCfg)
+			api.RegisterSecurityUFWRoutes(securityGroup, deps.Agent)
+			// M40 (ADR-0086) AppArmor admin status + per-profile mode flip, and
+			// the complain-mode acknowledgements (GH #2078).
+			api.RegisterSecurityAppArmorRoutes(securityGroup, api.SecurityAppArmorConfig{
+				Agent: deps.Agent,
+				Acks:  appArmorAcks,
+				Audit: deps.AuditRecorder,
+			})
+			// M42 (ADR-0087) AIDE FIM read-only status + manual check trigger.
+			api.RegisterSecurityAideRoutes(securityGroup, deps.Agent)
+			// M43 (ADR-0089) Trust test bench — "would this IP be blocked?" admin endpoint.
+			api.RegisterSecurityTrustRoutes(securityGroup, deps.Agent)
+			// M41 (ADR-0088) Snuffleupagus PHP hardening — status/mode/rules/incidents.
+			if deps.Snuffleupagus != nil {
+				api.RegisterSecuritySnuffleupagusRoutes(securityGroup, api.SecuritySnuffleupagusConfig{
+					Agent:      deps.Agent,
+					Repo:       deps.Snuffleupagus,
+					Reconciler: deps.SnuffleupagusReconciler,
+					BundleDir:  deps.SnuffleupagusBundleDir,
+				})
+			}
+			// M33 malware tab — ADR-0072. All five malware repos must be
+			// wired or RegisterSecurityMalwareRoutes is skipped (older test
+			// wiring without the M33 graph). Tab still renders empty state.
+			if deps.MalwareQuarantine != nil && deps.MalwareEvents != nil &&
+				deps.MalwareSettings != nil && deps.YARARules != nil {
+				api.RegisterSecurityMalwareRoutes(v1, api.SecurityMalwareHandlerConfig{
+					Agent:      deps.Agent,
+					Quarantine: deps.MalwareQuarantine,
+					Events:     deps.MalwareEvents,
+					Settings:   deps.MalwareSettings,
+					YARARules:  deps.YARARules,
+					Users:      deps.Users,
+					UserScans:  deps.MalwareUserScans,
+					Log:        deps.Log,
+				})
+			}
+		}
+		if deps.BackupJobs != nil && deps.Users != nil {
+			// Typed-nil guard: a nil *reconciler.Reconciler in the interface
+			// would be non-nil and panic on Schedule.
+			var restoreScheduler api.DomainScheduler
+			if deps.Reconciler != nil {
+				restoreScheduler = deps.Reconciler
+			}
+			api.RegisterBackupRoutes(v1, api.BackupHandlerConfig{
+				Agent:          deps.Agent,
+				Jobs:           deps.BackupJobs,
+				Destinations:   deps.BackupDestinations,
+				Users:          deps.Users,
+				Packages:       deps.Packages, // GH #1408 create-from-manifest
+				Databases:      deps.Databases,
+				DatabaseUsers:  deps.DatabaseUsers,
+				DatabaseGrants: deps.DatabaseUserGrants,
+				Domains:        deps.Domains,
+				Mailboxes:      deps.Mailboxes,
+				AppInstalls:    deps.WordPressInstalls,
+				DockerApps:     deps.DockerApps,
+				DNSZones:       deps.DNSZones,
+				DNSRecords:     deps.DNSRecords,
+				// JAB-312: the schema-v2 metadata repos were never wired into the
+				// admin backup handler, so buildAccountMetadata skipped these
+				// sections in manual backups AND the restore finalizer had no
+				// repos to rebuild them. Wire the full set (matches the scheduler
+				// and the CLI restore Deps) so manual backup bundles are complete
+				// and UI restores can reconstruct panel state.
+				SSLCerts:       deps.SSLCerts,
+				PHPPools:       deps.PHPPools,
+				PHPPoolIni:     deps.PHPPoolIniOverrides,
+				Forwarders:     deps.Forwarders,
+				Autoresponders: deps.Autoresponders,
+				MailboxShares:  deps.MailboxShares,
+				TrustedSenders: deps.MailboxTrustedSenders,
+				DNSSECKeys:     deps.DNSSECKeys,
+				SSHKeys:        deps.SSHKeys,
+				CronJobs:       deps.CronJobs,
+				FtpAccounts:    deps.FtpAccounts,
+				LimitOverrides: deps.LimitOverrides,
+				// JAB-359: the last two schema-v2 sections; without them the admin
+				// manual backup bundle omitted egress policies/requests.
+				EgressPolicies: deps.UserEgressPolicies,
+				EgressRequests: deps.UserEgressRequests,
+				KratosClient:   deps.KratosClient,
+				// GH #1898: the name guards a restored domain goes through.
+				WebDomainAliases: deps.WebDomainAliases,
+				ServerSettings:   deps.ServerSettings,
+				MailAddresses:    deps.MailAddresses,
+				UploadedBackups:  deps.UploadedBackups,
+				Scheduler:        restoreScheduler, // GH #1993: restored DNS records
+				Log:              deps.Log,
+				SSOKey:           deps.SSOKey,
+
+				// GH #2502: each domain's webmail branding, backed up and restored.
+				WebmailBranding: repository.NewDomainWebmailBrandingRepository(deps.DB),
+			})
+			api.RegisterMeBackupRoutes(v1, api.MeBackupsHandlerConfig{
+				Agent:          deps.Agent,
+				Jobs:           deps.BackupJobs,
+				Destinations:   deps.BackupDestinations,
+				SSOKey:         deps.SSOKey,
+				Users:          deps.Users,
+				Packages:       deps.Packages,
+				Databases:      deps.Databases,
+				DatabaseUsers:  deps.DatabaseUsers,
+				DatabaseGrants: deps.DatabaseUserGrants,
+				Domains:        deps.Domains,
+				Mailboxes:      deps.Mailboxes,
+				AppInstalls:    deps.WordPressInstalls,
+				DockerApps:     deps.DockerApps,
+				FtpAccounts:    deps.FtpAccounts,
+				DNSZones:       deps.DNSZones,
+				DNSRecords:     deps.DNSRecords,
+				// JAB-359: /me manual self-backup had the same schema-v2 wiring gap
+				// as the admin handler — a tenant's manual backup produced an
+				// incomplete bundle. Wire the full metadata repo set the builder
+				// consumes (matches BackupHandlerConfig + the scheduler).
+				SSLCerts:       deps.SSLCerts,
+				PHPPools:       deps.PHPPools,
+				PHPPoolIni:     deps.PHPPoolIniOverrides,
+				Forwarders:     deps.Forwarders,
+				Autoresponders: deps.Autoresponders,
+				MailboxShares:  deps.MailboxShares,
+				TrustedSenders: deps.MailboxTrustedSenders,
+				DNSSECKeys:     deps.DNSSECKeys,
+				SSHKeys:        deps.SSHKeys,
+				CronJobs:       deps.CronJobs,
+				LimitOverrides: deps.LimitOverrides,
+				EgressPolicies: deps.UserEgressPolicies,
+				EgressRequests: deps.UserEgressRequests,
+				// GH #454 Step 4: tenant scheduled-backup card. Schedules +
+				// Settings (the admin-owned cron time) gate the /me/backup-schedule
+				// routes; absent, the card's endpoints simply aren't mounted.
+				Schedules: deps.BackupSchedules,
+				Settings:  deps.ServerSettings,
+				Notify:    deps.NotificationQueue,
+				Log:       deps.Log,
+
+				// GH #1993: the tenant's own backup carries its domains' aliases.
+				WebDomainAliases: deps.WebDomainAliases,
+				// GH #2502: and their webmail branding.
+				WebmailBranding: repository.NewDomainWebmailBrandingRepository(deps.DB),
+			})
+		}
+		// M30.1 (ADR-0078): backup destinations + schedules.
+		if deps.BackupDestinations != nil {
+			api.RegisterBackupDestinationRoutes(v1, api.BackupDestinationsConfig{
+				Repo:   deps.BackupDestinations,
+				Agent:  deps.Agent,
+				SSOKey: deps.SSOKey,
+			})
+			// SSH-key listing/generate endpoints feed the SFTP key
+			// dropdown on the destinations drawer. Both ops run as
+			// root via the agent (panel-api can't read /root/.ssh
+			// or write /etc/dotnext/restic-remotes/).
+			api.RegisterSystemSSHKeysRoutes(v1, api.SystemSSHKeysConfig{
+				Agent: deps.Agent,
+			})
+			// Master restic password reveal — admin-only. Per
+			// ADR-0075 operators must back the password up
+			// out-of-band; losing it loses every snapshot.
+			api.RegisterBackupEncryptionKeyRoutes(v1, api.BackupEncryptionKeyConfig{
+				Agent: deps.Agent,
+			})
+		}
+		if deps.BackupSchedules != nil && deps.BackupDestinations != nil {
+			api.RegisterBackupScheduleRoutes(v1, api.BackupSchedulesConfig{
+				Schedules:    deps.BackupSchedules,
+				Destinations: deps.BackupDestinations,
+				Users:        deps.Users,
+				Jobs:         deps.BackupJobs,
+				Settings:     deps.ServerSettings,
+				Packages:     deps.Packages,
+			})
+		}
+		if deps.SSO != nil && deps.Databases != nil && deps.PhpMyAdminSSOTokens != nil {
+			api.RegisterSSOPhpMyAdminRoutes(v1, api.SSOPhpMyAdminHandlerConfig{
+				Databases:    deps.Databases,
+				SSO:          deps.SSO,
+				Log:          deps.Log,
+				SSORateLimit: rl.SSOPerActor(),
+			})
+		}
+		// M37 Phase 4: Adminer SSO mint route — engine-aware.
+		if deps.SSO != nil && deps.AdminerSSO != nil && deps.Databases != nil && deps.AdminerSSOTokens != nil {
+			api.RegisterSSOAdminerRoutes(v1, api.SSOAdminerHandlerConfig{
+				Databases:    deps.Databases,
+				SSO:          deps.SSO,
+				Adminer:      deps.AdminerSSO,
+				Log:          deps.Log,
+				SSORateLimit: rl.SSOPerActor(),
+			})
+		}
+		if deps.PHPPools != nil && deps.PHPPoolIniOverrides != nil {
+			// Pool tuning (pm.*, ini overrides) is admin-only: tenants must not
+			// resize the shared worker pool. Per-domain PHP *version* binding
+			// stays user-facing via RegisterDomainPHPPoolRoutes below.
+			api.RegisterPHPPoolRoutes(v1.Group("", middleware.RequireAdmin()), api.PHPPoolHandlerConfig{
+				PHPPools:            deps.PHPPools,
+				PHPPoolIniOverrides: deps.PHPPoolIniOverrides,
+				Domains:             deps.Domains,
+				Users:               deps.Users,
+				Agent:               deps.Agent,
+			})
+		}
+		if deps.PHPPerformanceModes != nil {
+			api.RegisterPHPPerformanceModeRoutes(v1, api.PHPPerformanceModeHandlerConfig{
+				Modes: deps.PHPPerformanceModes,
+			})
+		}
+		if deps.PHPPools != nil && deps.Packages != nil && deps.PHPPerformanceModes != nil {
+			api.RegisterPHPUserTuningRoutes(v1, api.PHPUserTuningHandlerConfig{
+				Agent:               deps.Agent,
+				Users:               deps.Users,
+				Packages:            deps.Packages,
+				PHPPools:            deps.PHPPools,
+				PHPPoolIniOverrides: deps.PHPPoolIniOverrides,
+				Modes:               deps.PHPPerformanceModes,
+			})
+			// GH #1332 item 16: per-(user,version) opt-in extra extensions.
+			api.RegisterPHPPoolExtensionsRoutes(v1, api.PHPPoolExtensionsHandlerConfig{
+				Agent:               deps.Agent,
+				Users:               deps.Users,
+				Packages:            deps.Packages,
+				PHPPools:            deps.PHPPools,
+				PHPPoolIniOverrides: deps.PHPPoolIniOverrides,
+			})
+			// GH #1332 item 9: per-(user,version) Xdebug toggle.
+			api.RegisterPHPXdebugRoutes(v1, api.PHPXdebugHandlerConfig{
+				Agent:               deps.Agent,
+				Users:               deps.Users,
+				Packages:            deps.Packages,
+				PHPPools:            deps.PHPPools,
+				PHPPoolIniOverrides: deps.PHPPoolIniOverrides,
+			})
+		}
+		if deps.Domains != nil && deps.PHPPools != nil {
+			api.RegisterDomainPHPPoolRoutes(v1, api.DomainPHPPoolHandlerConfig{
+				Domains:             deps.Domains,
+				PHPPools:            deps.PHPPools,
+				PHPPoolIniOverrides: deps.PHPPoolIniOverrides,
+				Users:               deps.Users,
+				Agent:               deps.Agent,
+				// GH #1701: a version switch applies now.
+				Packages:   deps.Packages,
+				Reconciler: domainPHPScheduler(deps.Reconciler),
+			})
+		}
+		if deps.Domains != nil {
+			api.RegisterDomainPHPSettingsRoutes(v1, api.DomainPHPSettingsHandlerConfig{
+				Domains:          deps.Domains,
+				PHPPools:         deps.PHPPools,
+				Agent:            deps.Agent,
+				PoolIniOverrides: deps.PHPPoolIniOverrides,
+				// GH #1701: the owner's package PHP settings policy.
+				Users:    deps.Users,
+				Packages: deps.Packages,
+				// GH #1701: a save applies now; the OPcache reset restarts an
+				// FPM master, so it takes a per-user budget.
+				Reconciler:     domainPHPScheduler(deps.Reconciler),
+				ResetRateLimit: rl.StrictPerActor(),
+			})
+			// GH #1332 item 14: per-domain env vars.
+			api.RegisterDomainEnvVarsRoutes(v1, api.DomainEnvVarsHandlerConfig{
+				Domains: deps.Domains,
+			})
+		}
+		if deps.Domains != nil {
+			api.RegisterDomainHtaccessRoutes(v1, api.DomainHtaccessHandlerConfig{
+				Domains: deps.Domains,
+			})
+		}
+		if deps.Domains != nil {
+			api.RegisterDomainNginxImportRoutes(v1, api.DomainNginxImportHandlerConfig{
+				Domains: deps.Domains,
+			})
+		}
+		if deps.WordPressInstalls != nil && deps.Databases != nil && deps.DatabaseUsers != nil &&
+			deps.DatabaseUserGrants != nil && deps.Domains != nil && deps.Users != nil && deps.Agent != nil {
+			appCfg := api.ApplicationHandlerConfig{
+				ApplicationInstalls: deps.WordPressInstalls,
+				Databases:           deps.Databases,
+				DatabaseUsers:       deps.DatabaseUsers,
+				DatabaseGrants:      deps.DatabaseUserGrants,
+				Domains:             deps.Domains,
+				Users:               deps.Users,
+				Packages:            deps.Packages,
+				Agent:               deps.Agent,
+				Apps:                deps.Apps,
+				CronJobs:            deps.CronJobs,
+				CRSExclusions:       repository.NewCRSRuleExclusionRepository(deps.DB),
+				CRSHostModes:        repository.NewCRSHostModeRepository(deps.DB),
+				Redis:               deps.Redis,
+				Reconciler:          deps.Reconciler,
+				CacheTokenSecret:    cacheHMACSecret(),
+				CacheTokenSalts:     repository.NewCacheTokenSaltRepository(deps.DB),
+				CacheWarmupRuns:     repository.NewCacheWarmupRunRepository(deps.DB),
+				CacheDoctorRuns:     repository.NewCacheDoctorRunRepository(deps.DB),
+			}
+			api.RegisterApplicationRoutes(v1, appCfg)
+
+			// GH #1016: per-tenant Redis credentials (reuses appCfg's Redis +
+			// cache-token secret/salts + Users). GH #2003: plus the tenant's
+			// scoped flush, per-user strict-tier limited. GH #2165: plus the
+			// key browser, per-user scan-tier limited.
+			redisCfg := appCfg
+			redisCfg.RedisFlushRateLimit = rl.StrictPerActor()
+			redisCfg.RedisKeysRateLimit = rl.ScanPerActor()
+			api.RegisterRedisAccessRoutes(v1, redisCfg)
+
+			// Log access routes (M13)
+			if deps.LogAccessStreams != nil && deps.Domains != nil && deps.Users != nil {
+				api.RegisterLogRoutes(v1, api.LogHandlerConfig{
+					LogAccessStreams: deps.LogAccessStreams,
+					Domains:          deps.Domains,
+					Users:            deps.Users,
+					Agent:            deps.Agent,
+				})
+				// WebSocket log streaming routes
+				api.RegisterLogStreamRoutes(v1, api.LogStreamHandlerConfig{
+					LogAccessStreams: deps.LogAccessStreams,
+					Domains:          deps.Domains,
+					Log:              deps.Log,
+					Agent:            deps.Agent,
+					Users:            deps.Users,
+				})
+			}
+		}
+
+		// Magic-link admin login (ADR-0040): mint-only. The agent-written
+		// PHP file is its own validator, so no validate endpoint lives here.
+		if deps.WordPressInstalls != nil && deps.Domains != nil &&
+			deps.Users != nil && deps.Agent != nil {
+			api.RegisterMagicLinkRoutes(v1, api.MagicLinkHandlerConfig{
+				ApplicationInstalls: deps.WordPressInstalls,
+				Domains:             deps.Domains,
+				Users:               deps.Users,
+				Agent:               deps.Agent,
+				SSORateLimit:        rl.SSOPerActor(),
+			})
+		}
+
+		// Cron jobs routes (M8)
+		if deps.CronJobs != nil && deps.Users != nil && deps.Domains != nil && deps.Agent != nil {
+			api.RegisterCronRoutes(v1, api.CronHandlerConfig{
+				CronJobs: deps.CronJobs,
+				Users:    deps.Users,
+				Domains:  deps.Domains,
+				Agent:    deps.Agent,
+				Log:      deps.Log,
+				Packages: deps.Packages, // GH #2290: shell scripts need SSH
+			})
+		}
+
+		// Docker app marketplace routes (M48). Optional; when the
+		// docker_apps repo + catalog are not wired the route group
+		// stays unmounted and any /admin/docker-apps/* request 404s.
+		if deps.DockerApps != nil && deps.Agent != nil {
+			api.RegisterDockerAppRoutes(v1, api.DockerAppHandlerConfig{
+				Repo:            deps.DockerApps,
+				DomainOwnership: repository.NewDomainOwnershipRepository(deps.DB), // GH #1816
+				Catalog:         deps.DockerCatalog,
+				ServerSettings:  deps.ServerSettings,
+				Domains:         deps.Domains,
+				// GH #1625: hijack guard on the docker-app domain auto-create path.
+				WebDomainAliases: deps.WebDomainAliases,
+				Agent:            deps.Agent,
+				Users:            deps.Users,
+				Log:              deps.Log,
+			})
+		}
+		// M49 (GH #170): tenant docker apps. Mounts /docker-apps on the
+		// authed base group; gated by the /etc/dotnext/docker-tenant-enabled
+		// host flag (written by `dotnext docker enable-tenant`).
+		if deps.DockerApps != nil && deps.DockerCatalog != nil && deps.Agent != nil {
+			api.RegisterUserDockerAppRoutes(v1, api.UserDockerAppHandlerConfig{
+				Repo:             deps.DockerApps,
+				DomainOwnership:  repository.NewDomainOwnershipRepository(deps.DB), // GH #1816
+				Catalog:          deps.DockerCatalog,
+				Domains:          deps.Domains,
+				Agent:            deps.Agent,
+				Users:            deps.Users,
+				Packages:         deps.Packages,
+				ServerSettings:   deps.ServerSettings,
+				WebDomainAliases: deps.WebDomainAliases,
+				Log:              deps.Log,
+			})
+		}
+		if deps.PythonApps != nil && deps.Agent != nil && deps.Domains != nil {
+			api.RegisterPythonAppRoutes(v1, api.PythonAppHandlerConfig{
+				Apps:       deps.PythonApps,
+				Domains:    deps.Domains,
+				Users:      deps.Users,
+				Packages:   deps.Packages,
+				Settings:   deps.ServerSettings,
+				Agent:      deps.Agent,
+				Reconciler: deps.Reconciler,
+				Catalog:    deps.PyFrameworks,
+			})
+		}
+		// GH #2276 (ADR-0176): Composer runs of a domain. Starting one takes a
+		// per-user budget: each is a Composer process on the server.
+		if deps.Agent != nil && deps.Domains != nil && deps.Users != nil && deps.Packages != nil && deps.DB != nil {
+			api.RegisterDomainComposerRoutes(v1, api.DomainComposerHandlerConfig{
+				Domains:        deps.Domains,
+				Users:          deps.Users,
+				Packages:       deps.Packages,
+				Runs:           repository.NewComposerRunRepository(deps.DB),
+				Settings:       repository.NewDomainComposerSettingsRepository(deps.DB),
+				Agent:          deps.Agent,
+				StartRateLimit: rl.StrictPerActor(),
+			})
+			// GH #2277 (ADR-0178): the Git repository a domain deploys from.
+			// Saving it and listing its branches make the server connect to
+			// the Git host, so both take a per-user budget.
+			// A deployment or rollback starts a unit on the server, and takes
+			// the same budget.
+			var gitSched gitdeploy.Scheduler
+			if deps.Reconciler != nil {
+				gitSched = deps.Reconciler
+			}
+			api.RegisterDomainGitRoutes(v1, api.DomainGitHandlerConfig{
+				Domains:         deps.Domains,
+				Users:           deps.Users,
+				Packages:        deps.Packages,
+				Repos:           repository.NewDomainGitRepoRepository(deps.DB),
+				Agent:           deps.Agent,
+				SSOKey:          deps.SSOKey,
+				RemoteRateLimit: rl.StrictPerActor(),
+				Deployments:     repository.NewDomainGitDeploymentRepository(deps.DB),
+				Reconciler:      gitSched,
+				Webhooks:        repository.NewDomainGitWebhookRepository(deps.DB),
+			})
+		}
+
+		// File manager routes (M11)
+		if deps.Users != nil && deps.Agent != nil {
+			api.RegisterFilesRoutes(v1, api.FilesHandlerConfig{
+				Users:          deps.Users,
+				Domains:        deps.Domains,
+				Agent:          deps.Agent,
+				Log:            deps.Log,
+				ServerSettings: deps.ServerSettings,
+				Audits:         automationAudits(deps.DB),
+				// JAB-380: recent-auth step-up on the /admin/files mount.
+				KratosClient: deps.KratosClient,
+			})
+		}
+
+		// SSH keys routes
+		if deps.SSHKeys != nil && deps.Reconciler != nil {
+			api.RegisterSSHKeysRoutes(v1, api.SSHKeysHandlerConfig{
+				SSHKeys:    deps.SSHKeys,
+				Reconciler: deps.Reconciler,
+				Logger:     deps.Log,
+			})
+		}
+
+		// GH #2032: a tenant's own Cloudflare token for DNS-01.
+		if deps.UserCloudflareTokens != nil && deps.Domains != nil {
+			api.RegisterUserCloudflareTokenRoutes(v1, api.UserCloudflareTokenHandlerConfig{
+				Tokens:          deps.UserCloudflareTokens,
+				Domains:         deps.Domains,
+				SSOKey:          deps.SSOKey,
+				Log:             deps.Log,
+				StrictRateLimit: rl.StrictPerActor(),
+			})
+		}
+
+		// FTP/SFTP subaccount routes (GH #1053). Agent optional at wire
+		// time: handlers fail closed per-request when it is nil.
+		if deps.FtpAccounts != nil && deps.Users != nil && deps.Packages != nil {
+			ftpCfg := api.FtpAccountsHandlerConfig{
+				Repo:            deps.FtpAccounts,
+				Users:           deps.Users,
+				Packages:        deps.Packages,
+				Agent:           deps.Agent,
+				Log:             deps.Log,
+				StrictRateLimit: rl.Strict(),
+				PatchRateLimit:  rl.StrictPerActor(), // JAB-266: per-user bound on sshd-reload PATCH
+				QuotaMount:      deps.QuotaMount,     // GH #1145 isolated per-uid setquota
+			}
+			// An isolated account's quota comes out of its tenant's own
+			// limit; without the limit sources isolation stays off.
+			if deps.LimitOverrides != nil && deps.ServerSettings != nil {
+				ftpCfg.Limits = limitsync.Tenant{
+					Users:     deps.Users,
+					Packages:  deps.Packages,
+					Overrides: deps.LimitOverrides,
+					Settings:  deps.ServerSettings,
+				}
+			}
+			api.RegisterFtpAccountRoutes(v1, ftpCfg)
+		}
+
+		// Admin routes
+		if deps.Reconciler != nil {
+			admin := v1.Group("/admin", middleware.RequireAdmin())
+			api.RegisterReconcileRoutes(admin, &api.ReconcileHandlerConfig{
+				Reconciler: deps.Reconciler,
+				Log:        deps.Log,
+			})
+			// GH #1169: admin DR status card feed.
+			api.RegisterDRStatusRoute(admin, api.DRStatusConfig{
+				Settings:     deps.ServerSettings,
+				Destinations: deps.BackupDestinations,
+			})
+		}
+		// GH #1627: custom DNS templates. Admin CRUD under the RequireAdmin
+		// group; a read-only list on the authed base group so a tenant's create
+		// form can offer the available templates (global — every tenant sees all).
+		if deps.DNSTemplates != nil {
+			adminTmpl := v1.Group("/admin", middleware.RequireAdmin())
+			api.RegisterAdminDNSTemplateRoutes(adminTmpl, api.DNSTemplateHandlerConfig{Templates: deps.DNSTemplates})
+			api.RegisterDNSTemplateRoutes(v1, api.DNSTemplateHandlerConfig{Templates: deps.DNSTemplates})
+		}
+		// GH #1624 / ADR-0169 Phase 3: admin web (nginx) templates. Admin CRUD
+		// under the RequireAdmin group only — there is NO tenant-facing route
+		// (admin-select-only: the admin denylist does not block proxy_pass, so a
+		// tenant-pickable template would be an SSRF vector with the admin as
+		// unwitting author).
+		if deps.WebTemplates != nil {
+			adminWebTmpl := v1.Group("/admin", middleware.RequireAdmin())
+			api.RegisterAdminWebTemplateRoutes(adminWebTmpl, api.WebTemplateHandlerConfig{Templates: deps.WebTemplates})
+		}
+		// M44: Automation API token management. Admin mints + revokes
+		// HMAC-signed tokens; the matching public read-only routes
+		// at /api/v1/automation/* are wired below outside the auth
+		// middleware (HMAC is the auth there, no Kratos session).
+		if deps.AutomationTokens != nil && deps.SSOKey != nil {
+			api.RegisterAdminAutomationTokens(v1, api.AdminAutomationTokensConfig{
+				Repo:  deps.AutomationTokens,
+				Key:   deps.SSOKey,
+				Audit: deps.AuditRecorder,
+			})
+		}
+		if deps.MigrationJobs != nil {
+			// M35 Step 8 read-only admin REST. Mutation
+			// endpoints (create/resume) land alongside the SPA
+			// once the JMAP-push + CreateUser orchestrator
+			// stabilise.
+			api.RegisterAdminMigrationRoutes(v1, api.AdminMigrationsHandlerConfig{
+				Jobs:      deps.MigrationJobs,
+				SizeCache: deps.MigrationSizeCache,
+				Settings:  deps.ServerSettings,
+				Agent:     deps.Agent,
+			})
+			// GH #647/#648: tenant owner-scoped WordPress self-migration.
+			if deps.Domains != nil && deps.Users != nil && deps.Agent != nil {
+				api.RegisterTenantMigrationRoutes(v1, api.TenantMigrationsConfig{
+					Jobs:     deps.MigrationJobs,
+					Domains:  deps.Domains,
+					Users:    deps.Users,
+					Agent:    deps.Agent,
+					Settings: deps.ServerSettings,
+				})
+			}
+		}
+		if deps.Agent != nil {
+			admin := v1.Group("/admin", middleware.RequireAdmin())
+			api.RegisterPHPVersionAdminRoutes(admin, deps.Agent, deps.ServerSettings)
+			api.RegisterPHPExtensionAdminRoutes(admin, deps.Agent, ioncube.Fetcher{})
+		}
+
+		// M45 root web terminal (ADR-0096). Off by default; the handler
+		// re-checks server_settings.root_terminal_enabled on every mint
+		// + WS upgrade. Mounted under the admin RequireAdmin group.
+		if deps.TerminalSessions != nil && deps.ServerSettings != nil {
+			tadmin := v1.Group("/admin", middleware.RequireAdmin())
+			api.RegisterTerminalRoutes(tadmin, api.TerminalHandlerConfig{
+				Sessions:       deps.TerminalSessions,
+				ServerSettings: deps.ServerSettings,
+				Notifications:  deps.NotificationQueue,
+				Log:            deps.Log,
+				// JAB-380: recent-auth step-up on root terminal mint.
+				KratosClient: deps.KratosClient,
+			})
+		}
+		// M34 per-user PHP-FPM egress firewall — admin + user routes share
+		// the same handler config; admin half mounts under /admin
+		// (RequireAdmin) and user half under the auth-only base group so
+		// /me/* resolves to the caller via JWT.
+		if deps.Users != nil && deps.UserEgressPolicies != nil && deps.UserEgressRequests != nil {
+			adminEgress := v1.Group("/admin", middleware.RequireAdmin())
+			cfg := api.UserEgressHandlerConfig{
+				Users:       deps.Users,
+				Policies:    deps.UserEgressPolicies,
+				Requests:    deps.UserEgressRequests,
+				DropSamples: deps.UserEgressDropSamples,
+				Agent:       deps.Agent,
+			}
+			api.RegisterAdminUserEgressRoutes(adminEgress, cfg)
+			api.RegisterMeEgressRoutes(v1, cfg)
+		}
+		if deps.Supervisor != nil {
+			adminSys := v1.Group("/admin", middleware.RequireAdmin())
+			modsystem.RegisterWorkerStatusRoute(adminSys, deps.Supervisor)
+		}
+	}
+
+	// Static SPA: owns r.NoRoute — serves embedded panel-ui/dist for
+	// unknown paths with client-side routing fallback, JSON 404 for
+	// API-ish prefixes.
+	webui.RegisterStatic(r, frontend.Assets())
+	// Method-not-allowed handler stays on the api side for JSON symmetry.
+	api.RegisterMethodNotAllowedHandler(r)
+	return r
+}
+
+// startRateLimiterSweeper launches a background goroutine that drops idle
+// per-IP buckets so the limiter's memory stays bounded. Safe to call once
+// per process; the goroutine lives for the program's lifetime.
+// domainPHPScheduler hands the PHP settings handlers the reconciler, or a nil
+// interface when there is none: a nil *Reconciler inside a non-nil interface
+// would pass the handlers' nil check and panic on Schedule.
+func domainPHPScheduler(r *reconciler.Reconciler) api.DomainPHPScheduler {
+	if r == nil {
+		return nil
+	}
+	return r
+}
+
+func startRateLimiterSweeper(rl *middleware.RateLimiter) {
+	ticker := time.NewTicker(rateLimiterSweepEvery)
+	go func() {
+		for range ticker.C {
+			rl.Cleanup(rateLimiterIdleCleanup)
+		}
+	}()
+}
+
+// cacheHMACSecret returns the dedicated WP-cache token-derivation secret used to
+// derive per-tenant Redis ACL tokens (GH #407). It is deliberately SEPARATE from
+// DOTNEXT_REDIS_PANEL_TOKEN so the panel's master Redis credential can be rotated
+// without stranding every tenant's wp-config cache token. Falls back to the
+// master token (with a one-time warning) for installs predating the dedicated
+// secret, so caching keeps working until install.sh provisions it.
+// CacheHMACSecret is cacheHMACSecret for the WP-cache cleanup, which serve.go
+// starts outside the route wiring and must derive the same install tokens.
+func CacheHMACSecret() string { return cacheHMACSecret() }
+
+func cacheHMACSecret() string {
+	if s := os.Getenv("DOTNEXT_WP_CACHE_HMAC_SECRET"); s != "" {
+		return s
+	}
+	if s := os.Getenv("DOTNEXT_REDIS_PANEL_TOKEN"); s != "" {
+		slog.Warn("DOTNEXT_WP_CACHE_HMAC_SECRET unset — deriving WP-cache tokens from DOTNEXT_REDIS_PANEL_TOKEN (GH #407); set the dedicated secret so rotating the master token does not strand tenant caches")
+		return s
+	}
+	return ""
+}
+
+// automationOps builds the JAB-140 async-operation repo (nil when no DB).
+// automationLimitsReconciler adapts the concrete
+// reconciler to the narrow userops interfaces WITHOUT boxing a typed nil
+// into the interface (the != nil guard would pass, then SIGSEGV — HANDOFF §9).
+func automationLimitsReconciler(r *reconciler.Reconciler) userops.LimitsReconciler {
+	if r == nil {
+		return nil
+	}
+	return r
+}
+
+// webmailBrandingSender is the reconciler as the branding handlers' sender,
+// or a nil interface (not one holding a nil pointer) when there is none.
+func webmailBrandingSender(r *reconciler.Reconciler) api.WebmailBrandingSender {
+	if r == nil {
+		return nil
+	}
+	return r
+}
+
+func automationOps(db *gorm.DB) repository.AutomationOperationRepository {
+	if db == nil {
+		return nil
+	}
+	return repository.NewAutomationOperationRepository(db)
+}
+
+// automationAudits builds the write-audit repo for the automation write layer.
+func automationAudits(db *gorm.DB) repository.AuditEventRepository {
+	if db == nil {
+		return nil
+	}
+	return repository.NewAuditEventRepository(db)
+}
+
+// automationBackupJobs / automationBackupDests wire the M30 system-backup path
+// into the automation write layer (JAB-140).
+func automationBackupJobs(db *gorm.DB) repository.BackupJobRepository {
+	if db == nil {
+		return nil
+	}
+	return repository.NewBackupJobRepository(db)
+}
+
+func automationBackupDests(db *gorm.DB) repository.BackupDestinationRepository {
+	if db == nil {
+		return nil
+	}
+	return repository.NewBackupDestinationRepository(db)
+}
+
+// automationNotifier returns the M14 publisher for the automation write layer, or
+// a genuine nil interface when the queue is absent (a typed-nil *Queue would make
+// the interface non-nil and defeat the nil-check in notifyWrite).
+func automationNotifier(q *notifications.Queue) api.AutomationNotifier {
+	if q == nil {
+		return nil
+	}
+	return q
+}

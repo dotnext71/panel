@@ -1,0 +1,484 @@
+// CreateMailboxWizardModal — 2-step mailbox creation flow.
+//
+// Step 1: just the Domain select. Submit is disabled until a domain is
+//         picked. No other fields visible so first-time users aren't
+//         hit with a wall of inputs before the target domain is chosen.
+// Step 2: once a domain is selected, the rest of the form materialises
+//         (local part, password, quota). Same submit button; now
+//         enabled once local_part is filled.
+//
+// GH #529: split into Account / Forwarding / Groups / Send As tabs to match
+// the Edit Mailbox drawer so Add and Edit look and feel the same. The account
+// fields still cascade in only after a domain is chosen (step-1/step-2). Send
+// As is post-create only (it needs the new mailbox's id), so on Add that tab
+// points the operator at Edit → Send As instead of a control that can't persist.
+//
+// The modal calls POST /domains/:id/mailboxes on submit and surfaces
+// the reveal-once password via the onCreated callback — the parent
+// page pops the DatabaseUserPasswordModal with it.
+import { useTranslation } from "react-i18next";
+import {
+  Alert,
+  Button,
+  Checkbox,
+  Drawer,
+  Form,
+  Grid,
+  Input,
+  InputNumber,
+  Select,
+  Space,
+  Tabs,
+  Typography,
+} from "antd";
+
+import { PasswordInput } from "../../../components/PasswordInput";
+import { feedback } from "../../../lib/feedback";
+import { useMailGroups, useAddMailboxToGroup } from "../../../hooks/useMailGroups";
+import { useCreateForwarder } from "../../../hooks/useForwarders";
+import {
+  useCreateMailbox,
+  type CreateMailboxResponse,
+} from "../../../hooks/useMailboxes";
+
+// Quota presets in bytes — 1 GiB default matches the DB column default;
+// the 16 MiB floor is panel-api's minMailboxQuotaBytes.
+const QUOTA_DEFAULT_BYTES = 1 * 1024 * 1024 * 1024;
+const QUOTA_MIN_BYTES = 16 * 1024 * 1024;
+
+function parseQuotaInput(v: number | string | null | undefined): number | undefined {
+  if (v === null || v === undefined || v === "") return undefined;
+  const n = typeof v === "number" ? v : Number(v);
+  if (Number.isNaN(n) || n <= 0) return undefined;
+  return Math.floor(n * 1024 * 1024); // UI unit is MiB, wire unit is bytes
+}
+
+// sendOnly marks a domain whose mail is hosted elsewhere: it takes only
+// send-only accounts (#2491), so the wizard creates one and offers no aliases,
+// forwarding or groups.
+type DomainOption = { id: string; name: string; sendOnly?: boolean };
+
+type Props = {
+  open: boolean;
+  domains: DomainOption[];
+  // GH #1387 (johnnyq): when the wizard is opened from a single domain's
+  // Mail Domains drill-down the target is already known, so don't ask for it.
+  // lockDomain pre-fills domains[0] and hides the Domain picker.
+  lockDomain?: boolean;
+  onCancel: () => void;
+  onCreated: (resp: CreateMailboxResponse) => void;
+};
+
+type FormValues = {
+  domain_id?: string;
+  local_part?: string;
+  display_name?: string;
+  password?: string;
+  quota_mib?: number;
+  send_only?: boolean;
+  group_ids?: string[];
+  aliases?: string;
+  forward_target?: string;
+  forward_keep_copy?: boolean;
+};
+
+export const CreateMailboxWizardModal = ({
+  open,
+  domains,
+  lockDomain,
+  onCancel,
+  onCreated,
+}: Props) => {
+  const { t } = useTranslation();
+  const [form] = Form.useForm<FormValues>();
+  // When locked, the domain is fixed to the only entry; it seeds the form so
+  // step-2 (account fields) materialises immediately without a picker step.
+  const lockedDomainId = lockDomain && domains.length > 0 ? domains[0].id : undefined;
+  const createMutation = useCreateMailbox();
+  const screens = Grid.useBreakpoint();
+  const isDesktop = screens.lg ?? (typeof window !== "undefined" ? window.innerWidth >= 992 : true);
+
+  // Watching domain_id is what drives step-2 reveal. Form.useWatch
+  // returns undefined until the user opens the Select and picks a
+  // value, so the cascading fields stay hidden on first render.
+  const watchedDomainId = Form.useWatch("domain_id", form);
+  const chosenDomain = domains.find((d) => d.id === watchedDomainId);
+  const { data: domainGroups } = useMailGroups(watchedDomainId);
+  const addToGroup = useAddMailboxToGroup();
+  const createForwarder = useCreateForwarder();
+
+  const onOk = async () => {
+    // validateFields rejects when required rules fail; AntD surfaces
+    // the per-field error text inline, so we just swallow the reject
+    // here and let the user correct and retry.
+    let values: FormValues;
+    try {
+      values = await form.validateFields();
+    } catch {
+      return;
+    }
+    if (!values.domain_id || !values.local_part) return;
+    try {
+      const resp = await createMutation.mutateAsync({
+        domainId: values.domain_id,
+        input: {
+          local_part: values.local_part,
+          display_name: values.display_name?.trim() || undefined,
+          password: values.password || undefined,
+          quota_bytes: parseQuotaInput(values.quota_mib),
+          send_only: chosenDomain?.sendOnly || values.send_only || undefined,
+        },
+      });
+      // The mailbox exists from here on, so a failed group, alias or forward
+      // must not undo it or hide behind it: collect each failure and list
+      // them once the mailbox is created.
+      const failures: string[] = [];
+      const failed = (what: string) => (err: unknown) => {
+        const why =
+          err instanceof Error && err.message
+            ? err.message
+            : t("createmailboxwizardmodal.extra_failed_unknown", "the request failed");
+        failures.push(t("createmailboxwizardmodal.extra_failed_line", "{{what}}: {{why}}", { what, why }));
+      };
+
+      if (values.group_ids?.length) {
+        await Promise.all(
+          values.group_ids.map((gid) => {
+            const group = domainGroups?.find((g) => g.id === gid);
+            const name = group?.display_name || group?.email || gid;
+            return addToGroup
+              .mutateAsync({ groupId: gid, mailboxId: resp.id, domainId: values.domain_id })
+              .catch(failed(t("createmailboxwizardmodal.extra_failed_group", "Group {{name}}", { name })));
+          }),
+        );
+      }
+
+      // GH #237: create aliases + an optional external forward at create time.
+      const mbEmail = `${values.local_part}@${chosenDomain?.name ?? ""}`;
+      const aliasParts = (values.aliases ?? "")
+        .split(/[\n,]/)
+        .map((a) => a.trim().toLowerCase())
+        .filter((a) => a.length > 0);
+      await Promise.all(
+        [...new Set(aliasParts)].map((localPart) =>
+          createForwarder
+            .mutateAsync({ mailboxID: resp.id, type: "alias", localPart, target: mbEmail })
+            .catch(
+              failed(
+                t("createmailboxwizardmodal.extra_failed_alias", "Alias {{address}}", {
+                  address: `${localPart}@${chosenDomain?.name ?? ""}`,
+                }),
+              ),
+            ),
+        ),
+      );
+      const fwd = values.forward_target?.trim();
+      if (fwd) {
+        await createForwarder
+          .mutateAsync({
+            mailboxID: resp.id,
+            type: "external",
+            target: fwd,
+            keepCopy: values.forward_keep_copy ?? false,
+          })
+          .catch(
+            failed(t("createmailboxwizardmodal.extra_failed_forward", "Forward to {{target}}", { target: fwd })),
+          );
+      }
+      form.resetFields();
+      onCreated(resp);
+      if (failures.length > 0) {
+        // The house toast, left up long enough to read the list; a click
+        // dismisses it.
+        const key = `mailbox-extras-${resp.id}`;
+        feedback.message.warning({
+          key,
+          duration: 15,
+          onClick: () => feedback.message.destroy(key),
+          content: (
+            <div style={{ display: "inline-block", textAlign: "start", verticalAlign: "top" }}>
+              <div>
+                {t(
+                  "createmailboxwizardmodal.extras_failed_title",
+                  "{{email}} was created, but not all of it was set up",
+                  { email: resp.email },
+                )}
+              </div>
+              <ul style={{ margin: "4px 0", paddingInlineStart: 18 }}>
+                {failures.map((f, i) => (
+                  <li key={i}>{f}</li>
+                ))}
+              </ul>
+              <div>
+                {t(
+                  "createmailboxwizardmodal.extras_failed_hint",
+                  "Add them from the mailbox's Edit drawer.",
+                )}
+              </div>
+            </div>
+          ),
+        });
+      }
+    } catch (err) {
+      const detail =
+        (err as { response?: { data?: { detail?: string; error?: string } } })?.response
+          ?.data?.detail ??
+        (err as { response?: { data?: { detail?: string; error?: string } } })?.response
+          ?.data?.error;
+      // Surface validation/conflict errors as a form-level alert rather
+      // than a floating toast so the user sees them next to the inputs
+      // that caused them.
+      form.setFields([
+        {
+          name: "local_part",
+          errors: [detail ?? "Failed to create mailbox"],
+        },
+      ]);
+    }
+  };
+
+  const onCancelInternal = () => {
+    form.resetFields();
+    onCancel();
+  };
+
+  // Shown on the Forwarding/Groups tabs before a domain is chosen — those
+  // fields depend on the selected domain (groups are per-domain), so they
+  // stay gated behind the step-1 domain pick like the account fields.
+  const pickDomainFirst = (
+    <Typography.Text type="secondary">
+      Select a domain on the Account tab first.
+    </Typography.Text>
+  );
+
+  const accountTab = (
+    <>
+      {lockDomain ? (
+        <>
+          {/* Domain already chosen by the drill-down — carry it in a hidden
+              field and just tell the user where the mailbox lands. */}
+          <Form.Item name="domain_id" hidden noStyle>
+            <Input />
+          </Form.Item>
+          <Typography.Paragraph type="secondary" style={{ marginBottom: 16 }}>
+            {t("createmailboxwizardmodal.adding_to_domain", "Adding a mailbox to")}{" "}
+            <Typography.Text strong>{domains[0]?.name}</Typography.Text>.
+          </Typography.Paragraph>
+        </>
+      ) : (
+        <Form.Item
+          label={t("createmailboxwizardmodal.domain")}
+          name="domain_id"
+          rules={[{ required: true, message: "Pick a domain" }]}
+          tooltip={t("createmailboxwizardmodal.only_domains_with_email_enabled_appear_here")}
+        >
+          <Select
+            showSearch
+            optionFilterProp="label"
+            placeholder={t("createmailboxwizardmodal.select_a_domain")}
+            options={domains.map((d) => ({ value: d.id, label: d.name }))}
+          />
+        </Form.Item>
+      )}
+
+      {chosenDomain && (
+        <>
+          <Form.Item
+            label={t("createmailboxwizardmodal.email_address")}
+            name="local_part"
+            rules={[
+              { required: true, message: "Required" },
+              {
+                pattern: /^[a-z0-9][a-z0-9._+-]*$/i,
+                message: "Letters, digits, dot/underscore/plus/hyphen only",
+              },
+              { max: 64, message: "64 characters max" },
+            ]}
+            extra="The part before the @ symbol."
+          >
+            <Input
+              placeholder="alice"
+              autoComplete="off"
+              addonAfter={`@${chosenDomain.name}`}
+            />
+          </Form.Item>
+
+          <Form.Item
+            label={t("createmailboxwizardmodal.display_name")}
+            name="display_name"
+            tooltip={t("createmailboxwizardmodal.shown_as_the_sender_name_in_webmail_and_outg")}
+          >
+            <Input placeholder={t("createmailboxwizardmodal.alice_smith")} autoComplete="off" maxLength={255} />
+          </Form.Item>
+
+          <Form.Item
+            label={t("createmailboxwizardmodal.password")}
+            name="password"
+            tooltip={t("createmailboxwizardmodal.leave_blank_to_auto_generate_generated_passw")}
+            rules={[{ min: 8, message: "8 characters minimum" }]}
+          >
+            <PasswordInput
+              autoComplete="new-password"
+              placeholder="(auto-generate)"
+            />
+          </Form.Item>
+
+          <Form.Item
+            label={t("createmailboxwizardmodal.quota_mib")}
+            name="quota_mib"
+            tooltip={`Default ${QUOTA_DEFAULT_BYTES / 1024 / 1024} MiB. Minimum ${
+              QUOTA_MIN_BYTES / 1024 / 1024
+            } MiB.`}
+          >
+            <InputNumber
+              min={QUOTA_MIN_BYTES / 1024 / 1024}
+              max={1024 * 1024}
+              step={256}
+              style={{ width: 200 }}
+            />
+          </Form.Item>
+
+          {chosenDomain.sendOnly ? (
+            // Shown checked and fixed; onOk sends send_only for this domain.
+            <Form.Item
+              extra={t(
+                "createmailboxwizardmodal.send_only_domain_extra",
+                "This domain's mail is hosted elsewhere, so its accounts can only send.",
+              )}
+            >
+              <Checkbox checked disabled>
+                Send-only (SMTP submission, no inbox)
+              </Checkbox>
+            </Form.Item>
+          ) : (
+            <Form.Item
+              name="send_only"
+              valuePropName="checked"
+              tooltip={t("createmailboxwizardmodal.a_send_only_mailbox_can_authenticate_for_smt")}
+            >
+              <Checkbox>Send-only (SMTP submission, no inbox)</Checkbox>
+            </Form.Item>
+          )}
+        </>
+      )}
+
+      {!chosenDomain && domains.length === 0 && (
+        <Alert
+          type="warning"
+          showIcon
+          message={t("createmailboxwizardmodal.no_email_enabled_domains")}
+          description={t("createmailboxwizardmodal.enable_email_on_at_least_one_domain_before_c")}
+        />
+      )}
+    </>
+  );
+
+  // A send-only account receives nothing, so aliases, forwarding and groups
+  // would never see a message.
+  const sendOnlyNote = (
+    <Typography.Text type="secondary">
+      {t(
+        "createmailboxwizardmodal.send_only_domain_note",
+        "This domain's mail is hosted elsewhere, so this account can only send. Aliases, forwarding and groups don't apply to it.",
+      )}
+    </Typography.Text>
+  );
+
+  const forwardingTab = chosenDomain?.sendOnly ? (
+    sendOnlyNote
+  ) : chosenDomain ? (
+    <>
+      <Form.Item
+        label={t("createmailboxwizardmodal.aliases_optional")}
+        name="aliases"
+        tooltip={t("createmailboxwizardmodal.extra_addresses_that_deliver_to_this_mailbox")}
+      >
+        <Input.TextArea
+          rows={2}
+          placeholder={`sales, info  (→ @${chosenDomain.name})`}
+          autoComplete="off"
+        />
+      </Form.Item>
+      <Form.Item
+        label={t("createmailboxwizardmodal.forward_to_optional")}
+        name="forward_target"
+        tooltip={t("createmailboxwizardmodal.redirect_a_copy_of_incoming_mail_to_an_exter")}
+        rules={[{ type: "email", message: "Must be a valid email" }]}
+      >
+        <Input placeholder="external@example.com" autoComplete="off" />
+      </Form.Item>
+      <Form.Item name="forward_keep_copy" valuePropName="checked" noStyle>
+        <Checkbox>Keep a copy in this mailbox when forwarding</Checkbox>
+      </Form.Item>
+    </>
+  ) : (
+    pickDomainFirst
+  );
+
+  const groupsTab = chosenDomain?.sendOnly ? (
+    sendOnlyNote
+  ) : chosenDomain ? (
+    <Form.Item
+      label={t("createmailboxwizardmodal.add_to_groups")}
+      name="group_ids"
+      tooltip={t("createmailboxwizardmodal.the_mailbox_joins_these_groups_and_gains_the")}
+    >
+      <Select
+        mode="multiple"
+        allowClear
+        disabled={!domainGroups || domainGroups.length === 0}
+        placeholder={t("createmailboxwizardmodal.select_groups_optional")}
+        optionFilterProp="label"
+        options={(domainGroups ?? []).map((g) => ({ value: g.id, label: g.display_name || g.email }))}
+      />
+    </Form.Item>
+  ) : (
+    pickDomainFirst
+  );
+
+  // Send As can't be granted until the mailbox exists (it needs the new
+  // mailbox's id), so on Add this tab points the operator at Edit rather
+  // than a control that couldn't persist.
+  const sendAsTab = (
+    <Typography.Text type="secondary">
+      Send As lets one mailbox send as another. It can only be granted after
+      this mailbox exists — create it, then open it from the mailbox list and
+      use Edit → Send As.
+    </Typography.Text>
+  );
+
+  return (
+    <Drawer
+      title={t("createmailboxwizardmodal.create_mailbox")}
+      open={open}
+      onClose={onCancelInternal}
+      width={isDesktop ? 520 : undefined}
+      placement="right"
+      destroyOnClose
+      extra={
+        <Space>
+          <Button onClick={onCancelInternal}>Cancel</Button>
+          <Button type="primary" loading={createMutation.isPending} onClick={onOk}>
+            Create mailbox
+          </Button>
+        </Space>
+      }
+    >
+      <Form
+        form={form}
+        layout="vertical"
+        initialValues={{ quota_mib: QUOTA_DEFAULT_BYTES / 1024 / 1024, domain_id: lockedDomainId }}
+      >
+        <Tabs
+          defaultActiveKey="account"
+          items={[
+            { key: "account", label: "Account", forceRender: true, children: accountTab },
+            { key: "forwarding", label: "Forwarding", forceRender: true, children: forwardingTab },
+            { key: "groups", label: "Groups", forceRender: true, children: groupsTab },
+            { key: "sendas", label: "Send As", children: sendAsTab },
+          ]}
+        />
+      </Form>
+    </Drawer>
+  );
+};

@@ -1,0 +1,79 @@
+services:
+  paperless-ngx:
+    image: {{ .ImageChannel }}
+    container_name: dotnext-app-{{ .Slug }}
+    restart: unless-stopped
+    depends_on:
+      - db
+      - broker
+    environment:
+{{- if (index .Env "SMTP_HOST") }}
+      # Operator-supplied SMTP (GH #322) — values q-escaped so special chars
+      # (e.g. API-key passwords) can't break the rendered compose YAML.
+      PAPERLESS_EMAIL_HOST: {{ q (index .Env "SMTP_HOST") }}
+      PAPERLESS_EMAIL_PORT: {{ q (or (index .Env "SMTP_PORT") "587") }}
+      PAPERLESS_EMAIL_HOST_USER: {{ q (index .Env "SMTP_USER") }}
+      PAPERLESS_EMAIL_HOST_PASSWORD: {{ q (index .Env "SMTP_PASSWORD") }}
+      PAPERLESS_EMAIL_FROM: {{ q (or (index .Env "SMTP_FROM") (printf "paperless@%s" .Domain)) }}
+      PAPERLESS_EMAIL_USE_TLS: "{{ if eq (index .Env "SMTP_PORT") "465" }}false{{ else }}true{{ end }}"
+      PAPERLESS_EMAIL_USE_SSL: "{{ if eq (index .Env "SMTP_PORT") "465" }}true{{ else }}false{{ end }}"
+{{- end }}
+      PAPERLESS_REDIS: "redis://broker:6379"
+      PAPERLESS_DBHOST: "db"
+      PAPERLESS_DBNAME: "paperless"
+      PAPERLESS_DBUSER: "paperless"
+      PAPERLESS_DBPASS: {{ q (index .Env "POSTGRES_PASSWORD") }}
+      PAPERLESS_SECRET_KEY: {{ q (index .Env "PAPERLESS_SECRET_KEY") }}
+      PAPERLESS_ADMIN_USER: "dotnext"
+      PAPERLESS_ADMIN_PASSWORD: {{ q (index .Env "PAPERLESS_ADMIN_PASSWORD") }}
+      PAPERLESS_URL: "{{ if .Domain }}https://{{ .Domain }}{{ end }}"
+      PAPERLESS_PORT: "8000"
+      PAPERLESS_TIME_ZONE: "UTC"
+      PAPERLESS_OCR_LANGUAGE: "eng"
+    volumes:
+      - {{ .DataRoot }}/data:/usr/src/paperless/data
+      - {{ .DataRoot }}/media:/usr/src/paperless/media
+    ports:
+{{- with index .Ports "http" }}
+      - "{{ .BindInterface }}:{{ .HostPort }}:{{ .ContainerPort }}/{{ .Protocol }}"
+{{- end }}
+    deploy:
+      resources:
+        limits:
+          cpus: "{{ .CPULimit }}"
+          memory: {{ .MemoryLimit }}
+    healthcheck:
+      # The image has no wget; this is the probe its own HEALTHCHECK runs.
+      test: ["CMD", "curl", "-fsS", "-L", "--max-time", "2", "-o", "/dev/null", "http://localhost:8000"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
+  broker:
+    image: redis:7-alpine@sha256:6ab0b6e7381779332f97b8ca76193e45b0756f38d4c0dcda72dbb3c32061ab99
+    container_name: dotnext-app-{{ .Slug }}-broker
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  db:
+    image: postgres:17-alpine@sha256:dc17045ccfd343b49600570ea734b9c4991cf1c3f3302e67df51e3b402dd55c4
+    container_name: dotnext-app-{{ .Slug }}-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: {{ q (index .Env "POSTGRES_PASSWORD") }}
+      POSTGRES_USER: "paperless"
+      POSTGRES_DB: "paperless"
+    volumes:
+      - {{ .DataRoot }}/db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U paperless"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s

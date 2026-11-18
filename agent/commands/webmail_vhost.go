@@ -1,0 +1,665 @@
+package commands
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"text/template"
+
+	"github.com/dotnext-panel/dotnext/agentwire"
+)
+
+// webmail_vhost.go provides the two agent commands the reconciler uses
+// to toggle the per-domain mail.<domain> nginx vhost:
+//
+//   - webmail.vhost_apply — render + write + nginx reload
+//   - webmail.vhost_remove — rm + nginx reload
+//
+// The vhost proxies browser traffic to Bulwark (127.0.0.1:3000) for the
+// webmail UI and to Stalwart's loopback HTTP listener (127.0.0.1:8446)
+// for JMAP + admin API calls. The canonical template lives at
+// infrastructure/nginx/dotnext-mail-vhost.conf.tmpl (committed so operators can
+// diff it); this file keeps its own copy for build independence. If the
+// two drift, the source-of-truth is the committed template — align by
+// re-copying here.
+
+// mailVhostTemplate mirrors infrastructure/nginx/dotnext-mail-vhost.conf.tmpl.
+// Go template variables: .DomainName, .SSLCertPath, .SSLKeyPath,
+// .DocRoot, .ListenIPv4, .ListenIPv6, .SubFilterHost, .ExtraServerNames
+// (the last two resolved by resolveMailHostnames, JAB-390).
+//
+// listen-line shape mirrors domain_create.go: when an explicit IPv4 or
+// IPv6 binding is set, we emit `listen <ip>:<port>` so the mail vhost
+// joins nginx's specific-IP listener pool and beats the wildcard
+// listener for traffic on that IP. Without this, on a host where the
+// apex domain vhost binds the public IP explicitly (M24 default), the
+// mail subdomain falls into the wildcard pool which nginx then
+// IGNORES for that IP — and SNI lands on whichever apex vhost
+// happens to be alphabetically first. Result: mail.<domain> serves
+// the wrong tenant's cert. Incident 2026-04-26.
+const mailVhostTemplate = `# Rendered by panel-agent webmail.vhost_apply (M6 Step 8).
+# DO NOT EDIT — changes belong in infrastructure/nginx/dotnext-mail-vhost.conf.tmpl.
+
+{{ if not .ChallengeOnly }}server {
+{{ if .ListenIPv4 }}  listen {{.ListenIPv4}}:443 ssl{{.HTTP2Param}};
+{{ else }}  listen 443 ssl{{.HTTP2Param}};
+{{ end }}{{ if .ListenIPv6 }}  listen [{{.ListenIPv6}}]:443 ssl{{.HTTP2Param}};
+{{ else }}  listen [::]:443 ssl{{.HTTP2Param}};
+{{ end }}{{ if .HTTP2Directive }}  {{.HTTP2Directive}}
+{{ end }}  server_name mail.{{.DomainName}} autoconfig.{{.DomainName}} autodiscover.{{.DomainName}} mta-sts.{{.DomainName}}{{ range .ExtraServerNames }} {{.}}{{ end }};
+{{ if .PanelHostGuard }}  # A request naming the panel never reaches a domain, not even on the
+  # domain's own address (panelHostGuard).
+  if ($http_host ~* "{{.PanelHostGuard}}") { return 421; }
+{{ end }}
+  ssl_certificate {{.SSLCertPath}};
+  ssl_certificate_key {{.SSLKeyPath}};
+
+{{ if .SubFilterHost }}  # Same-origin JMAP rewrite. Bulwark's /api/config returns
+  # jmapServerUrl=https://{{.PanelHostname}} (the panel-wide setting in
+  # /etc/dotnext/bulwark.env), and Stalwart's /.well-known/jmap
+  # Session response advertises absolute URLs at the same host. The
+  # SPA then issues cross-origin preflights from mail.<tenant>, which
+  # fail because the panel hostname's cert / DNS isn't trusted from
+  # the user's browser. sub_filter rewrites the hostname to the
+  # requested $host so the SPA stays same-origin against the
+  # per-domain mail vhost it was loaded from.
+  #
+  # sub_filter_* inherit into every location below; Accept-Encoding=""
+  # is set per-location (nginx fully replaces proxy_set_header when a
+  # lower level defines any) so neither Bulwark nor Stalwart can gzip
+  # the body — sub_filter silently no-ops on gzipped payloads.
+  sub_filter_types application/json;
+  sub_filter_once off;
+  sub_filter "{{.SubFilterHost}}" $host;
+
+{{ end }}{{ if .NoWebmail }}  # Webmail is off for this domain (GH #2082): mail.<domain> serves the
+  # mail-app endpoints below and nothing else.
+  location / {
+    return 404;
+  }
+{{ else }}  # Intentionally no X-Forwarded-Proto on this location — Next.js
+  # middleware-rewrite uses it to build internal proxy URLs, and with
+  # "https" would try to TLS-connect to Bulwark's plain-HTTP upstream.
+  # See the source-of-truth template in infrastructure/nginx/dotnext-mail-vhost.conf.tmpl.
+  #
+  # M25 Step 5: Bulwark on Unix socket via the dotnext_bulwark upstream
+  # declared in /etc/nginx/sites-available/dotnext-bulwark.conf.
+  location / {
+    proxy_pass http://dotnext_bulwark/;
+    proxy_set_header Host $host;
+    # Bulwark picks a domain's branding by X-Forwarded-Host before Host
+    # (GH #2502): set it here so the browser can't name another host.
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header Accept-Encoding "";
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 3600s;
+    proxy_send_timeout 3600s;
+  }
+
+  # Each domain's webmail branding pictures (GH #2502), kept by panel-api
+  # outside Bulwark's own directory, which a webmail upgrade replaces.
+  # Every one is a PNG panel-api encoded itself; served as nothing else.
+  location ^~ /dotnext-webmail-branding/ {
+    alias /var/lib/dotnext/webmail-branding/;
+    autoindex off;
+    types { }
+    default_type image/png;
+    add_header X-Content-Type-Options nosniff always;
+    add_header Content-Security-Policy "default-src 'none'; sandbox" always;
+    add_header Cache-Control "public, max-age=86400" always;
+  }
+{{ end }}
+  location /jmap {
+    proxy_pass http://127.0.0.1:8446;
+    proxy_set_header Host $host;
+    proxy_set_header Accept-Encoding "";
+    proxy_http_version 1.1;
+    proxy_read_timeout 3600s;
+  }
+
+  location /.well-known/jmap {
+    proxy_pass http://127.0.0.1:8446;
+    proxy_set_header Host $host;
+    proxy_set_header Accept-Encoding "";
+  }
+
+  # CalDAV / CardDAV (GH #1039 follow-up). Stalwart serves the DAV
+  # collections and the RFC 6764 autodiscovery endpoints on the same
+  # loopback HTTP listener as JMAP. The _caldavs._tcp / _carddavs._tcp
+  # SRV records already point clients at mail.<domain>:443, and
+  # /.well-known/caldav|carddav 307-redirect (relative) to /dav/cal|
+  # /dav/card — so this last hop lets Thunderbird / Apple Mail discover
+  # and mount calendars + address books. Scoped to cal + card ONLY:
+  # /dav/file (WebDAV file storage) and /dav/pal (principals) are
+  # deliberately NOT exposed on the mail vhost. The inherited sub_filter
+  # is a no-op here — sub_filter_types is application/json while DAV
+  # responses are application/xml — so it never rewrites DAV bodies.
+  location = /.well-known/caldav {
+    proxy_pass http://127.0.0.1:8446;
+    proxy_set_header Host $host;
+    proxy_set_header Accept-Encoding "";
+  }
+  location = /.well-known/carddav {
+    proxy_pass http://127.0.0.1:8446;
+    proxy_set_header Host $host;
+    proxy_set_header Accept-Encoding "";
+  }
+  location /dav/cal {
+    proxy_pass http://127.0.0.1:8446;
+    proxy_set_header Host $host;
+    proxy_set_header Accept-Encoding "";
+    proxy_http_version 1.1;
+    proxy_read_timeout 3600s;
+    client_max_body_size 50m;
+  }
+  location /dav/card {
+    proxy_pass http://127.0.0.1:8446;
+    proxy_set_header Host $host;
+    proxy_set_header Accept-Encoding "";
+    proxy_http_version 1.1;
+    proxy_read_timeout 3600s;
+    client_max_body_size 50m;
+  }
+{{ if not .NoWebmail }}
+  # /api/* intentionally routes to Bulwark (catch-all /) — Bulwark owns
+  # its own API endpoints (/api/auth/session, etc.) and proxies
+  # Stalwart admin internally via STALWART_API_URL. Routing /api → 8446
+  # here would hijack Bulwark's login route.
+
+  # Webmail SSO landing — proxy to panel-api (Unix socket as of M25
+  # Step 4). Panel itself serves GET /sso/webmail?token=… and sets the
+  # Bulwark session cookie on its response so the 303 lands the user
+  # logged in. Reuses the dotnext_panel_api upstream declared in
+  # /etc/nginx/sites-available/dotnext-api.conf.
+  location = /sso/webmail {
+    proxy_pass http://dotnext_panel_api/sso/webmail;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_http_version 1.1;
+  }
+{{ end }}
+  # Mail-client autoconfiguration (GH #1039). panel-api renders the config
+  # documents from the domain's mail settings (mail.<domain>, IMAPS 993 /
+  # SMTPS 465). Host is forwarded so panel-api derives the domain from
+  # autoconfig.<domain> / autodiscover.<domain>. These paths used to 404
+  # (autodiscover) or fall through location / to Bulwark webmail (autoconfig).
+  #
+  #   Thunderbird / Mozilla: GET  /mail/config-v1.1.xml
+  #                          GET  /.well-known/autoconfig/mail/config-v1.1.xml
+  #   Outlook / Exchange:    POST /autodiscover/autodiscover.xml (+ capitalised)
+  location = /mail/config-v1.1.xml {
+    proxy_pass http://dotnext_panel_api;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_http_version 1.1;
+  }
+  location = /.well-known/autoconfig/mail/config-v1.1.xml {
+    proxy_pass http://dotnext_panel_api/mail/config-v1.1.xml;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_http_version 1.1;
+  }
+  location = /autodiscover/autodiscover.xml {
+    proxy_pass http://dotnext_panel_api;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_http_version 1.1;
+  }
+  location = /Autodiscover/Autodiscover.xml {
+    proxy_pass http://dotnext_panel_api;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto https;
+    proxy_http_version 1.1;
+  }
+}
+
+{{ end }}server {
+{{ if .ListenIPv4 }}  listen {{.ListenIPv4}}:80;
+{{ else }}  listen 80;
+{{ end }}{{ if .ListenIPv6 }}  listen [{{.ListenIPv6}}]:80;
+{{ else }}  listen [::]:80;
+{{ end }}  server_name mail.{{.DomainName}} autoconfig.{{.DomainName}} autodiscover.{{.DomainName}} mta-sts.{{.DomainName}}{{ range .ExtraServerNames }} {{.}}{{ end }};
+{{ if .PanelHostGuard }}  # A request naming the panel never reaches a domain, not even on the
+  # domain's own address (panelHostGuard).
+  if ($http_host ~* "{{.PanelHostGuard}}") { return 421; }
+{{ end }}
+  # ACME HTTP-01 webroot. Must be a location block — a server-level
+  # redirect fires in nginx SERVER_REWRITE phase BEFORE FIND_CONFIG,
+  # so a server-scoped redirect bypasses ^~ matching for ACME paths.
+  # Webroot mirrors what panel-api/internal/reconciler.IssueDomainCert
+  # passes as -w (the apex domain DocRoot). Incident 2026-04-26:
+  # dotnext.site cert failed because mail.<domain>:80 redirected to
+  # https where the mail vhost served 404 for /.well-known/acme.
+  #
+  # Panel-primary rows (M6.4 / ADR-0048) are mail-only — no docroot.
+  # The panel-cert reconciler (ssl.panel.issue kind=mail) owns
+  # mail.<panel-hostname> cert renewal and validates HTTP-01 with
+  # -w /var/www/dotnext-api-acme, so the panel-primary branch below
+  # serves THAT webroot (it must not fall through to the 301, or the
+  # challenge redirects to https and 404s — GH #268). It omits the
+  # {{.DocRoot}} fallback (no docroot) to avoid a bare root directive.
+  #
+  # A mail-only TENANT domain (GH #1449: web off) has no docroot either,
+  # but its mail.<domain> certificate is the M6.6 per-domain one, which
+  # ssl.mail.issue validates with -w /var/www/dotnext-acme. It gets that
+  # webroot alone. Keying the panel branch on the empty docroot sent
+  # these domains to the panel's webroot instead, so their challenge
+  # 404'd and mail.<domain> never got a certificate (GH #2082).
+  #
+  # When DocRoot IS set (tenant domain) the location serves TWO
+  # webroots in priority order:
+  #   1. /var/www/dotnext-acme — the shared panel ACME webroot used by
+  #      the M6.6 per-domain mail cert (ssl.mail.issue passes -w
+  #      /var/www/dotnext-acme) and the M32 panel cert.
+  #   2. {{.DocRoot}} — the apex domain docroot used by the regular
+  #      per-domain cert (reconciler IssueDomainCert passes -w
+  #      DocRoot). Reached via the @acme_docroot fallback.
+  # Both certs cover mail.<domain> as a SAN and both validate over
+  # mail.<domain>:80, but they drop their challenge token into
+  # DIFFERENT directories — without serving both, whichever path
+  # didn't write here 404s. Incident GH #132: the M6.6 mail cert
+  # 404'd because this location only served the docroot, leaving
+  # Stalwart on its self-signed default on :465.
+{{ if .DocRoot }}  location ^~ /.well-known/acme-challenge/ {
+    default_type "text/plain";
+    root /var/www/dotnext-acme;
+    try_files $uri @acme_docroot;
+  }
+
+  location @acme_docroot {
+    default_type "text/plain";
+    root {{.DocRoot}};
+    try_files $uri =404;
+  }
+
+  location / {
+    return 301 https://$host$request_uri;
+  }
+{{ else if .IsPanelPrimary }}  # Panel-primary mail vhost (M6.4 / ADR-0048): mail-only, no per-domain
+  # docroot. The panel mail cert (ssl.panel.issue kind=mail) validates
+  # mail.<panel-hostname> over HTTP-01 with -w /var/www/dotnext-api-acme,
+  # so this :80 block MUST serve that webroot — otherwise the challenge
+  # falls through to the 301 below, redirects to https, and 404s on the
+  # mail vhost, parking the panel mail cert in failed/attempt-N (GH #268).
+  location ^~ /.well-known/acme-challenge/ {
+    default_type "text/plain";
+    root /var/www/dotnext-api-acme;
+    try_files $uri =404;
+  }
+
+  location / {
+    return 301 https://$host$request_uri;
+  }
+{{ else }}  # Mail-only tenant domain (GH #1449 web off, GH #2082): the M6.6 mail
+  # certificate's webroot, and no docroot to fall back to.
+  location ^~ /.well-known/acme-challenge/ {
+    default_type "text/plain";
+    root /var/www/dotnext-acme;
+    try_files $uri =404;
+  }
+
+  location / {
+    return 301 https://$host$request_uri;
+  }
+{{ end }}}
+`
+
+// mailVhostSitesAvailable + mailVhostSitesEnabled are overridable for
+// tests. The naming `<domain>-mail.conf` avoids colliding with the main
+// `<domain>.conf` that domain.create writes.
+var (
+	mailVhostSitesAvailable = "/etc/nginx/sites-available"
+	mailVhostSitesEnabled   = "/etc/nginx/sites-enabled"
+	// bulwarkUpstreamConf declares the dotnext_bulwark upstream. install.sh
+	// installs it with Bulwark.
+	bulwarkUpstreamConf = "/etc/nginx/conf.d/dotnext-bulwark-upstream.conf"
+)
+
+type webmailVhostApplyParams struct {
+	DomainName  string `json:"domain_name"`
+	SSLCertPath string `json:"ssl_cert_path"`
+	SSLKeyPath  string `json:"ssl_key_path"`
+	// DocRoot is the apex domain document root, used as the ACME
+	// HTTP-01 webroot in the :80 server block. Mirrors what panel-api
+	// passes to ssl.issue (-w) so the renewal challenge file lands at
+	// the path nginx will actually serve.
+	DocRoot string `json:"doc_root"`
+	// ListenIPv4 / ListenIPv6 mirror the apex vhost's listener
+	// binding (M24). Empty falls back to wildcard. Required to keep
+	// SNI deterministic when the apex vhost has a specific-IP listen.
+	ListenIPv4 string `json:"listen_ipv4,omitempty"`
+	ListenIPv6 string `json:"listen_ipv6,omitempty"`
+	// HTTP/2 form per host nginx version (GH #292); set before render.
+	HTTP2Param     string `json:"-"`
+	HTTP2Directive string `json:"-"`
+	// PanelHostname is server_settings.hostname (e.g. mx.dotnext-panel.com).
+	// When set, the rendered vhost installs an nginx sub_filter that
+	// rewrites the panel hostname to the requested $host in Bulwark
+	// /api/config and Stalwart /.well-known/jmap response bodies, so
+	// the SPA stays same-origin on mail.<tenant-domain>. Empty value
+	// disables the rewrite (fresh install / pre-bootstrap).
+	PanelHostname string `json:"panel_hostname,omitempty"`
+	// IsPanelPrimary marks the panel-hostname mail vhost (M6.4 /
+	// ADR-0048 / DomainName == PanelHostname). For that one row the
+	// server_name list ALSO includes the bare panel hostname — Bulwark's
+	// /api/auth/impersonate proxies upstream JMAP fetches to
+	// `https://<panel-hostname>/jmap`, and without bare hostname in
+	// server_name those requests fall to nginx default + return 500.
+	// M6.6 / 2026-06-01 live-smoke regression.
+	IsPanelPrimary bool `json:"is_panel_primary,omitempty"`
+	// PanelMailHostname is the panel mail hostname (JAB-390): the applied
+	// custom shared mail hostname, else mail.<PanelHostname>. It is the name
+	// Bulwark's JMAP URL carries, so it is what the sub_filter rewrites.
+	// Empty (an older panel) falls back to mail.<PanelHostname>.
+	PanelMailHostname string `json:"panel_mail_hostname,omitempty"`
+	// ExtraServerNames are further names the panel-primary mail vhost
+	// answers on :443 and :80 — the custom shared mail hostname, which is
+	// not mail.<DomainName>. Refused for any other row: a tenant's mail
+	// vhost must never claim a name outside its own domain.
+	ExtraServerNames []string `json:"extra_server_names,omitempty"`
+	// SubFilterHost is the resolved sub_filter target; set by the handler.
+	SubFilterHost string `json:"-"`
+	// PanelHostGuard is the Host pattern the vhost refuses (panelHostGuard);
+	// set by the handler, never for the panel-primary mail vhost, which is
+	// the panel's own.
+	PanelHostGuard string `json:"-"`
+	// ChallengeOnly renders the :80 block alone, for a domain with mail but
+	// no webmail (GH #2082): mail.<domain> still answers Let's Encrypt's
+	// check for its mail certificate, and nothing else is served. No
+	// certificate is needed.
+	ChallengeOnly bool `json:"challenge_only,omitempty"`
+	// NoWebmail renders the vhost without the Bulwark webmail app and its SSO
+	// landing, for a domain with mail but webmail off (GH #2082): mail apps
+	// still find autoconfig/autodiscover, CalDAV/CardDAV and JMAP on
+	// mail.<domain>, and / answers 404. ChallengeOnly wins over it.
+	NoWebmail bool `json:"no_webmail,omitempty"`
+}
+
+// vhostServerNameRe matches a lower-case DNS name of two or more labels.
+// Mail hostnames reach nginx config verbatim (server_name, sub_filter), so
+// nothing outside [a-z0-9._-] may pass.
+var vhostServerNameRe = regexp.MustCompile(`^[a-z0-9]([a-z0-9_-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9_-]{0,61}[a-z0-9])?)+$`)
+
+// normalizeVhostServerName lower-cases s and checks it is a plain DNS name.
+func normalizeVhostServerName(field, s string) (string, error) {
+	h := strings.ToLower(s)
+	if len(h) > 253 || !vhostServerNameRe.MatchString(h) {
+		return "", &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: fmt.Sprintf("%s is not a valid host name", field),
+		}
+	}
+	return h, nil
+}
+
+// resolveMailHostnames validates the JAB-390 mail hostname params and sets
+// SubFilterHost and the de-duplicated ExtraServerNames.
+func (p *webmailVhostApplyParams) resolveMailHostnames() error {
+	switch {
+	case p.PanelMailHostname != "":
+		h, err := normalizeVhostServerName("panel_mail_hostname", p.PanelMailHostname)
+		if err != nil {
+			return err
+		}
+		p.SubFilterHost = h
+	case p.PanelHostname != "":
+		// An older panel: the derived name, exactly as before.
+		p.SubFilterHost = "mail." + p.PanelHostname
+	}
+	if len(p.ExtraServerNames) == 0 {
+		return nil
+	}
+	if !p.IsPanelPrimary {
+		return &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: "extra_server_names is only accepted for the panel-primary mail vhost",
+		}
+	}
+	seen := map[string]bool{}
+	for _, prefix := range []string{"mail.", "autoconfig.", "autodiscover.", "mta-sts."} {
+		seen[prefix+strings.ToLower(p.DomainName)] = true
+	}
+	names := make([]string, 0, len(p.ExtraServerNames))
+	for i, n := range p.ExtraServerNames {
+		h, err := normalizeVhostServerName(fmt.Sprintf("extra_server_names[%d]", i), n)
+		if err != nil {
+			return err
+		}
+		if !seen[h] {
+			seen[h] = true
+			names = append(names, h)
+		}
+	}
+	p.ExtraServerNames = names
+	return nil
+}
+
+// validateNginxValues refuses a param that would change the rendered vhost
+// (the mail hostnames are checked by resolveMailHostnames).
+func (p *webmailVhostApplyParams) validateNginxValues() error {
+	for _, n := range [][2]string{{"domain_name", p.DomainName}, {"panel_hostname", p.PanelHostname}} {
+		if err := validateNginxName(n[0], n[1]); err != nil {
+			return err
+		}
+	}
+	for _, f := range [][2]string{{"ssl_cert_path", p.SSLCertPath}, {"ssl_key_path", p.SSLKeyPath}, {"doc_root", p.DocRoot}} {
+		if f[1] == "" {
+			continue
+		}
+		if err := validateNginxPath(f[0], f[1]); err != nil {
+			return err
+		}
+	}
+	if err := validateListenIP("listen_ipv4", p.ListenIPv4, true); err != nil {
+		return err
+	}
+	return validateListenIP("listen_ipv6", p.ListenIPv6, false)
+}
+
+type webmailVhostResponse struct {
+	Ok      bool   `json:"ok"`
+	Path    string `json:"path,omitempty"`
+	Changed bool   `json:"changed"`
+}
+
+func webmailVhostApplyHandler(ctx context.Context, params json.RawMessage) (any, error) {
+	if len(params) == 0 {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: "params required"}
+	}
+	var p webmailVhostApplyParams
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: fmt.Sprintf("parse params: %v", err)}
+	}
+	if err := validateDomainNameForShell(p.DomainName); err != nil {
+		return nil, err
+	}
+	if err := p.validateNginxValues(); err != nil {
+		return nil, err
+	}
+	if !p.ChallengeOnly && (p.SSLCertPath == "" || p.SSLKeyPath == "") {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: "ssl_cert_path and ssl_key_path are required",
+		}
+	}
+
+	if err := p.resolveMailHostnames(); err != nil {
+		return nil, err
+	}
+	// A server without Bulwark (installed with mail off, say) has no
+	// dotnext_bulwark upstream, and a vhost naming it fails `nginx -t`. The
+	// write lands right after the previous op's reload, which nginx applies
+	// asynchronously: that reload then read this file too and was refused,
+	// so another domain's vhost change never went live. Serve the mail-app
+	// endpoints without webmail instead.
+	if !p.NoWebmail && !p.ChallengeOnly && !fileExists(bulwarkUpstreamConf) {
+		p.NoWebmail = true
+	}
+	if !p.IsPanelPrimary {
+		p.PanelHostGuard = panelHostGuard(append([]string{"mail." + p.DomainName, "autoconfig." + p.DomainName,
+			"autodiscover." + p.DomainName, "mta-sts." + p.DomainName}, p.ExtraServerNames...)...)
+	}
+
+	h2 := nginxHTTP2()
+	p.HTTP2Param, p.HTTP2Directive = h2.Param, h2.Directive
+	tmpl, err := template.New("mailvhost").Parse(mailVhostTemplate)
+	if err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("template parse: %v", err)}
+	}
+	var rendered bytes.Buffer
+	if err := tmpl.Execute(&rendered, p); err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("template execute: %v", err)}
+	}
+
+	configPath := filepath.Join(mailVhostSitesAvailable, p.DomainName+"-mail.conf")
+	enabledPath := filepath.Join(mailVhostSitesEnabled, p.DomainName+"-mail.conf")
+
+	// JAB-71: serialize the whole write→test→reload (both the fast-path relink
+	// branch and the full write) against every other nginx op.
+	nginxOpMu.Lock()
+	defer nginxOpMu.Unlock()
+
+	// Hash-gated write: if the on-disk content matches what we'd render,
+	// skip the write + reload. Matches writeVhost's idempotency contract.
+	if existing, err := os.ReadFile(configPath); err == nil && bytes.Equal(existing, rendered.Bytes()) {
+		// Ensure the symlink exists even when the content hasn't changed —
+		// a prior vhost_remove may have torn it down.
+		if _, err := os.Lstat(enabledPath); os.IsNotExist(err) {
+			if err := os.Symlink(configPath, enabledPath); err != nil {
+				return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("re-link enabled path: %v", err)}
+			}
+			if err := nginxTestAndReload(ctx); err != nil {
+				return nil, err
+			}
+			return webmailVhostResponse{Ok: true, Path: configPath, Changed: true}, nil
+		}
+		return webmailVhostResponse{Ok: true, Path: configPath, Changed: false}, nil
+	}
+
+	// Atomic write: tmp then rename. If rename fails we leave the tmp file
+	// so a subsequent run can diagnose (and the idempotency check above
+	// will re-try on next pass).
+	tmp := configPath + ".tmp"
+	if err := os.WriteFile(tmp, rendered.Bytes(), 0644); err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("write tmp vhost: %v", err)}
+	}
+	if err := os.Rename(tmp, configPath); err != nil {
+		os.Remove(tmp)
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("rename vhost: %v", err)}
+	}
+
+	// (Re-)link into sites-enabled. Re-link unconditionally so a dangling
+	// symlink from an earlier broken state is repaired.
+	os.Remove(enabledPath)
+	if err := os.Symlink(configPath, enabledPath); err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("symlink enabled: %v", err)}
+	}
+
+	if err := nginxTestAndReload(ctx); err != nil {
+		// Roll back the vhost: nginx is currently happy because the bad
+		// file isn't loaded yet (we haven't reloaded after the rename).
+		// But leaving a bad file in sites-enabled would break the NEXT
+		// reload by anyone else. Safer to remove both and surface.
+		os.Remove(enabledPath)
+		os.Remove(configPath)
+		return nil, err
+	}
+	return webmailVhostResponse{Ok: true, Path: configPath, Changed: true}, nil
+}
+
+type webmailVhostRemoveParams struct {
+	DomainName string `json:"domain_name"`
+}
+
+func webmailVhostRemoveHandler(ctx context.Context, params json.RawMessage) (any, error) {
+	if len(params) == 0 {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: "params required"}
+	}
+	var p webmailVhostRemoveParams
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: fmt.Sprintf("parse params: %v", err)}
+	}
+	if err := validateDomainNameForShell(p.DomainName); err != nil {
+		return nil, err
+	}
+
+	configPath := filepath.Join(mailVhostSitesAvailable, p.DomainName+"-mail.conf")
+	enabledPath := filepath.Join(mailVhostSitesEnabled, p.DomainName+"-mail.conf")
+
+	// JAB-71: serialize remove→test→reload against every other nginx op.
+	nginxOpMu.Lock()
+	defer nginxOpMu.Unlock()
+
+	// Idempotent remove. If neither file exists we still return ok+changed=false
+	// so the reconciler can cheaply ask us on every tick.
+	changed := false
+	if _, err := os.Lstat(enabledPath); err == nil {
+		if err := os.Remove(enabledPath); err != nil {
+			return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("rm enabled: %v", err)}
+		}
+		changed = true
+	}
+	if _, err := os.Stat(configPath); err == nil {
+		if err := os.Remove(configPath); err != nil {
+			return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("rm available: %v", err)}
+		}
+		changed = true
+	}
+
+	if changed {
+		if err := nginxTestAndReload(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return webmailVhostResponse{Ok: true, Changed: changed}, nil
+}
+
+// nginxTestAndReload is the tiny shim shared by apply + remove: test
+// first, reload only on a clean test. Overridable for tests so unit
+// coverage doesn't need a real nginx binary on the host.
+var nginxTestAndReload = defaultNginxTestAndReload
+
+func defaultNginxTestAndReload(ctx context.Context) error {
+	var out bytes.Buffer
+	test := execCommandContext(ctx, "nginx", "-t")
+	test.Stdout = &out
+	test.Stderr = &out
+	if err := test.Run(); err != nil {
+		return nginxTestFailure("webmail.vhost", out.String())
+	}
+	out.Reset()
+	reload := execCommandContext(ctx, "systemctl", "reload", "nginx")
+	reload.Stdout = &out
+	reload.Stderr = &out
+	if err := reload.Run(); err != nil {
+		return &agentwire.AgentError{
+			Code:    agentwire.CodeInternal,
+			Message: fmt.Sprintf("nginx reload failed: %s", out.String()),
+		}
+	}
+	return nil
+}
+
+func init() {
+	Default.Register("webmail.vhost_apply", webmailVhostApplyHandler)
+	Default.Register("webmail.vhost_remove", webmailVhostRemoveHandler)
+}

@@ -1,0 +1,112 @@
+import { describe, it, expect } from "vitest";
+
+import {
+  adminLinks,
+  crumbsToMenuItems,
+  ownerLabel,
+  ownerCrumbs,
+  ownerResourceCrumbs,
+  resourceListCrumbs,
+  userResourceSiblings,
+} from "./entityLinks";
+
+describe("adminLinks", () => {
+  it("builds plain list links", () => {
+    expect(adminLinks.users()).toBe("/admin/users");
+    expect(adminLinks.domains()).toBe("/admin/domains");
+    expect(adminLinks.mailboxes()).toBe("/admin/mail");
+    expect(adminLinks.dockerApps()).toBe("/admin/docker-apps");
+    expect(adminLinks.backups()).toBe("/admin/backups");
+  });
+
+  it("appends ?user_id when owner-scoped", () => {
+    expect(adminLinks.domains("01ARZ3NDEKTSV4RRFFQ69G5FAV")).toBe(
+      "/admin/domains?user_id=01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    );
+    expect(adminLinks.mailboxes("u1")).toBe("/admin/mail?user_id=u1");
+  });
+
+  it("builds detail links", () => {
+    expect(adminLinks.user("u1")).toBe("/admin/users/u1");
+    expect(adminLinks.domainEdit("d1")).toBe("/admin/domains/edit/d1");
+    expect(adminLinks.packageEdit("p1")).toBe("/admin/packages/edit/p1");
+  });
+
+  it("url-encodes ids", () => {
+    expect(adminLinks.user("a/b")).toBe("/admin/users/a%2Fb");
+  });
+});
+
+describe("ownerLabel", () => {
+  it("prefers username", () => {
+    expect(ownerLabel({ id: "01ARZ3NDEKTSV4RRFFQ69G5FAV", username: "alice" })).toBe("alice");
+  });
+  it("falls back to short id when username missing or blank", () => {
+    expect(ownerLabel({ id: "01ARZ3NDEKTSV4RRFFQ69G5FAV", username: null })).toBe("01ARZ3ND");
+    expect(ownerLabel({ id: "01ARZ3NDEKTSV4RRFFQ69G5FAV", username: "  " })).toBe("01ARZ3ND");
+  });
+});
+
+describe("userResourceSiblings", () => {
+  it("returns the other owner-scoped resources, excluding the current one", () => {
+    const sibs = userResourceSiblings("u1", "domains");
+    expect(sibs.map((s) => s.key)).toEqual(["mailboxes", "docker-apps", "backups"]);
+    expect(sibs.every((s) => s.href.includes("user_id=u1"))).toBe(true);
+  });
+  it("returns all four when no current key", () => {
+    expect(userResourceSiblings("u1")).toHaveLength(4);
+  });
+});
+
+describe("crumb builders", () => {
+  const user = { id: "u1", username: "alice" };
+
+  it("ownerCrumbs links Users, leaves the name as the leaf", () => {
+    const c = ownerCrumbs(user);
+    expect(c).toEqual([
+      { title: "Users", href: "/admin/users" },
+      { title: "alice" },
+    ]);
+  });
+
+  it("ownerResourceCrumbs links Users + name and adds a sibling menu on the resource", () => {
+    const c = ownerResourceCrumbs(user, { key: "domains", label: "Domains" });
+    expect(c[0]).toEqual({ title: "Users", href: "/admin/users" });
+    expect(c[1]).toEqual({ title: "alice", href: "/admin/users/u1" });
+    expect(c[2].title).toBe("Domains");
+    expect(c[2].href).toBe("/admin/domains?user_id=u1");
+    expect(c[2].menu?.map((m) => m.key)).toEqual(["mailboxes", "docker-apps", "backups"]);
+  });
+
+  it("resourceListCrumbs is a single leaf", () => {
+    expect(resourceListCrumbs("Domains")).toEqual([{ title: "Domains" }]);
+  });
+});
+
+describe("crumbsToMenuItems (mobile collapse)", () => {
+  const user = { id: "u1", username: "alice" };
+
+  it("flattens the trail into navigable entries + inlined sibling menus", () => {
+    // Users(href) / alice(href) / Domains(menu) / example.com(leaf)
+    const items = [
+      ...ownerResourceCrumbs(user, { key: "domains", label: "Domains" }),
+      { title: "example.com" },
+    ];
+    const menu = crumbsToMenuItems(items);
+    // Users + alice hrefs, then Domains' siblings inlined; leaf has no href.
+    expect(menu.map((m) => m.label)).toEqual([
+      "Users",
+      "alice",
+      "Domains",
+      "Mailboxes",
+      "Docker Apps",
+      "Backups",
+    ]);
+    expect(menu.find((m) => m.label === "Users")?.href).toBe("/admin/users");
+    expect(menu.find((m) => m.label === "alice")?.href).toBe("/admin/users/u1");
+  });
+
+  it("omits leaf-only crumbs that have no href", () => {
+    expect(crumbsToMenuItems([{ title: "Domains" }])).toEqual([]);
+  });
+});

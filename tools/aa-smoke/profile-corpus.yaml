@@ -1,0 +1,77 @@
+# aa-smoke profile corpus (M40.1).
+#
+# Maps each profile name to the unix sockets that profile MUST be
+# able to dial in production. The runner (`make aa-smoke`) iterates
+# this list and runs `aa-exec -p <profile> -- aa-smoke <sockets>`
+# for each entry; any failed dial fails the make target.
+#
+# Path conventions:
+#   - dotnext daemons: /run/dotnext-<X>/<sock> per ADR-0050
+#   - upstream: keep the symlink-canonical /var/run/mysqld path
+#     (some MariaDB clients hard-code it). Profiles must allow both
+#     /run/mysqld/mysqld.sock + /var/run/mysqld/mysqld.sock.
+#
+# When you add a new profile or a new socket the daemon learns about,
+# add a row here. CI will catch the drift. Prefix `opt:` for the socket of
+# a service that only runs in some setups: it is skipped when missing.
+
+profiles:
+  # M40.1 dotnext-agent — privileged orchestrator. Talks to MariaDB
+  # (gmysql DSN), Redis, and the kratos admin socket via the M25
+  # unix-socket model.
+  - name: dotnext-agent
+    sockets:
+      - /run/dotnext/agent.sock
+      - /run/mysqld/mysqld.sock
+      - /var/run/mysqld/mysqld.sock
+      - /run/redis/redis.sock
+      - /run/dotnext-kratos/admin.sock
+
+  # panel-api — the HTTP API. Talks to MariaDB, Redis, agent, kratos
+  # public + admin.
+  - name: dotnext-api
+    sockets:
+      - /run/dotnext-panel/api.sock
+      - /run/dotnext/agent.sock
+      - /run/mysqld/mysqld.sock
+      - /var/run/mysqld/mysqld.sock
+      - /run/redis/redis.sock
+      - /run/dotnext-kratos/admin.sock
+      - /run/dotnext-kratos/public.sock
+
+  # bulwark — public-facing webmail. Talks ONLY to panel-api.
+  - name: dotnext-bulwark
+    sockets:
+      - /run/dotnext-bulwark/bulwark.sock
+      - /run/dotnext-panel/api.sock
+
+  # kratos — auth identity service. Talks to MariaDB; serves admin +
+  # public sockets.
+  - name: dotnext-kratos
+    sockets:
+      - /run/dotnext-kratos/admin.sock
+      - /run/dotnext-kratos/public.sock
+      - /run/mysqld/mysqld.sock
+      - /var/run/mysqld/mysqld.sock
+
+  # stalwart — mail server. Talks to MariaDB for the SqlDirectory
+  # backend; serves admin-http on loopback TCP (not in this corpus —
+  # this corpus covers UNIX sockets only).
+  - name: stalwart-mail
+    sockets:
+      - /run/mysqld/mysqld.sock
+      - /var/run/mysqld/mysqld.sock
+
+  # dotnext-sendmail (JAB-230) — the PHP mail() shim. dotnext-fpm-app hands
+  # the shim to it (Px); its own profile file since GH #2001. Dials the
+  # Stalwart submission listener over loopback
+  # TCP (tcp: prefix — the runner passes it through to aa-smoke, which
+  # does a TCP dial for these instead of unix).
+  #
+  # GH #2056: in smarthost mode the shim hands the message to the website
+  # mail relay instead. The relay only runs in that mode (opt: skips the
+  # socket when it isn't there; run once with the smarthost selected).
+  - name: dotnext-sendmail
+    sockets:
+      - tcp:127.0.0.1:587
+      - opt:/run/dotnext-mailrelay/relay.sock

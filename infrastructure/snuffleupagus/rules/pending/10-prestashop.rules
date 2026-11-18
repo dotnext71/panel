@@ -1,0 +1,5 @@
+# DotNext Snuffleupagus -- PrestaShop overlay (M41, ADR-0088).
+
+# WS-API SSRF: tenant code calling fopen/file_get_contents on
+# user-supplied URLs. Wrappers limited via sp.wrappers_whitelist in
+# 00-base; phar://, ftp://, expect:// already excluded there.

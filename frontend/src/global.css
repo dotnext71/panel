@@ -1,0 +1,452 @@
+/* Global AntD + dotNext surface tokens & responsive layout rules. */
+
+:root {
+  --dn-surface: #ffffff;
+  --dn-canvas: #f8fafc;
+  --dn-border: #e2e8f0;
+  --dn-header-bg: rgba(248, 250, 252, 0.86);
+  --dn-accent: #0891b2;
+}
+
+body[data-theme="dark"],
+html[data-theme="dark"] {
+  --dn-surface: #111827;
+  --dn-canvas: #0b0f17;
+  --dn-border: #1e293b;
+  --dn-header-bg: rgba(11, 15, 23, 0.84);
+  --dn-accent: #06b6d4;
+}
+
+/* Crisp hairline cards aligned with dotNext's dark-first design system */
+.ant-card,
+.ant-card-bordered {
+  border: 1px solid var(--dn-border) !important;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+body[data-theme="dark"] .ant-card,
+body[data-theme="dark"] .ant-card-bordered {
+  box-shadow: none;
+}
+
+/* Tabular figures for metrics, IPs, quotas, counts */
+.dn-tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Accessible visible focus rings for keyboard navigation */
+a:focus-visible,
+button:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--dn-accent);
+  outline-offset: 2px;
+}
+
+/* Glass sticky header + sidebar polish */
+.dotnext-header {
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--dn-border) !important;
+}
+
+.dotnext-sider {
+  border-inline-end: 1px solid var(--dn-border) !important;
+}
+
+/* Dropdown menu items that embed a <Button type="text"> as their label
+ * (DomainRedirectsButton, DomainSettingsButton, RowDeleteButton, …) end
+ * up painting two hover backgrounds: the menu item's own row hover and
+ * the inner Button's text-hover. Suppress the inner Button's hover bg
+ * so the row hover alone provides the visual feedback, and strip the
+ * Button's padding/height so the label sits where a plain menu item
+ * label would. */
+.ant-dropdown-menu-item .ant-btn-text,
+.ant-dropdown-menu-item .ant-btn-text:hover,
+.ant-dropdown-menu-item .ant-btn-text:focus,
+.ant-dropdown-menu-item .ant-btn-text:active {
+  background: transparent;
+  padding: 0;
+  height: auto;
+  width: 100%;
+  justify-content: flex-start;
+  box-shadow: none;
+}
+
+/* ---------- Mobile / tablet responsive constraints ----------
+ *
+ * Many Modal + Drawer call sites pass width={500..900} as a px value.
+ * On a 375px phone or 768px tablet that overflows the viewport and
+ * clips controls. AntD writes `width: <N>px` inline; cap it via CSS
+ * with !important since :where() prefixed wrapper rules don't
+ * outrank inline styles.
+ */
+.ant-modal {
+  max-width: calc(100vw - 16px);
+}
+/* Tall modals (multi-field create dialogs like Python/Docker app create)
+   overflow short / mobile viewports — the footer renders below the fold and
+   fields aren't reachable. Cap the modal body to the viewport and scroll it so
+   every field + the footer actions stay reachable. Additive: only scrolls when
+   the content would actually overflow. (Gitea #492) */
+.ant-modal-body {
+  max-height: calc(100vh - 140px);
+  overflow-y: auto;
+}
+
+/* Short viewports (small phones / short windows): AntD centers modals
+   vertically, so a modal taller than the viewport pushes its footer (the
+   primary actions) below the fold. Top-anchor the modal and tighten the body
+   cap so header + body + footer all fit. (GH #502) */
+@media (max-height: 720px) {
+  .ant-modal,
+  .ant-modal-centered .ant-modal {
+    top: 8px !important;
+    vertical-align: top !important;
+    padding-bottom: 0 !important;
+  }
+  .ant-modal-body {
+    max-height: calc(100vh - 124px) !important;
+  }
+}
+/* When the impersonation banner is up it eats viewport height — drop the modal
+   below it and shrink the body cap by the banner height. (GH #502 case 8) */
+/* The modal-wrap already gets padding-top: banner (below), which clears the
+   fixed banner. Adding the banner to the modal's own `top` too double-counted
+   it and pushed the footer below the fold when impersonating on a small phone
+   (GH #503 case 6). Keep the base 8px offset only. */
+body.imp-active .ant-modal,
+body.imp-active .ant-modal-centered .ant-modal {
+  top: 8px !important;
+}
+body.imp-active .ant-modal-body {
+  max-height: calc(100vh - 124px - var(--imp-banner-h, 40px)) !important;
+}
+.ant-drawer-content-wrapper {
+  max-width: 100vw !important;
+}
+@media (max-width: 600px) {
+  /* Phones: drawers + modals get nearly full viewport.
+     The 16px gutter on Modal keeps the close button visible
+     against the edge. */
+  .ant-drawer-content-wrapper {
+    width: 100vw !important;
+  }
+  /* Drawer header: when actions live in the header `extra` (e.g. New mailbox
+     Cancel/Create), they collide with the title at 320px. Let the header wrap
+     so the actions drop below the title instead of overlapping. (GH #502) */
+  .ant-drawer-header {
+    flex-wrap: wrap !important;
+    row-gap: 8px !important;
+  }
+  /* Give BOTH the title block and the actions a full line. Without forcing
+     the title to 0-0-100 it stays flex:1-1-0 and collapses to width 0 when the
+     extra demands 100%, leaving the title text overlapping the actions. */
+  .ant-drawer-header-title {
+    flex: 0 0 100% !important;
+  }
+  .ant-drawer-extra {
+    margin-inline-start: 0 !important;
+    flex: 0 0 100% !important;
+    justify-content: flex-end;
+  }
+  .ant-modal {
+    margin: 8px auto;
+  }
+  /* Alert with an `action` (e.g. UFW "Firewall DISABLED" + Enable button):
+     AntD lays content + action in one flex row, so on a phone the action
+     button squeezes the text column until it wraps one word per line. Stack
+     the action below the message instead. (GH #503 case 4) */
+  .ant-alert-action {
+    margin-inline-start: 0 !important;
+    margin-top: 8px;
+    width: 100%;
+  }
+  .ant-alert {
+    flex-wrap: wrap;
+  }
+  /* Layout content padding tightens so cards aren't squeezed. */
+  .ant-layout-content {
+    padding: 12px !important;
+  }
+  /* Card bodies — default 24px is too generous on a phone. */
+  .ant-card-body {
+    padding: 16px !important;
+  }
+  /* Page titles and Card headers — tighter line-height for narrow widths. */
+  .ant-card-head {
+    padding-inline: 16px !important;
+    min-height: auto !important;
+  }
+  /* Allow card head title to wrap rather than ellipsis-clip on narrow
+     phones — shows the full label "Two-factor (TOTP)" instead of
+     "Two-factor authentic…". */
+  .ant-card-head-title {
+    white-space: normal !important;
+    overflow: visible !important;
+    text-overflow: clip !important;
+    line-height: 1.3 !important;
+  }
+  /* Card head title + extra: allow wrap so a long extra (Check for
+     updates) doesn't squeeze the title into "Ja…" / "Sy…", but keep
+     them inline when they actually fit (Recent Domains | View all
+     fits comfortably at 320px wide). flex-basis: auto lets the title
+     take its natural width; the title's white-space:normal above
+     allows it to wrap to a second line if needed before stacking. */
+  .ant-card-head-wrapper {
+    flex-wrap: wrap !important;
+    gap: 8px !important;
+  }
+  .ant-card-head-wrapper > .ant-card-head-title {
+    flex: 1 1 auto !important;
+  }
+  .ant-card-head-wrapper > .ant-card-extra {
+    flex: 0 0 auto !important;
+    margin-inline-start: auto !important;
+  }
+  /* Page-level h2 + extras (e.g. DNS Records page header) — same
+     stacking treatment, since they use Space justify=space-between
+     which collapses awkwardly on narrow widths. */
+  h1, h2, h3 {
+    word-break: break-word;
+  }
+  /* AntD Space flex children get min-width: auto by default, which
+     for a Typography.Title means "shrink to longest unbreakable
+     word" — and the rendered <h2> sometimes gets squeezed below
+     that to one letter per line when sibling Space content is wide.
+     min-width: 0 on flex children + the word-break above lets the
+     title break across two lines instead. */
+  .ant-space-item h1,
+  .ant-space-item h2,
+  .ant-space-item h3,
+  .ant-space-item .ant-typography {
+    min-width: 0;
+  }
+  /* AntD Tabs — let labels wrap across two lines instead of clipping
+     "Storage" → "Stor". Default tab-nav uses overflow:hidden + ellipsis. */
+  .ant-tabs-tab {
+    padding: 8px 8px !important;
+  }
+  .ant-tabs-tab .ant-tabs-tab-btn {
+    white-space: normal !important;
+    line-height: 1.2 !important;
+  }
+  /* Notification + user-menu dropdowns: cap to viewport so the panel
+     doesn't render half-off-screen when triggered from the right edge
+     of the DotNextHeader. */
+  .ant-dropdown,
+  .ant-dropdown-menu {
+    max-width: calc(100vw - 16px) !important;
+  }
+  .ant-dropdown-menu-item {
+    white-space: normal !important;
+    word-break: break-word;
+  }
+  /* AntD Notification (toast) drawer is fixed at 384px which on a
+     304px viewport overflows. */
+  .ant-notification {
+    max-width: calc(100vw - 24px) !important;
+    inset-inline-end: 12px !important;
+  }
+  .ant-notification-notice {
+    max-width: 100% !important;
+    width: 100% !important;
+  }
+}
+
+/* Tables overflow horizontally inside their card. SearchableTable
+ * already sets scroll.x = "max-content"; raw <Table> usages
+ * (dashboards) keep their natural sizing — applying overflow-x:auto
+ * here also implies overflow-y:auto in browsers, which painted a
+ * vertical scrollbar on every dashboard table. Per-component
+ * scroll prop is the right knob; CSS shouldn't second-guess it. */
+/* AntD Tabs: when the overflow "more" dropdown does not engage, the tabs
+   exceed the nav-wrap and the last visible tab is clipped to a sliver
+   before the … menu (Gitea #484/#485). Let the nav-wrap scroll
+   horizontally at ALL widths so every tab stays reachable. Additive:
+   when AntD's collapse DOES engage the list fits and no scrollbar shows. */
+.ant-tabs-nav-wrap {
+  overflow-x: auto !important;
+  scrollbar-width: thin;
+}
+.ant-tabs-nav-wrap::-webkit-scrollbar {
+  height: 4px;
+}
+.ant-tabs-nav-wrap::-webkit-scrollbar-thumb {
+  background: var(--dn-scroll-thumb, rgba(140, 140, 140, 0.5));
+  border-radius: 4px;
+}
+
+.ant-table-container {
+  max-width: 100%;
+}
+
+/* A free-text or path value in a list cell. Tables size to their
+   content (scroll={{ x: "max-content" }}), so a cell never wraps on its own:
+   one long value widened its column and pushed the list past the card. Capped
+   here, the value wraps, and the table scrolls only when it still can't fit.
+   The cap follows the viewport, so it narrows with browser zoom too. */
+.dn-wrap-cell {
+  display: inline-block;
+  max-width: min(32em, 25vw);
+  overflow-wrap: anywhere;
+  white-space: normal;
+}
+/* A wrapped code value gets its padded box on every line, not one box cut
+   across the break. */
+.dn-wrap-cell code {
+  -webkit-box-decoration-break: clone;
+  box-decoration-break: clone;
+}
+
+/* Safari's page zoom multiplies a <col> width a second time (GH #2328), and
+   antd sizes the expand-arrow column on its <col>: at 250% it takes 120px
+   and squeezes the text columns. Size it on its cells instead, at antd's
+   width (checkbox 16px + 2 x padding 16px). Column widths go through
+   columnWidth() for the same reason. */
+.ant-table-wrapper table col.ant-table-expand-icon-col {
+  width: auto;
+}
+.ant-table-wrapper table .ant-table-row-expand-icon-cell {
+  width: 48px;
+}
+
+/* ---------- Scrollbar styling (panel-wide) ----------------------------------
+ * Browsers default to chunky 16px scrollbars that look out of place on
+ * dark surfaces. Use thin/transparent rails everywhere — Firefox via
+ * scrollbar-width, Chromium/WebKit via ::-webkit-scrollbar pseudos.
+ * Track is transparent so it inherits the surface color; thumb uses the
+ * theme-aware AntD border-base token via currentColor opacity so dark
+ * + light themes both look right. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(128, 128, 128, 0.35) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background-color: rgba(128, 128, 128, 0.35);
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background-color: rgba(128, 128, 128, 0.6);
+}
+*::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ---------- File manager: bump font size on tree + table ----------------- */
+.dn-file-manager .ant-tree {
+  font-size: 14px;
+}
+.dn-file-manager .ant-tree-treenode {
+  padding: 2px 0;
+}
+.dn-file-manager .ant-tree .ant-tree-title {
+  font-size: 14px;
+}
+.dn-file-manager .ant-table-thead > tr > th,
+.dn-file-manager .ant-table-tbody > tr > td {
+  font-size: 14px;
+}
+
+/* File manager folders pane: keep titles on a single line and let
+ * the body horizontally scroll when names overrun the card width. */
+.dn-file-manager .ant-tree-list-holder-inner {
+  display: inline-block;
+  min-width: 100%;
+}
+.dn-file-manager .ant-tree .ant-tree-title {
+  white-space: nowrap;
+}
+
+/* GoAccess modal: zero out the inner content padding so the iframe
+ * fills the modal edge-to-edge. The close icon stays in its absolute
+ * position. body padding is already 0 via inline styles in
+ * LogStreamModal — this rule kills the .ant-modal-content padding
+ * that would otherwise inset the iframe. */
+.goaccess-modal .ant-modal-content {
+  padding: 0;
+}
+
+/* ---------- Long inline code + pre blocks (mobile overflow) -----------------
+ * Inline <code> (hostnames, sockets, paths, keys, e.g. mail.dotnext.local
+ * or /run/php/dotnext-<u>/fpm.sock) is the #1 source of horizontal overflow in
+ * cards on narrow screens. Let it wrap. This does NOT affect code inside a
+ * <pre>: <pre> keeps white-space:pre, which prevents line-breaking regardless
+ * of word-break, so log/command formatting is preserved. <pre> itself scrolls
+ * horizontally rather than pushing the page wide. */
+code {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+pre {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+/* The tenant shell's content column (UserLayout) clips horizontal overflow
+   so one wide element cannot sideways-scroll the page on a phone. clip, not
+   hidden: overflow-x: hidden makes the column a scroll container, and as it
+   never scrolls (the window does), every position: sticky element inside a
+   page stuck to it and scrolled away with the page (the File Manager bulk
+   bar). hidden stays as the fallback for browsers without clip (Safari < 16).
+   The admin shell is different: its content column scrolls itself, so sticky
+   already works there. */
+.dn-user-content {
+  overflow-x: hidden;
+  overflow-x: clip;
+}
+
+/* GH #279 — while impersonating, the always-visible amber banner (sticky,
+   z-index above the modal mask as a security indicator) used to overlap modal
+   and drawer CONTENT. Offset that content below the banner so the bar stays
+   visible but no longer covers the dialog. --imp-banner-h is published by
+   ImpersonationBanner; falls back to 40px. */
+body.imp-active .ant-modal-wrap {
+  padding-top: var(--imp-banner-h, 40px);
+}
+body.imp-active .ant-drawer-content-wrapper,
+body.imp-active .ant-drawer .ant-drawer-content {
+  margin-top: var(--imp-banner-h, 40px);
+  height: calc(100% - var(--imp-banner-h, 40px));
+}
+
+/* GH #1626 — tenant sidebar section-header alignment.
+ * The always-open sections (Hosting/Services) render as antd menu item
+ * groups, whose title (.ant-menu-item-group-title) text sits at 16px from
+ * the rail edge. The collapsible sections (Tools/Account) render as antd
+ * SubMenus one inline-indent level deeper: antd writes an inline
+ * `padding-left: 24px` on the submenu title and the row keeps a 4px item
+ * margin, so its text lands at 28px — 12px right of the group headers, which
+ * made Tools/Account read as indented under Services (reporter: johnnyq).
+ * Pull the submenu title's inline start padding to 12px so 4px margin + 12px
+ * = 16px, lining the two header rows up. `!important` because antd sets the
+ * padding as an inline style (a plain rule would lose the cascade). Scoped to
+ * the expanded inline rail: the collapsed icon rail is .ant-menu-vertical
+ * .ant-menu-inline-collapsed (no .ant-menu-inline), and hover popups portal
+ * outside .tenant-sidebar, so both stay untouched. */
+.tenant-sidebar.ant-menu-inline .ant-menu-submenu-title {
+  padding-inline-start: 12px !important;
+}
+
+/* GH #1626 (round 2, reporter: johnnyq) — align the collapsible section
+ * children too. antd indents SubMenu children one inline level deeper than
+ * group children: a Tools/Account item lands at padding-left 48px (24px per
+ * level x 2) versus 24px for a Hosting/Services group item, so its text sits
+ * at 52px versus 28px — 24px too far right. Pull the inline submenu's item
+ * padding back to 24px so both children columns line up at 28px (24px + the
+ * 4px item margin). Group children live under .ant-menu-item-group-list (not
+ * .ant-menu-sub) so they are untouched; the collapsed rail's flyouts are
+ * .ant-menu-sub.ant-menu-vertical portaled outside .tenant-sidebar, so the
+ * .ant-menu-inline qualifier + the .tenant-sidebar scope exclude them.
+ * `!important` beats antd's inline per-level padding. */
+.tenant-sidebar.ant-menu-inline .ant-menu-sub.ant-menu-inline .ant-menu-item {
+  padding-inline-start: 24px !important;
+}

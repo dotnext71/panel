@@ -1,0 +1,51 @@
+slug: ghost
+popularity: 80
+name: Ghost
+tags: ["Blog", "CMS"]
+version: "6.73.0"
+description: |
+  Modern publishing platform. SQLite by default; the operator can
+  switch to MySQL by editing the compose post-install. Single
+  container, persistent /var/lib/ghost/content.
+icon: icon.png
+upstream: https://github.com/TryGhost/Ghost
+documentation: https://ghost.org/docs/
+
+image_channel: ghost:6-alpine@sha256:4195f6c405e40230cd10c0770425cf500c1f542a96e9f6584c11649c150e5a89
+update_mode: manual
+# Builds its public URL from the install's domain and does not start
+# without one.
+requires_domain: true
+tenant_installable: true
+
+resources:
+  cpu: "1.0"
+  memory: "512m"
+  pids: 200
+
+volumes:
+  - name: content
+    container_path: /var/lib/ghost/content
+
+ports:
+  - name: http
+    container_port: 2368
+    protocol: tcp
+    default_enabled: true
+    default_bind: loopback
+    default_reverse_proxy: true
+    health_path: /
+
+env:
+  - name: NODE_ENV
+    value: "production"
+  - name: database__client
+    value: "sqlite3"
+  - name: database__connection__filename
+    value: "/var/lib/ghost/content/data/ghost.db"
+  - name: database__useNullAsDefault
+    value: "true"
+
+# Operator-supplied SMTP (GH #322): auto-injects standard SMTP_* install fields;
+# compose maps them to this app's SMTP env.
+smtp: true

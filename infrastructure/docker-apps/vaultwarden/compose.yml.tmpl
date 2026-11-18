@@ -1,0 +1,42 @@
+services:
+  vaultwarden:
+    image: {{ .ImageChannel }}
+    container_name: dotnext-app-{{ .Slug }}
+    restart: unless-stopped
+    environment:
+{{- if (index .Env "SMTP_HOST") }}
+      # Operator-supplied SMTP (GH #322) — values q-escaped so special chars
+      # (e.g. API-key passwords) can't break the rendered compose YAML.
+      SMTP_HOST: {{ q (index .Env "SMTP_HOST") }}
+      SMTP_PORT: {{ q (or (index .Env "SMTP_PORT") "587") }}
+      SMTP_SECURITY: "{{ if eq (index .Env "SMTP_PORT") "465" }}force_tls{{ else }}starttls{{ end }}"
+      SMTP_USERNAME: {{ q (index .Env "SMTP_USER") }}
+      SMTP_PASSWORD: {{ q (index .Env "SMTP_PASSWORD") }}
+      SMTP_FROM: {{ q (or (index .Env "SMTP_FROM") (printf "vaultwarden@%s" .Domain)) }}
+      SMTP_FROM_NAME: {{ q (or (index .Env "SMTP_FROM_NAME") "Vaultwarden") }}
+{{- end }}
+      DOMAIN: "https://{{ .Domain }}"
+      WEBSOCKET_ENABLED: "true"
+{{- range $name, $val := .Env }}
+{{- if not (hasPrefix $name "SMTP_") }}
+      {{ $name }}: {{ q $val }}
+{{- end }}
+{{- end }}
+    volumes:
+      - {{ .DataRoot }}/data:/data
+    ports:
+{{- with index .Ports "http" }}
+      - "{{ .BindInterface }}:{{ .HostPort }}:{{ .ContainerPort }}/{{ .Protocol }}"
+{{- end }}
+    deploy:
+      resources:
+        limits:
+          cpus: "{{ .CPULimit }}"
+          memory: {{ .MemoryLimit }}
+    healthcheck:
+      # The image has no wget; this is the probe its own HEALTHCHECK runs.
+      test: ["CMD", "/healthcheck.sh"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s

@@ -1,0 +1,77 @@
+package reconciler
+
+import (
+	"context"
+	"log/slog"
+	"testing"
+	"time"
+
+	"github.com/dotnext-panel/dotnext/internal/dnscompile"
+	"github.com/dotnext-panel/dotnext/internal/models"
+)
+
+// GH #648: restoreBootstrapApex re-renders a dotnext-authored (canonical) _dmarc
+// to the domain's DMARCbis settings, but leaves an operator-customised record
+// alone. MX + apex SPF are pre-seeded so only the _dmarc path is exercised.
+func dmarcApexExisting(dmarcContent string) []models.DNSRecord {
+	return []models.DNSRecord{
+		{ID: "mx", ZoneID: "z1", Name: "@", Type: "MX", Content: "mail.example.com"},
+		{ID: "spf", ZoneID: "z1", Name: "@", Type: "TXT", Content: `"v=spf1 mx ~all"`},
+		{ID: "dmarc", ZoneID: "z1", Name: "_dmarc", Type: "TXT", Content: dmarcContent},
+	}
+}
+
+func TestRestoreBootstrapApex_ReRendersCanonicalDMARC(t *testing.T) {
+	zone := &models.DNSZone{ID: "z1", Name: "example.com"}
+	legacy := `"v=DMARC1; p=quarantine; sp=quarantine; adkim=r; aspf=r"` // canonical default
+	dnsRepo := &fakeDNSRecordRepo{records: map[string]*models.DNSRecord{
+		"dmarc": {ID: "dmarc", ZoneID: "z1", Name: "_dmarc", Type: "TXT", Content: legacy},
+	}}
+	r := &Reconciler{dnsRecords: dnsRepo, log: slog.Default()}
+	dom := &models.Domain{ID: "d1", DmarcNP: "reject", DmarcTesting: true}
+
+	r.restoreBootstrapApex(context.Background(), zone, dom, &models.ServerSettings{},
+		dmarcApexExisting(legacy), time.Now().UTC())
+
+	want := dnscompile.BuildDMARCString("example.com", "reject", true)
+	if got := dnsRepo.records["dmarc"].Content; got != want {
+		t.Errorf("canonical _dmarc should re-render to %s, got %s", want, got)
+	}
+}
+
+// A record rendered before rua was added is upgraded, so receivers start
+// sending aggregate reports to postmaster@<zone>, where Stalwart reads them.
+func TestRestoreBootstrapApex_AddsRUAToAnOlderCanonicalDMARC(t *testing.T) {
+	zone := &models.DNSZone{ID: "z1", Name: "example.com"}
+	legacy := `"v=DMARC1; p=quarantine; sp=quarantine; adkim=r; aspf=r; np=reject"`
+	dnsRepo := &fakeDNSRecordRepo{records: map[string]*models.DNSRecord{
+		"dmarc": {ID: "dmarc", ZoneID: "z1", Name: "_dmarc", Type: "TXT", Content: legacy},
+	}}
+	r := &Reconciler{dnsRecords: dnsRepo, log: slog.Default()}
+	dom := &models.Domain{ID: "d1", DmarcNP: "reject"}
+
+	r.restoreBootstrapApex(context.Background(), zone, dom, &models.ServerSettings{},
+		dmarcApexExisting(legacy), time.Now().UTC())
+
+	want := `"v=DMARC1; p=quarantine; sp=quarantine; adkim=r; aspf=r; rua=mailto:postmaster@example.com; np=reject"`
+	if got := dnsRepo.records["dmarc"].Content; got != want {
+		t.Errorf("_dmarc = %s, want %s", got, want)
+	}
+}
+
+func TestRestoreBootstrapApex_LeavesOperatorCustomDMARC(t *testing.T) {
+	zone := &models.DNSZone{ID: "z1", Name: "example.com"}
+	custom := `"v=DMARC1; p=reject; rua=mailto:dmarc@example.com"` // hand-edited, not canonical
+	dnsRepo := &fakeDNSRecordRepo{records: map[string]*models.DNSRecord{
+		"dmarc": {ID: "dmarc", ZoneID: "z1", Name: "_dmarc", Type: "TXT", Content: custom},
+	}}
+	r := &Reconciler{dnsRecords: dnsRepo, log: slog.Default()}
+	dom := &models.Domain{ID: "d1", DmarcNP: "reject", DmarcTesting: true}
+
+	r.restoreBootstrapApex(context.Background(), zone, dom, &models.ServerSettings{},
+		dmarcApexExisting(custom), time.Now().UTC())
+
+	if got := dnsRepo.records["dmarc"].Content; got != custom {
+		t.Errorf("operator-customised _dmarc must be left untouched, got %s", got)
+	}
+}

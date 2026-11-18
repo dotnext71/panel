@@ -1,0 +1,568 @@
+// Per-user metadata bundle written as a sidecar restic snapshot at
+// stage=metadata. Captures everything that lives in panel-api MariaDB
+// rows but isn't naturally part of /home, dumps, or mail data — e.g.
+// the user's database users + grants, application install rows, ssh
+// keys. Restore reads this back to recreate panel-side state at the
+// same time the data stages get re-imported.
+//
+// This file lives in internal/backup so both panel-api (writer) and
+// panel-agent (also writer for system-side counterpart) can share the
+// schema. The producer side does the heavy lifting (panel-api sends
+// the bundle in backup.create params); the agent only needs to know
+// the JSON shape so it can write the snapshot.
+package backup
+
+// AccountMetadata is the JSON shape captured at stage=metadata for one
+// account_backup. SchemaVersion + ProducerPanelSHA let the restore-side
+// reject bundles produced by an incompatible panel.
+//
+// Schema v2 (M30.1+) carries every per-user table the panel touches so
+// disaster recovery can rebuild a user's full state when the source's
+// system_backup panel_db dump is missing the rows (e.g. user was
+// deleted between account-backup time and system-backup time, or the
+// operator is restoring per-user accounts onto a different host).
+type AccountMetadata struct {
+	SchemaVersion    int    `json:"schema_version"`
+	ProducerPanelSHA string `json:"producer_panel_sha,omitempty"`
+
+	// User core (dotnext_panel.users) — full row except mysqladmin
+	// password ciphertext is encoded base64 because varbinary doesn't
+	// round-trip through JSON cleanly.
+	User MetadataUser `json:"user"`
+
+	// Kratos identity + credentials. Optional (may be absent on rows
+	// created before M20 backfill landed) but normally populated.
+	Kratos *MetadataKratos `json:"kratos,omitempty"`
+
+	// Per-domain rows. The Domains slice itself includes everything that
+	// hangs off a domain (SSL cert, mailboxes, forwarders, etc.) so the
+	// restore-side can walk a single tree and apply rows in dependency
+	// order (domain → mailbox → forwarder/autoresponder).
+	Domains []MetadataDomain `json:"domains,omitempty"`
+
+	// PHP pools + ini overrides (per user, not per domain — domains
+	// reference pools by id).
+	PHPPools []MetadataPHPPool `json:"php_pools,omitempty"`
+
+	// PHPExtensions are the PHP extensions enabled on the source server for
+	// each PHP version the pools use (built-in ones left out), recorded by the
+	// agent at backup time so a restore can check this server has them
+	// (GH #1993). Nil in bundles made before it.
+	PHPExtensions map[string][]string `json:"php_extensions,omitempty"`
+
+	// MariaDB databases + their grant matrix.
+	Databases     []MetadataDatabase     `json:"databases,omitempty"`
+	DatabaseUsers []MetadataDatabaseUser `json:"database_users,omitempty"`
+
+	// Application installs (WordPress, Joomla, Drupal, …).
+	AppInstalls []MetadataAppInstall `json:"app_installs,omitempty"`
+
+	// DockerApps are the account's tenant docker-app rows (GH #954). Their
+	// data trees ride the stage=docker snapshot (#1017); these rows make the
+	// restored apps panel-managed rather than orphaned.
+	DockerApps []MetadataDockerApp `json:"docker_apps,omitempty"`
+
+	// SSH keys + cron jobs hang off the user, not a domain.
+	SSHKeys  []MetadataSSHKey  `json:"ssh_keys,omitempty"`
+	CronJobs []MetadataCronJob `json:"cron_jobs,omitempty"`
+
+	// FtpAccounts are the account's FTP/SFTP subaccount rows (GH #1361).
+	// Without these an account restore never recreates the subaccounts (the
+	// reconciler reprovisions the system user/jail/quota from the row). Each
+	// row's PasswordShadow is enriched agent-side at backup time (the panel
+	// can't read /etc/shadow) so a restore can preserve the login password.
+	FtpAccounts []MetadataFtpAccount `json:"ftp_accounts,omitempty"`
+
+	// User-level egress + limit overrides (M18 / M34).
+	EgressPolicy   *MetadataEgressPolicy   `json:"egress_policy,omitempty"`
+	EgressRequests []MetadataEgressRequest `json:"egress_requests,omitempty"`
+	LimitOverride  *MetadataLimitOverride  `json:"limit_override,omitempty"`
+}
+
+// MetadataUser mirrors models.User. Pointers preserve NULL semantics
+// for nullable columns so the restore-side INSERT writes the right
+// thing back into MariaDB.
+type MetadataUser struct {
+	ID                      string  `json:"id"`
+	Email                   string  `json:"email"`
+	Username                *string `json:"username,omitempty"`
+	NameFirst               string  `json:"name_first"`
+	NameLast                string  `json:"name_last"`
+	PasswordHash            string  `json:"password_hash,omitempty"`
+	IsAdmin                 bool    `json:"is_admin"`
+	PackageID               *string `json:"package_id,omitempty"`
+	LinuxUID                *uint32 `json:"linux_uid,omitempty"`
+	MysqladminUsername      *string `json:"mysqladmin_username,omitempty"`
+	MysqladminPasswordEnc   []byte  `json:"mysqladmin_password_enc,omitempty"`
+	MysqladminProvisionedAt string  `json:"mysqladmin_provisioned_at,omitempty"`
+	KratosIdentityID        *string `json:"kratos_identity_id,omitempty"`
+	CreatedAt               string  `json:"created_at,omitempty"`
+}
+
+// MetadataKratos carries the raw exported identity data from Kratos export API.
+// This replaces manual database extraction with official export/import functionality.
+type MetadataKratos struct {
+	// Raw exported identity data from Kratos export API, stored as JSON
+	ExportedIdentity string `json:"exported_identity"`
+}
+
+// MetadataDomain mirrors models.Domain plus the per-domain children
+// (SSL cert, mailboxes, forwarders, autoresponders, mailbox shares,
+// DNSSEC keys). Restore-side iterates in this nested order so FK
+// dependencies are satisfied.
+type MetadataDomain struct {
+	ID                    string  `json:"id"`
+	Name                  string  `json:"name"`
+	DocRoot               string  `json:"doc_root"`
+	IsEnabled             bool    `json:"is_enabled"`
+	NginxCustomDirectives *string `json:"nginx_custom_directives,omitempty"`
+	RedirectAllTo         *string `json:"redirect_all_to,omitempty"`
+	RedirectAllType       *string `json:"redirect_all_type,omitempty"`
+	PageRedirects         string  `json:"page_redirects,omitempty"` // raw JSON
+	NginxRules            string  `json:"nginx_rules,omitempty"`    // raw JSON
+	IndexPriority         string  `json:"index_priority"`
+	SSLEnabled            bool    `json:"ssl_enabled"`
+	PHPPoolID             *string `json:"php_pool_id,omitempty"`
+	PHPMemoryLimit        *string `json:"php_memory_limit,omitempty"`
+	PHPUploadMaxFilesize  *string `json:"php_upload_max_filesize,omitempty"`
+	PHPPostMaxSize        *string `json:"php_post_max_size,omitempty"`
+	PHPMaxInputVars       *int    `json:"php_max_input_vars,omitempty"`
+	PHPMaxExecutionTime   *int    `json:"php_max_execution_time,omitempty"`
+	PHPMaxInputTime       *int    `json:"php_max_input_time,omitempty"`
+	// The domain's other PHP settings (GH #1993), as the PHP settings page
+	// stores them: nil inherits the pool's or the server's value.
+	// PHPOpenBasedir is the token form (internal/phpbasedir). An archive made
+	// before them carries only the limits above and leaves
+	// PHPSettingsComplete false: a restore over an existing domain then keeps
+	// that domain's own settings instead of clearing them.
+	PHPDisplayErrors    *bool   `json:"php_display_errors,omitempty"`
+	PHPErrorReporting   *int    `json:"php_error_reporting,omitempty"`
+	PHPTimezone         *string `json:"php_timezone,omitempty"`
+	PHPLogErrors        *bool   `json:"php_log_errors,omitempty"`
+	PHPFileUploads      *bool   `json:"php_file_uploads,omitempty"`
+	PHPShortOpenTag     *bool   `json:"php_short_open_tag,omitempty"`
+	PHPOpenBasedir      *string `json:"php_open_basedir,omitempty"`
+	PHPAllowURLFopen    *bool   `json:"php_allow_url_fopen,omitempty"`
+	PHPSettingsComplete bool    `json:"php_settings_complete,omitempty"`
+	RateLimitRPS        uint32  `json:"rate_limit_rps"`
+	ConnectionLimit     uint32  `json:"connection_limit"`
+	ListenIPv4ID        *uint64 `json:"listen_ipv4_id,omitempty"`
+	ListenIPv6ID        *uint64 `json:"listen_ipv6_id,omitempty"`
+	EmailEnabled        bool    `json:"email_enabled"`
+	DkimSelector        *string `json:"dkim_selector,omitempty"`
+	DkimPublicKey       *string `json:"dkim_public_key,omitempty"`
+	EmailEnabledAt      string  `json:"email_enabled_at,omitempty"`
+	IsPanelPrimary      bool    `json:"is_panel_primary"`
+	CatchallTarget      *string `json:"catchall_target,omitempty"`
+	DisclaimerEnabled   bool    `json:"disclaimer_enabled"`
+	DisclaimerText      *string `json:"disclaimer_text,omitempty"`
+	DNSSECEnabled       bool    `json:"dnssec_enabled"`
+	DNSSECEnabledAt     string  `json:"dnssec_enabled_at,omitempty"`
+	CreatedAt           string  `json:"created_at,omitempty"`
+	// SSLMode and SkipAutoSAN (GH #1993) are the domain's certificate mode
+	// and its opt-out of the automatic www/alias names on it. Empty in an
+	// archive made before them: the restore then uses the default mode.
+	SSLMode     string `json:"ssl_mode,omitempty"`
+	SkipAutoSAN bool   `json:"skip_auto_san,omitempty"`
+	// The domain's mail settings (GH #1993), as its pages store them: the
+	// mail provider and the provider's DKIM tokens, the DMARC np and testing
+	// tags, the CalDAV/CardDAV hosts and the MTA-STS switch. An archive made
+	// before them has no MailProvider: a restore then leaves the provider to
+	// the column's default and an existing domain's mail settings as they are.
+	MailProvider    string  `json:"mail_provider,omitempty"`
+	M365Onmicrosoft *string `json:"m365_onmicrosoft,omitempty"`
+	GoogleDKIM      *string `json:"google_dkim,omitempty"`
+	DmarcNP         string  `json:"dmarc_np,omitempty"`
+	DmarcTesting    bool    `json:"dmarc_testing,omitempty"`
+	CalDAVHost      string  `json:"caldav_host,omitempty"`
+	CardDAVHost     string  `json:"carddav_host,omitempty"`
+	MTASTSEnabled   bool    `json:"mta_sts_enabled,omitempty"`
+	// OwnershipStatus (GH #1816 / ADR-0170) is the source row's ownership
+	// state. A restore keeps an explicitly pending name pending; a verified
+	// or absent status (archives from before the field) restores verified
+	// with method "restore", as the restore is admin-run.
+	OwnershipStatus string `json:"ownership_status,omitempty"`
+
+	// The domain's web settings (GH #1993), as its pages store them. An
+	// archive made before these fields restores each one at its default, so
+	// the settings that default on (www, webmail) are pointers: absent keeps
+	// them on.
+	NginxTenantDirectives    *string `json:"nginx_tenant_directives,omitempty"`
+	NginxSafeOptions         string  `json:"nginx_safe_options,omitempty"` // raw JSON
+	EnvVars                  string  `json:"env_vars,omitempty"`           // raw JSON
+	CacheEnabled             bool    `json:"cache_enabled,omitempty"`
+	CachePath                string  `json:"cache_path,omitempty"`
+	CacheTTLSeconds          int     `json:"cache_ttl_seconds,omitempty"`
+	CacheQueryAllowlist      string  `json:"cache_query_allowlist,omitempty"`
+	CreateWWW                *bool   `json:"create_www,omitempty"`
+	WebmailEnabled           *bool   `json:"webmail_enabled,omitempty"`
+	TempURLEnabled           bool    `json:"temp_url_enabled,omitempty"`
+	BotChallengeExempt       bool    `json:"bot_challenge_exempt,omitempty"`
+	BotChallengeInclude      bool    `json:"bot_challenge_include,omitempty"`
+	AllowSubdomainDelegation bool    `json:"allow_subdomain_delegation,omitempty"`
+	WebDisabled              bool    `json:"web_disabled,omitempty"`
+	DNSDisabled              bool    `json:"dns_disabled,omitempty"`
+
+	// Aliases (GH #1625, GH #1993) are the domain's web domain aliases: other
+	// hostnames its site answers on.
+	Aliases []MetadataDomainAlias `json:"aliases,omitempty"`
+
+	SSLCertificate *MetadataSSLCert    `json:"ssl_certificate,omitempty"`
+	Mailboxes      []MetadataMailbox   `json:"mailboxes,omitempty"`
+	Forwarders     []MetadataForwarder `json:"forwarders,omitempty"`
+	// DNSRecords (GH #267) captures the user-created DNS rows so a restore can
+	// re-insert them. Managed records (BootstrapRecords + mail) are excluded —
+	// they re-derive from domain config via the reconciler.
+	DNSRecords []MetadataDNSRecord `json:"dns_records,omitempty"`
+	DNSSECKeys []MetadataDNSSECKey `json:"dnssec_keys,omitempty"`
+
+	// WebmailBranding (GH #2502) is the domain's own webmail branding, nil
+	// when it has none.
+	WebmailBranding *MetadataWebmailBranding `json:"webmail_branding,omitempty"`
+}
+
+// MetadataDomainAlias mirrors models.WebDomainAlias. A restore gives each
+// alias a new id: an id the file chose never names a row already on the
+// server. OwnershipStatus is the alias's own ownership state (GH #1816); a
+// pending alias stays pending.
+type MetadataDomainAlias struct {
+	ID              string `json:"id"`
+	Hostname        string `json:"hostname"`
+	OwnershipStatus string `json:"ownership_status,omitempty"`
+}
+
+// MetadataWebmailBranding mirrors models.DomainWebmailBranding (GH #2502).
+// LogoLight, LogoDark and Favicon are the hashes the panel's row names each
+// picture by. The pictures themselves (LogoLightPNG, …) are read by the agent
+// from the domain's picture directory when the backup is made, each only when
+// its hash matches; a restore stores each again under a new hash.
+type MetadataWebmailBranding struct {
+	AppName     string `json:"app_name,omitempty"`
+	CompanyName string `json:"company_name,omitempty"`
+	WebsiteURL  string `json:"website_url,omitempty"`
+	PrivacyURL  string `json:"privacy_url,omitempty"`
+	ImprintURL  string `json:"imprint_url,omitempty"`
+	LogoLight   string `json:"logo_light,omitempty"`
+	LogoDark    string `json:"logo_dark,omitempty"`
+	Favicon     string `json:"favicon,omitempty"`
+	SetByAdmin  bool   `json:"set_by_admin,omitempty"`
+
+	LogoLightPNG []byte `json:"logo_light_png,omitempty"`
+	LogoDarkPNG  []byte `json:"logo_dark_png,omitempty"`
+	FaviconPNG   []byte `json:"favicon_png,omitempty"`
+}
+
+// MaxWebmailBrandingPictureBytes bounds each webmail branding picture a
+// backup carries and a restore takes. The panel stores a picture of at most
+// 1024 × 1024 pixels encoded again as PNG, which can be larger than the
+// upload it came from.
+const MaxWebmailBrandingPictureBytes = 4 << 20
+
+// MaxWebmailBrandingBackupBytes bounds all of an account's webmail branding
+// pictures in one backup. The metadata travels whole in the restore's reply
+// to the panel, so a backup it would not fit in can't be restored at all.
+const MaxWebmailBrandingBackupBytes = 16 << 20
+
+// MetadataSSLCert mirrors models.SSLCertificate (sans large per-cert
+// content — the cert + key are on disk under /etc/letsencrypt and the
+// system-backup tls stage already captures them).
+type MetadataSSLCert struct {
+	ID            string  `json:"id"`
+	Status        string  `json:"status"`
+	IssuedAt      string  `json:"issued_at,omitempty"`
+	ExpiresAt     string  `json:"expires_at,omitempty"`
+	RenewalCount  int     `json:"renewal_count"`
+	LastRenewedAt string  `json:"last_renewed_at,omitempty"`
+	LastError     *string `json:"last_error,omitempty"`
+	Staging       bool    `json:"staging"`
+	CertPath      *string `json:"cert_path,omitempty"`
+	KeyPath       *string `json:"key_path,omitempty"`
+	CreatedAt     string  `json:"created_at,omitempty"`
+	// CertPEM and KeyPEM (GH #1993) are the certificate with its chain and
+	// its private key, read by the agent from the domain's own certificate
+	// files when the backup is made. Empty for a self-signed certificate and
+	// for one that also covers names outside the account's domains.
+	CertPEM string `json:"cert_pem,omitempty"`
+	KeyPEM  string `json:"key_pem,omitempty"`
+}
+
+// MetadataPHPPool mirrors models.PHPPool plus its ini overrides.
+type MetadataPHPPool struct {
+	ID                        string                       `json:"id"`
+	PHPVersion                string                       `json:"php_version"`
+	PmMode                    string                       `json:"pm_mode"`
+	PmMaxChildren             uint32                       `json:"pm_max_children"`
+	ProcessIdleTimeoutSeconds uint32                       `json:"process_idle_timeout_seconds"`
+	Status                    string                       `json:"status"`
+	CreatedAt                 string                       `json:"created_at,omitempty"`
+	IniOverrides              []MetadataPHPPoolIniOverride `json:"ini_overrides,omitempty"`
+}
+
+// MetadataPHPPoolIniOverride mirrors models.PHPPoolIniOverride.
+type MetadataPHPPoolIniOverride struct {
+	ID        string `json:"id"`
+	Directive string `json:"directive"`
+	Value     string `json:"value"`
+	Kind      string `json:"kind"`
+	CreatedAt string `json:"created_at,omitempty"`
+}
+
+// MetadataDatabase mirrors models.Database.
+type MetadataDatabase struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Engine    string `json:"engine"`
+	Charset   string `json:"charset"`
+	Collation string `json:"collation"`
+	CreatedAt string `json:"created_at,omitempty"`
+}
+
+// MetadataDatabaseUser mirrors models.DatabaseUser plus its grants
+// (one DBUser → many DatabaseIDs). PasswordHash is the panel row's own
+// hash; the MariaDB account itself is recreated from NativePasswordHash.
+type MetadataDatabaseUser struct {
+	ID           string `json:"id"`
+	Username     string `json:"username"`
+	PasswordHash string `json:"password_hash,omitempty"`
+	// Engine is "mariadb" or "postgres". Empty in bundles made before
+	// GH #1993, which carried no engine.
+	Engine string `json:"engine,omitempty"`
+	// NativePasswordHash is the MariaDB account's mysql_native_password hash
+	// ('*' + 40 hex), filled in by the agent when it writes the bundle (the
+	// panel doesn't have it). A restore recreates the account with it, so
+	// the site's database login keeps working. Empty for other engines and
+	// plugins, and in bundles made before GH #1993.
+	NativePasswordHash string `json:"native_password_hash,omitempty"`
+	// PostgresPasswordVerifier is the PostgreSQL role's SCRAM-SHA-256
+	// verifier from pg_authid, filled in by the agent like
+	// NativePasswordHash. A restore recreates the role with it, so the
+	// site's database login keeps working. Empty for MariaDB users, for a
+	// role with an md5 or no password, and in bundles made before it.
+	PostgresPasswordVerifier string                      `json:"postgres_password_verifier,omitempty"`
+	CreatedAt                string                      `json:"created_at,omitempty"`
+	Grants                   []MetadataDatabaseUserGrant `json:"grants,omitempty"`
+}
+
+// MetadataDatabaseUserGrant pairs a database user with the database it
+// can access at the recorded grant level. DatabaseID is the panel-side
+// id (dotnext_panel.databases.id); DatabaseName is captured for display
+// + cross-checking when the source schema didn't preserve the id.
+type MetadataDatabaseUserGrant struct {
+	ID           string `json:"id,omitempty"`
+	DatabaseID   string `json:"database_id"`
+	DatabaseName string `json:"database_name,omitempty"`
+	GrantLevel   string `json:"grant_level"`
+	Privileges   string `json:"privileges,omitempty"`
+	CreatedAt    string `json:"created_at,omitempty"`
+}
+
+// MetadataMailbox mirrors models.Mailbox plus its attached
+// autoresponder + share rows. PasswordEnc carries the AES-256-GCM
+// blob used by the webmail SSO flow — round-tripped as base64 in JSON.
+type MetadataMailbox struct {
+	ID            string                 `json:"id"`
+	LocalPart     string                 `json:"local_part"`
+	EmailCached   string                 `json:"email_cached,omitempty"`
+	PasswordHash  string                 `json:"password_hash,omitempty"`
+	PasswordEnc   []byte                 `json:"password_enc,omitempty"`
+	QuotaBytes    uint64                 `json:"quota_bytes"`
+	IsDisabled    bool                   `json:"is_disabled"`
+	CreatedAt     string                 `json:"created_at,omitempty"`
+	Autoresponder *MetadataAutoresponder `json:"autoresponder,omitempty"`
+	SharedWith    []MetadataMailboxShare `json:"shared_with,omitempty"`
+
+	// TrustedSenders are the addresses the mailbox trusts (GH #2017),
+	// canonical, sorted.
+	TrustedSenders []string `json:"trusted_senders,omitempty"`
+}
+
+// MetadataForwarder mirrors models.EmailForwarder. Each forwarder
+// belongs to a (domain, mailbox) pair.
+type MetadataForwarder struct {
+	ID        string  `json:"id"`
+	MailboxID *string `json:"mailbox_id,omitempty"`
+	Type      string  `json:"type"` // alias | external
+	LocalPart *string `json:"local_part,omitempty"`
+	Target    string  `json:"target"`
+	Enabled   bool    `json:"enabled"`
+	CreatedAt string  `json:"created_at,omitempty"`
+}
+
+// MetadataAutoresponder mirrors models.EmailAutoresponder.
+type MetadataAutoresponder struct {
+	Enabled  bool    `json:"enabled"`
+	FromDate string  `json:"from_date,omitempty"`
+	ToDate   string  `json:"to_date,omitempty"`
+	Subject  *string `json:"subject,omitempty"`
+	TextBody *string `json:"text_body,omitempty"`
+	HTMLBody *string `json:"html_body,omitempty"`
+}
+
+// MetadataMailboxShare mirrors models.MailboxShare. Rights is JSON-in-JSON.
+type MetadataMailboxShare struct {
+	ID                  string `json:"id"`
+	SharedWithMailboxID string `json:"shared_with_mailbox_id"`
+	Rights              string `json:"rights"` // raw JSON
+	CreatedAt           string `json:"created_at,omitempty"`
+}
+
+// MetadataDNSRecord mirrors the user-editable columns of models.DNSRecord so a
+// restore can re-create a zone's custom records (GH #267).
+type MetadataDNSRecord struct {
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	Content   string `json:"content"`
+	TTL       int    `json:"ttl"`
+	Priority  int    `json:"priority"`
+	IsEnabled bool   `json:"is_enabled"`
+}
+
+// MetadataDNSSECKey mirrors models.DomainDNSSECKey.
+type MetadataDNSSECKey struct {
+	KeyTag     int    `json:"key_tag"`
+	KeyType    string `json:"key_type"`
+	Algorithm  uint8  `json:"algorithm"`
+	PublicKey  string `json:"public_key"`
+	Active     bool   `json:"active"`
+	ObservedAt string `json:"observed_at,omitempty"`
+}
+
+// MetadataAppInstall mirrors models.ApplicationInstall.
+type MetadataAppInstall struct {
+	ID            string  `json:"id"`
+	DomainID      string  `json:"domain_id"`
+	DBID          *string `json:"db_id,omitempty"`
+	Version       *string `json:"version,omitempty"`
+	AdminUsername string  `json:"admin_username"`
+	AdminEmail    string  `json:"admin_email"`
+	Locale        string  `json:"locale"`
+	UseWWW        bool    `json:"use_www"`
+	Subdirectory  string  `json:"subdirectory,omitempty"`
+	Status        string  `json:"status"`
+	AppType       string  `json:"app_type"`
+	CreatedAt     string  `json:"created_at,omitempty"`
+}
+
+// MetadataDockerApp mirrors models.DockerApp — the panel row for a tenant
+// docker-app install (GH #954). The app's DATA tree is a separate restic
+// stage=docker snapshot (#1017); this row is what makes the restored app
+// panel-managed instead of orphaned on-disk. The reverse-proxy domain link is
+// carried by the domain's own proxy_pass rule (reconstructed with the domain),
+// so preserving the app ID + published host ports keeps them consistent.
+type MetadataDockerApp struct {
+	ID             string  `json:"id"`
+	Slug           string  `json:"slug"`
+	InstanceSlug   string  `json:"instance_slug"`
+	Name           string  `json:"name"`
+	CatalogVersion string  `json:"catalog_version"`
+	ImageSHA       *string `json:"image_sha,omitempty"`
+	Status         string  `json:"status"`
+	UpdateMode     string  `json:"update_mode"`
+	CPULimit       *string `json:"cpu_limit,omitempty"`
+	MemoryLimit    *string `json:"memory_limit,omitempty"`
+	PIDsLimit      *int    `json:"pids_limit,omitempty"`
+	CreatedAt      string  `json:"created_at,omitempty"`
+	// ServerLevel marks an admin / server-level app (models.DockerApp.UserID
+	// NULL, M48). These have no tenant account, so account backups omitted
+	// them (GH #1360); an admin's account backup now carries them, and Apply
+	// must rebuild the row with UserID left NULL to keep it server-level
+	// rather than re-owning it to the admin. Absent on tenant apps and on
+	// pre-#1360 snapshots (defaults false → tenant).
+	ServerLevel bool `json:"server_level,omitempty"`
+	// Ports are the published-port rows (host_port pins the reverse-proxy
+	// target the migrated domain's proxy_pass points at).
+	Ports []MetadataDockerAppPort `json:"ports,omitempty"`
+}
+
+// MetadataDockerAppPort mirrors models.DockerAppPublishedPort.
+type MetadataDockerAppPort struct {
+	ID            string `json:"id"`
+	PortName      string `json:"port_name"`
+	ContainerPort int    `json:"container_port"`
+	BindInterface string `json:"bind_interface"`
+	HostPort      int    `json:"host_port"`
+	Protocol      string `json:"protocol"`
+	ReverseProxy  bool   `json:"reverse_proxy"`
+	Enabled       bool   `json:"enabled"`
+}
+
+// MetadataSSHKey mirrors models.SSHKey.
+type MetadataSSHKey struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	PublicKey   string `json:"public_key"`
+	Fingerprint string `json:"fingerprint"`
+	CreatedAt   string `json:"created_at,omitempty"`
+}
+
+// MetadataFtpAccount mirrors models.FtpAccount (GH #1361). The reconciler
+// reprovisions the system user/jail/quota from these fields, so UID + JailPath
+// + Isolated are preserved as-is (the uid is the row's identity and its owned
+// files carry it). PasswordShadow is the crypt hash from /etc/shadow, filled
+// agent-side at backup time (enrichFtpCredentials) — empty on the panel-built
+// bundle and on pre-#1361 snapshots.
+type MetadataFtpAccount struct {
+	ID           string  `json:"id"`
+	Username     string  `json:"username"`
+	HomePath     string  `json:"home_path"`
+	FTPAccess    bool    `json:"ftp_access"`
+	SFTPAccess   bool    `json:"sftp_access"`
+	WebDAVAccess bool    `json:"webdav_access"`
+	IsEnabled    bool    `json:"is_enabled"`
+	UID          *uint32 `json:"uid,omitempty"`
+	Isolated     bool    `json:"isolated"`
+	QuotaMB      uint32  `json:"quota_mb"`
+	JailPath     string  `json:"jail_path,omitempty"`
+	CreatedAt    string  `json:"created_at,omitempty"`
+	// PasswordShadow is the account's /etc/shadow crypt hash (field 2), used
+	// to restore the original login password. NEVER read/written by panel-api
+	// (it can't reach /etc/shadow); the agent fills it at backup and consumes
+	// it at restore. Never persisted to the panel DB.
+	PasswordShadow string `json:"password_shadow,omitempty"`
+}
+
+// MetadataCronJob mirrors models.CronJob.
+type MetadataCronJob struct {
+	ID        string `json:"id"`
+	Name      string `json:"name"`
+	Command   string `json:"command"`
+	Schedule  string `json:"schedule"`
+	Enabled   bool   `json:"enabled"`
+	CreatedAt string `json:"created_at,omitempty"`
+}
+
+// MetadataEgressPolicy mirrors models.UserEgressPolicy.
+type MetadataEgressPolicy struct {
+	State             string `json:"state"`
+	AllowedExtra      string `json:"allowed_extra"` // raw JSON
+	LearningStartedAt string `json:"learning_started_at,omitempty"`
+	UpdatedBy         string `json:"updated_by,omitempty"`
+}
+
+// MetadataEgressRequest mirrors models.UserEgressRequest.
+type MetadataEgressRequest struct {
+	ID         string `json:"id"`
+	CIDR       string `json:"cidr"`
+	Port       *uint  `json:"port,omitempty"`
+	Protocol   string `json:"protocol"`
+	Reason     string `json:"reason"`
+	Status     string `json:"status"`
+	ReviewedBy string `json:"reviewed_by,omitempty"`
+	DecidedAt  string `json:"decided_at,omitempty"`
+	CreatedAt  string `json:"created_at,omitempty"`
+}
+
+// MetadataLimitOverride mirrors models.UserLimitOverride.
+type MetadataLimitOverride struct {
+	DiskQuotaMB     *uint32 `json:"disk_quota_mb,omitempty"`
+	CPUQuotaPercent *uint32 `json:"cpu_quota_percent,omitempty"`
+	MemoryLimitMB   *uint32 `json:"memory_limit_mb,omitempty"`
+	IOReadMbps      *uint32 `json:"io_read_mbps,omitempty"`
+	IOWriteMbps     *uint32 `json:"io_write_mbps,omitempty"`
+	MaxTasks        *uint32 `json:"max_tasks,omitempty"`
+}
+
+// MetadataSchemaVersion is the current AccountMetadata.schema_version.
+// Bump on incompatible changes; restore validates strict equality and
+// the producer always writes this constant.
+const MetadataSchemaVersion = 2

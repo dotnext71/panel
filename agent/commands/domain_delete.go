@@ -1,0 +1,203 @@
+package commands
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/dotnext-panel/dotnext/agentwire"
+)
+
+// domainDeleteParams is the input shape for domain.delete.
+type domainDeleteParams struct {
+	Domain string `json:"domain"`
+}
+
+// domainDeleteResponse is the output shape for domain.delete.
+type domainDeleteResponse struct {
+	Domain  string `json:"domain"`
+	Deleted bool   `json:"deleted"`
+}
+
+func domainDeleteHandler(ctx context.Context, params json.RawMessage) (any, error) {
+	var p domainDeleteParams
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: fmt.Sprintf("failed to parse params: %v", err),
+		}
+	}
+
+	// Validate domain format
+	if !domainRegex.MatchString(p.Domain) {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: fmt.Sprintf("invalid domain %q: must match ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", p.Domain),
+		}
+	}
+
+	// JAB-230: reap the domain's relay credential (and re-point the owner's
+	// default.cred). Placed HERE — the shared chokepoint every delete path
+	// funnels through — per the #754 lesson, so no panel-side path can skip it.
+	removeSendmailCredForDomain(p.Domain)
+
+	if err := removeDomainNginxConfig(ctx, p.Domain); err != nil {
+		return nil, err
+	}
+
+	// #432: reap the per-domain nginx logs (current + rotated/compressed) so a
+	// deleted domain doesn't leave orphan logs accumulating in /var/log/nginx.
+	// p.Domain is domainRegex-validated (only [a-z0-9-.]), so the glob carries no
+	// attacker-controlled metacharacters.
+	for _, suffix := range []string{"-access.log", "-error.log"} {
+		matches, _ := filepath.Glob("/var/log/nginx/" + p.Domain + suffix + "*")
+		for _, m := range matches {
+			_ = os.Remove(m)
+		}
+	}
+
+	// GH #1579: a full teardown must leave no stale SSL artifacts for the name —
+	// the self-signed cert dir and any Let's Encrypt lineage. domain.delete is
+	// the shared teardown chokepoint, so this covers both a real delete and a
+	// rename's old-name teardown. Scoped strictly to p.Domain (domainRegex-
+	// validated), so a shared/wildcard cert under a different name is untouched.
+	removeDomainCertArtifacts(ctx, p.Domain)
+
+	return domainDeleteResponse{
+		Domain:  p.Domain,
+		Deleted: true,
+	}, nil
+}
+
+// removeDomainCertArtifacts deletes the on-disk TLS material a domain teardown
+// leaves behind: the self-signed cert directory, the web certbot/LE lineage for
+// the exact name, AND the per-domain mail lineage (mail.<domain>) that
+// ssl.mail.issue created. Best-effort — a missing path is a no-op — and
+// name-scoped, so it never reaches an unrelated (e.g. shared/wildcard)
+// certificate. Reaping the mail lineage here matters: left behind it keeps an
+// auto-renewing renewal conf pointing at a name that no longer resolves, which
+// makes `certbot renew` noisy (and, with broken live files, can abort renew
+// box-wide — the #738 scar). domain.delete is the shared teardown chokepoint, so
+// this covers both a real delete and a rename's old-name teardown; on a rename
+// the reissued cert lands under the distinct mail.<new> lineage, untouched.
+func removeDomainCertArtifacts(ctx context.Context, domain string) {
+	_ = os.RemoveAll(filepath.Join(baseSelfSignDir, domain))
+	for _, name := range []string{domain, "mail." + domain} {
+		cleanupCertbotLineage(ctx, sslLERoot, name)
+		removeUntrackedLineage(sslLERoot, name)
+	}
+}
+
+// removeUntrackedLineage removes root/live/<name>/ and root/archive/<name>/
+// once certbot no longer tracks name (no renewal conf): the certificate and key
+// an owner uploaded or a restore installed (ssl.install_custom), which `certbot
+// delete` never reaches, and what is left of a lineage whose delete failed.
+// Left behind, a deleted domain's private key stays on the server, and a later
+// restore of the name finds the stale files "on this server" (GH #1993).
+func removeUntrackedLineage(root, name string) {
+	if _, err := os.Stat(filepath.Join(root, "renewal", name+".conf")); err == nil {
+		return
+	}
+	_ = os.RemoveAll(filepath.Join(root, "live", name))
+	_ = os.RemoveAll(filepath.Join(root, "archive", name))
+}
+
+// removeDomainNginxConfig removes every piece of nginx config the domain has,
+// then reloads nginx. It holds nginxOpMu across the removals and the reload
+// (JAB-71), so no other nginx op tests or reloads a half-removed config.
+// domain is expected pre-validated (domainRegex) by the caller.
+func removeDomainNginxConfig(ctx context.Context, domain string) error {
+	nginxOpMu.Lock()
+	defer nginxOpMu.Unlock()
+
+	// Remove enabled symlink (ignore if missing)
+	enabledPath := filepath.Join("/etc/nginx/sites-enabled", domain+".conf")
+	os.Remove(enabledPath)
+
+	// Remove available config (ignore if missing)
+	availablePath := filepath.Join("/etc/nginx/sites-available", domain+".conf")
+	os.Remove(availablePath)
+
+	// And the default page the vhost served for a site with no index file
+	// (GH #2422); nothing else names it once the vhost is gone.
+	os.Remove(defaultPagePath(domain))
+
+	// Also reap the per-domain mail vhost (mail.<domain>, file
+	// `<domain>-mail.conf`). domain.delete is only ever invoked on a FULL
+	// domain teardown, so the mail vhost must go with it. reconcileWebmailVhosts
+	// only visits domains that still exist, so a deleted domain's mail vhost was
+	// otherwise never reaped — it orphaned in sites-available + sites-enabled on
+	// every delete path (HTTP via Reconciler.ReconcileDeleted and CLI
+	// `dotnext user delete` alike). Same `<domain>-mail.conf` convention
+	// webmail.vhost_remove uses; the single reload below covers it.
+	removeMailVhostFiles(domain)
+	// And the MTA-STS vhost and policy (`<domain>-mta-sts.conf`), for the
+	// same reason. Left behind, the vhost keeps naming the domain's
+	// certificate, which removeDomainCertArtifacts deletes: from then on
+	// `nginx -t` fails for the whole server, and nginx doesn't start.
+	removeMTAStsVhostFiles(domain)
+	// And the proxy vhost of a domain a Docker app created
+	// (`<domain>-dockerapp.conf`): a user delete or a delete on the Domains
+	// page reaches that domain only here. Left behind, it names the
+	// certificate removeDomainCertArtifacts deletes, and it keeps proxying to
+	// a loopback port the panel hands to the next app installed.
+	_, _ = removeDockerAppVhostFiles(domain)
+	// And the domain's snippet dir (`/etc/nginx/dotnext/<domain>/`): the app
+	// installs' includes and the PHP pins. A domain delete never runs the
+	// apps' own teardown, and the vhost includes every `*.conf` in that dir,
+	// so left behind, the next domain created with this name — by any owner —
+	// would serve the old installs' locations.
+	_ = os.RemoveAll(filepath.Join(nginxDotNextDir, domain))
+
+	// Reload nginx
+	reloadCmd := execCommandContext(ctx, "systemctl", "reload", "nginx")
+	var reloadOutput bytes.Buffer
+	reloadCmd.Stdout = &reloadOutput
+	reloadCmd.Stderr = &reloadOutput
+	if err := reloadCmd.Run(); err != nil {
+		return &agentwire.AgentError{
+			Code:    agentwire.CodeInternal,
+			Message: fmt.Sprintf("systemctl reload nginx failed: %s", reloadOutput.String()),
+		}
+	}
+	return nil
+}
+
+// removeMailVhostFiles reaps the per-domain mail vhost (`<domain>-mail.conf`)
+// from sites-available + sites-enabled, using the same overridable path vars
+// webmail.vhost_remove uses. Idempotent; returns true if it removed anything so
+// the caller can decide whether an nginx reload is warranted. The caller drives
+// the reload (domain.delete reloads once for the main + mail vhost together).
+// domain is expected pre-validated (domainRegex) by the caller.
+func removeMailVhostFiles(domain string) bool {
+	changed := false
+	for _, p := range []string{
+		filepath.Join(mailVhostSitesEnabled, domain+"-mail.conf"),
+		filepath.Join(mailVhostSitesAvailable, domain+"-mail.conf"),
+	} {
+		if _, err := os.Lstat(p); err != nil {
+			continue // absent (or unreadable) — nothing to reap
+		}
+		if err := os.Remove(p); err == nil {
+			changed = true
+		}
+	}
+	return changed
+}
+
+// removeMTAStsVhostFiles reaps the domain's MTA-STS vhost from
+// sites-enabled and sites-available, and its policy dir, as
+// mail.mtasts.disable does. The caller drives the reload. domain is expected
+// pre-validated (domainRegex) by the caller.
+func removeMTAStsVhostFiles(domain string) {
+	_ = os.Remove(filepath.Join(mtaStsSitesEnabl, domain+"-mta-sts.conf"))
+	_ = os.Remove(filepath.Join(mtaStsSitesAvail, domain+"-mta-sts.conf"))
+	_ = os.RemoveAll(filepath.Join(mtaStsRoot, domain))
+}
+
+func init() {
+	Default.Register("domain.delete", domainDeleteHandler)
+}

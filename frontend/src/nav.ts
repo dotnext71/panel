@@ -1,0 +1,490 @@
+// nav.ts — single source of truth for sidebar menu items.
+//
+// Replaces Refine's `resources={[...]}` config. Each shell owns its
+// own list so an admin page can never accidentally leak into the user
+// menu. The shape is small on purpose — anything page-specific
+// (search behavior, row actions) lives in the page itself, not here.
+//
+// `path` is the absolute URL the item navigates to. `match` optionally
+// lists longer paths that should still highlight this entry — useful
+// when a nested route (e.g. /admin/users/create) should keep
+// the "Users" row active.
+import type { ReactNode } from "react";
+
+import {
+  AppstoreOutlined,
+  BellOutlined,
+  CalendarCheckOutlined,
+  ChartBarOutlined,
+  ThunderboltOutlined,
+  CloudServerOutlined,
+  CodeOutlined,
+  SquareTerminalOutlined,
+  DownloadOutlined,
+  FileTextOutlined,
+  LifeBuoyOutlined,
+  DatabaseOutlined,
+  EthernetPortOutlined,
+  FolderOutlined,
+  GlobalOutlined,
+  HddOutlined,
+  HomeOutlined,
+  KeyOutlined,
+  ApiOutlined,
+  MailOutlined,
+  PackageOpenOutlined,
+  SafetyOutlined,
+  SaveOutlined,
+  ServerOutlined,
+  SettingOutlined,
+  ShieldCheckOutlined,
+  SwapOutlined,
+  TeamOutlined,
+  ContainerOutlined,
+  ToolOutlined,
+  UserOutlined
+} from "@icons";
+import { createElement } from "react";
+import type { ComponentType } from "react";
+
+export type NavItem = {
+  key: string;
+  /** i18n key (see src/locales/en/common.json) — translate at render time. */
+  label: string;
+  icon: ReactNode;
+  path: string;
+  // i18n key for the hover tooltip shown beside the sidebar item
+  // (right-placed) explaining what the tab does.
+  description?: string;
+  // matchPatterns lets an item claim deeper sub-paths it doesn't own
+  // by `path` startsWith. Regex tested against the full pathname; if
+  // any matches, the item is selected even when another item's path
+  // would be a longer prefix. Use for nested routes that logically
+  // belong to a different sidebar entry than the one whose path is the
+  // longer prefix.
+  matchPatterns?: RegExp[];
+};
+
+// All sidebar icons render a shade larger than AntD's default (14px
+// inherited from fontSize). 20px reads comfortably without crowding the
+// label and keeps the collapsed-sider footprint tidy. Change here and
+// every entry picks it up.
+const NAV_ICON_SIZE = 20;
+
+// Tailwind gray-500 (#6b7280) keeps the inactive icon row muted while
+// the AntD-active item still gets its brand colour via the Menu's
+// itemSelectedColor theme token (which overrides this inline color
+// only for the selected key — `currentColor` inheritance kicks in
+// on selection).
+const NAV_ICON_COLOR = "#6b7280";
+
+const navIcon = (Icon: ComponentType<{ style?: React.CSSProperties }>) =>
+  createElement(Icon, { style: { fontSize: NAV_ICON_SIZE, color: NAV_ICON_COLOR } });
+
+export const adminNav: NavItem[] = [
+  {
+    key: "dashboard",
+    label: "nav.admin.dashboard",
+    description: "nav.admin.dashboard_desc",
+    icon: navIcon(HomeOutlined),
+    path: "/admin/dashboard",
+  },
+  {
+    key: "users",
+    label: "nav.admin.users",
+    // JAB-126: Sessions moved into the Users page as a tab
+    // (/admin/users?tab=sessions), so this row stays active while
+    // viewing sessions and the sidebar loses the standalone Sessions entry.
+    description: "nav.admin.users_desc",
+    icon: navIcon(TeamOutlined),
+    path: "/admin/users",
+  },
+  {
+    key: "domains",
+    label: "nav.admin.domains",
+    description: "nav.admin.domains_desc",
+    icon: navIcon(GlobalOutlined),
+    path: "/admin/domains",
+  },
+  {
+    key: "databases",
+    label: "nav.admin.databases",
+    description: "nav.admin.databases_desc",
+    icon: navIcon(DatabaseOutlined),
+    path: "/admin/databases",
+  },
+  {
+    key: "mail",
+    label: "nav.admin.mail",
+    description: "nav.admin.mail_desc",
+    icon: navIcon(MailOutlined),
+    path: "/admin/mail",
+  },
+  {
+    key: "packages",
+    label: "nav.admin.packages",
+    description: "nav.admin.packages_desc",
+    icon: navIcon(PackageOpenOutlined),
+    path: "/admin/packages",
+  },
+  {
+    key: "ssl",
+    label: "nav.admin.ssl",
+    description: "nav.admin.ssl_desc",
+    icon: navIcon(ShieldCheckOutlined),
+    path: "/admin/ssl",
+  },
+  {
+    key: "applications",
+    label: "nav.admin.applications",
+    description: "nav.admin.applications_desc",
+    icon: navIcon(AppstoreOutlined),
+    path: "/admin/applications",
+  },
+  {
+    key: "docker-apps",
+    label: "nav.admin.docker-apps",
+    description: "nav.admin.docker-apps_desc",
+    icon: navIcon(ContainerOutlined),
+    path: "/admin/docker-apps",
+  },
+  {
+    key: "settings",
+    label: "nav.admin.settings",
+    description: "nav.admin.settings_desc",
+    icon: navIcon(SettingOutlined),
+    path: "/admin/settings",
+  },
+  {
+    // GH #1184: hidden unless admin_file_manager_enabled (gated in AdminLayout).
+    key: "admin-files",
+    label: "nav.admin.admin-files",
+    description: "nav.admin.admin-files_desc",
+    icon: navIcon(FolderOutlined),
+    path: "/admin/admin-files",
+  },
+  {
+    key: "server-status",
+    label: "nav.admin.server-status",
+    description: "nav.admin.server-status_desc",
+    icon: navIcon(ChartBarOutlined),
+    path: "/admin/server-status",
+  },
+  {
+    key: "cache",
+    label: "nav.admin.cache",
+    description: "nav.admin.cache_desc",
+    icon: navIcon(ThunderboltOutlined),
+    path: "/admin/cache",
+  },
+  {
+    key: "security",
+    label: "nav.admin.security",
+    description: "nav.admin.security_desc",
+    icon: navIcon(SafetyOutlined),
+    path: "/admin/security",
+  },
+  {
+    key: "backups",
+    label: "nav.admin.backups",
+    description: "nav.admin.backups_desc",
+    icon: navIcon(SaveOutlined),
+    path: "/admin/backups",
+  },
+  {
+    key: "php-pools",
+    label: "nav.admin.php-pools",
+    description: "nav.admin.php-pools_desc",
+    icon: navIcon(CodeOutlined),
+    path: "/admin/php-pools",
+  },
+  {
+    key: "dns",
+    label: "nav.admin.dns",
+    description: "nav.admin.dns_desc",
+    icon: navIcon(ServerOutlined),
+    path: "/admin/dns",
+  },
+  {
+    key: "ips",
+    label: "nav.admin.ips",
+    description: "nav.admin.ips_desc",
+    icon: navIcon(EthernetPortOutlined),
+    path: "/admin/ips",
+  },
+  {
+    key: "notifications",
+    label: "nav.admin.notifications",
+    description: "nav.admin.notifications_desc",
+    icon: navIcon(BellOutlined),
+    path: "/admin/notifications/channels",
+  },
+  {
+    key: "updates",
+    label: "nav.admin.updates",
+    description: "nav.admin.updates_desc",
+    icon: navIcon(DownloadOutlined),
+    path: "/admin/updates",
+  },
+  {
+    key: "automation",
+    label: "nav.admin.automation",
+    description: "nav.admin.automation_desc",
+    icon: navIcon(KeyOutlined),
+    path: "/admin/automation",
+  },
+  {
+    key: "api-tokens",
+    label: "nav.admin.api-tokens",
+    description: "nav.admin.api-tokens_desc",
+    icon: navIcon(ApiOutlined),
+    path: "/admin/api-tokens",
+  },
+  {
+    key: "migrations",
+    label: "nav.admin.migrations",
+    description: "nav.admin.migrations_desc",
+    icon: navIcon(SwapOutlined),
+    path: "/admin/migrations",
+  },
+  {
+    key: "terminal",
+    label: "nav.admin.terminal",
+    description: "nav.admin.terminal_desc",
+    icon: navIcon(SquareTerminalOutlined),
+    path: "/admin/terminal",
+  },
+  {
+    key: "logs",
+    label: "nav.admin.logs",
+    description: "nav.admin.logs_desc",
+    icon: navIcon(FileTextOutlined),
+    path: "/admin/logs",
+  },
+  {
+    key: "cron",
+    label: "nav.admin.cron",
+    description: "nav.admin.cron_desc",
+    icon: navIcon(CalendarCheckOutlined),
+    path: "/admin/cron",
+  },
+  {
+    key: "support",
+    label: "nav.admin.support",
+    description: "nav.admin.support_desc",
+    icon: navIcon(LifeBuoyOutlined),
+    path: "/admin/support",
+  },
+];
+
+export const userNav: NavItem[] = [
+  {
+    key: "dashboard",
+    label: "nav.user.dashboard",
+    icon: navIcon(HomeOutlined),
+    path: "/panel/dashboard",
+  },
+  {
+    key: "domains",
+    label: "nav.user.domains",
+    icon: navIcon(GlobalOutlined),
+    path: "/panel/domains",
+  },
+  {
+    key: "mail",
+    label: "nav.user.mail",
+    icon: navIcon(MailOutlined),
+    // GH #1387: Mail lands on the per-domain Mail Domains list (Mail → Mail
+    // Domains → a domain → accounts). The flat mail/:tab page redirects here.
+    path: "/panel/mail-domains",
+    // The link targets the default subtab, but the item owns every mail
+    // subtab (groups/forwarders/…) — keep it highlighted across all of them
+    // (GH #314). matchPatterns win over the longest-path-prefix match.
+    matchPatterns: [/^\/panel\/mail(?:\/|$)/],
+  },
+  {
+    key: "applications",
+    label: "nav.user.applications",
+    icon: navIcon(AppstoreOutlined),
+    path: "/panel/applications",
+  },
+  {
+    key: "python-apps",
+    label: "nav.user.python-apps",
+    icon: navIcon(CodeOutlined),
+    path: "/panel/python-apps",
+  },
+  {
+    key: "docker-apps",
+    label: "nav.user.docker-apps",
+    icon: navIcon(AppstoreOutlined),
+    path: "/panel/docker-apps",
+  },
+  {
+    key: "databases",
+    label: "nav.user.databases",
+    icon: navIcon(DatabaseOutlined),
+    path: "/panel/databases",
+  },
+  {
+    key: "disk-usage",
+    label: "nav.user.disk-usage",
+    icon: navIcon(HddOutlined),
+    path: "/panel/disk-usage",
+  },
+  {
+    key: "files",
+    label: "nav.user.files",
+    icon: navIcon(FolderOutlined),
+    path: "/panel/files",
+  },
+  {
+    key: "logs",
+    label: "nav.user.logs",
+    icon: navIcon(FileTextOutlined),
+    path: "/panel/logs",
+  },
+  {
+    key: "ssh-keys",
+    label: "nav.user.ssh-keys",
+    icon: navIcon(KeyOutlined),
+    path: "/panel/ssh-keys",
+  },
+  {
+    key: "ftp-accounts",
+    label: "nav.user.ftp-accounts",
+    icon: navIcon(CloudServerOutlined),
+    path: "/panel/ftp-accounts",
+  },
+  {
+    key: "api-tokens",
+    label: "nav.user.api-tokens",
+    icon: navIcon(ApiOutlined),
+    path: "/panel/api-tokens",
+  },
+  {
+    key: "notifications",
+    label: "nav.user.notifications",
+    icon: navIcon(BellOutlined),
+    path: "/panel/notifications",
+  },
+  {
+    key: "dns",
+    label: "nav.user.dns",
+    icon: navIcon(CloudServerOutlined),
+    path: "/panel/dns",
+  },
+  {
+    key: "ssl",
+    label: "nav.user.ssl",
+    icon: navIcon(ShieldCheckOutlined),
+    path: "/panel/ssl",
+  },
+  {
+    key: "php-settings",
+    label: "nav.user.php-settings",
+    icon: navIcon(CodeOutlined),
+    path: "/panel/php-settings",
+  },
+  {
+    key: "cron",
+    label: "nav.user.cron",
+    icon: navIcon(CalendarCheckOutlined),
+    path: "/panel/cron",
+  },
+  {
+    key: "backups",
+    label: "nav.user.backups",
+    icon: navIcon(SaveOutlined),
+    path: "/panel/backups",
+  },
+];
+
+// A visual grouping of userNav leaf entries in the tenant sidebar
+// (GH #1626). The leaves themselves stay flat in `userNav` — breadcrumb,
+// header search, and selectedNavKey all consume that flat list unchanged;
+// a group only references leaves by key so grouping can never drift from
+// the routes that actually exist.
+//
+// `collapsible: false` renders as an always-open AntD `type:"group"`
+// (labelled header, items always shown) — Hosting and Services. `true`
+// renders as a collapsible SubMenu, collapsed by default, that pops its
+// children out when the sider itself is collapsed — Tools and Account;
+// those two carry an `icon` because a collapsed SubMenu shows only its
+// icon. Every userNav key except the standalone Dashboard belongs to
+// exactly one group (asserted by nav.test.ts).
+export type NavGroup = {
+  key: string;
+  /** i18n key (see src/locales/en/common.json → nav.user.group.*). */
+  label: string;
+  collapsible: boolean;
+  /** Shown when the sider collapses; required for collapsible groups. */
+  icon?: ReactNode;
+  /** userNav keys in display order. */
+  itemKeys: string[];
+};
+
+export const userNavGroups: NavGroup[] = [
+  {
+    key: "hosting",
+    label: "nav.user.group.hosting",
+    collapsible: false,
+    itemKeys: ["domains", "mail", "dns", "databases", "cron", "backups"],
+  },
+  {
+    key: "services",
+    label: "nav.user.group.services",
+    collapsible: false,
+    itemKeys: ["ftp-accounts", "docker-apps"],
+  },
+  {
+    key: "tools",
+    label: "nav.user.group.tools",
+    collapsible: true,
+    icon: navIcon(ToolOutlined),
+    itemKeys: ["files", "applications", "python-apps", "disk-usage", "ssl", "logs"],
+  },
+  {
+    key: "account",
+    label: "nav.user.group.account",
+    collapsible: true,
+    icon: navIcon(UserOutlined),
+    itemKeys: ["ssh-keys", "api-tokens", "notifications", "php-settings"],
+  },
+];
+
+/** The label of the Application Manager's entry (key "python-apps"), which
+ * names the runtimes that are on (ADR-0175: Python and Node.js apps share
+ * the page). */
+export function appManagerNavLabel(python: boolean, node: boolean): string {
+  if (node && python) return "nav.user.python-node-apps";
+  if (node) return "nav.user.node-apps";
+  return "nav.user.python-apps";
+}
+
+/** The group that owns a userNav leaf key, or undefined for a standalone
+ * entry such as Dashboard. */
+export function navGroupForKey(key: string): NavGroup | undefined {
+  return userNavGroups.find((g) => g.itemKeys.includes(key));
+}
+
+/**
+ * Pick the best-matching menu entry for the current pathname using
+ * longest-prefix match. Ensures /admin/users/create still
+ * highlights "Users".
+ */
+export function selectedNavKey(
+  items: NavItem[],
+  pathname: string,
+): string | undefined {
+  // matchPatterns win over startsWith — they're explicit overrides for
+  // nested routes that semantically belong to a different sidebar entry
+  // than the longest path prefix would pick.
+  const byPattern = items.find((item) =>
+    item.matchPatterns?.some((re) => re.test(pathname)),
+  );
+  if (byPattern) return byPattern.key;
+  return [...items]
+    .sort((a, b) => b.path.length - a.path.length)
+    .find((item) => pathname.startsWith(item.path))?.key;
+}

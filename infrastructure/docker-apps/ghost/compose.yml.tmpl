@@ -1,0 +1,43 @@
+services:
+  ghost:
+    image: {{ .ImageChannel }}
+    container_name: dotnext-app-{{ .Slug }}
+    restart: unless-stopped
+    environment:
+{{- if (index .Env "SMTP_HOST") }}
+      # Operator-supplied SMTP (GH #322) — values q-escaped so special chars
+      # (e.g. API-key passwords) can't break the rendered compose YAML.
+      mail__transport: "SMTP"
+      mail__options__host: {{ q (index .Env "SMTP_HOST") }}
+      mail__options__port: {{ q (or (index .Env "SMTP_PORT") "587") }}
+      mail__options__secure: "{{ if eq (index .Env "SMTP_PORT") "465" }}true{{ else }}false{{ end }}"
+      mail__options__auth__user: {{ q (index .Env "SMTP_USER") }}
+      mail__options__auth__pass: {{ q (index .Env "SMTP_PASSWORD") }}
+      mail__from: {{ q (or (index .Env "SMTP_FROM") (printf "ghost@%s" .Domain)) }}
+{{- end }}
+      url: "https://{{ .Domain }}"
+{{- range $name, $val := .Env }}
+{{- if not (hasPrefix $name "SMTP_") }}
+      {{ $name }}: {{ q $val }}
+{{- end }}
+{{- end }}
+    volumes:
+      - {{ .DataRoot }}/content:/var/lib/ghost/content
+    ports:
+{{- with index .Ports "http" }}
+      - "{{ .BindInterface }}:{{ .HostPort }}:{{ .ContainerPort }}/{{ .Protocol }}"
+{{- end }}
+    deploy:
+      resources:
+        limits:
+          cpus: "{{ .CPULimit }}"
+          memory: {{ .MemoryLimit }}
+    healthcheck:
+      # Ghost answers a plain-http request with a 301 to https://<domain>,
+      # which wget followed out of the container. Any answer below 500
+      # means Ghost is up; the redirect is not followed.
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:2368/ghost/api/admin/site/', r => process.exit(r.statusCode < 500 ? 0 : 1)).on('error', () => process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s

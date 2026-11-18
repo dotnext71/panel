@@ -1,0 +1,299 @@
+package models
+
+import (
+	"strings"
+	"time"
+)
+
+// HostingPackage defines a quota bundle that admins assign to hosting users.
+// Quotas are soft limits enforced by the agent at provisioning time and
+// checked by periodic sync jobs. The panel stores them; the agent enforces.
+type HostingPackage struct {
+	ID   string `gorm:"type:char(26);primaryKey" json:"id"`
+	Name string `gorm:"type:varchar(100);uniqueIndex:ux_packages_name;not null" json:"name"`
+
+	// Quotas — zero means unlimited for that resource.
+	DiskQuotaMB uint32 `gorm:"type:int unsigned;not null;default:0" json:"disk_quota_mb"`
+	// Resource limits (M18). Enforced via POSIX user quota (disk) +
+	// cgroups v2 drop-in on the per-user slice (cpu/memory/io/tasks).
+	// Zero = unlimited for every field — the agent omits the systemd
+	// directive entirely rather than emitting "CPUQuota=0%".
+	CPUQuotaPercent  uint32 `gorm:"type:int unsigned;not null;default:0" json:"cpu_quota_percent"`
+	MemoryLimitMB    uint32 `gorm:"type:int unsigned;not null;default:0" json:"memory_limit_mb"`
+	IOReadMbps       uint32 `gorm:"type:int unsigned;not null;default:0" json:"io_read_mbps"`
+	IOWriteMbps      uint32 `gorm:"type:int unsigned;not null;default:0" json:"io_write_mbps"`
+	MaxTasks         uint32 `gorm:"type:int unsigned;not null;default:0" json:"max_tasks"`
+	BandwidthQuotaMB uint32 `gorm:"type:int unsigned;not null;default:0" json:"bandwidth_quota_mb"`
+	MaxDomains       uint32 `gorm:"type:int unsigned;not null;default:0" json:"max_domains"`
+	MaxEmailAccounts uint32 `gorm:"type:int unsigned;not null;default:0" json:"max_email_accounts"`
+	MaxDatabases     uint32 `gorm:"type:int unsigned;not null;default:0" json:"max_databases"`
+	MaxDatabaseUsers uint32 `gorm:"type:int unsigned;not null;default:0" json:"max_database_users"`
+	// MaxDockerApps caps simultaneous tenant docker-app installs for users on
+	// this plan. 0 = docker apps NOT included (safe default, opt-in per plan).
+	MaxDockerApps uint32 `gorm:"type:int unsigned;not null;default:0" json:"max_docker_apps"`
+
+	// MaxPythonApps caps simultaneous tenant python-app installs for users on
+	// this plan (Gitea #491). 0 = python apps NOT included (safe default,
+	// opt-in per plan), mirroring MaxDockerApps.
+	MaxPythonApps uint32 `gorm:"type:int unsigned;not null;default:0" json:"max_python_apps"`
+
+	// MaxFTPAccounts caps tenant-created FTP/SFTP subaccounts on this plan
+	// (GH #1053). 0 = feature NOT included and hidden in the user shell
+	// (safe default, opt-in per plan, mirrors MaxDockerApps). Explicit
+	// column tag: GORM's namer mangles consecutive-capital initialisms.
+	MaxFTPAccounts uint32 `gorm:"column:max_ftp_accounts;type:int unsigned;not null;default:0" json:"max_ftp_accounts"`
+
+	// DockerAppSlugs (GH #170 #3) is a CSV allowlist of catalog slugs a tenant
+	// on this package may install. Empty = fall back to the server-wide
+	// docker_tenant_apps curation. Always AND-ed with MaxDockerApps>0 +
+	// tenant_installable.
+	DockerAppSlugs string `gorm:"column:docker_app_slugs;type:varchar(2000);not null;default:''" json:"docker_app_slugs"`
+
+	// Backup entitlement (GH #454). MaxBackups is the tenant retention cap
+	// (max snapshots kept); 0 = tenant backups NOT included on this plan (safe
+	// default, opt-in per plan, mirrors MaxDockerApps). The whole tenant backup
+	// UI is gated on MaxBackups > 0. ScheduledBackupsEnabled gates the tenant
+	// scheduled-backup toggle — the admin owns the schedule TIME, the tenant
+	// owns the content within these limits. AllowedBackupDestinationKinds is a
+	// CSV of BackupDestinationKind* a tenant on this package may target; empty
+	// = none allowed.
+	MaxBackups              uint32 `gorm:"column:max_backups;type:int unsigned;not null;default:0" json:"max_backups"`
+	ScheduledBackupsEnabled bool   `gorm:"column:scheduled_backups_enabled;type:tinyint(1);not null;default:0" json:"scheduled_backups_enabled"`
+	// MaxBackupSchedules (GH #454 7B) caps how many scheduled backups a tenant on
+	// this plan may own. 1 = the original single-schedule behaviour (existing
+	// plans unchanged); > 1 unlocks the tenant multi-schedule surface + the
+	// window-governed dispatch path. Explicit column tag — GORM would otherwise
+	// mangle nothing here, but keep it consistent with the sibling backup fields.
+	MaxBackupSchedules            uint32 `gorm:"column:max_backup_schedules;type:int unsigned;not null;default:1" json:"max_backup_schedules"`
+	AllowedBackupDestinationKinds string `gorm:"column:allowed_backup_destination_kinds;type:varchar(255);not null;default:''" json:"allowed_backup_destination_kinds"`
+	// BackupRetentionPolicy (GH #454) chooses the behaviour when a tenant hits
+	// MaxBackups: "reject" (default, safe) blocks the new backup and notifies;
+	// "prune" auto-forgets the oldest OWNED backup to make room, then creates,
+	// and notifies. Admin-owned, per package.
+	BackupRetentionPolicy string `gorm:"column:backup_retention_policy;type:varchar(16);not null;default:'reject'" json:"backup_retention_policy"`
+
+	// Feature toggles.
+	SSHEnabled bool `gorm:"type:tinyint(1);not null;default:0" json:"ssh_enabled"`
+	CGIEnabled bool `gorm:"type:tinyint(1);not null;default:0" json:"cgi_enabled"`
+
+	// WebmailEnabled (GH #1628) makes webmail (the Bulwark UI) a per-package
+	// entitlement, defaulting ON. It replaced the per-user
+	// users.webmail_enabled toggle (#316), whose column migration 000312
+	// dropped (GH #1817). The webmail reconciler and the webmail SSO gate read
+	// it. Mail delivery is unaffected.
+	//
+	// NO `default:1` GORM tag on purpose: GORM's create callback substitutes a
+	// tag default for a zero-value field AND writes it back onto the struct, so
+	// an explicit false (admin unchecking Webmail on create / `--webmail=false`)
+	// would silently persist and echo back as true (feedback_gorm_default_tag_
+	// zero_value; TestPackage_Create_PersistsExplicitWebmailFalse). Instead every
+	// creator sets this field explicitly — see the mk() seed, PlanToHostingPackage,
+	// the API create handler (nil→true), and the CLI create flag (default true) —
+	// and the DB column carries DEFAULT 1 (migration 000299) for existing rows.
+	WebmailEnabled bool `gorm:"column:webmail_enabled;type:tinyint(1);not null" json:"webmail_enabled"`
+
+	// PHPExecEnabled (GH #402) opts pools on this package OUT of the #401
+	// disable_functions command-exec lockdown — emits no disable_functions
+	// line so exec/proc_open/shell_exec/... work for apps that need them.
+	// Admin-only (packages are admin-assigned); default 0 keeps the lockdown.
+	// GH #1701: now derived from PHPDisabledFunctions (true when no lockdown
+	// function is disabled) and written with it, so an older binary reading
+	// the row still sees the right opt-out.
+	PHPExecEnabled bool `gorm:"column:php_exec_enabled;type:tinyint(1);not null;default:0" json:"php_exec_enabled"`
+
+	// WebsiteSendsEmail (GH #2056, ADR 0174) lets the sites of users on this
+	// package send mail with PHP mail(), through the local mail server or the
+	// operator's smarthost. Migration 000317 turned it on for every package
+	// that existed then; new packages start with it off. Users with no
+	// package send through the local mail server only (GH #282).
+	WebsiteSendsEmail bool `gorm:"column:website_sends_email;type:tinyint(1);not null;default:0" json:"website_sends_email"`
+
+	// ComposerEnabled (GH #2276, ADR-0176) lets users on this package run
+	// Composer for their domains from the panel. A run executes the
+	// composer.json's scripts with the exec functions allowed, in the user's
+	// SSH sandbox, so grant it as you would SSH. Off by default, existing
+	// packages included; users with no package can't run Composer (GH #282:
+	// a privileged feature).
+	ComposerEnabled bool `gorm:"column:composer_enabled;type:tinyint(1);not null;default:0" json:"composer_enabled"`
+
+	// GitDeployEnabled (GH #2277, ADR-0178) lets users on this package deploy
+	// their domains from a Git repository. A deployment runs the user's own
+	// commands (composer.json scripts, deploy hooks) in their SSH sandbox, so
+	// grant it as you would SSH. Off by default, existing packages included;
+	// users with no package can't deploy (GH #282: a privileged feature).
+	GitDeployEnabled bool `gorm:"column:git_deploy_enabled;type:tinyint(1);not null;default:0" json:"git_deploy_enabled"`
+
+	// WebmailBrandingEnabled (GH #2502) lets users on this package brand the
+	// webmail of their domains (mail.<domain>): its name, logos, favicon and
+	// links. Off by default, existing packages included; users with no
+	// package can't (GH #282). An administrator can brand any domain.
+	WebmailBrandingEnabled bool `gorm:"column:webmail_branding_enabled;type:tinyint(1);not null;default:0" json:"webmail_branding_enabled"`
+
+	// RedisKeysPerCall (GH #2165) is how many keys one call of the Redis key
+	// browser API may list (its `limit`) or delete, RedisKeysPerCallMin to
+	// RedisKeysPerCallMax. Unlike the other limits, 0 is not "unlimited": it
+	// is invalid. Read it through EffectiveRedisKeysPerCall.
+	RedisKeysPerCall int `gorm:"column:redis_keys_per_call;not null;default:500" json:"redis_keys_per_call"`
+
+	// PHPDisabledFunctions (GH #1701) is the disable_functions list this
+	// package's pools run with, canonical comma-separated form. nil = the
+	// GH #401 lockdown default (or no list at all when PHPExecEnabled is set on
+	// a row written before this column). See EffectivePHPDisabledFunctions.
+	PHPDisabledFunctions *string `gorm:"column:php_disabled_functions;type:text" json:"php_disabled_functions"`
+
+	// Per-package egress allowances for the M34 per-user firewall (GH #1798).
+	// Both default 0 (DENY): outbound SSH and ICMP stay blocked for enforced
+	// tenants unless an admin opts the package in. A NULL-package account gets
+	// neither — the egress reconciler LEFT JOINs hosting_packages and COALESCEs
+	// a missing row to 0, matching the #282 "privileged feature → deny when no
+	// package" rule. Plain bools (not pointers) — the create handler sets them
+	// explicitly and the DB default is 0, so the GORM zero-value-default trap
+	// that bit webmail_enabled does not apply here.
+	//
+	// EgressSSHOut, when true, adds outbound TCP :22 to the allowlist of every
+	// enforced/learning user on the package. EgressSSHOutCIDRs is a JSON array
+	// of CIDRs scoping that allowance (e.g. GitHub's ranges); empty '' means
+	// anywhere — the reconciler substitutes ["0.0.0.0/0","::/0"]. EgressICMP,
+	// when true, allows ICMP echo-request (ping) out over IPv4 + IPv6 only —
+	// not the whole ICMP protocol.
+	EgressSSHOut      bool   `gorm:"column:egress_ssh_out;type:tinyint(1);not null;default:0" json:"egress_ssh_out"`
+	EgressSSHOutCIDRs string `gorm:"column:egress_ssh_out_cidrs;type:varchar(1000);not null;default:''" json:"egress_ssh_out_cidrs"`
+	EgressICMP        bool   `gorm:"column:egress_icmp;type:tinyint(1);not null;default:0" json:"egress_icmp"`
+
+	// PHP-FPM performance tiers (GH #339 phase 2). Per-package policy for the
+	// tiered pool tuning: FpmUserCanEdit gates the L1 "Performance Mode"
+	// dropdown; FpmAdvancedMode gates the L2 clamped pm.* knobs (implies
+	// FpmUserCanEdit). FpmMaxChildrenCap bounds any tenant-produced
+	// pm_max_children; FpmWorkerMemMb drives the advisory memory-impact budget
+	// (cap * mem). FpmVersionDefaults is a JSON map {"8.3":{pm_mode,...}} of the
+	// pm.* a fresh pool on this package gets, empty {} = the global mode default.
+	FpmMaxChildrenCap  uint32 `gorm:"column:fpm_max_children_cap;type:int unsigned;not null;default:20" json:"fpm_max_children_cap"`
+	FpmWorkerMemMb     uint32 `gorm:"column:fpm_worker_mem_mb;type:int unsigned;not null;default:64" json:"fpm_worker_mem_mb"`
+	FpmUserCanEdit     bool   `gorm:"column:fpm_user_can_edit;type:tinyint(1);not null;default:0" json:"fpm_user_can_edit"`
+	FpmAdvancedMode    bool   `gorm:"column:fpm_advanced_mode;type:tinyint(1);not null;default:0" json:"fpm_advanced_mode"`
+	FpmVersionDefaults string `gorm:"column:fpm_version_defaults;type:varchar(2000);not null;default:'{}'" json:"fpm_version_defaults"`
+
+	// PHPSettingsPolicy (GH #1701) is a JSON object of php.ini directive ->
+	// level (admin_only / tenant_allowed / tenant_privileged): who may set that
+	// directive on the per-domain PHP Settings page for domains on this
+	// package. '' or a missing key = the catalog default. Written only through
+	// NormalizePHPSettingsPolicy and read only through PHPSettingLevelFor,
+	// which fails closed (see php_settings_policy.go).
+	PHPSettingsPolicy string `gorm:"column:php_settings_policy;type:text;not null" json:"php_settings_policy"`
+
+	// NspawnImageVersion (M13 / ADR-0067) pins users on this package to a
+	// specific systemd-nspawn rootfs at /var/lib/dotnext-nspawn/images/<v>/.
+	// NULL → reconciler stamps from server_settings.default_nspawn_image_version
+	// at next sweep. Only takes effect when ssh_sandbox_mode=nspawn AND the
+	// package has ssh_enabled=true.
+	NspawnImageVersion *string `gorm:"type:varchar(64);column:nspawn_image_version" json:"nspawn_image_version,omitempty"`
+
+	CreatedAt time.Time `gorm:"type:datetime(6);not null" json:"created_at"`
+	UpdatedAt time.Time `gorm:"type:datetime(6);not null" json:"updated_at"`
+}
+
+func (HostingPackage) TableName() string { return "hosting_packages" }
+
+// BackupsEnabled reports whether tenants on this package may use backups at all
+// (MaxBackups > 0). The tenant backup UI + API are gated on this (GH #454).
+func (p HostingPackage) BackupsEnabled() bool { return p.MaxBackups > 0 }
+
+// MaxBackupSchedulesOrDefault returns the per-tenant schedule cap, treating 0
+// (an unmigrated / cleared value) as 1 so a tenant always keeps at least the
+// single-schedule capability (GH #454 7B).
+func (p HostingPackage) MaxBackupSchedulesOrDefault() int {
+	if p.MaxBackupSchedules == 0 {
+		return 1
+	}
+	return int(p.MaxBackupSchedules)
+}
+
+// TenantMultiScheduleEnabled reports whether this plan unlocks the tenant
+// multi-schedule surface (cap > 1). Below that the tenant keeps the legacy
+// single-schedule card (GH #454 7B).
+func (p HostingPackage) TenantMultiScheduleEnabled() bool {
+	return p.BackupsEnabled() && p.ScheduledBackupsEnabled && p.MaxBackupSchedulesOrDefault() > 1
+}
+
+// AllowedBackupKinds parses AllowedBackupDestinationKinds (CSV) into a deduped,
+// lower-cased, order-preserving slice. Empty when none are allowed.
+func (p HostingPackage) AllowedBackupKinds() []string {
+	seen := map[string]struct{}{}
+	out := []string{}
+	for _, part := range strings.Split(p.AllowedBackupDestinationKinds, ",") {
+		k := strings.ToLower(strings.TrimSpace(part))
+		if k == "" {
+			continue
+		}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		out = append(out, k)
+	}
+	return out
+}
+
+// AllowsBackupKind reports whether a tenant on this package may target the given
+// backup destination kind. Always false when backups are disabled.
+func (p HostingPackage) AllowsBackupKind(kind string) bool {
+	if !p.BackupsEnabled() {
+		return false
+	}
+	k := strings.ToLower(strings.TrimSpace(kind))
+	if k == "" {
+		return false
+	}
+	for _, a := range p.AllowedBackupKinds() {
+		if a == k {
+			return true
+		}
+	}
+	return false
+}
+
+// Backup retention policies (GH #454).
+const (
+	BackupRetentionReject = "reject"
+	BackupRetentionPrune  = "prune"
+)
+
+// IsValidBackupRetentionPolicy validates the admin-supplied policy so a bad
+// value can't reach the DB / the create gate. The empty string is accepted and
+// treated as the safe "reject" default.
+func IsValidBackupRetentionPolicy(s string) bool {
+	switch s {
+	case "", BackupRetentionReject, BackupRetentionPrune:
+		return true
+	}
+	return false
+}
+
+// BackupRetentionPrunes reports whether this package auto-prunes the oldest
+// backup at the cap. Anything other than an explicit "prune" (including the
+// empty string / an unknown value) means reject — fail safe, never auto-delete
+// tenant data on a misconfiguration.
+func (p HostingPackage) BackupRetentionPrunes() bool {
+	return p.BackupRetentionPolicy == BackupRetentionPrune
+}
+
+// The bounds of HostingPackage.RedisKeysPerCall (GH #2165). The default is
+// what every package had before it was a setting, and what a user with no
+// package gets.
+const (
+	RedisKeysPerCallMin     = 100
+	RedisKeysPerCallDefault = 500
+	RedisKeysPerCallMax     = 5000
+)
+
+// EffectiveRedisKeysPerCall is how many keys one Redis key browser call may
+// list or delete for a user on package p. No package, or a stored value
+// outside RedisKeysPerCallMin..RedisKeysPerCallMax (validation keeps them
+// out, a direct DB edit does not), gets the default: never the ceiling, and
+// never unbounded.
+func EffectiveRedisKeysPerCall(p *HostingPackage) int {
+	if p == nil || p.RedisKeysPerCall < RedisKeysPerCallMin || p.RedisKeysPerCall > RedisKeysPerCallMax {
+		return RedisKeysPerCallDefault
+	}
+	return p.RedisKeysPerCall
+}

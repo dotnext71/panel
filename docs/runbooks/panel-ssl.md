@@ -1,0 +1,136 @@
+# Panel SSL — runbook
+
+The panel hostname's TLS cert sits at `/etc/dotnext/tls/panel.{crt,key}`. By default it is **self-signed**. M32 (ADR-0066) adds an opt-in flow to replace it with a Let's Encrypt cert for `<hostname>`. The panel mail certificate is a separate lineage (ADR-0105); see [Panel mail certificate](#panel-mail-certificate).
+
+## What each status means
+
+| Status | Meaning |
+|---|---|
+| `self_signed` | The starting state and the silent fallback. The cert is the openssl-generated SAN cert `provision_tls_cert` produced. The "Use Let's Encrypt" toggle is OFF, OR the routability gate failed. |
+| `pending_acme` | The reconciler (or the admin via "Retry now") just dispatched `ssl.panel.issue`. Will flip to `issued` or `pending_acme_retry` within a minute. |
+| `issued` | Certbot returned a fresh lineage; the deploy-hook copied `fullchain.pem` + `privkey.pem` to `/etc/dotnext/tls/panel.{crt,key}` and reloaded nginx + dotnext-api + dotnext-bulwark (and vsftpd when FTP is active). `expires_at` is the LE notAfter. |
+| `pending_acme_retry` | Last attempt failed; `last_error` carries the reason. Reconciler will retry every 3 hours until either issued or the admin disables `use_le`. |
+| `failed` | Terminal — non-retryable error (e.g. LE rate-limit exhausted). M32.1 will surface a Reset button; today: edit the row directly via `mariadb` to clear the state. |
+
+## Routability gate
+
+The "Use Let's Encrypt" toggle is **disabled** in the UI when the gate refuses. Reasons surfaced as `routable_reason`:
+
+- `missing hostname` — set Server Settings → General → Hostname first.
+- `missing public_ipv4` — set Server Settings → General → Public IPv4 first.
+- `non-routable hostname suffix` — `localhost`, `*.local`, `*.localdomain`. LE refuses these and so do we.
+- `dns lookup failed: …` — `<hostname>` doesn't resolve from the panel server. Check the registrar A-record.
+- `dns lookup returned no IPv4 records` — only AAAA records returned. M32.1 may add IPv6-only support.
+- `dns points elsewhere (got X.X.X.X, want Y.Y.Y.Y); …` — the A-record points at a different IP than the panel's `public_ipv4`. Either fix the registrar record or update Server Settings. When `got` is a CDN's addresses (a Cloudflare record with the proxy on, the orange cloud), set the record to **DNS only**: the proxy answers Let's Encrypt's HTTP check itself instead of passing it to this server. Keeping the proxy means keeping the self-signed certificate, with Cloudflare's SSL mode set to Full.
+- `no public A record: <hostname> resolves to 127.0.1.1 only through this server's /etc/hosts, …` — locally the name resolves only through an `/etc/hosts` line (Debian adds `127.0.1.1 <hostname>`), and public DNS has no address for it. Add the public A-record. The `/etc/hosts` line itself doesn't matter: when the local answer is loopback, the gate asks public resolvers (1.1.1.1, 9.9.9.9, 8.8.8.8) directly, and they never read `/etc/hosts`.
+- `<hostname> resolves to 127.0.1.1 only through this server's /etc/hosts, and public DNS could not be reached to check it` — the same `/etc/hosts` line, and outbound DNS (UDP and TCP port 53) to those resolvers is blocked. Allow outbound port 53, or map the hostname to the public IP in `/etc/hosts`.
+
+## First-time issuance
+
+Sequence on a fresh public VPS:
+
+1. Set the registrar A-record `<hostname>` → VPS public IP. Wait for propagation (`dig +short <hostname> @8.8.8.8`).
+2. Server Settings → General → confirm Hostname / Public IPv4 / Admin email are correct (admin email is required for LE registration).
+3. Optional: flip the **staging** toggle ON before flipping use_le ON for a rehearsal that doesn't burn the LE rate limit.
+4. Flip "Use Let's Encrypt" ON. Status flips to `pending_acme` within ~30s (one reconciler tick), then `issued` within another minute.
+5. If you used staging: flip staging OFF, then click **Retry now** to pull a real (browser-trusted) cert.
+6. Hard-refresh `https://<hostname>:8443/` and `https://mail.<hostname>/` — both should now show a valid padlock.
+
+## Manual recovery — reconciler stuck on `pending_acme_retry`
+
+If the reconciler keeps failing and you want to debug certbot directly:
+
+```sh
+# Read what certbot saw last:
+mariadb -uroot dotnext_panel \
+  -e "SELECT status, attempt_count, last_error, next_retry_at FROM panel_certificate"
+
+# Hand-run certbot (same args the agent uses):
+sudo certbot certonly --webroot \
+  -w /var/www/dotnext-api-acme \
+  -d "$(hostname -f)" \
+  -m "<admin-email>" \
+  --agree-tos --non-interactive --keep-until-expiring
+
+# If it succeeds, run the deploy-hook so the panel picks up the cert:
+sudo /etc/letsencrypt/renewal-hooks/deploy/dotnext-api-cert.sh
+
+# Reset the row's retry state so the reconciler stops backing off:
+mariadb -uroot dotnext_panel \
+  -e "UPDATE panel_certificate SET status='self_signed', attempt_count=0, next_retry_at=NULL WHERE id=1"
+```
+
+## Roll back to self-signed
+
+Flip "Use Let's Encrypt" OFF in the UI. The existing LE cert stays on disk until it expires, and the reconciler stops requesting new ones. certbot's own timer still renews the lineage, and the deploy hook (`dotnext-api-cert.sh`, which routes by lineage name, not by `use_le`) installs each successful renewal. A renewal behind a proxy that blocks the challenge fails, so the cert expires. Once it expires, the reconciler replaces it with a self-signed cert (GH #2166).
+
+With `use_le=0` the reconciler keeps the self-signed cert matched to the hostname (`ssl.panel.selfsign`): it regenerates when the cert is missing, no longer covers `<hostname>` and `mail.<hostname>`, or has expired. It never replaces a CA cert that is still valid. On the same tick the hostname row follows the cert: a Let's Encrypt retry or error left from a manual attempt clears, and a kept CA cert shows as `issued` with its expiry. **Regenerate self-signed** on the hostname row does the same now, without public DNS or an admin email, and answers 202 while it regenerates (the panel restarts a few seconds later) or 200 with what is already served.
+
+The mail cert follows the same switch (`ssl.panel.mail_selfsign`), when email is enabled on the panel hostname. It is checked against the mail row's name and `mail.<hostname>`, and regenerated with its own key (never `panel.key`) at `/etc/dotnext/tls/panel-mail.{crt,key}` (0640 root:dotnext). Then nginx reloads for webmail, and the cert is pushed into Stalwart (`dotnext-stalwart-push-cert`) before Stalwart restarts. The same rules apply: a valid CA cert is kept until it expires, and a current self-signed cert is left alone, so no tick restarts Stalwart for nothing. The mail row follows the cert, and **Regenerate self-signed** on the mail card dispatches it (202) or answers what is served (200). The lineage record `panel-mail.lineage` is left alone, so a later Let's Encrypt renewal still deploys over it.
+
+To replace a still-valid LE cert with self-signed right away:
+
+```sh
+sudo rm /etc/dotnext/tls/panel.{crt,key}
+sudo /usr/local/bin/dotnext-cli update -f   # provision_tls_cert re-runs
+```
+
+## Renewal mechanics
+
+- `certbot.timer` (Debian default) runs daily.
+- On every successful renewal certbot calls every script in `/etc/letsencrypt/renewal-hooks/deploy/`.
+- `/etc/letsencrypt/renewal-hooks/deploy/dotnext-api-cert.sh` (M32 deploy-hook):
+    1. Copies `fullchain.pem` → `/etc/dotnext/tls/panel.crt` (root:dotnext 0640) atomically via `install -m`.
+    2. Copies `privkey.pem` → `/etc/dotnext/tls/panel.key` (same).
+    3. `systemctl reload nginx` (graceful, keeps existing :443 sessions up).
+    4. `systemctl restart dotnext-api` (Go server doesn't SIGHUP-reread; ~100ms TLS gap).
+    5. `systemctl restart dotnext-bulwark` (Next custom server reads cert at boot; ~3-5s webmail gap).
+    6. `systemctl try-reload-or-restart vsftpd` **only if vsftpd is already active** (JAB-268). FTPS reads the same `panel.{crt,key}` but has no hook of its own, so without this it presents the stale in-memory cert until the daemon next restarts. The `is-active` guard means a masked/opt-out FTP module (the default) is never started by a renewal. A failure is logged naming FTPS as the stale consumer.
+
+The panel cert is intentionally separate from the per-domain SSL certs the reconciler manages for hosted domains. M32 only governs the panel hostname; everything else still flows through `ssl_certificates` + the M14 SSL renewal pipeline.
+
+## Panel mail certificate
+
+The panel mail certificate is its own Let's Encrypt lineage for the mail hostname, `mail.<hostname>` by default. An administrator can move mail to another name; see [Mail Hostname](../site/admin/mail-hostname.md).
+
+The deploy hook handles this lineage as kind `mail`:
+
+1. It copies the lineage to `/etc/dotnext/tls/panel-mail.{crt,key}` (root:dotnext 0640).
+2. It records the lineage name in `/etc/dotnext/tls/panel-mail.lineage`. certbot's unattended renewals carry no kind, so the hook deploys only the recorded lineage as the panel mail certificate.
+3. It reloads nginx, pushes the certificate into Stalwart with `/usr/local/bin/dotnext-stalwart-push-cert`, then restarts `dotnext-stalwart`. Stalwart loads certificates only at startup, so the push must come before the restart.
+
+### Mail clients still get the old certificate
+
+Symptom: a mail hostname change fails with "the mail server does not serve the new certificate", or IMAPS/SMTPS present an old or self-signed certificate.
+
+Compare what Stalwart serves with the lineage on disk. Replace `<mail-hostname>` with the name in question:
+
+```sh
+cat /etc/dotnext/tls/panel-mail.lineage
+openssl x509 -noout -fingerprint -sha256 -in /etc/letsencrypt/live/<mail-hostname>/fullchain.pem
+for port in 993 465; do
+  openssl s_client -connect 127.0.0.1:$port -servername <mail-hostname> </dev/null 2>/dev/null \
+    | openssl x509 -noout -fingerprint -sha256
+done
+```
+
+`-servername` is required: without SNI, Stalwart serves its default certificate.
+
+- The lineage record is missing or names another lineage: the deploy hook is out of date. Run `dotnext-cli update`, which reinstalls the hook and `dotnext-stalwart-push-cert`.
+- The record is right but a port serves another fingerprint: run `dotnext-stalwart-push-cert`, then `systemctl restart dotnext-stalwart`, and compare again.
+
+A change that fails this check retries after one hour. The name in use stays until the check passes.
+
+## Files of interest
+
+| Path | Owner | Why |
+|---|---|---|
+| `/etc/dotnext/tls/panel.crt` | root:dotnext 0640 | The actual cert nginx, panel-api, and Bulwark all read |
+| `/etc/dotnext/tls/panel.key` | root:dotnext 0640 | Same lifecycle |
+| `/etc/letsencrypt/live/<hostname>/` | root:root | LE lineage; deploy-hook reads from here |
+| `/etc/dotnext/tls/panel-mail.{crt,key}` | root:dotnext 0640 | The panel mail certificate (nginx `mail.<hostname>`, Stalwart) |
+| `/etc/dotnext/tls/panel-mail.lineage` | root:root 0644 | Name of the lineage the deploy-hook deploys as the panel mail certificate |
+| `/usr/local/bin/dotnext-stalwart-push-cert` | root:root | Loads the panel mail certificate into Stalwart |
+| `/etc/letsencrypt/renewal-hooks/deploy/dotnext-api-cert.sh` | root:root 0755 | Deploy-hook itself |
+| `/var/www/dotnext-api-acme/` | root:www-data 0750 | LE HTTP-01 challenge webroot |
+| nginx default `:80` server block | n/a | Has `location ^~ /.well-known/acme-challenge/ { root /var/www/dotnext-api-acme; }` |

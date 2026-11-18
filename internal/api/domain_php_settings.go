@@ -1,0 +1,932 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"regexp"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/dotnext-panel/dotnext/internal/paneltime"
+	"github.com/dotnext-panel/dotnext/internal/phpbasedir"
+	"github.com/dotnext-panel/dotnext/internal/agent"
+	"github.com/dotnext-panel/dotnext/internal/auth"
+	ginctx "github.com/dotnext-panel/dotnext/internal/ginctx"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+)
+
+// DomainPHPSettingsHandlerConfig wires the domain PHP settings routes.
+type DomainPHPSettingsHandlerConfig struct {
+	Domains  repository.DomainRepository
+	PHPPools repository.PHPPoolRepository
+	// Agent + PoolIniOverrides power the pool_defaults hint (GH #1543): the real
+	// value a domain inherits per directive, so the UI can label each dropdown's
+	// inherit option "<value> (Default)". Both optional — nil degrades the
+	// response to omit pool_defaults, and the UI falls back to a generic label.
+	Agent            agent.AgentInterface
+	PoolIniOverrides repository.PHPPoolIniOverrideRepository
+	// Users + Packages resolve the domain owner's hosting package, whose PHP
+	// settings policy (GH #1701) says which directives the owner may set.
+	// Without them a tenant may set nothing (fail closed); an admin is
+	// unaffected.
+	Users    repository.UserRepository
+	Packages repository.PackageRepository
+	// Reconciler applies a saved change now (GH #1701): PATCH schedules the
+	// domain, so its vhost carries the new values within seconds instead of
+	// at the next full reconcile pass. Optional; nil leaves it to that pass.
+	Reconciler DomainPHPScheduler
+	// ResetRateLimit bounds the OPcache reset, which restarts an FPM master.
+	// Wire from rl.StrictPerActor(); nil disables it.
+	ResetRateLimit gin.HandlerFunc
+}
+
+// DomainPHPScheduler schedules an out-of-band reconcile of one domain.
+type DomainPHPScheduler interface {
+	Schedule(domainID string)
+}
+
+// RegisterDomainPHPSettingsRoutes adds the PHP settings endpoints:
+//   - GET   /domains/:id/php-settings
+//   - PATCH /domains/:id/php-settings
+//   - POST  /domains/:id/php-settings/opcache-reset
+//   - GET   /domains/:id/php-settings/effective
+func RegisterDomainPHPSettingsRoutes(g *gin.RouterGroup, cfg DomainPHPSettingsHandlerConfig) {
+	h := &domainPHPSettingsHandler{cfg: cfg}
+	resetLimit := cfg.ResetRateLimit
+	if resetLimit == nil {
+		resetLimit = func(c *gin.Context) { c.Next() }
+	}
+	g.GET("/domains/:id/php-settings", h.get)
+	g.PATCH("/domains/:id/php-settings", h.patch)
+	g.POST("/domains/:id/php-settings/opcache-reset", resetLimit, h.resetOpcache)
+	g.GET("/domains/:id/php-settings/effective", h.effective)
+}
+
+type domainPHPSettingsHandler struct {
+	cfg DomainPHPSettingsHandlerConfig
+}
+
+// getDomainPHPSettingsRequest is unused for GET; response is below.
+type getDomainPHPSettingsResponse struct {
+	PHPPoolID            *string `json:"php_pool_id,omitempty"`
+	PHPVersion           *string `json:"php_version,omitempty"`
+	PHPMemoryLimit       *string `json:"php_memory_limit,omitempty"`
+	PHPUploadMaxFilesize *string `json:"php_upload_max_filesize,omitempty"`
+	PHPPostMaxSize       *string `json:"php_post_max_size,omitempty"`
+	PHPMaxInputVars      *int    `json:"php_max_input_vars,omitempty"`
+	PHPMaxExecutionTime  *int    `json:"php_max_execution_time,omitempty"`
+	PHPMaxInputTime      *int    `json:"php_max_input_time,omitempty"`
+	// GH #1332 per-domain runtime directives.
+	PHPDisplayErrors  *bool   `json:"php_display_errors,omitempty"`
+	PHPErrorReporting *int    `json:"php_error_reporting,omitempty"`
+	PHPTimezone       *string `json:"php_timezone,omitempty"`
+	// GH #1701 Slice 2 flags.
+	PHPLogErrors    *bool `json:"php_log_errors,omitempty"`
+	PHPFileUploads  *bool `json:"php_file_uploads,omitempty"`
+	PHPShortOpenTag *bool `json:"php_short_open_tag,omitempty"`
+	// GH #1701 Slice 3 admin values. PHPOpenBasedir is the stored token form
+	// (internal/phpbasedir).
+	PHPOpenBasedir   *string `json:"php_open_basedir,omitempty"`
+	PHPAllowURLFopen *bool   `json:"php_allow_url_fopen,omitempty"`
+	// PoolDefaults (GH #1543) is the effective value this domain INHERITS per
+	// directive when it sets no override — the pool's ini override if it has
+	// one, else the box's FPM php.ini baseline (read live via the agent). Keys
+	// are php.ini directive names (memory_limit, upload_max_filesize, …). Absent
+	// when the agent/pool can't be resolved; the UI then shows a generic label.
+	PoolDefaults map[string]string `json:"pool_defaults,omitempty"`
+	// Policy (GH #1701) is who may set each directive on this domain: the
+	// domain owner's package policy over models.PHPPolicyDirectives. Both an
+	// admin and the owner get it, so the admin sees what the owner may change.
+	Policy map[string]models.PHPSettingLevel `json:"policy"`
+	// Editable lists the directives the CALLER may set: every policy
+	// directive for an admin, the ones their package permits for a tenant.
+	Editable []string `json:"editable"`
+	// OpcacheResetAllowed: the caller may reset this domain's OPcache (POST
+	// …/php-settings/opcache-reset). Same rule as the OPcache & JIT tab's
+	// reset: an admin always, a tenant whose package lets them edit FPM.
+	OpcacheResetAllowed bool `json:"opcache_reset_allowed"`
+}
+
+// updateDomainPHPSettingsRequest mirrors the overridable fields plus an optional
+// PHPVersion change. NULL values clear the override. The client is expected to
+// send the full set on each PATCH (the UI does) — an omitted field is nil, which
+// clears it. PHPVersion, if set, updates the DOMAIN OWNER's pool (one pool per
+// user, per ADR-0023) — it applies to every domain that user owns.
+type updateDomainPHPSettingsRequest struct {
+	PHPVersion           *string `json:"php_version"`
+	PHPMemoryLimit       *string `json:"php_memory_limit"`
+	PHPUploadMaxFilesize *string `json:"php_upload_max_filesize"`
+	PHPPostMaxSize       *string `json:"php_post_max_size"`
+	PHPMaxInputVars      *int    `json:"php_max_input_vars"`
+	PHPMaxExecutionTime  *int    `json:"php_max_execution_time"`
+	PHPMaxInputTime      *int    `json:"php_max_input_time"`
+	// GH #1332 per-domain runtime directives.
+	PHPDisplayErrors  *bool   `json:"php_display_errors"`
+	PHPErrorReporting *int    `json:"php_error_reporting"`
+	PHPTimezone       *string `json:"php_timezone"`
+	// GH #1701 Slice 2 flags (nil = inherit).
+	PHPLogErrors    *bool `json:"php_log_errors"`
+	PHPFileUploads  *bool `json:"php_file_uploads"`
+	PHPShortOpenTag *bool `json:"php_short_open_tag"`
+	// GH #1701 Slice 3 admin values (nil = inherit). PHPOpenBasedir is
+	// validated against the owner's home by internal/phpbasedir.
+	PHPOpenBasedir   *string `json:"php_open_basedir"`
+	PHPAllowURLFopen *bool   `json:"php_allow_url_fopen"`
+}
+
+// regexes for input validation
+var (
+	regexSizeParam = regexp.MustCompile(`^(\d{1,8})([KMG]?)$`)
+	// regexTimezone bounds a date.timezone identifier to plain tz-database
+	// characters before it is handed to time.LoadLocation — keeps anything
+	// with a newline/quote out of the fastcgi_param PHP_VALUE line the agent
+	// renders (GH #1332). Must stay in step with phpTimezoneRE in the agent.
+	regexTimezone = regexp.MustCompile(`^[A-Za-z0-9_+/-]{1,64}$`)
+)
+
+// phpErrorReportingMax is E_ALL in PHP 8. error_reporting is a bitmask, so any
+// value in [0, 32767] is a legal combination (0 = report nothing).
+const phpErrorReportingMax = 32767
+
+// validateErrorReporting bounds the error_reporting bitmask to [0, E_ALL].
+func validateErrorReporting(v int) error {
+	if v < 0 || v > phpErrorReportingMax {
+		return errInvalidPHPSetting("error_reporting out of range (0..32767)")
+	}
+	return nil
+}
+
+// validateTimezone accepts only a real tz-database identifier. Character-class
+// first (cheap + injection guard), then time.LoadLocation confirms PHP will
+// accept it (both read the same IANA tz data).
+func validateTimezone(s string) error {
+	if !regexTimezone.MatchString(s) {
+		return errInvalidPHPSetting("invalid timezone format")
+	}
+	if _, err := time.LoadLocation(s); err != nil {
+		return errInvalidPHPSetting("unknown timezone")
+	}
+	return nil
+}
+
+// validateSizeParam validates memory_limit, upload_max_filesize, post_max_size.
+// Regex: ^\d+[KMG]?$ (case-insensitive), max 8 chars total, no special characters.
+func validateSizeParam(s string) error {
+	if len(s) > 8 {
+		return errInvalidPHPSetting("too long (max 8 chars)")
+	}
+	if !regexSizeParam.MatchString(s) {
+		return errInvalidPHPSetting("invalid format (digits + optional K/M/G)")
+	}
+	return nil
+}
+
+// validateIntParam validates max_input_vars, max_execution_time, max_input_time.
+// Range: 1..86400 seconds (or vars).
+func validateIntParam(i int, fieldName string) error {
+	if i < 1 || i > 86400 {
+		return errInvalidPHPSetting("out of range (1..86400)")
+	}
+	return nil
+}
+
+type errInvalidPHPSetting string
+
+func (e errInvalidPHPSetting) Error() string {
+	return "invalid_php_setting: " + string(e)
+}
+
+func (h *domainPHPSettingsHandler) get(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	ctx := c.Request.Context()
+	domainID := c.Param("id")
+
+	dom, err := h.cfg.Domains.FindByID(ctx, domainID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "domain_not_found"})
+			return
+		}
+		slog.ErrorContext(ctx, "get php-settings: load domain", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+
+	// Owner or admin check
+	if !claims.IsAdmin && dom.UserID != claims.UserID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
+
+	resp := getDomainPHPSettingsResponse{
+		PHPPoolID:            dom.PHPPoolID,
+		PHPMemoryLimit:       dom.PHPMemoryLimit,
+		PHPUploadMaxFilesize: dom.PHPUploadMaxFilesize,
+		PHPPostMaxSize:       dom.PHPPostMaxSize,
+		PHPMaxInputVars:      dom.PHPMaxInputVars,
+		PHPMaxExecutionTime:  dom.PHPMaxExecutionTime,
+		PHPMaxInputTime:      dom.PHPMaxInputTime,
+		PHPDisplayErrors:     dom.PHPDisplayErrors,
+		PHPErrorReporting:    dom.PHPErrorReporting,
+		PHPTimezone:          dom.PHPTimezone,
+		PHPLogErrors:         dom.PHPLogErrors,
+		PHPFileUploads:       dom.PHPFileUploads,
+		PHPShortOpenTag:      dom.PHPShortOpenTag,
+		PHPOpenBasedir:       dom.PHPOpenBasedir,
+		PHPAllowURLFopen:     dom.PHPAllowURLFopen,
+	}
+	resp.Policy, resp.Editable = h.callerPHPPolicy(ctx, phpPolicyAdmin(claims), dom.UserID)
+
+	// The effective PHP version + the pool itself. If neither exists, leave
+	// nil and the UI renders "Server default".
+	pool := h.domainPool(ctx, dom)
+	resp.OpcacheResetAllowed = pool != nil && h.opcacheResetAllowed(ctx, claims, dom.UserID)
+	if pool != nil {
+		v := pool.PHPVersion
+		resp.PHPVersion = &v
+		// GH #1543: the value this domain inherits per directive — pool ini
+		// override if set, else the box php.ini baseline for the version. Best
+		// effort: any failure just omits pool_defaults (the UI keeps a generic
+		// "pool default" label rather than a wrong number).
+		resp.PoolDefaults = h.resolvePoolDefaults(ctx, pool)
+	}
+
+	c.JSON(http.StatusOK, resp)
+}
+
+// poolIniDefaultCacheTTL keeps the per-version agent read rare — the box
+// php.ini baseline changes only when the operator retunes it, so a short cache
+// spares an agent round-trip on every settings-page load.
+const poolIniDefaultCacheTTL = 5 * time.Minute
+
+type cachedIniDefaults struct {
+	at   time.Time
+	vals map[string]string
+}
+
+var (
+	poolIniDefaultMu    sync.Mutex
+	poolIniDefaultCache = map[string]cachedIniDefaults{}
+)
+
+// resolvePoolDefaults returns the effective inherited value per directive for a
+// pool: the box php.ini baseline for the pool's PHP version (read via the agent,
+// cached per version) with the pool's own ini overrides layered on top. Returns
+// nil on any failure so the caller omits the hint.
+func (h *domainPHPSettingsHandler) resolvePoolDefaults(ctx context.Context, pool *models.PHPPool) map[string]string {
+	if h.cfg.Agent == nil {
+		return nil
+	}
+	base := h.phpIniDefaults(ctx, pool.PHPVersion)
+	if base == nil {
+		return nil
+	}
+	// Copy the cached baseline before mutating — the cache entry is shared.
+	out := make(map[string]string, len(base))
+	for k, v := range base {
+		out[k] = v
+	}
+	// Overlay the pool's own ini overrides for the directives tracked here. A
+	// flag-kind override, or any override on a boolean directive, is read the
+	// way PHP reads it and reported the way ini_get does ("1" / "") so the page
+	// reads every flag the same way (GH #1701 Slice 2).
+	if h.cfg.PoolIniOverrides != nil {
+		if ovs, err := h.cfg.PoolIniOverrides.ListByPool(ctx, pool.ID); err == nil {
+			for i := range ovs {
+				if _, tracked := out[ovs[i].Directive]; !tracked {
+					continue
+				}
+				if ovs[i].Kind != "flag" && !phpBoolDirectives[ovs[i].Directive] {
+					out[ovs[i].Directive] = ovs[i].Value
+					continue
+				}
+				if models.PHPIniBoolOn(ovs[i].Value) {
+					out[ovs[i].Directive] = "1"
+				} else {
+					out[ovs[i].Directive] = ""
+				}
+			}
+		}
+	}
+	return out
+}
+
+// phpBoolDirectives are the per-domain boolean directives: a pool override on
+// one is a boolean whether it was saved as a flag or a value.
+var phpBoolDirectives = map[string]bool{"log_errors": true, "file_uploads": true, "short_open_tag": true}
+
+// phpIniDefaults reads (and caches) the box FPM php.ini baseline for a PHP
+// version via the agent's php.ini_defaults command.
+func (h *domainPHPSettingsHandler) phpIniDefaults(ctx context.Context, version string) map[string]string {
+	if version == "" {
+		return nil
+	}
+	poolIniDefaultMu.Lock()
+	if c, ok := poolIniDefaultCache[version]; ok && time.Since(c.at) < poolIniDefaultCacheTTL {
+		poolIniDefaultMu.Unlock()
+		return c.vals
+	}
+	poolIniDefaultMu.Unlock()
+
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	raw, err := h.cfg.Agent.Call(cctx, "php.ini_defaults", map[string]any{"php_version": version})
+	if err != nil {
+		return nil
+	}
+	var resp struct {
+		Defaults map[string]string `json:"defaults"`
+	}
+	if json.Unmarshal(raw, &resp) != nil || resp.Defaults == nil {
+		return nil
+	}
+	poolIniDefaultMu.Lock()
+	poolIniDefaultCache[version] = cachedIniDefaults{at: time.Now(), vals: resp.Defaults}
+	poolIniDefaultMu.Unlock()
+	return resp.Defaults
+}
+
+func (h *domainPHPSettingsHandler) patch(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
+	var req updateDomainPHPSettingsRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body"})
+		return
+	}
+
+	// Validate each field
+	if req.PHPMemoryLimit != nil {
+		if err := validateSizeParam(*req.PHPMemoryLimit); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if req.PHPUploadMaxFilesize != nil {
+		if err := validateSizeParam(*req.PHPUploadMaxFilesize); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if req.PHPPostMaxSize != nil {
+		if err := validateSizeParam(*req.PHPPostMaxSize); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if req.PHPMaxInputVars != nil {
+		if err := validateIntParam(*req.PHPMaxInputVars, "max_input_vars"); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if req.PHPMaxExecutionTime != nil {
+		if err := validateIntParam(*req.PHPMaxExecutionTime, "max_execution_time"); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if req.PHPMaxInputTime != nil {
+		if err := validateIntParam(*req.PHPMaxInputTime, "max_input_time"); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if req.PHPErrorReporting != nil {
+		if err := validateErrorReporting(*req.PHPErrorReporting); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if req.PHPTimezone != nil {
+		// GH #2320: PHP refuses an old name a browser lists (Asia/Calcutta) and
+		// runs the site on UTC, so it is saved by its current name.
+		tz := paneltime.CanonicalZone(*req.PHPTimezone)
+		req.PHPTimezone = &tz
+		if err := validateTimezone(*req.PHPTimezone); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+	}
+	if req.PHPVersion != nil {
+		if !isVersionSupported(*req.PHPVersion) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "unsupported_php_version"})
+			return
+		}
+	}
+
+	ctx := c.Request.Context()
+	domainID := c.Param("id")
+
+	dom, err := h.cfg.Domains.FindByID(ctx, domainID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "domain_not_found"})
+			return
+		}
+		slog.ErrorContext(ctx, "patch php-settings: load domain", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+
+	// Owner or admin check
+	if !claims.IsAdmin && dom.UserID != claims.UserID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
+
+	// GH #1701: a tenant may change only the directives their package permits.
+	// A directive they may not set must come back unchanged (the page sends the
+	// full set, locked values included); any change to one is refused, never
+	// silently dropped. An admin may set every directive.
+	if !phpPolicyAdmin(claims) {
+		pkg, perr := h.ownerPackage(ctx, dom.UserID)
+		if perr != nil {
+			slog.ErrorContext(ctx, "patch php-settings: resolve owner package", "error", perr, "user_id", dom.UserID)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+			return
+		}
+		var denied []string
+		for _, d := range changedPHPDirectives(req, dom) {
+			if !pkg.PHPSettingLevelFor(d).TenantMaySet() {
+				denied = append(denied, d)
+			}
+		}
+		if len(denied) > 0 {
+			c.JSON(http.StatusForbidden, gin.H{
+				"error":      "php_setting_not_permitted",
+				"directives": denied,
+				"detail":     "your hosting package lets only an administrator set: " + strings.Join(denied, ", "),
+			})
+			return
+		}
+	}
+
+	// GH #1701 Slice 3: a changed open_basedir is checked against the
+	// owner's home. A tenant may only list folders inside it; an admin may add
+	// other paths, never another user's home. An unchanged value is the one
+	// already stored (the page sends a locked value back as is) and is not
+	// checked again: it may be an admin path a tenant could not have set.
+	if req.PHPOpenBasedir != nil && !eqPtr(req.PHPOpenBasedir, dom.PHPOpenBasedir) {
+		owner, oerr := h.ownerUsername(ctx, dom.UserID)
+		if oerr != nil {
+			slog.ErrorContext(ctx, "patch php-settings: resolve owner", "error", oerr, "user_id", dom.UserID)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+			return
+		}
+		norm, verr := phpbasedir.Normalize(*req.PHPOpenBasedir, owner, !phpPolicyAdmin(claims))
+		if verr != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": errInvalidPHPSetting("open_basedir: " + verr.Error()).Error()})
+			return
+		}
+		req.PHPOpenBasedir = &norm
+	}
+
+	// Update settings
+	settings := repository.DomainPHPSettings{
+		MemoryLimit:       req.PHPMemoryLimit,
+		UploadMaxFilesize: req.PHPUploadMaxFilesize,
+		PostMaxSize:       req.PHPPostMaxSize,
+		MaxInputVars:      req.PHPMaxInputVars,
+		MaxExecutionTime:  req.PHPMaxExecutionTime,
+		MaxInputTime:      req.PHPMaxInputTime,
+		DisplayErrors:     req.PHPDisplayErrors,
+		ErrorReporting:    req.PHPErrorReporting,
+		Timezone:          req.PHPTimezone,
+		LogErrors:         req.PHPLogErrors,
+		FileUploads:       req.PHPFileUploads,
+		ShortOpenTag:      req.PHPShortOpenTag,
+		OpenBasedir:       req.PHPOpenBasedir,
+		AllowURLFopen:     req.PHPAllowURLFopen,
+	}
+
+	if err := h.cfg.Domains.UpdatePHPSettings(ctx, domainID, settings); err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "domain_not_found"})
+			return
+		}
+		slog.ErrorContext(ctx, "patch php-settings: update", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+
+	// PHPVersion change: update the DOMAIN OWNER's pool (one pool per
+	// user) and mark it pending so the reconciler re-applies the FPM
+	// config with the new version. This affects every domain the user
+	// owns, not just this one — see the type-level comment.
+	if req.PHPVersion != nil && h.cfg.PHPPools != nil {
+		pool, perr := h.cfg.PHPPools.FindByUserID(ctx, dom.UserID)
+		if perr != nil && !errors.Is(perr, repository.ErrNotFound) {
+			slog.ErrorContext(ctx, "patch php-settings: load user pool", "error", perr, "user_id", dom.UserID)
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+			return
+		}
+		if pool != nil && pool.PHPVersion != *req.PHPVersion {
+			// JAB-174: if the user already has a separate per-version pool for
+			// the target version (per-domain binding, GH #329), switching the
+			// default row to it collides with uniq_user_phpver → a raw 500.
+			// Return a clean, actionable 409 instead.
+			if other, ferr := h.cfg.PHPPools.FindByUserAndVersion(ctx, dom.UserID, *req.PHPVersion); ferr == nil && other != nil && other.ID != pool.ID {
+				c.JSON(http.StatusConflict, gin.H{
+					"error":  "version_pool_exists",
+					"detail": fmt.Sprintf("this user already has a separate PHP %s pool (bound to specific domains); delete it or rebind its domains before switching the default to %s", *req.PHPVersion, *req.PHPVersion),
+				})
+				return
+			} else if ferr != nil && !errors.Is(ferr, repository.ErrNotFound) {
+				slog.ErrorContext(ctx, "patch php-settings: check version pool", "error", ferr, "user_id", dom.UserID)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+				return
+			}
+			pool.PHPVersion = *req.PHPVersion
+			pool.Status = "pending"
+			if uerr := h.cfg.PHPPools.Update(ctx, pool); uerr != nil {
+				slog.ErrorContext(ctx, "patch php-settings: update pool", "error", uerr, "pool_id", pool.ID)
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+				return
+			}
+		}
+	}
+
+	// Apply now (GH #1701): re-render this domain's vhost with the saved
+	// values instead of waiting for the next full reconcile pass, but only
+	// while the pool serving the domain runs. A pool that does not (a version
+	// change above marks it pending) converges on that pass, which applies
+	// the pool before it renders the vhost.
+	if h.cfg.Reconciler != nil && poolRunning(h.domainPool(ctx, dom)) {
+		h.cfg.Reconciler.Schedule(domainID)
+	}
+
+	c.JSON(http.StatusOK, gin.H{"success": true})
+}
+
+// domainPool is the pool that serves dom: its bound pool, else the owner's
+// default pool (ADR-0023). nil when there is none.
+func (h *domainPHPSettingsHandler) domainPool(ctx context.Context, dom *models.Domain) *models.PHPPool {
+	if h.cfg.PHPPools == nil {
+		return nil
+	}
+	var pool *models.PHPPool
+	if dom.PHPPoolID != nil && *dom.PHPPoolID != "" {
+		pool, _ = h.cfg.PHPPools.FindByID(ctx, *dom.PHPPoolID)
+	} else {
+		pool, _ = h.cfg.PHPPools.FindByUserID(ctx, dom.UserID)
+	}
+	return pool
+}
+
+// opcacheResetAllowed: the same rule as the reset on the OPcache & JIT tab —
+// the owner's package must let them edit FPM (no package, or a package that
+// can't be read, means no). An admin, also while acting as the owner, always
+// may.
+func (h *domainPHPSettingsHandler) opcacheResetAllowed(ctx context.Context, claims *auth.AccessClaims, ownerID string) bool {
+	if phpPolicyAdmin(claims) {
+		return true
+	}
+	pkg, err := h.ownerPackage(ctx, ownerID)
+	if err != nil {
+		slog.WarnContext(ctx, "php-settings: owner package unreadable, OPcache reset refused", "error", err, "user_id", ownerID)
+		return false
+	}
+	return pkg != nil && pkg.FpmUserCanEdit
+}
+
+// resetOpcache restarts the FPM master serving this domain, which drops its
+// OPcache (GH #1701). OPcache belongs to the pool, so every site on the same
+// pool loses its cache too; the UI says so before it asks.
+func (h *domainPHPSettingsHandler) resetOpcache(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	ctx := c.Request.Context()
+	dom, err := h.cfg.Domains.FindByID(ctx, c.Param("id"))
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "domain_not_found"})
+			return
+		}
+		slog.ErrorContext(ctx, "opcache-reset: load domain", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	if !claims.IsAdmin && dom.UserID != claims.UserID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
+	if !h.opcacheResetAllowed(ctx, claims, dom.UserID) {
+		c.JSON(http.StatusForbidden, gin.H{"error": "fpm_editing_not_allowed"})
+		return
+	}
+	pool := h.domainPool(ctx, dom)
+	if pool == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "pool_not_found"})
+		return
+	}
+	if h.cfg.Agent == nil || h.cfg.Users == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "opcache_reset_unavailable"})
+		return
+	}
+	owner, err := h.cfg.Users.FindByID(ctx, dom.UserID)
+	if err != nil || owner == nil {
+		slog.ErrorContext(ctx, "opcache-reset: load owner", "error", err, "user_id", dom.UserID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	if !resetPoolOpcache(c, h.cfg.Agent, h.cfg.PHPPools, owner, pool) {
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"restarted": true, "php_version": pool.PHPVersion})
+}
+
+// ownerPackage returns the hosting package of a domain's owner: nil when the
+// owner has no package, or the package row is gone (the catalog defaults
+// apply, as for every other package-gated feature, GH #282). Any other failure,
+// including missing repositories, is an error so the caller fails closed.
+func (h *domainPHPSettingsHandler) ownerPackage(ctx context.Context, userID string) (*models.HostingPackage, error) {
+	if h.cfg.Users == nil || h.cfg.Packages == nil {
+		return nil, errors.New("php settings policy: users/packages repository not wired")
+	}
+	user, err := h.cfg.Users.FindByID(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("load owner: %w", err)
+	}
+	if user.PackageID == nil || *user.PackageID == "" {
+		return nil, nil
+	}
+	pkg, err := h.cfg.Packages.FindByID(ctx, *user.PackageID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("load package: %w", err)
+	}
+	return pkg, nil
+}
+
+// callerPHPPolicy returns the owner's resolved policy and the directives the
+// caller may set. When the owner's package cannot be resolved, every
+// directive reads admin_only and a tenant may set none.
+func (h *domainPHPSettingsHandler) callerPHPPolicy(ctx context.Context, isAdmin bool, ownerID string) (map[string]models.PHPSettingLevel, []string) {
+	directives := models.PHPPolicyDirectives()
+	var policy map[string]models.PHPSettingLevel
+	pkg, err := h.ownerPackage(ctx, ownerID)
+	if err != nil {
+		slog.WarnContext(ctx, "php-settings: resolve owner package", "error", err, "user_id", ownerID)
+		policy = make(map[string]models.PHPSettingLevel, len(directives))
+		for _, d := range directives {
+			policy[d] = models.PHPSettingAdminOnly
+		}
+	} else {
+		policy = pkg.ResolvedPHPSettingsPolicy()
+	}
+	editable := make([]string, 0, len(directives))
+	for _, d := range directives {
+		if isAdmin || policy[d].TenantMaySet() {
+			editable = append(editable, d)
+		}
+	}
+	return policy, editable
+}
+
+// ownerUsername returns the system username of a domain's owner, whose home
+// bounds the domain's open_basedir.
+func (h *domainPHPSettingsHandler) ownerUsername(ctx context.Context, userID string) (string, error) {
+	if h.cfg.Users == nil {
+		return "", errors.New("php settings: users repository not wired")
+	}
+	user, err := h.cfg.Users.FindByID(ctx, userID)
+	if err != nil {
+		return "", fmt.Errorf("load owner: %w", err)
+	}
+	if user == nil || user.Username == nil || *user.Username == "" {
+		return "", errors.New("owner has no system username")
+	}
+	return *user.Username, nil
+}
+
+// changedPHPDirectives lists, in policy order (models.PHPPolicyDirectives),
+// the directives whose value in the request differs from the domain's stored
+// value (nil = no override).
+func changedPHPDirectives(req updateDomainPHPSettingsRequest, dom *models.Domain) []string {
+	changed := map[string]bool{
+		"memory_limit":        !eqPtr(req.PHPMemoryLimit, dom.PHPMemoryLimit),
+		"upload_max_filesize": !eqPtr(req.PHPUploadMaxFilesize, dom.PHPUploadMaxFilesize),
+		"post_max_size":       !eqPtr(req.PHPPostMaxSize, dom.PHPPostMaxSize),
+		"max_input_vars":      !eqPtr(req.PHPMaxInputVars, dom.PHPMaxInputVars),
+		"max_execution_time":  !eqPtr(req.PHPMaxExecutionTime, dom.PHPMaxExecutionTime),
+		"max_input_time":      !eqPtr(req.PHPMaxInputTime, dom.PHPMaxInputTime),
+		"display_errors":      !eqPtr(req.PHPDisplayErrors, dom.PHPDisplayErrors),
+		"error_reporting":     !eqPtr(req.PHPErrorReporting, dom.PHPErrorReporting),
+		"date.timezone":       !eqPtr(req.PHPTimezone, dom.PHPTimezone),
+		"log_errors":          !eqPtr(req.PHPLogErrors, dom.PHPLogErrors),
+		"file_uploads":        !eqPtr(req.PHPFileUploads, dom.PHPFileUploads),
+		"short_open_tag":      !eqPtr(req.PHPShortOpenTag, dom.PHPShortOpenTag),
+		"open_basedir":        !eqPtr(req.PHPOpenBasedir, dom.PHPOpenBasedir),
+		"allow_url_fopen":     !eqPtr(req.PHPAllowURLFopen, dom.PHPAllowURLFopen),
+	}
+	var out []string
+	for _, d := range models.PHPPolicyDirectives() {
+		// A policy directive this map does not compare counts as changed, so
+		// adding one to the policy without comparing it here locks it for a
+		// tenant rather than letting their change through unchecked.
+		if c, ok := changed[d]; !ok || c {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+func eqPtr[T comparable](a, b *T) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+// phpPolicyAdmin reports whether the caller sets PHP directives as an admin:
+// a real admin, or an admin acting as the domain's owner (ADR-0128). An admin
+// has no separate page for a domain's PHP settings and opens the owner's page
+// through impersonation, so the owner's package policy does not bind them
+// there (GH #1701). ImpersonatedBy is set only by ResolveImpersonation, after
+// it has checked the real session is an admin's and the grant is theirs; the
+// owner check above still scopes the request to the impersonated user. This
+// is a recorded exception to ADR-0128's "IsAdmin=false during act-as" rule;
+// see its "Exception: per-domain PHP settings policy" section.
+func phpPolicyAdmin(claims *auth.AccessClaims) bool {
+	return claims.IsAdmin || claims.ImpersonatedBy != ""
+}
+
+// domainPHPEffectiveResponse is what the domain's PHP pool really runs with
+// (GH #1701), read by the agent from the files the pool's master loads. Shown
+// read-only on PHP Settings to the admin and the domain owner.
+type domainPHPEffectiveResponse struct {
+	PHPVersion string `json:"php_version"`
+	// PoolFound is false while the pool has not been written yet.
+	PoolFound bool `json:"pool_found"`
+	// DisabledFunctions: source "pool" (the hosting package's list) or
+	// "php.ini" (server-wide).
+	DisabledFunctions []domainPHPEffectiveFunction `json:"disabled_functions"`
+	PHPDefense        domainPHPDefenseEffective    `json:"php_defense"`
+	IncludePath       domainPHPEffectiveIni        `json:"include_path"`
+	SessionSavePath   domainPHPEffectiveIni        `json:"session_save_path"`
+	// IniReadError: the php.ini read failed, so php.ini values are missing.
+	IniReadError string `json:"ini_read_error,omitempty"`
+	// UnavailableFunctions (GH #1701): reported functions this PHP version's
+	// FPM build does not provide (pcntl_* without pcntl, dl). Always a list.
+	UnavailableFunctions []string `json:"unavailable_functions"`
+	// AvailabilityError: that check could not run; the list is then empty.
+	AvailabilityError string `json:"availability_error,omitempty"`
+	// ExecConfined (GH #2001): the PHP-FPM AppArmor profile is enforced, so
+	// exec, shell_exec, system and the rest can start only the shell and cat.
+	ExecConfined bool `json:"exec_confined"`
+	// ExecConfinement (GH #2001): what those functions can start here.
+	// "enforce" (only the shell and cat), "complain" or "none" (any program:
+	// the profile only logs, or is not loaded / AppArmor is off), "unknown".
+	ExecConfinement string `json:"exec_confinement"`
+}
+
+type domainPHPEffectiveFunction struct {
+	Name   string `json:"name"`
+	Source string `json:"source"`
+}
+
+type domainPHPDefenseEffective struct {
+	// Active: PHP Defense is loaded for this PHP version.
+	Active bool `json:"active"`
+	// Mode of the rules the pool loads: enforce, simulation or off.
+	Mode string `json:"mode"`
+	// PoolRules: the pool loads its own rules, without the bans its package
+	// lifts.
+	PoolRules bool `json:"pool_rules"`
+	// Functions PHP Defense bans there: state "blocked" or "logged".
+	Functions []domainPHPDefenseFunction `json:"functions"`
+}
+
+type domainPHPDefenseFunction struct {
+	Name  string `json:"name"`
+	State string `json:"state"`
+}
+
+type domainPHPEffectiveIni struct {
+	Value  string `json:"value"`
+	Source string `json:"source"`
+}
+
+// phpEffectiveCacheTTL bounds the agent read, which starts a PHP process, to a
+// few per minute per pool however often the page is opened. Short, so a
+// package change shows up almost at once.
+const phpEffectiveCacheTTL = 15 * time.Second
+
+type cachedPHPEffective struct {
+	at   time.Time
+	resp domainPHPEffectiveResponse
+}
+
+var (
+	phpEffectiveMu    sync.Mutex
+	phpEffectiveCache = map[string]cachedPHPEffective{}
+)
+
+// effective returns what the domain's PHP pool really runs with (GH #1701):
+// its disabled functions, the functions PHP Defense bans there, and
+// include_path / session.save_path. Read-only; the domain owner or an admin,
+// like GET.
+func (h *domainPHPSettingsHandler) effective(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	ctx := c.Request.Context()
+	dom, err := h.cfg.Domains.FindByID(ctx, c.Param("id"))
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "domain_not_found"})
+			return
+		}
+		slog.ErrorContext(ctx, "php-settings effective: load domain", "error", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	if !claims.IsAdmin && dom.UserID != claims.UserID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
+	pool := h.domainPool(ctx, dom)
+	if pool == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "pool_not_found"})
+		return
+	}
+	if h.cfg.Agent == nil || h.cfg.Users == nil || h.cfg.PHPPools == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "effective_unavailable"})
+		return
+	}
+	owner, err := h.cfg.Users.FindByID(ctx, dom.UserID)
+	if err != nil || owner == nil || owner.Username == nil || *owner.Username == "" {
+		slog.ErrorContext(ctx, "php-settings effective: load owner", "error", err, "user_id", dom.UserID)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	// The slug exactly as the pool apply resolves it: the owner's earliest
+	// pool is the default (slug == username).
+	isDefault := true
+	if list, lerr := h.cfg.PHPPools.ListByUserID(ctx, owner.ID); lerr == nil && len(list) > 0 {
+		isDefault = list[0].ID == pool.ID
+	}
+	slug := models.PoolSlug(*owner.Username, pool.PHPVersion, isDefault)
+
+	key := pool.PHPVersion + "|" + slug
+	phpEffectiveMu.Lock()
+	if hit, ok := phpEffectiveCache[key]; ok && time.Since(hit.at) < phpEffectiveCacheTTL {
+		phpEffectiveMu.Unlock()
+		c.JSON(http.StatusOK, hit.resp)
+		return
+	}
+	phpEffectiveMu.Unlock()
+
+	cctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	raw, err := h.cfg.Agent.Call(cctx, "php.pool.effective", map[string]any{"php_version": pool.PHPVersion, "slug": slug})
+	if err != nil {
+		slog.WarnContext(ctx, "php-settings effective: agent", "error", err, "slug", slug)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "agent_unavailable"})
+		return
+	}
+	var resp domainPHPEffectiveResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		slog.WarnContext(ctx, "php-settings effective: decode", "error", err)
+		c.JSON(http.StatusBadGateway, gin.H{"error": "agent_unavailable"})
+		return
+	}
+	if resp.DisabledFunctions == nil {
+		resp.DisabledFunctions = []domainPHPEffectiveFunction{}
+	}
+	if resp.PHPDefense.Functions == nil {
+		resp.PHPDefense.Functions = []domainPHPDefenseFunction{}
+	}
+	if resp.UnavailableFunctions == nil {
+		resp.UnavailableFunctions = []string{}
+	}
+	phpEffectiveMu.Lock()
+	phpEffectiveCache[key] = cachedPHPEffective{at: time.Now(), resp: resp}
+	phpEffectiveMu.Unlock()
+	c.JSON(http.StatusOK, resp)
+}

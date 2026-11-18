@@ -1,0 +1,213 @@
+[
+  {
+    "@type": "create",
+    "object": "x:Directory",
+    "value": {
+      "#sql-directory": {
+        "@type": "Sql",
+        "description": "DotNext panel mailboxes (authoritative; see ADR-0042)",
+        "store": {
+          "@type": "MySql",
+          "host": "127.0.0.1",
+          "port": 3306,
+          "database": "dotnext_panel",
+          "authUsername": "dotnext-stalwart-ro",
+          "authSecret": {
+            "@type": "Value",
+            "secret": "{{.MariaDBPassword}}"
+          },
+          "useTls": false,
+          "allowInvalidCerts": false
+        },
+        "columnEmail": "email_cached",
+        "columnSecret": "password_hash",
+        "columnClass": null,
+        "columnDescription": null,
+        "queryLogin": "SELECT m.email_cached, m.password_hash FROM mailboxes m JOIN domains d ON d.id = m.domain_id WHERE m.email_cached = ? AND m.is_disabled = 0 AND d.ownership_status = 'verified' AND NOT EXISTS (SELECT 1 FROM users u WHERE u.id = d.user_id AND u.suspended = 1)",
+        "queryRecipient": "SELECT u.email_cached, u.password_hash FROM (SELECT ? AS lookup) input JOIN (SELECT m.email_cached AS email_cached, m.password_hash AS password_hash, m.email_cached AS match_key FROM mailboxes m JOIN domains md ON md.id = m.domain_id WHERE m.is_disabled = 0 AND m.send_only = 0 AND md.ownership_status = 'verified' UNION ALL SELECT mb.email_cached, mb.password_hash, g.email_cached AS match_key FROM mail_groups g JOIN domains gd ON gd.id = g.domain_id JOIN mail_group_members gm ON gm.group_id = g.id JOIN mailboxes mb ON mb.id = gm.mailbox_id JOIN domains mbd ON mbd.id = mb.domain_id WHERE g.has_mailbox = 1 AND (g.group_kind <> 'distribution' OR g.internal_only = 1) AND mb.is_disabled = 0 AND mb.send_only = 0 AND gd.ownership_status = 'verified' AND mbd.ownership_status = 'verified' UNION ALL SELECT pm.email_cached, pm.password_hash, g.email_cached AS match_key FROM mail_groups g JOIN domains gd ON gd.id = g.domain_id JOIN domains hd ON hd.is_panel_primary = 1 JOIN mailboxes pm ON pm.domain_id = hd.id WHERE g.group_kind = 'distribution' AND pm.local_part = 'postmaster' AND gd.ownership_status = 'verified' AND EXISTS (SELECT 1 FROM mail_group_external_members xe WHERE xe.group_id = g.id)) u ON (u.match_key = input.lookup OR u.email_cached = (SELECT mb2.email_cached FROM email_forwarders f JOIN domains d ON d.id = f.domain_id JOIN mailboxes mb2 ON mb2.id = f.mailbox_id WHERE f.enabled = 1 AND f.type = 'alias' AND f.mailbox_id IS NOT NULL AND d.ownership_status = 'verified' AND CONCAT(f.local_part, '@', d.name) = input.lookup AND NOT EXISTS (SELECT 1 FROM mailboxes xo WHERE xo.domain_id = f.domain_id AND xo.local_part = f.local_part) LIMIT 1) OR u.match_key = (SELECT pm.email_cached FROM domains pd JOIN domains hd ON hd.is_panel_primary = 1 JOIN mailboxes pm ON pm.domain_id = hd.id WHERE pm.local_part = 'postmaster' AND pd.email_enabled = 1 AND pd.ownership_status = 'verified' AND CONCAT('postmaster@', pd.name) = input.lookup AND NOT EXISTS (SELECT 1 FROM mailboxes xm WHERE xm.domain_id = pd.id AND xm.local_part = 'postmaster') AND NOT EXISTS (SELECT 1 FROM email_forwarders xf WHERE xf.domain_id = pd.id AND xf.local_part = 'postmaster') AND NOT EXISTS (SELECT 1 FROM mail_groups xg WHERE xg.email_cached = input.lookup) LIMIT 1))",
+        "queryMemberOf": null,
+        "queryEmailAliases": "SELECT a.alias FROM (SELECT ? AS lookup) input JOIN (SELECT CONCAT(f.local_part, '@', d.name) AS alias, m.email_cached AS owner FROM email_forwarders f JOIN domains d ON d.id = f.domain_id JOIN mailboxes m ON m.id = f.mailbox_id WHERE f.enabled = 1 AND f.type = 'alias' AND d.ownership_status = 'verified' AND NOT EXISTS (SELECT 1 FROM mailboxes xo WHERE xo.domain_id = f.domain_id AND xo.local_part = f.local_part) UNION ALL SELECT CONCAT('postmaster@', pd.name) AS alias, pm.email_cached AS owner FROM domains pd JOIN domains hd ON hd.is_panel_primary = 1 JOIN mailboxes pm ON pm.domain_id = hd.id WHERE pm.local_part = 'postmaster' AND pd.email_enabled = 1 AND pd.ownership_status = 'verified' AND NOT EXISTS (SELECT 1 FROM mailboxes xm WHERE xm.domain_id = pd.id AND xm.local_part = 'postmaster') AND NOT EXISTS (SELECT 1 FROM email_forwarders xf WHERE xf.domain_id = pd.id AND xf.local_part = 'postmaster') AND NOT EXISTS (SELECT 1 FROM mail_groups xg WHERE xg.email_cached = CONCAT('postmaster@', pd.name))) a ON a.owner = input.lookup"
+      }
+    }
+  },
+
+  {
+    "@type": "update",
+    "object": "x:Authentication",
+    "id": "singleton",
+    "value": {
+      "directoryId": "#sql-directory",
+      "passwordHashAlgorithm": "bcrypt"
+    }
+  },
+
+  {
+    "@type": "create",
+    "object": "x:NetworkListener",
+    "value": {
+      "#smtp-25": {
+        "name": "smtp-25",
+        "bind": {"0.0.0.0:25": true},
+        "protocol": "smtp",
+        "useTls": true,
+        "implicitTls": false,
+        "socketReuseAddress": true,
+        "socketReusePort": false,
+        "socketNoDelay": true
+      },
+      "#smtp-submissions-465": {
+        "name": "smtp-submissions-465",
+        "bind": {"0.0.0.0:465": true},
+        "protocol": "smtp",
+        "useTls": true,
+        "implicitTls": true,
+        "socketReuseAddress": true,
+        "socketReusePort": false,
+        "socketNoDelay": true
+      },
+      "#smtp-submission-587": {
+        "name": "smtp-submission-587",
+        "bind": {"0.0.0.0:587": true},
+        "protocol": "smtp",
+        "useTls": true,
+        "implicitTls": false,
+        "socketReuseAddress": true,
+        "socketReusePort": false,
+        "socketNoDelay": true
+      },
+      "#imap-993": {
+        "name": "imap-993",
+        "bind": {"0.0.0.0:993": true},
+        "protocol": "imap",
+        "useTls": true,
+        "implicitTls": true,
+        "socketReuseAddress": true,
+        "socketReusePort": false,
+        "socketNoDelay": true
+      },
+      "#jmap-loopback": {
+        "name": "jmap-loopback",
+        "bind": {"127.0.0.1:8446": true},
+        "protocol": "http",
+        "useTls": false,
+        "implicitTls": false,
+        "socketReuseAddress": true,
+        "socketReusePort": false,
+        "socketNoDelay": true
+      },
+      "#internal-loopback": {
+        "name": "internal-loopback",
+        "bind": {"127.0.0.1:18181": true},
+        "protocol": "http",
+        "useTls": false,
+        "implicitTls": false,
+        "socketReuseAddress": true,
+        "socketReusePort": false,
+        "socketNoDelay": true
+      }
+    }
+  },
+
+  {
+    "@type": "update",
+    "object": "x:SpamSettings",
+    "id": "singleton",
+    "value": {
+      "enable": true,
+      "trustContacts": true,
+      "trustReplies": true,
+      "scoreSpam": 5.0,
+      "scoreReject": 15.0,
+      "scoreDiscard": 20.0,
+      "spamFilterRulesUrl": "file:///opt/stalwart/share/spam-filter-rules.json.gz"
+    }
+  },
+
+  {
+    "@type": "update",
+    "object": "x:SieveUserInterpreter",
+    "id": "singleton",
+    "value": {
+      "maxRedirects": 20,
+      "maxOutMessages": 25
+    }
+  },
+
+  {
+    "@type": "update",
+    "object": "x:Security",
+    "id": "singleton",
+    "value": {
+      "authBanRate": null,
+      "abuseBanRate": null,
+      "scanBanRate": null
+    }
+  },
+
+  {
+    "@type": "create",
+    "object": "x:Tracer",
+    "value": {
+      "#dotnext-mail-bf-stdout": {
+        "@type": "Stdout",
+        "enable": true,
+        "level": "debug",
+        "lossy": false,
+        "ansi": false,
+        "buffered": false
+      },
+      "#dotnext-delivery-log": {
+        "@type": "Log",
+        "enable": true,
+        "level": "debug",
+        "path": "/var/log/stalwart",
+        "prefix": "delivery",
+        "rotate": "daily",
+        "ansi": false,
+        "multiline": false,
+        "lossy": false,
+        "eventsPolicy": "include",
+        "events": {
+          "queue.message-queued": true,
+          "queue.authenticated-message-queued": true,
+          "delivery.completed": true,
+          "delivery.failed": true
+        }
+      }
+    }
+  },
+
+  {
+    "@type": "update",
+    "object": "x:Calendar",
+    "id": "singleton",
+    "value": {
+      "defaultDisplayName": "Personal"
+    }
+  },
+
+  {
+    "@type": "update",
+    "object": "x:AddressBook",
+    "id": "singleton",
+    "value": {
+      "defaultDisplayName": "Personal"
+    }
+  },
+
+  {
+    "@type": "update",
+    "object": "x:Email",
+    "id": "singleton",
+    "value": {
+      "defaultFolders": {
+        "inbox": { "name": "Inbox", "create": true, "subscribe": true },
+        "drafts": { "name": "Drafts", "create": true, "subscribe": true },
+        "sent": { "name": "Sent", "create": true, "subscribe": true },
+        "junk": { "name": "Junk", "create": true, "subscribe": true },
+        "trash": { "name": "Trash", "create": true, "subscribe": true },
+        "archive": { "name": "Archive", "create": true, "subscribe": true }
+      }
+    }
+  }
+]

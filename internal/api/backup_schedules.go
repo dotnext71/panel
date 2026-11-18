@@ -1,0 +1,425 @@
+// M30.1 Step 8 — admin REST for backup_schedules + the
+// backup_schedule_destinations join (ADR-0078).
+//
+// Cron expressions are validated server-side via internal/backup.ParseCron
+// before insert. The handler returns the next 5 firings as a UI helper
+// so the admin can sanity-check the schedule before saving.
+package api
+
+import (
+	"errors"
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	internalbackup "github.com/dotnext-panel/dotnext/internal/backup"
+	"github.com/dotnext-panel/dotnext/internal/backupscheduleops"
+	"github.com/dotnext-panel/dotnext/internal/middleware"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+)
+
+type BackupSchedulesConfig struct {
+	Schedules    repository.BackupScheduleRepository
+	Destinations repository.BackupDestinationRepository
+	Users        repository.UserRepository
+	Jobs         repository.BackupJobRepository
+	// Settings holds the tenant backup window an account's own (interval)
+	// schedule is re-timed in when its cadence changes. nil = whole day.
+	Settings repository.ServerSettingsRepository
+	// Packages applies an account's plan to its own schedule (GH #2246): the
+	// admin creates and edits it under the rules the account's page uses.
+	Packages repository.PackageRepository
+}
+
+// leafDeps hands the lifecycle only the collaborators that are wired: a nil
+// repository stored in an interface field would read as present.
+func (h *backupScheduleHandler) leafDeps() backupscheduleops.Deps {
+	d := backupscheduleops.Deps{Schedules: h.cfg.Schedules, Users: h.cfg.Users}
+	if h.cfg.Settings != nil {
+		d.Settings = h.cfg.Settings
+	}
+	if h.cfg.Packages != nil {
+		d.Packages = h.cfg.Packages
+	}
+	if h.cfg.Destinations != nil {
+		d.Destinations = h.cfg.Destinations
+	}
+	return d
+}
+
+func RegisterBackupScheduleRoutes(rg *gin.RouterGroup, cfg BackupSchedulesConfig) {
+	if cfg.Schedules == nil || cfg.Destinations == nil {
+		return
+	}
+	h := &backupScheduleHandler{cfg: cfg}
+	admin := rg.Group("/admin", middleware.RequireAdmin())
+	admin.GET("/backup-schedules", h.list)
+	admin.GET("/backup-schedules/:id", h.get)
+	admin.POST("/backup-schedules", h.create)
+	admin.PATCH("/backup-schedules/:id", h.update)
+	admin.DELETE("/backup-schedules/:id", h.delete)
+	admin.POST("/backup-schedules/:id/run-now", h.runNow)
+}
+
+type backupScheduleHandler struct {
+	cfg BackupSchedulesConfig
+}
+
+type scheduleDTO struct {
+	ID                  string   `json:"id"`
+	Kind                string   `json:"kind"`
+	UserID              *string  `json:"user_id,omitempty"`
+	UserIDs             []string `json:"user_ids"`
+	IncludeSystemBackup bool     `json:"include_system_backup"`
+	CronExpr            string   `json:"cron_expr"`
+	// Content is what each run backs up (full / files / database / folders).
+	// Cadence is set on an account's own schedule, which runs on that interval
+	// instead of cron_expr (GH #2246); "" = a cron schedule.
+	Content        string                 `json:"content"`
+	Cadence        string                 `json:"cadence"`
+	Enabled        bool                   `json:"enabled"`
+	KeepDaily      *int                   `json:"keep_daily,omitempty"`
+	KeepWeekly     *int                   `json:"keep_weekly,omitempty"`
+	KeepMonthly    *int                   `json:"keep_monthly,omitempty"`
+	KeepWithinDays *int                   `json:"keep_within_days,omitempty"`
+	LastRunAt      *string                `json:"last_run_at,omitempty"`
+	NextRunAt      *string                `json:"next_run_at,omitempty"`
+	NextFirings    []string               `json:"next_firings,omitempty"`
+	Destinations   []backupDestinationDTO `json:"destinations,omitempty"`
+}
+
+func toScheduleDTO(s *models.BackupSchedule, dests []models.BackupDestination) scheduleDTO {
+	dto := scheduleDTO{
+		ID: s.ID, Kind: s.Kind, UserID: s.UserID,
+		UserIDs:             append([]string{}, s.UserIDs...),
+		IncludeSystemBackup: s.IncludeSystemBackup,
+		CronExpr:            s.CronExpr, Enabled: s.Enabled,
+		Content:   models.NormalizeBackupContent(s.Content),
+		Cadence:   s.Cadence,
+		KeepDaily: s.KeepDaily, KeepWeekly: s.KeepWeekly, KeepMonthly: s.KeepMonthly,
+		KeepWithinDays: s.KeepWithinDays,
+	}
+	if s.LastRunAt != nil {
+		v := s.LastRunAt.Format(time.RFC3339)
+		dto.LastRunAt = &v
+	}
+	if s.NextRunAt != nil {
+		v := s.NextRunAt.Format(time.RFC3339)
+		dto.NextRunAt = &v
+	}
+	if fires, err := internalbackup.PreviewFires(s.CronExpr, time.Now().UTC(), 5); err == nil {
+		for _, f := range fires {
+			dto.NextFirings = append(dto.NextFirings, f.Format(time.RFC3339))
+		}
+	}
+	for i := range dests {
+		dto.Destinations = append(dto.Destinations, toDestDTO(&dests[i]))
+	}
+	return dto
+}
+
+func (h *backupScheduleHandler) list(c *gin.Context) {
+	rows, err := h.cfg.Schedules.List(c.Request.Context())
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_list"})
+		return
+	}
+	out := make([]scheduleDTO, 0, len(rows))
+	for i := range rows {
+		dests, _ := h.cfg.Schedules.GetDestinations(c.Request.Context(), rows[i].ID)
+		uids, _ := h.cfg.Schedules.GetUserIDs(c.Request.Context(), rows[i].ID)
+		rows[i].UserIDs = uids
+		out = append(out, toScheduleDTO(&rows[i], dests))
+	}
+	c.JSON(http.StatusOK, gin.H{"data": out, "total": len(out)})
+}
+
+func (h *backupScheduleHandler) get(c *gin.Context) {
+	s, err := h.cfg.Schedules.Get(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "not_found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_get"})
+		return
+	}
+	dests, _ := h.cfg.Schedules.GetDestinations(c.Request.Context(), s.ID)
+	uids, _ := h.cfg.Schedules.GetUserIDs(c.Request.Context(), s.ID)
+	s.UserIDs = uids
+	c.JSON(http.StatusOK, toScheduleDTO(s, dests))
+}
+
+type createScheduleRequest struct {
+	// Kind defaults to account_backup when omitted (UI no longer
+	// exposes the system-only kind — system backups are an opt-in
+	// flag on the account schedule).
+	Kind string `json:"kind"`
+	// Legacy single-user field; kept for backwards compat. New
+	// callers should send UserIDs (multi-select). Empty UserIDs +
+	// nil/empty UserID = "all non-admin users" fan-out at tick time.
+	UserID              *string  `json:"user_id"`
+	UserIDs             []string `json:"user_ids"`
+	IncludeSystemBackup bool     `json:"include_system_backup"`
+	// CronExpr times an admin schedule. An account's own schedule sends
+	// Cadence instead (one user, one destination) and is created under the
+	// account's plan (GH #2246).
+	CronExpr       string   `json:"cron_expr"`
+	Cadence        string   `json:"cadence"`
+	Content        string   `json:"content"`
+	Enabled        *bool    `json:"enabled"`
+	KeepDaily      *int     `json:"keep_daily"`
+	KeepWeekly     *int     `json:"keep_weekly"`
+	KeepMonthly    *int     `json:"keep_monthly"`
+	KeepWithinDays *int     `json:"keep_within_days"`
+	DestinationIDs []string `json:"destination_ids"`
+}
+
+func (h *backupScheduleHandler) create(c *gin.Context) {
+	var req createScheduleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_body", "detail": err.Error()})
+		return
+	}
+	// Adapter concern: promote the legacy single user_id into the
+	// multi-select UserIDs before handing resolved ids to the lifecycle.
+	if req.UserID != nil && *req.UserID != "" {
+		req.UserIDs = append(req.UserIDs, *req.UserID)
+	}
+	if req.Cadence != "" {
+		h.createForAccount(c, req)
+		return
+	}
+
+	s, err := backupscheduleops.Create(c.Request.Context(), h.leafDeps(), backupscheduleops.CreateInput{
+		Kind:                req.Kind,
+		UserIDs:             req.UserIDs,
+		IncludeSystemBackup: req.IncludeSystemBackup,
+		CronExpr:            req.CronExpr,
+		Content:             req.Content,
+		Enabled:             req.Enabled,
+		KeepDaily:           req.KeepDaily,
+		KeepWeekly:          req.KeepWeekly,
+		KeepMonthly:         req.KeepMonthly,
+		KeepWithinDays:      req.KeepWithinDays,
+		DestinationIDs:      req.DestinationIDs,
+	})
+	if err != nil {
+		writeScheduleOpError(c, err, "db_create")
+		return
+	}
+	dests, _ := h.cfg.Schedules.GetDestinations(c.Request.Context(), s.ID)
+	c.JSON(http.StatusCreated, toScheduleDTO(s, dests))
+}
+
+// createForAccount creates an account's own interval schedule: the kind the
+// account adds on its Backups page, with one account, one destination, and
+// no cron or system backup.
+func (h *backupScheduleHandler) createForAccount(c *gin.Context, req createScheduleRequest) {
+	if req.Kind != "" && req.Kind != models.BackupScheduleKindAccount {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_kind"})
+		return
+	}
+	users := make([]string, 0, len(req.UserIDs))
+	for _, u := range req.UserIDs {
+		if u != "" {
+			users = append(users, u)
+		}
+	}
+	if len(users) != 1 || req.IncludeSystemBackup || req.CronExpr != "" {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "account_schedule",
+			"detail": "an account's own schedule backs up one account, runs on its cadence and has no cron expression or system backup"})
+		return
+	}
+	if len(req.DestinationIDs) > 1 {
+		writeScheduleOpError(c, backupscheduleops.ErrOneDestination, "db_create")
+		return
+	}
+	dest := ""
+	if len(req.DestinationIDs) == 1 {
+		dest = req.DestinationIDs[0]
+	}
+	enabled := true
+	if req.Enabled != nil {
+		enabled = *req.Enabled
+	}
+	s, err := backupscheduleops.CreateForAccount(c.Request.Context(), h.leafDeps(), backupscheduleops.AccountScheduleInput{
+		UserID:         users[0],
+		Content:        req.Content,
+		Cadence:        req.Cadence,
+		DestinationID:  dest,
+		KeepDaily:      req.KeepDaily,
+		KeepWithinDays: req.KeepWithinDays,
+		Enabled:        enabled,
+	})
+	if err != nil {
+		writeScheduleOpError(c, err, "db_create")
+		return
+	}
+	dests, _ := h.cfg.Schedules.GetDestinations(c.Request.Context(), s.ID)
+	c.JSON(http.StatusCreated, toScheduleDTO(s, dests))
+}
+
+// writeScheduleOpError maps a backupscheduleops error to the wire codes the
+// admin REST surface has always emitted, so the contract is unchanged. The
+// policy codes are shared by every lifecycle call; dbErrCode is the generic
+// 500 string for the caller's operation ("db_create" for create, "db_update"
+// for update), since the leaf's single transactional write can't tell the row
+// change apart from the membership replacement.
+func writeScheduleOpError(c *gin.Context, err error, dbErrCode string) {
+	var ure *backupscheduleops.UserRejectedError
+	switch {
+	case errors.Is(err, backupscheduleops.ErrInvalidKind):
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_kind"})
+	case errors.As(err, &ure) && errors.Is(err, backupscheduleops.ErrAdminUser):
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "admin_user_not_allowed", "detail": ure.UserID})
+	case errors.As(err, &ure):
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "user_not_found", "detail": ure.UserID})
+	case errors.Is(err, backupscheduleops.ErrInvalidCron):
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_cron", "detail": err.Error()})
+	case errors.Is(err, backupscheduleops.ErrInvalidContent):
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_content", "detail": "content must be full/files/database/folders"})
+	case errors.Is(err, backupscheduleops.ErrInvalidCadence):
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_cadence", "detail": "cadence must be hourly/every_6h/every_12h/daily/weekly"})
+	case errors.Is(err, backupscheduleops.ErrIntervalSchedule):
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "interval_schedule", "detail": err.Error()})
+	case errors.Is(err, backupscheduleops.ErrCronSchedule):
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "cron_schedule", "detail": err.Error()})
+	case errors.Is(err, backupscheduleops.ErrAccountSchedule):
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "account_schedule", "detail": err.Error()})
+	// The account's plan (GH #2246): the codes the account's own Backups page
+	// returns for the same refusals.
+	case errors.Is(err, backupscheduleops.ErrPlanUnavailable):
+		c.JSON(http.StatusServiceUnavailable, gin.H{"status": "error", "error": "backup_gating_unavailable", "detail": err.Error()})
+	case errors.Is(err, backupscheduleops.ErrScheduledBackupsNotAllowed):
+		c.JSON(http.StatusForbidden, gin.H{"status": "error", "error": "scheduled_backups_not_enabled", "detail": err.Error()})
+	case errors.Is(err, backupscheduleops.ErrSingleSchedulePlan):
+		c.JSON(http.StatusForbidden, gin.H{"status": "error", "error": "single_schedule_plan", "detail": err.Error()})
+	case errors.Is(err, backupscheduleops.ErrScheduleLimit):
+		c.JSON(http.StatusForbidden, gin.H{"status": "error", "error": "schedule_limit_reached", "detail": err.Error()})
+	case errors.Is(err, backupscheduleops.ErrUnknownDestination):
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "unknown_destination", "detail": err.Error()})
+	case errors.Is(err, backupscheduleops.ErrDestinationDisabled):
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "destination_disabled", "detail": err.Error()})
+	case errors.Is(err, backupscheduleops.ErrDestinationNotAllowed):
+		c.JSON(http.StatusForbidden, gin.H{"status": "error", "error": "destination_not_allowed", "detail": err.Error()})
+	case errors.Is(err, backupscheduleops.ErrDestinationRequired):
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "destination_required", "detail": err.Error()})
+	case errors.Is(err, backupscheduleops.ErrOneDestination):
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "one_destination", "detail": err.Error()})
+	case errors.Is(err, backupscheduleops.ErrKeepOutOfRange), errors.Is(err, backupscheduleops.ErrKeepDaysOutOfRange):
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "keep_out_of_range", "detail": err.Error()})
+	default:
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": dbErrCode})
+	}
+}
+
+type updateScheduleRequest struct {
+	CronExpr            *string   `json:"cron_expr"`
+	Cadence             *string   `json:"cadence"`
+	Content             *string   `json:"content"`
+	Enabled             *bool     `json:"enabled"`
+	IncludeSystemBackup *bool     `json:"include_system_backup"`
+	KeepDaily           *int      `json:"keep_daily"`
+	KeepWeekly          *int      `json:"keep_weekly"`
+	KeepMonthly         *int      `json:"keep_monthly"`
+	KeepWithinDays      *int      `json:"keep_within_days"`
+	DestinationIDs      *[]string `json:"destination_ids"`
+	UserIDs             *[]string `json:"user_ids"`
+}
+
+func (h *backupScheduleHandler) update(c *gin.Context) {
+	id := c.Param("id")
+	var req updateScheduleRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid_body", "detail": err.Error()})
+		return
+	}
+	// Route the whole patch through the lifecycle leaf. It validates the
+	// change against the stored, immutable kind (on an account schedule every
+	// explicit target user must exist and must not be an admin; an invalid
+	// cron aborts) and persists the field changes plus any membership
+	// replacement in ONE transaction. The previous inline path wrote the row,
+	// destinations, and users as three separate statements, so a failure after
+	// the row committed left the schedule with a membership that silently
+	// differed from the request — and for an account schedule an empty user
+	// set fans out to every non-admin at tick time, so a partial write there
+	// broadens the blast radius. (Admin-target rejection was already enforced
+	// on this surface inline; this change is atomicity plus de-duplication of
+	// the policy the leaf already owns.)
+	s, err := backupscheduleops.Update(c.Request.Context(), h.leafDeps(), backupscheduleops.UpdateInput{
+		ID:                  id,
+		CronExpr:            req.CronExpr,
+		Cadence:             req.Cadence,
+		Content:             req.Content,
+		Enabled:             req.Enabled,
+		IncludeSystemBackup: req.IncludeSystemBackup,
+		KeepDaily:           req.KeepDaily,
+		KeepWeekly:          req.KeepWeekly,
+		KeepMonthly:         req.KeepMonthly,
+		KeepWithinDays:      req.KeepWithinDays,
+		DestinationIDs:      req.DestinationIDs,
+		UserIDs:             req.UserIDs,
+	})
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "not_found"})
+			return
+		}
+		writeScheduleOpError(c, err, "db_update")
+		return
+	}
+	// Output shaping: the leaf sets s.UserIDs only when it replaced the account
+	// membership (a non-nil, possibly-empty slice — never null). For every
+	// other case re-read the current membership so the DTO reflects what's
+	// stored, matching the shape this surface has always returned.
+	if req.UserIDs == nil || s.Kind != models.BackupScheduleKindAccount {
+		ids, _ := h.cfg.Schedules.GetUserIDs(c.Request.Context(), s.ID)
+		s.UserIDs = ids
+	}
+	dests, _ := h.cfg.Schedules.GetDestinations(c.Request.Context(), s.ID)
+	c.JSON(http.StatusOK, toScheduleDTO(s, dests))
+}
+
+func (h *backupScheduleHandler) delete(c *gin.Context) {
+	id := c.Param("id")
+	if err := h.cfg.Schedules.Delete(c.Request.Context(), id); err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "not_found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_delete"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
+}
+
+// runNow advances next_run_at to NOW so the scheduler tick fires the
+// schedule on its next iteration. Doesn't bypass concurrency gates —
+// if a backup is already running, the agent rejects the duplicate.
+func (h *backupScheduleHandler) runNow(c *gin.Context) {
+	id := c.Param("id")
+	s, err := h.cfg.Schedules.Get(c.Request.Context(), id)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			c.JSON(http.StatusNotFound, gin.H{"status": "error", "error": "not_found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_get"})
+		return
+	}
+	if !s.Enabled {
+		c.JSON(http.StatusConflict, gin.H{"status": "error", "error": "schedule_disabled"})
+		return
+	}
+	if err := h.cfg.Schedules.UpdateNextRun(c.Request.Context(), id, time.Now().UTC()); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"status": "error", "error": "db_update"})
+		return
+	}
+	c.JSON(http.StatusAccepted, gin.H{
+		"status": "ok",
+		"detail": "schedule next-run advanced; tick will fire within " + internalbackup.PresetCronExpr["daily"],
+	})
+}

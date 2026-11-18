@@ -1,0 +1,135 @@
+// Package backup — SFTP remote-ls helper for M30.1 destinations (JAB-405 Part 2a).
+//
+// A repository corrupted by a concurrent-init race (two `restic init` on one
+// empty repo → more than one key file but a single config only one key can
+// decrypt) cannot be opened by restic at all — `restic key list` itself dies
+// with the same `ciphertext verification failed`, because restic opens config
+// before it lists keys. So to tell an operator whether a key/config mismatch is
+// the race (move a key aside and retry) or a genuinely corrupt config (start
+// fresh), the agent counts the key files by listing the repository's keys/
+// directory DIRECTLY, below restic: `ssh user@host -- ls -1 <path>/keys` for an
+// SFTP repo, os.ReadDir for a local one.
+package backup
+
+import (
+	"context"
+	"fmt"
+	"os/exec"
+	"strings"
+)
+
+// buildSSHConnArgs assembles the argv prefix shared by every remote ssh exec:
+// `[sshpass -e] ssh [-i KEY -o IdentitiesOnly=yes] -o StrictHostKeyChecking=...
+// [auth opts] [-p PORT] -l USER -- HOST`. The caller appends the remote
+// command. TestBuildSSHConnArgs_Pin holds it byte-for-byte.
+//
+// The user goes in as -l's argument and the host after `--`, so ssh never
+// reads either as one of its own options. With `user@host -- cmd`, a user
+// starting with `-` (`-oProxyCommand=...`) became an ssh option and the
+// remote command's first word became the host.
+func buildSSHConnArgs(in SFTPInputs) []string {
+	parts := []string{}
+	if in.Auth == "password" {
+		parts = append(parts, "sshpass", "-e")
+	}
+	parts = append(parts, "ssh")
+	if in.Auth == "key" && in.KeyPath != "" {
+		parts = append(parts, "-i", in.KeyPath, "-o", "IdentitiesOnly=yes")
+	}
+	parts = append(parts, "-o", "StrictHostKeyChecking=accept-new")
+	if in.Auth == "password" {
+		parts = append(parts, "-o", "PreferredAuthentications=password",
+			"-o", "PubkeyAuthentication=no")
+	} else {
+		parts = append(parts, "-o", "BatchMode=yes")
+	}
+	if in.Port > 0 && in.Port != 22 {
+		parts = append(parts, "-p", fmt.Sprintf("%d", in.Port))
+	}
+	return append(parts, "-l", in.User, "--", in.Host)
+}
+
+// remoteShellArg makes s one word for the remote shell. ssh joins the remote
+// command's arguments with spaces and the remote user's shell runs that string,
+// so a path with a space split into more arguments and one with `;` ran a
+// second command on the backup host. A path made only of characters no shell
+// treats specially passes as-is, so a plain path reaches the remote shell byte
+// for byte as before; any other path is single-quoted. A leading `-` gets a
+// `./` so ls and mv don't read the path as an option.
+func remoteShellArg(s string) string {
+	if strings.HasPrefix(s, "-") {
+		s = "./" + s
+	}
+	for _, r := range s {
+		if !strings.ContainsRune(remoteShellSafe, r) {
+			return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+		}
+	}
+	return s
+}
+
+const remoteShellSafe = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/._-+,:@%="
+
+// buildSSHListArgs assembles the argv for `[conn] -- ls -1 <remotePath>`.
+// remotePath goes through remoteShellArg: the remote shell parses the command,
+// so a path with spaces or shell metacharacters must be quoted to stay one
+// argument.
+func buildSSHListArgs(in SFTPInputs, remotePath string) []string {
+	return append(buildSSHConnArgs(in), "ls", "-1", remoteShellArg(remotePath))
+}
+
+// ListRemoteSFTP runs `ssh user@host -- ls -1 <remotePath>` over the same auth
+// path restic's sftp.command uses (sshpass for password, `-i <key>` for key
+// auth, `-p N` for non-22 ports) and returns the raw combined output. It is
+// READ-ONLY — it never creates, moves, or deletes anything. Callers parse the
+// output for restic key-file names. On error the combined output is returned so
+// the caller can fold a short diagnostic into a fail-soft message.
+func ListRemoteSFTP(ctx context.Context, in SFTPInputs, remotePath string, extraEnv []string) ([]byte, error) {
+	if in.Host == "" || in.User == "" {
+		return nil, fmt.Errorf("sftp: host+user required")
+	}
+	args := buildSSHListArgs(in, remotePath)
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd.Env = append(cmd.Environ(), extraEnv...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return out, fmt.Errorf("ssh ls -1 %s: %w (output: %s)",
+			remotePath, err, strings.TrimSpace(string(out)))
+	}
+	return out, nil
+}
+
+// buildSSHRenameArgs assembles the argv for `[conn] -- mv -n <src> <dst>`. src
+// and dst each go through remoteShellArg, so a repository path with spaces or
+// shell metacharacters stays one argument on the remote shell. -n
+// (no-clobber) is belt-and-braces: the JAB-405 caller builds dst from a
+// nanosecond timestamp, so the destination never pre-exists.
+func buildSSHRenameArgs(in SFTPInputs, src, dst string) []string {
+	return append(buildSSHConnArgs(in), "mv", "-n", remoteShellArg(src), remoteShellArg(dst))
+}
+
+// RenameRemoteSFTP runs `ssh user@host -- mv -n <src> <dst>` over the same auth
+// path restic's sftp.command uses. It renames a single file within the remote
+// repository — src and dst live on the same filesystem, so `mv` is an atomic
+// rename, never a copy+unlink. The JAB-405 Part 2b move-aside repair uses it to
+// move a mismatched key file OUT of keys/ (into the repository root, which restic
+// never scans for key candidates). It NEVER deletes: `mv` only renames, so the
+// moved key stays on disk and can be restored. On error the combined output is
+// returned so the caller can surface a diagnostic.
+func RenameRemoteSFTP(ctx context.Context, in SFTPInputs, src, dst string, extraEnv []string) ([]byte, error) {
+	if in.Host == "" || in.User == "" {
+		return nil, fmt.Errorf("sftp: host+user required")
+	}
+	if src == "" || dst == "" {
+		return nil, fmt.Errorf("sftp: src+dst required")
+	}
+	args := buildSSHRenameArgs(in, src, dst)
+	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
+	cmd.Env = append(cmd.Environ(), extraEnv...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return out, fmt.Errorf("ssh mv -n %s %s: %w (output: %s)",
+			src, dst, err, strings.TrimSpace(string(out)))
+	}
+	return out, nil
+}

@@ -1,0 +1,117 @@
+# Secret rotation runbook (JAB-357 crit-7)
+
+## When to run this
+
+Run this after the JAB-351/357 isolation fix (`#1208`/`#1217`/`#1222`/`#1246`) has been deployed to a host, to invalidate secrets that the internet-facing webmail service could read **before** the fix. The isolation stops future reads; rotation invalidates what an attacker may already have. Both are required to fully close the critical.
+
+This is an **operator ceremony**, run as **root**, on **one host at a time**:
+
+```
+sudo dotnext-cli secrets rotate <name> --dry-run   # always preview first
+sudo dotnext-cli secrets rotate <name>
+```
+
+It is deliberately **not** automated. It is never wired into `install.sh`'s converger or the 04:30 fleet auto-update — auto-rotating fleet secrets unprompted is the outage this ticket exists to prevent. Every rotation restarts the affected service; do it in a maintenance window.
+
+Every command:
+- previews with `--dry-run` and touches nothing;
+- applies the privileged change, then rewrites the on-disk secret **atomically** (temp + rename), preserving the file's exact owner and mode;
+- keeps a **root-only `.rotate.bak`** snapshot, restores from it if a post-rotation health probe fails, and **purges it on success** (a lingering `.bak` is a fresh copy of the old credential);
+- writes an audit event (`secrets.rotate.*`) that records the secret name, never its value.
+
+## Scope — what webmail could read (and what it could not)
+
+JAB-351 proved `dotnext-webmail` (broad `dotnext` group) could read `0640 root:dotnext` secrets. Scope is **exactly that exposure class**, not "every secret on the box".
+
+| Secret | Tooling | Notes |
+|---|---|---|
+| Panel DB app-user password (`db-password` + `DATABASE_URL`) | `dotnext-cli secrets rotate db-app-user` ✅ | `dotnext_panel_app@localhost` (the panel's own user, not root). ALTER USER → rewrite `db-password` + the `DATABASE_URL` line in `panel.env` → restart → verify the new credential. |
+| Kratos DB password + `secrets.cookie` / `secrets.default` (inlined in `kratos.yml`, `root:dotnext 0640`) | `dotnext-cli secrets rotate kratos` ✅ | Replaces all three with no rollover (old values are exposed) and revokes every session — **signs every user out once**. See "Kratos — IN scope" below. |
+| `JWT_SECRET` (`panel.env`) | `dotnext-cli secrets rotate jwt` ✅ | Vestigial post-M20 (panel auth is Kratos; webmail SSO uses the separate `bulwark-jwt-auth.secret`). Rotating it is a safe near-noop; included only because it lived in the exposed file. |
+| `postgres.password` | `dotnext-cli db root-password --engine postgres` (existing) | Same exposure class (`root:dotnext 0640`). **Only if `/etc/dotnext/postgres.password` exists.** |
+| MariaDB root password (`mysql-root.password`, `root:dotnext 0640`) | `dotnext-cli db root-password --engine mariadb` (existing) | Break-glass root credential; socket auth preserved (ADR-0097). **Only if `/etc/dotnext/mysql-root.password` exists.** `install.sh` never writes that file; only an earlier `db root-password` run does. Without it, root has Debian's default (`unix_socket` plus the unusable `invalid` hash), so there was no password to read, and running the command *adds* a working root password the host didn't have. |
+| Panel TLS key (`/etc/dotnext/tls/panel.key`) | Let's Encrypt: none (renewal). Self-signed: `dotnext-cli panel-cert new-key` ✅ | **Let's Encrypt** (issuer not "dotNext"): certbot gives the cert a new key at each renewal (no `reuse_key`), so a cert renewed after the fix is clean and an older one is replaced at its next renewal. **Self-signed** (issuer O="dotNext"): keeps its key for 10 years; the reconciler never replaces a current one. `new-key` writes a new cert + key beside the old pair, swaps them in, reloads nginx and restarts the panel; it refuses a live CA cert. Accept the new cert in the browser; verify `/login` 200 after. **Don't move the files away instead:** until the reconciler regenerates them, an nginx restart fails and takes every site down. |
+| Panel-mail TLS key (`/etc/dotnext/tls/panel-mail.key`) | Let's Encrypt: none (renewal). Self-signed: `dotnext-cli panel-cert new-key mail` ✅ | Same rules as the hostname cert. `new-key mail` also pushes the cert into Stalwart and restarts it; mail apps ask to accept the new cert once. |
+| `DOTNEXT_REDIS_PANEL_TOKEN` (`panel.env` + redis aclfile) | `dotnext-cli secrets rotate redis-panel-token` ✅ | Rotates **live**: `ACL SETUSER dotnext_panel resetpass >…` on the running Redis (authing as dotnext_panel with the old token), then rewrites `panel.env` + the aclfile `user dotnext_panel` line (default + tenant `wp_*` lines preserved), then restarts panel and verifies. **Never `ACL LOAD` / restart Redis** — that wipes the runtime `wp_<osuser>` tenant ACL users until the reconciler recreates them. Rolls back the live password too on failure. |
+| `PDNS_DB_PASSWORD` (`pdns.env` + gmysql conf) | `dotnext-cli secrets rotate pdns` ✅ | ALTER the `dotnext_pdns` DB user, rewrite `PDNS_DB_PASSWORD` in `pdns.env` **and** `gmysql-password` in `/etc/powerdns/pdns.d/01-dotnext-mysql.conf`, restart pdns, verify + rollback, then restart `dotnext-agent` (dotnext-api restarts with it). The agent opens its PowerDNS DB connection at start-up, so until it restarts the panel's zone writes fail with "Access denied for user 'dotnext_pdns'". **Builds before this change do not restart the agent: after `rotate pdns`, run `systemctl restart dotnext-agent` yourself.** Cleanly no-ops with a "not provisioned" message if PowerDNS is absent. |
+| `migration-secrets/<job>.env` | **purge, don't rotate** | Transient Plesk/cPanel/SSH **source-host** credentials. Any file lingering from before the fix exposed a third party's password — delete lingering files; the operator re-enters source credentials on the next migration. Not our secret to rotate. |
+| `DOTNEXT_WP_CACHE_HMAC_SECRET` (`panel.env`) | **deferred** (documented risk) | See below. |
+
+### Deferred: WP-cache HMAC secret
+
+`DOTNEXT_WP_CACHE_HMAC_SECRET` derives a per-tenant Redis-cache ACL token that is baked into **every** WordPress tenant's `wp-config.php`. Rotating it therefore is **not** a one-file swap: it requires re-deriving and rewriting every tenant's `wp-config.php` via the agent — a fleet-wide, per-tenant fan-out that must be throttled (the fleet's 2 GB VMs can fall into a kswapd death-spiral under unbounded fan-out). It is deferred to a dedicated, throttled reconciler task rather than bolted onto this tool. Until then, treat the value as exposed: it grants access only to the shared tenant object cache, not to panel/DB/TLS material.
+
+### Out of scope
+
+DKIM keys (`root:dotnext-sftp 0600`), tenant DB passwords, tenant Let's Encrypt lineage, and the Stalwart admin token (`dotnext-mail`).
+
+`mailhook.token` (`root:dotnext 0640`) was in the exposure class, but rotating it buys nothing. It only authenticates calls to the loopback disclaimer hook (`127.0.0.1:8462`, ADR-0143). That hook appends a domain's disclaimer text, which every outgoing message already shows, and reads the DB read-only. A copy lets a local process get disclaimers appended to its own message, nothing more.
+
+### Kratos — IN scope (correction, 2026-09-26)
+
+An earlier version of this runbook put Kratos out of scope because the root-only `kratos-secrets/` files are not `dotnext`-readable. **That was wrong.** `/etc/dotnext/kratos.yml` is `root:dotnext 0640` on every install — Kratos runs as `dotnext` and must read it — and it inlines three secrets that webmail could therefore read before the fix:
+
+| Secret | What an attacker could do with the old value |
+|---|---|
+| Kratos DB password (`dsn`) | Read the Kratos database: identities, password hashes, TOTP secrets and **live session tokens**. |
+| `secrets.cookie` / `secrets.default` | Mint valid CSRF tokens and open captured Kratos cookies. |
+
+`dotnext-cli secrets rotate kratos` replaces all three:
+
+- It runs `ALTER USER dotnext_kratos` and rewrites four files atomically: `kratos-db-password`, `kratos-secrets/{default,cookie}` and the dsn plus secrets in `kratos.yml`. The next `dotnext-cli update` re-renders from those files, so it keeps the new values.
+- It restarts `dotnext-kratos` and verifies both the service and the new DB password. On failure it rolls back.
+- It then **revokes every active session**.
+
+**Old values are deliberately not kept.** Kratos's usual rollover (prepend the new secret, keep the old one for verification) would leave the exposed secret valid.
+
+- The cost: **every panel user is signed out once** and must sign in again. Run it in a maintenance window, and expect your own session to end.
+- Nothing at rest depends on these secrets, since `kratos.yml` has no `ciphers:` block, so nothing needs re-encrypting.
+- If the command reports that session revocation failed, the secrets **stay rotated**; rolling back would bring the exposed values back. Revoke the rest with `dotnext-cli session list` / `dotnext-cli session revoke-user`.
+- If it reports that `kratos.yml` does not match its source files, run `dotnext-cli update` to re-render it, then retry.
+
+### Administrator passwords and 2FA (after `rotate kratos`)
+
+The old DB password could have been used to copy password hashes and TOTP secrets. Rotating the password stops further reads, but it does not invalidate data that was already copied. A copied TOTP secret keeps producing valid codes until the user sets up 2FA again.
+
+Decision (JAB-357, 2026-09-27): on each affected host, reset every administrator's password and 2FA by hand. The panel has no bulk command and no "change password at next login" flag. It does not make a user set up 2FA again either, because Kratos runs with `required_aal: highest_available`: a user with 2FA must use it, but a user without it is not asked to add it.
+
+Run these steps **after** `dotnext-cli secrets rotate kratos`, so the new credentials are written after the old DB password stops working:
+
+1. `dotnext-cli user list`: note every row with ROLE `admin`.
+2. For each admin, run `dotnext-cli user password <admin>`.
+   - This sets a new random password directly, and the old one stops working at once.
+   - Give the new password to the admin over a safe channel.
+   - Do not use `--link` here. With a recovery link, the old password may keep working until the admin finishes the recovery; this is not verified.
+3. For each admin, run `dotnext-cli user 2fa-reset <admin>`. This removes the TOTP secret and the recovery codes. The password is not changed.
+4. Each admin signs in, changes the password in their profile, and sets up 2FA again. The panel does not enforce this, so confirm with each admin that it is done.
+
+Tenant accounts are not covered by this decision.
+
+## Recommended order (per host)
+
+`dotnext-cli secrets rotate all` runs the built rotations (`db-app-user` → `redis-panel-token` → `jwt`) in this lockout-safe order, each with its own verify+rollback, stopping at the first failure (already-rotated secrets stay rotated; re-run to continue). The remaining items below are run individually.
+
+1. `db-app-user` — highest value; verify `/login` still works after.
+2. `postgres` / MariaDB root — if those engines are present.
+3. `redis-panel-token` — once tooled.
+4. `pdns` — if PowerDNS present.
+5. Panel + panel-mail TLS reissue.
+6. `jwt` — cheap, do it alongside any panel restart.
+7. `kratos` — last, in a maintenance window: it signs every user out. Deliberately NOT part of `rotate all`, so the forced sign-out is always an explicit choice.
+8. Administrator passwords and 2FA, right after `kratos`. See "Administrator passwords and 2FA" above.
+9. Purge lingering `migration-secrets/*.env` (the daily reaper now also removes orphans with no job row).
+10. Note the deferred WP-cache HMAC as an open item.
+
+## Verify after each rotation
+
+- Panel: `systemctl is-active dotnext-api` and `curl -sk https://<host>/login -o /dev/null -w '%{http_code}'` → 200. **Allow a few seconds after the restart:** the panel is marked `active` within ~1s but takes a moment to bind its socket, so an immediate curl can return a transient **502** that self-clears (observed on the .60 drill). The rotate command itself waits for a stable-active panel before reporting success, so trust its exit status; if you poll manually, retry for ~10s before treating a 502 as a failure.
+- Dispatcher/Redis: the panel's Redis-backed queues still process (no ACL errors in `journalctl -u dotnext-api`).
+- Mail (after TLS): send a test message.
+
+## Rollback
+
+Each command rolls itself back automatically if its post-rotation probe fails (restores the file from `.rotate.bak` and reverts the privileged change). If you need to roll back manually after the fact, the `.rotate.bak` is gone on success by design — recover from your host backup.
+
+## Closing the ticket
+
+JAB-357 crit-7 closes when the operator has run the rotation across the affected hosts **and** the external auditor (`codex-security-test`, who filed JAB-351/357) has re-confirmed the exposed secrets are invalidated — not when this tooling merges.

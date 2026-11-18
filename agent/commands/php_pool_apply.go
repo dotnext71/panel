@@ -1,0 +1,951 @@
+package commands
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log/slog"
+	"os"
+	"os/user"
+	"path/filepath"
+	"regexp"
+	"strconv"
+	"strings"
+	"text/template"
+	"time"
+
+	"github.com/dotnext-panel/dotnext/agentwire"
+	"github.com/dotnext-panel/dotnext/internal/platform/osinfo"
+	"golang.org/x/sys/unix"
+)
+
+// phpPoolApplyParams is the input shape for php.pool.apply.
+type phpPoolApplyParams struct {
+	Username   string `json:"username"`
+	PHPVersion string `json:"php_version"`
+	Additive   bool   `json:"additive,omitempty"` // M35.8: keep other-version pools for this user
+	// Slug is the pool/instance identity used for all on-disk paths and the
+	// systemd instance name (GH #329). Empty => the legacy per-user default
+	// pool: slug == username, byte-identical to pre-#329 behaviour. A
+	// non-empty slug (e.g. "alice-php8.2") provisions an ADDITIONAL versioned
+	// master alongside the default one; user=/group= in the pool conf stay the
+	// real OS user (the dotnext-pma opaque-instance pattern), so privilege is
+	// unchanged — only the PHP version differs.
+	Slug                           string `json:"slug,omitempty"`
+	PmMode                         string `json:"pm_mode"`
+	PmMaxChildren                  uint32 `json:"pm_max_children"`
+	ProcessIdleTimeoutSeconds      uint32 `json:"process_idle_timeout_seconds"`
+	PmStartServers                 uint32 `json:"pm_start_servers"`
+	PmMinSpareServers              uint32 `json:"pm_min_spare_servers"`
+	PmMaxSpareServers              uint32 `json:"pm_max_spare_servers"`
+	PmMaxRequests                  uint32 `json:"pm_max_requests"`
+	RequestTerminateTimeoutSeconds uint32 `json:"request_terminate_timeout_seconds"`
+	// SlowlogTimeoutSeconds (GH #1332 item 12): >0 enables the pool slow log with
+	// this request threshold. The slowlog PATH is derived here from the slug —
+	// never accepted over the wire — and lands under the tenant-owned
+	// /home/<user>/logs so the tenant-run FPM master can write it.
+	SlowlogTimeoutSeconds uint32 `json:"slowlog_timeout_seconds,omitempty"`
+	AdminValues           []KV   `json:"admin_values"`
+	AdminFlags            []KV   `json:"admin_flags"`
+	// DisableFunctions (GH #402) overrides the php_admin_value[disable_functions]
+	// line. nil = caller did not specify -> the safe default (#401) is used;
+	// "" = explicit admin opt-out (emit no line); any other value is rendered
+	// verbatim. Admin-only channel: bypasses the tenant-facing
+	// forbiddenDirectives guard (which still rejects disable_functions in
+	// admin_values), so a tenant can never shorten their own blocklist.
+	DisableFunctions *string `json:"disable_functions"`
+	// ExtraExtensions are opt-in PHP extensions to load for this pool only (GH
+	// #1332 item 16), rendered as php_admin_value[extension]=<name>.so. Names
+	// are validated here (regex + the .so must exist) — an unknown or missing
+	// one is skipped, never rendered raw. Panel-controlled channel: it bypasses
+	// the tenant admin_values allowlist (which has no "extension" entry) exactly
+	// like disable_functions does.
+	ExtraExtensions []string `json:"extra_extensions,omitempty"`
+	// XdebugEnabled (GH #1332 item 9) turns Xdebug on for THIS pool via a per-slug
+	// PHP_INI_SCAN_DIR ini (fpm-exec sets the scan dir). Safe modes only — no
+	// step-debug/remote-connect. Requires xdebug.so installed; the agent refuses
+	// to enable it otherwise so the master can't crash-loop on a missing .so.
+	XdebugEnabled bool `json:"xdebug_enabled,omitempty"`
+}
+
+// phpExtNameRE bounds an extension name to a safe module identifier before it is
+// turned into "<name>.so" and rendered into the pool conf.
+var phpExtNameRE = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
+
+// KV represents a key-value pair for ini directives.
+type KV struct {
+	Name  string `json:"name"`
+	Value string `json:"value"`
+}
+
+// phpPoolApplyResponse is the output shape for php.pool.apply.
+type phpPoolApplyResponse struct {
+	SocketPath string `json:"socket_path"`
+	PoolName   string `json:"pool_name"`
+}
+
+// phpPoolSpecTemplate represents the template data for rendering the pool config.
+type phpPoolSpecTemplate struct {
+	PoolName                       string
+	User                           string
+	Group                          string
+	SocketPath                     string
+	PmMode                         string
+	PmMaxChildren                  uint32
+	ProcessIdleTimeoutSeconds      uint32
+	PmStartServers                 uint32
+	PmMinSpareServers              uint32
+	PmMaxSpareServers              uint32
+	PmMaxRequests                  uint32
+	RequestTerminateTimeoutSeconds uint32
+	SlowlogTimeoutSeconds          uint32
+	SlowlogPath                    string
+	AdminValues                    []KV
+	AdminFlags                     []KV
+	DisableFunctions               string
+}
+
+// phpVersionRegex validates PHP version format: X.Y where X and Y are digits.
+var phpVersionRegex = regexp.MustCompile(`^\d+\.\d+$`)
+
+// phpPoolUsernameRegex validates PHP pool username format: must start with lowercase
+// letter, contain only lowercase letters, digits, underscores, max 32 chars.
+var phpPoolUsernameRegex = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
+
+// phpPoolSlugRegex validates a pool slug (GH #329). Superset of the username
+// regex that also permits the "-php<X.Y>" versioned suffix (dot + hyphen).
+// Panel constructs slugs as "<user>-php<version>"; the regex is defense in
+// depth against a malformed slug ever reaching a filesystem path.
+var phpPoolSlugRegex = regexp.MustCompile(`^[a-z][a-z0-9_.-]{0,63}$`)
+
+// adminValueAllowlist is the set of allowed php_admin_value directives.
+var adminValueAllowlist = map[string]bool{
+	"memory_limit":        true,
+	"upload_max_filesize": true,
+	"post_max_size":       true,
+	"max_execution_time":  true,
+	"max_input_vars":      true,
+	"max_input_time":      true,
+	"date.timezone":       true,
+	// GH #1332 OPcache / JIT controls (per-pool = per-user,version). Values
+	// are clamped/validated by the panel endpoint before they reach here; this
+	// allowlist is the final gate on the directive NAMES. opcache.jit takes a
+	// CRTO string ("tracing"/"function"/"off"); the others are byte/int sizes.
+	"opcache.memory_consumption":    true,
+	"opcache.max_accelerated_files": true,
+	"opcache.revalidate_freq":       true,
+	"opcache.jit":                   true,
+	"opcache.jit_buffer_size":       true,
+}
+
+// adminFlagAllowlist is the set of allowed php_admin_flag directives.
+var adminFlagAllowlist = map[string]bool{
+	"display_errors": true,
+	"log_errors":     true,
+	"file_uploads":   true,
+	// GH #1332 OPcache on/off + timestamp validation (per-pool).
+	"opcache.enable":              true,
+	"opcache.validate_timestamps": true,
+}
+
+// defaultDisableFunctions is the GH #401 command-exec lockdown: the safe,
+// non-overridable php_admin_value[disable_functions] applied to every pool
+// unless an admin opts the owner's package out (GH #402, params.DisableFunctions
+// == ""). Single source of truth — the template renders {{.DisableFunctions}},
+// it is NOT hard-coded in the .tmpl anymore. Blocks process-spawning only;
+// curl/file_get_contents stay enabled (WordPress HTTP API).
+const defaultDisableFunctions = "exec,passthru,shell_exec,system,proc_open,popen,pcntl_exec,pcntl_fork,proc_nice,dl"
+
+// forbiddenDirectives are directives that must never appear in overrides,
+// even if they pass the allowlist check. Belt-and-suspenders defense.
+var forbiddenDirectives = map[string]bool{
+	"open_basedir":      true,
+	"disable_functions": true,
+	"extension_dir":     true,
+	"zend_extension":    true,
+}
+
+// beltAndSuspendersCheck performs a final check on directive names to ensure
+// no jailbreak-relevant directives slip through.
+func isForbiddenDirective(name string) bool {
+	if forbiddenDirectives[name] {
+		return true
+	}
+	// Also reject any name containing a newline, regardless of allowlist.
+	if strings.ContainsAny(name, "\n\r") {
+		return true
+	}
+	return false
+}
+
+// hasControlChar reports whether s holds an ASCII control character
+// (newline, carriage return, NUL, tab, DEL, ...).
+func hasControlChar(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return true
+		}
+	}
+	return false
+}
+
+// validatePoolIniOverrides checks the admin_values and admin_flags a pool
+// apply renders into the pool conf: directive names against the allowlists and
+// forbiddenDirectives, values for control characters, flags for on/off.
+func validatePoolIniOverrides(values, flags []KV) *agentwire.AgentError {
+	// Validate admin_values directives.
+	for _, av := range values {
+		if isForbiddenDirective(av.Name) {
+			return &agentwire.AgentError{
+				Code:    agentwire.CodeInvalidArgument,
+				Message: fmt.Sprintf("forbidden directive: %s", av.Name),
+			}
+		}
+		if !adminValueAllowlist[av.Name] {
+			return &agentwire.AgentError{
+				Code:    agentwire.CodeInvalidArgument,
+				Message: fmt.Sprintf("unknown admin_value directive: %s", av.Name),
+			}
+		}
+		// The value is rendered raw into the pool conf: a newline would start
+		// a new line past the directive allowlist and forbiddenDirectives
+		// (e.g. php_admin_value[open_basedir] = /).
+		if hasControlChar(av.Value) {
+			return &agentwire.AgentError{
+				Code:    agentwire.CodeInvalidArgument,
+				Message: fmt.Sprintf("admin_value %s: value contains a control character", av.Name),
+			}
+		}
+		// OPcache sizing goes into an ini file the master reads at startup
+		// (GH #2466): only a plain size, count or JIT mode word.
+		if !validOpcacheStartupValue(av.Name, av.Value) {
+			return &agentwire.AgentError{
+				Code:    agentwire.CodeInvalidArgument,
+				Message: fmt.Sprintf("admin_value %s: invalid value %q", av.Name, av.Value),
+			}
+		}
+	}
+
+	// Validate admin_flags directives and values.
+	for _, af := range flags {
+		if isForbiddenDirective(af.Name) {
+			return &agentwire.AgentError{
+				Code:    agentwire.CodeInvalidArgument,
+				Message: fmt.Sprintf("forbidden directive: %s", af.Name),
+			}
+		}
+		if !adminFlagAllowlist[af.Name] {
+			return &agentwire.AgentError{
+				Code:    agentwire.CodeInvalidArgument,
+				Message: fmt.Sprintf("unknown admin_flag directive: %s", af.Name),
+			}
+		}
+		if af.Value != "on" && af.Value != "off" {
+			return &agentwire.AgentError{
+				Code:    agentwire.CodeInvalidArgument,
+				Message: fmt.Sprintf("admin_flag value must be 'on' or 'off', got: %s", af.Value),
+			}
+		}
+	}
+	return nil
+}
+
+// globDeletePoolFiles removes pool files for the given username, optionally
+// keeping the named version intact. Pass excludeVersion="" for the legacy
+// wipe-all-versions behavior; pass a concrete version to leave that one
+// in place — used by M35.8 per-domain PHP restore so multi-version pools
+// for a single user coexist. Returns a map of PHP versions whose pool
+// files were deleted (for subsequent reload).
+func globDeletePoolFiles(username string, excludeVersion ...string) (map[string]bool, error) {
+	matches, err := globPoolFilesForSlug(username)
+	if err != nil {
+		return nil, fmt.Errorf("glob failed: %w", err)
+	}
+	keep := map[string]bool{}
+	for _, v := range excludeVersion {
+		if v != "" {
+			keep[v] = true
+		}
+	}
+
+	deletedVersions := make(map[string]bool)
+	for _, path := range matches {
+		version, _ := osinfo.ExtractPHPVersionFromPoolDir(filepath.Dir(path))
+		if keep[version] {
+			continue
+		}
+		if version != "" {
+			deletedVersions[version] = true
+		}
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return nil, fmt.Errorf("failed to remove %s: %w", path, err)
+		}
+	}
+	return deletedVersions, nil
+}
+
+// systemctlDetail returns systemctl's own first output line as " (…)" for an
+// error message, or "" when it printed nothing. GH #1820: "exit status 1"
+// alone hid the cause; systemctl says e.g. "Job for … failed because of
+// unavailable resources or another system error." The pool's last_error is
+// what the panel shows, so this is the line an admin acts on.
+func systemctlDetail(out []byte) string {
+	line, _, _ := strings.Cut(strings.TrimSpace(string(out)), "\n")
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return ""
+	}
+	if len(line) > 300 {
+		line = line[:300] + "…"
+	}
+	return " (" + line + ")"
+}
+
+// restartOrReloadUserFPM handles per-user FPM service restart/reload.
+// If oldVersion == newVersion (and not empty), attempts reload via USR2.
+// If the reload fails (unit not loaded/inactive), falls back to restart.
+// On version change or first-time apply, does full restart.
+// Also enables the service for auto-start on boot.
+func restartOrReloadUserFPM(ctx context.Context, username string, oldVersion, newVersion string) error {
+	// Skip systemctl operations in test environments.
+	if os.Getenv("DOTNEXT_PHP_POOL_SKIP_RELOAD") != "" {
+		return nil
+	}
+
+	serviceName := fmt.Sprintf("dotnext-fpm@%s.service", username)
+
+	// Try reload if versions match and oldVersion is not empty.
+	if oldVersion == newVersion && oldVersion != "" {
+		reloadCmd := execCommandContext(ctx, "systemctl", "reload", serviceName)
+		if out, err := reloadCmd.CombinedOutput(); err != nil {
+			// Reload failed; check if unit is not loaded or inactive, then restart.
+			// Otherwise return the error.
+			isActiveCmd := execCommandContext(ctx, "systemctl", "is-active", serviceName)
+			if aerr := isActiveCmd.Run(); aerr != nil {
+				// Unit not loaded or inactive; fall through to restart.
+			} else {
+				// Unit is active but reload failed — this is an error. GH #1820:
+				// this wrapped the is-active result (nil) instead of the reload
+				// error, so the pool's last_error read "%!w(<nil>)".
+				return fmt.Errorf("failed to reload %s: %w%s%s", serviceName, err, systemctlDetail(out), tasksLimitSuffix(ctx, serviceName))
+			}
+		} else {
+			// Reload succeeded; enable and return.
+			_ = execCommandContext(ctx, "systemctl", "enable", "--quiet", serviceName).Run()
+			return nil
+		}
+	}
+
+	// Restart (version changed or first-time apply).
+	restartCmd := execCommandContext(ctx, "systemctl", "restart", serviceName)
+	if out, err := restartCmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("failed to restart %s: %w%s%s", serviceName, err, systemctlDetail(out), tasksLimitSuffix(ctx, serviceName))
+	}
+
+	// Enable the service for auto-start on boot.
+	enableCmd := execCommandContext(ctx, "systemctl", "enable", "--quiet", serviceName)
+	if err := enableCmd.Run(); err != nil {
+		return fmt.Errorf("failed to enable %s: %w", serviceName, err)
+	}
+
+	return nil
+}
+
+// readVersionPinFile reads the version pin from disk, or returns empty string if not found.
+func readVersionPinFile(username string) (string, error) {
+	verPinRoot := os.Getenv("DOTNEXT_PHP_VER_PIN_ROOT")
+	if verPinRoot == "" {
+		verPinRoot = "/etc/dotnext/user-phpver"
+	}
+	verPinPath := filepath.Join(verPinRoot, username)
+	data, err := os.ReadFile(verPinPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("failed to read version pin: %w", err)
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+// writeVersionPinFile writes the version pin to disk.
+func writeVersionPinFile(username, version string) error {
+	verPinRoot := os.Getenv("DOTNEXT_PHP_VER_PIN_ROOT")
+	if verPinRoot == "" {
+		verPinRoot = "/etc/dotnext/user-phpver"
+	}
+	if err := os.MkdirAll(verPinRoot, 0755); err != nil {
+		return fmt.Errorf("failed to create version pin dir: %w", err)
+	}
+	verPinPath := filepath.Join(verPinRoot, username)
+	if err := os.WriteFile(verPinPath, []byte(version+"\n"), 0644); err != nil {
+		return fmt.Errorf("failed to write version pin: %w", err)
+	}
+	return nil
+}
+
+// writePerUserFPMConfig writes the per-user FPM config that includes only this user's pool.
+func writePerUserFPMConfig(username, version string) error {
+	fpmConfRoot := os.Getenv("DOTNEXT_FPM_CONFIG_ROOT")
+	if fpmConfRoot == "" {
+		fpmConfRoot = "/etc/dotnext/fpm"
+	}
+	if err := os.MkdirAll(fpmConfRoot, 0755); err != nil {
+		return fmt.Errorf("failed to create fpm config dir: %w", err)
+	}
+
+	fpmConfPath := filepath.Join(fpmConfRoot, username+".conf")
+	poolConfigPath := filepath.Join(phpPoolDirForVersion(version), fmt.Sprintf("dotnext-%s.conf", username))
+
+	confContent := fmt.Sprintf(`[global]
+pid = /run/php/dotnext-%s/fpm.pid
+error_log = /var/log/php-fpm-%s.log
+daemonize = no
+
+; Include only this user's pool file — prevents multi-master-loads-all-pools bug.
+include=%s
+`, username, username, poolConfigPath)
+
+	if err := os.WriteFile(fpmConfPath, []byte(confContent), 0644); err != nil {
+		return fmt.Errorf("failed to write per-user fpm config: %w", err)
+	}
+	return nil
+}
+
+// ensureVersionedFPMDropin writes the systemd drop-in for an additional
+// versioned FPM master (GH #329) at
+// /etc/systemd/system/dotnext-fpm@<slug>.service.d/slice.conf. The content
+// points the instance at the user's EXISTING slice and real OS user/group —
+// identical to the default pool's drop-in (written by user.slice.ensure) but
+// for the slug instance. Idempotent: only writes + daemon-reloads on change.
+func ensureVersionedFPMDropin(ctx context.Context, slug, username string) error {
+	dropinDir := filepath.Join(systemdRoot(), fmt.Sprintf("dotnext-fpm@%s.service.d", slug))
+	if err := os.MkdirAll(dropinDir, 0755); err != nil {
+		return fmt.Errorf("mkdir drop-in dir: %w", err)
+	}
+	dropinPath := filepath.Join(dropinDir, "slice.conf")
+	content := []byte(buildFPMDropinContent(username))
+	if filesMatch(dropinPath, content) {
+		return nil
+	}
+	if err := writeFileAtomically(dropinPath, content, 0644); err != nil {
+		return fmt.Errorf("write drop-in: %w", err)
+	}
+	// A new instance drop-in requires a daemon-reload before the instance is
+	// started so systemd picks up Slice=/User=/Group=.
+	if os.Getenv("DOTNEXT_PHP_POOL_SKIP_RELOAD") == "" {
+		_ = execCommandContext(ctx, "systemctl", "daemon-reload").Run()
+	}
+	return nil
+}
+
+// userLogsHomeRoot is where tenant homes live; a var so tests can point it at
+// a temp dir.
+var userLogsHomeRoot = "/home"
+
+// ensureUserLogsDir makes /home/<user>/logs (0750, tenant-owned) if missing and
+// returns it (GH #1332 item 12). The per-user FPM master runs AS the tenant, so
+// its slow log must live somewhere the tenant can write; this also sets up the
+// per-domain log shortcut. Chown is best-effort — the dir already being
+// tenant-owned (the common case) is fine.
+//
+// The agent runs as root and some tenants own their home, so nothing here
+// follows a link: an existing logs entry must be a real directory (Lstat),
+// only the last component is created (Mkdir, never a missing home) and the
+// owner is set with Lchown.
+func ensureUserLogsDir(username string) (string, error) {
+	if !phpPoolUsernameRegex.MatchString(username) {
+		return "", fmt.Errorf("invalid username %q", username)
+	}
+	dir := filepath.Join(userLogsHomeRoot, username, "logs")
+	if err := os.Mkdir(dir, 0o750); err != nil && !errors.Is(err, fs.ErrExist) {
+		return "", err
+	}
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return "", err
+	}
+	if !fi.IsDir() {
+		return "", fmt.Errorf("%s is not a directory", dir)
+	}
+	if u, err := user.Lookup(username); err == nil {
+		uid, _ := strconv.Atoi(u.Uid)
+		gid, _ := strconv.Atoi(u.Gid)
+		_ = os.Lchown(dir, uid, gid)
+	}
+	return dir, nil
+}
+
+// acquireLock acquires an exclusive flock on a per-user lock file with a 30-second timeout.
+func acquireLock(username string) (*os.File, error) {
+	lockDir := "/run/dotnext"
+	if err := os.MkdirAll(lockDir, 0700); err != nil {
+		return nil, fmt.Errorf("failed to create lock dir: %w", err)
+	}
+
+	lockPath := filepath.Join(lockDir, fmt.Sprintf("pool-apply-%s.lock", username))
+	file, err := os.Create(lockPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create lock file: %w", err)
+	}
+
+	// Attempt to acquire exclusive lock with 30-second timeout.
+	doneCh := make(chan error, 1)
+	go func() {
+		doneCh <- unix.Flock(int(file.Fd()), unix.LOCK_EX)
+	}()
+
+	select {
+	case err := <-doneCh:
+		if err != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed to acquire flock: %w", err)
+		}
+		return file, nil
+	case <-time.After(30 * time.Second):
+		file.Close()
+		return nil, fmt.Errorf("lock acquisition timeout (30s) — stuck apply?")
+	}
+}
+
+func phpPoolApplyHandler(ctx context.Context, params json.RawMessage) (any, error) {
+	var p phpPoolApplyParams
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: fmt.Sprintf("failed to parse params: %v", err),
+		}
+	}
+
+	// Validate username.
+	if !phpPoolUsernameRegex.MatchString(p.Username) {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: "invalid username format",
+		}
+	}
+
+	// Validate php_version format and check directory exists.
+	if !phpVersionRegex.MatchString(p.PHPVersion) {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: "invalid php_version format (expected X.Y)",
+		}
+	}
+
+	// Resolve the pool slug (GH #329). Empty => legacy per-user default pool
+	// (slug == username), byte-identical to pre-#329. A non-empty slug
+	// provisions an additional versioned master. Validate as a safe path
+	// component before any filesystem work.
+	slug := p.Username
+	if p.Slug != "" {
+		slug = p.Slug
+	}
+	if !phpPoolSlugRegex.MatchString(slug) || strings.Contains(slug, "..") {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: "invalid slug format",
+		}
+	}
+	isVersioned := slug != p.Username
+
+	poolDir := phpPoolDirForVersion(p.PHPVersion)
+	if info, err := os.Stat(poolDir); err != nil || !info.IsDir() {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: fmt.Sprintf("php version %s not installed", p.PHPVersion),
+		}
+	}
+
+	// Validate pm_mode.
+	pmModes := map[string]bool{"static": true, "ondemand": true, "dynamic": true}
+	if !pmModes[p.PmMode] {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: "invalid pm_mode (must be static, ondemand, or dynamic)",
+		}
+	}
+
+	// Validate pm_max_children.
+	if p.PmMaxChildren == 0 {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: "pm_max_children must be > 0",
+		}
+	}
+
+	// Validate process_idle_timeout_seconds.
+	if p.ProcessIdleTimeoutSeconds == 0 {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: "process_idle_timeout_seconds must be > 0",
+		}
+	}
+
+	// GH #339: dynamic pm requires start/spare sizing and FPM enforces
+	// min_spare <= start <= max_spare <= max_children. Fail closed so a bad
+	// combo never reaches FPM (which would refuse to start the pool).
+	if p.PmMode == "dynamic" {
+		if p.PmStartServers == 0 || p.PmMinSpareServers == 0 || p.PmMaxSpareServers == 0 {
+			return nil, &agentwire.AgentError{
+				Code:    agentwire.CodeInvalidArgument,
+				Message: "dynamic pm requires pm_start_servers, pm_min_spare_servers, pm_max_spare_servers > 0",
+			}
+		}
+		if !(p.PmMinSpareServers <= p.PmStartServers &&
+			p.PmStartServers <= p.PmMaxSpareServers &&
+			p.PmMaxSpareServers <= p.PmMaxChildren) {
+			return nil, &agentwire.AgentError{
+				Code:    agentwire.CodeInvalidArgument,
+				Message: "dynamic pm requires pm_min_spare_servers <= pm_start_servers <= pm_max_spare_servers <= pm_max_children",
+			}
+		}
+	}
+
+	if err := validatePoolIniOverrides(p.AdminValues, p.AdminFlags); err != nil {
+		return nil, err
+	}
+
+	// The config dir can exist without the FPM binary (a partial install, or a
+	// version whose CLI-only packages landed). fpm-exec would then crash-loop
+	// the master with a bare exit 127. Fail fast with a clear message so the
+	// pool lands in "error" with an actionable reason instead (GH #329). Checked
+	// after argument validation so a bad request still returns InvalidArgument.
+	fpmBinary := phpFPMBinaryForVersion(p.PHPVersion)
+	if _, err := os.Stat(fpmBinary); err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeFailedPrecondition,
+			Message: fmt.Sprintf("php-fpm binary for %s not installed (%s missing) — install php%s-fpm", p.PHPVersion, fpmBinary, p.PHPVersion),
+		}
+	}
+
+	// Acquire per-slug flock to serialize pool-apply operations. Keying on the
+	// slug (not the user) lets the default pool and a versioned pool for the
+	// same user apply independently without blocking each other.
+	lockFile, err := acquireLock(slug)
+	if err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInternal,
+			Message: fmt.Sprintf("flock acquisition failed: %v", err),
+		}
+	}
+	defer lockFile.Close()
+
+	// Read old version before making changes.
+	oldVersion, err := readVersionPinFile(slug)
+	if err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInternal,
+			Message: fmt.Sprintf("failed to read old version: %v", err),
+		}
+	}
+
+	// Delete stale pool files for this user. Legacy callers (operator
+	// switches primary PHP version via the panel) wipe ALL (user, *)
+	// pool files so only one survives. M35.8 migration restore needs
+	// per-domain PHP — multiple versions co-exist; only the version
+	// being upserted should be deleted-and-rewritten. The `additive`
+	// flag toggles between the two: additive=true leaves other-version
+	// pools intact; additive=false (legacy default) wipes everything.
+	var keep []string
+	if p.Additive || isVersioned {
+		keep = append(keep, p.PHPVersion)
+	}
+	// A versioned slug's glob (dotnext-<user>-php<ver>.conf) only ever matches
+	// its own single version dir, so this never touches the default pool or
+	// any sibling version — it just rewrites this slug's own file.
+	_, err = globDeletePoolFiles(slug, keep...)
+	if err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInternal,
+			Message: fmt.Sprintf("failed to clean stale pools: %v", err),
+		}
+	}
+
+	// Build pool config path and socket path.
+	// Support DOTNEXT_PHP_POOL_CONFIG_DIR env var for testing.
+	poolConfigDir := os.Getenv("DOTNEXT_PHP_POOL_CONFIG_DIR")
+	if poolConfigDir == "" {
+		poolConfigDir = phpPoolDirForVersion(p.PHPVersion)
+	}
+	poolConfigPath := fmt.Sprintf("%s/dotnext-%s.conf", poolConfigDir, slug)
+	// Socket lives in a slug-owned subdir of /run/php (see fpm-pre-start).
+	// For the default pool (slug == user) the path is the legacy
+	// /run/php/dotnext-<user>/fpm.sock, version-independent so its vhosts
+	// survive a version switch without regen. A versioned slug gets its own
+	// /run/php/dotnext-<user>-php<ver>/fpm.sock (GH #329).
+	socketPath := fmt.Sprintf("/run/php/dotnext-%s/fpm.sock", slug)
+	poolName := fmt.Sprintf("dotnext-%s", slug)
+
+	// Render the template.
+	tmplPath := poolTemplatePath()
+	tmplData, err := os.ReadFile(tmplPath)
+	if err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInternal,
+			Message: fmt.Sprintf("failed to read pool template: %v", err),
+		}
+	}
+
+	tmpl, err := template.New("pool").Parse(string(tmplData))
+	if err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInternal,
+			Message: fmt.Sprintf("failed to parse pool template: %v", err),
+		}
+	}
+
+	// Resolve disable_functions: nil param -> the #401 safe default; a
+	// non-nil value (incl. "") is the admin per-package decision (#402).
+	// Reject control chars so a value can never break out of the pool-conf
+	// line (defense-in-depth; the value comes from panel-api, not a tenant).
+	disableFunctions := defaultDisableFunctions
+	if p.DisableFunctions != nil {
+		disableFunctions = *p.DisableFunctions
+	}
+	if strings.ContainsAny(disableFunctions, "\n\r\x00") {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: "disable_functions contains control characters",
+		}
+	}
+	// GH #1701: only comma-separated lowercase function names (the panel's
+	// canonical form) ever reach the pool conf.
+	if err := validateDisableFunctions(disableFunctions); err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: err.Error()}
+	}
+
+	// The tenant-owned logs dir holds the PHP error logs of every pool (see
+	// php_error_log.go): without it PHP falls back to FastCGI stderr. Made on
+	// every apply, with the tenant's logrotate stanza; a failure here only
+	// matters to the slow log below.
+	logsDir, logsErr := ensureUserLogsDir(p.Username)
+	if logsErr != nil {
+		slog.Warn("php pool: tenant logs dir", "user", p.Username, "err", logsErr)
+	} else if err := writePHPErrorLogrotate(p.Username); err != nil {
+		slog.Warn("php pool: PHP error log rotation", "user", p.Username, "err", err)
+	}
+
+	// GH #1332 item 12: derive the slow-log path from the slug (never over the
+	// wire) and ensure the tenant-owned logs dir exists so the tenant-run FPM
+	// master can write it. Clamp defensively — the panel validates 0..600.
+	var slowlogPath string
+	slowlogTimeout := p.SlowlogTimeoutSeconds
+	if slowlogTimeout > 600 {
+		slowlogTimeout = 600
+	}
+	if slowlogTimeout > 0 {
+		name := "php-slow.log"
+		if isVersioned {
+			name = "php-slow-" + slug + ".log"
+		}
+		if logsErr != nil {
+			return nil, &agentwire.AgentError{
+				Code:    agentwire.CodeInternal,
+				Message: fmt.Sprintf("ensure logs dir: %v", logsErr),
+			}
+		}
+		slowlogPath = filepath.Join(logsDir, name)
+	}
+
+	// OPcache sizing is read by the master at startup, not from the pool
+	// (GH #2466): it goes into the slug's own ini below, not the pool conf.
+	poolValues, opcacheStartup := splitOpcacheStartupValues(p.AdminValues)
+
+	spec := phpPoolSpecTemplate{
+		PoolName:                       poolName,
+		User:                           p.Username,
+		Group:                          p.Username,
+		SocketPath:                     socketPath,
+		PmMode:                         p.PmMode,
+		PmMaxChildren:                  p.PmMaxChildren,
+		ProcessIdleTimeoutSeconds:      p.ProcessIdleTimeoutSeconds,
+		PmStartServers:                 p.PmStartServers,
+		PmMinSpareServers:              p.PmMinSpareServers,
+		PmMaxSpareServers:              p.PmMaxSpareServers,
+		PmMaxRequests:                  p.PmMaxRequests,
+		RequestTerminateTimeoutSeconds: p.RequestTerminateTimeoutSeconds,
+		SlowlogTimeoutSeconds:          slowlogTimeout,
+		SlowlogPath:                    slowlogPath,
+		AdminValues:                    poolValues,
+		AdminFlags:                     p.AdminFlags,
+		DisableFunctions:               disableFunctions,
+	}
+
+	// GH #1332 item 16: load opt-in extra extensions for THIS pool via
+	// php_admin_value[extension]=<name>.so (box-drilled: multiple such lines
+	// accumulate). Panel-controlled channel like disable_functions — validate
+	// the name and that the .so is actually installed; skip anything unknown so
+	// a bad entry can never break the pool. Copy first: don't mutate the caller's
+	// AdminValues backing array.
+	if len(p.ExtraExtensions) > 0 {
+		merged := make([]KV, 0, len(spec.AdminValues)+len(p.ExtraExtensions))
+		merged = append(merged, spec.AdminValues...)
+		seen := map[string]bool{}
+		for _, ext := range p.ExtraExtensions {
+			if !phpExtNameRE.MatchString(ext) || seen[ext] {
+				continue
+			}
+			so := ext + ".so"
+			if !findPHPModuleSo(p.PHPVersion, so) {
+				continue
+			}
+			seen[ext] = true
+			merged = append(merged, KV{Name: "extension", Value: so})
+		}
+		spec.AdminValues = merged
+	}
+
+	var buf strings.Builder
+	if err := tmpl.Execute(&buf, spec); err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInternal,
+			Message: fmt.Sprintf("failed to render pool template: %v", err),
+		}
+	}
+
+	// Write the pool config file.
+	if err := os.WriteFile(poolConfigPath, []byte(buf.String()), 0644); err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInternal,
+			Message: fmt.Sprintf("failed to write pool config: %v", err),
+		}
+	}
+
+	// Write the per-user FPM config (includes only this user's pool).
+	if err := writePerUserFPMConfig(slug, p.PHPVersion); err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInternal,
+			Message: fmt.Sprintf("failed to write per-user fpm config: %v", err),
+		}
+	}
+
+	// Write the version pin file (keyed by slug).
+	if err := writeVersionPinFile(slug, p.PHPVersion); err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInternal,
+			Message: fmt.Sprintf("failed to write version pin: %v", err),
+		}
+	}
+
+	// A versioned slug is an ADDITIONAL master; it needs its own systemd
+	// slice drop-in (dotnext-fpm@<slug>.service.d/slice.conf) pointing at the
+	// SAME per-user slice + real OS user/group. The default pool's drop-in is
+	// owned by user.slice.ensure, so only do this for versioned slugs (#329).
+	if isVersioned {
+		if err := ensureVersionedFPMDropin(ctx, slug, p.Username); err != nil {
+			return nil, &agentwire.AgentError{
+				Code:    agentwire.CodeInternal,
+				Message: fmt.Sprintf("failed to write versioned fpm drop-in: %v", err),
+			}
+		}
+	}
+
+	// Per-user CLI php wrapper so the user's shell, Composer, wp-cli, and cron
+	// resolve `php` to their pinned version (GH #184). This is the user's SHELL
+	// php and belongs to the DEFAULT pool only — a per-domain versioned pool
+	// must not repoint the shell. Best-effort: a failure here must not fail the
+	// FPM apply (the web path is already converged).
+	if !isVersioned {
+		if err := ensureUserCLIPHP(p.Username, p.PHPVersion); err != nil {
+			slog.Warn("per-user CLI php wrapper", "user", p.Username, "version", p.PHPVersion, "err", err)
+		}
+	}
+
+	// GH #1332 item 9: manage the per-slug Xdebug ini before the (re)start.
+	// fpm-exec adds /etc/php/<ver>/dotnext-ext/<slug> to PHP_INI_SCAN_DIR, so an
+	// ini dropped there enables Xdebug for THIS pool only. Refuse to enable when
+	// xdebug.so is missing (a bad zend_extension line crash-loops the master).
+	xdebugChanged, xderr := applyPoolXdebug(p.PHPVersion, slug, p.Username, p.XdebugEnabled)
+	if xderr != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeFailedPrecondition, Message: xderr.Error()}
+	}
+
+	// GH #1701: a pool whose disable_functions leaves PHP Defense's exec bans
+	// enabled loads its own PHP Defense rules without them, so the package's
+	// decision holds in enforce mode too. Written before the reload below,
+	// which is enough for the master to pick it up.
+	if _, pderr := applyPoolPHPDefense(p.PHPVersion, slug, phpDefenseAllowFromDisabled(disableFunctions)); pderr != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: pderr.Error()}
+	}
+
+	// GH #2466: the pool's OPcache sizing, in the slug's scan dir.
+	opcacheChanged, operr := applyPoolOpcacheIni(p.PHPVersion, slug, opcacheStartup)
+	if operr != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: operr.Error()}
+	}
+
+	// Restart or reload the slug's FPM service.
+	if err := restartOrReloadUserFPM(ctx, slug, oldVersion, p.PHPVersion); err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInternal,
+			Message: err.Error(),
+		}
+	}
+
+	// A changed Xdebug state needs a FULL restart — a USR2 reload (which
+	// restartOrReloadUserFPM may have done for an unchanged version) never
+	// re-reads a zend_extension. Changed OPcache sizing likewise: the
+	// master sizes its shared memory only when it starts.
+	if (xdebugChanged || opcacheChanged) && os.Getenv("DOTNEXT_PHP_POOL_SKIP_RELOAD") == "" {
+		_ = execCommandContext(ctx, "systemctl", "restart", fmt.Sprintf("dotnext-fpm@%s.service", slug)).Run()
+	}
+
+	return phpPoolApplyResponse{
+		SocketPath: socketPath,
+		PoolName:   poolName,
+	}, nil
+}
+
+// applyPoolXdebug writes or removes the per-slug Xdebug ini (GH #1332 item 9),
+// returning whether the on-disk state changed (so the caller can force a full
+// restart). Safe modes only — develop/coverage/profile, never remote
+// step-debug; profiler output goes to the tenant's ~/logs.
+func applyPoolXdebug(version, slug, username string, enabled bool) (bool, error) {
+	dir := filepath.Join("/etc/php", version, "dotnext-ext", slug)
+	ini := filepath.Join(dir, "20-xdebug.ini")
+	_, statErr := os.Stat(ini)
+	isOn := statErr == nil
+
+	if !enabled {
+		if !isOn {
+			return false, nil
+		}
+		if err := os.Remove(ini); err != nil && !os.IsNotExist(err) {
+			return false, fmt.Errorf("disable xdebug: %w", err)
+		}
+		return true, nil
+	}
+
+	// Enabling: xdebug.so must be installed or the master won't start.
+	if !findPHPModuleSo(version, "xdebug.so") {
+		return false, fmt.Errorf("Xdebug is not installed on this server")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return false, fmt.Errorf("create xdebug scan dir: %w", err)
+	}
+	logsDir, err := ensureUserLogsDir(username)
+	if err != nil {
+		return false, fmt.Errorf("xdebug output dir: %w", err)
+	}
+	content := "; Managed by dotnext (GH #1332 item 9). Safe modes only — no remote step-debug.\n" +
+		"zend_extension=xdebug.so\n" +
+		"xdebug.mode=develop,coverage,profile\n" +
+		"xdebug.start_with_request=no\n" +
+		"xdebug.output_dir=" + logsDir + "\n"
+	if isOn {
+		if cur, _ := os.ReadFile(ini); string(cur) == content {
+			return false, nil // already in the desired state
+		}
+	}
+	if err := os.WriteFile(ini, []byte(content), 0o644); err != nil {
+		return false, fmt.Errorf("write xdebug ini: %w", err)
+	}
+	return true, nil
+}
+
+func init() {
+	Default.Register("php.pool.apply", phpPoolApplyHandler)
+}

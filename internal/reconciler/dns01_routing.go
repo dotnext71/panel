@@ -1,0 +1,437 @@
+package reconciler
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/dotnext-panel/dotnext/hostedsvc"
+	"github.com/dotnext-panel/dotnext/internal/agent"
+	"github.com/dotnext-panel/dotnext/internal/cftoken"
+	"github.com/dotnext-panel/dotnext/internal/dns01"
+	"github.com/dotnext-panel/dotnext/internal/dnsverify"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+	"github.com/dotnext-panel/dotnext/internal/ssokey"
+)
+
+// JAB-235 — DNS-01 fallback for CDN-fronted domains.
+//
+// A domain whose apex resolves to a CDN (Cloudflare orange-cloud and kin)
+// cannot pass HTTP-01: the edge answers the challenge path itself (403/404)
+// and one failed name fails the whole cert, so the origin is stranded on
+// self-signed. DNS-01 sidesteps the HTTP path entirely — the TXT record
+// just has to land wherever the zone is REALLY hosted: our own PowerDNS
+// when we are authoritative, or the customer's Cloudflare zone through the
+// operator's stored API token. Domains with neither provider are parked
+// with a clear reason and re-checked daily — never retried against LE
+// (whose failed-authorization quota is what melted a production fleet).
+
+const (
+	// dns01IssueTimeout bounds one certbot DNS-01 round trip: two hook
+	// invocations with settle sleeps per name plus LE's validation poll.
+	// Same budget as the shared-cert sweep (acmeSharedIssueTimeout) — the
+	// HTTP-01 path's 60s would guarantee a context-deadline failure here.
+	dns01IssueTimeout = 4 * time.Minute
+	// dns01NoProviderRecheck paces re-checks of a fronted domain with no
+	// available DNS provider. Daily: the fix is an operator/customer action
+	// (store a token, grant zone access, move NS), not something that
+	// changes minute-to-minute, and no LE quota is involved either way.
+	dns01NoProviderRecheck = 24 * time.Hour
+	// dns01RouteCacheTTL bounds how long an NS-delegation decision is
+	// reused before re-asking public DNS. In-memory (not persisted on the
+	// cert row as the ticket sketched): it survives across ticks in the
+	// long-lived reconciler process and self-heals after NS changes.
+	dns01RouteCacheTTL = time.Hour
+	// dns01RouteNegativeCacheTTL is the shorter TTL for a "no provider" result.
+	// ProviderNone is the transient "operator is mid-fix" state — they're moving
+	// NS to our PowerDNS or adding a Cloudflare token — so it must be re-checked
+	// soon, not held stale for the full hour. GH #1221: after correcting a DNS
+	// delegation an operator runs `dotnext ssl retry`; without a short negative
+	// TTL the retry re-resolves to the cached ProviderNone and silently re-parks
+	// the cert for another day. A POSITIVE route is stable and keeps the 1h TTL.
+	dns01RouteNegativeCacheTTL = 5 * time.Minute
+)
+
+// IssueMethod values recorded on ssl_certificates rows.
+const (
+	issueMethodHTTP01 = "http-01"
+	issueMethodDNS01  = "dns-01"
+)
+
+type dns01CachedRoute struct {
+	route dns01.Route
+	// version is the cftoken.Set version the route was decided with: a
+	// token saved, replaced or removed since makes the entry stale.
+	version string
+	expires time.Time
+}
+
+// WithDNS01Key wires the sso key that unseals server_settings.cf_api_token_enc
+// for the Cloudflare DNS-01 path. Nil-safe: without it, Cloudflare-hosted
+// zones simply report "no token configured".
+func (r *Reconciler) WithDNS01Key(key *ssokey.Key) *Reconciler {
+	r.dns01SSOKey = key
+	return r
+}
+
+// WithCloudflareTokens wires tenants' own Cloudflare tokens (GH #2032),
+// tried before the server's for the domains each tenant owns. Nil-safe:
+// without it only the server token is used, as before.
+func (r *Reconciler) WithCloudflareTokens(repo repository.UserCloudflareTokenRepository) *Reconciler {
+	r.dns01UserTokens = repo
+	return r
+}
+
+// frontedByCDN reports whether the apex is served from somewhere that is
+// not this box. Requires POSITIVE evidence on both sides — a failed apex
+// lookup or unknown public IPs keeps the domain on HTTP-01 exactly as
+// before (narrow, never invent a reason to change behaviour — the
+// sanReachability philosophy).
+func frontedByCDN(apexAddrs, ourAddrs []string) bool {
+	if len(apexAddrs) == 0 || len(ourAddrs) == 0 {
+		return false
+	}
+	return !intersects(apexAddrs, ourAddrs)
+}
+
+// dns01Route decides (with a TTL cache) who can host the _acme-challenge
+// record for name. The same dns01.AuthoritativeRoute powers the acme-hook
+// CLI, so the routing decision and the record write can never disagree.
+// The tokens come from cftoken with the domain's name as the lineage —
+// the domain's certificate is issued as --cert-name <domain> — so the
+// hook, resolving them again at issue time, picks the same ones.
+func (r *Reconciler) dns01Route(ctx context.Context, srv *models.ServerSettings, name string) dns01.Route {
+	tokens := cftoken.Resolver{Domains: r.domains, Tokens: r.dns01UserTokens, Key: r.dns01SSOKey}
+	set, tokErr := tokens.For(ctx, srv, name, name)
+	if tokErr != nil {
+		r.log.Error("ssl: cannot read every Cloudflare API token — DNS-01 uses the ones that could be read", "domain", name, "err", tokErr)
+	}
+
+	r.dns01RouteMu.Lock()
+	if cached, ok := r.dns01RouteCache[name]; ok && cached.version == set.Version && time.Now().Before(cached.expires) {
+		r.dns01RouteMu.Unlock()
+		return cached.route
+	}
+	r.dns01RouteMu.Unlock()
+
+	cfg := dns01.Config{
+		LookupNS:   dnsverify.LookupNSExternal,
+		OurNSHosts: []string{srv.NS1Name, srv.NS2Name},
+	}
+	if r.dns01LookupNS != nil { // test seam
+		cfg.LookupNS = r.dns01LookupNS
+	}
+	newFinder := func(token string) dns01.ZoneFinder { return hostedsvc.NewCloudflareAPI(token) }
+	if r.dns01NewFinder != nil { // test seam
+		newFinder = r.dns01NewFinder
+	}
+	for _, c := range set.Candidates {
+		cfg.CF = append(cfg.CF, newFinder(c.Token))
+	}
+	if r.dns01ZoneFinder != nil { // test seam
+		cfg.CF = []dns01.ZoneFinder{r.dns01ZoneFinder}
+	}
+
+	routeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	route := dns01.AuthoritativeRoute(routeCtx, cfg, name)
+	cancel()
+	if route.Provider == dns01.ProviderCloudflare && route.CFIndex > 0 && route.CFIndex < len(set.Candidates) &&
+		set.Candidates[0].Source == cftoken.SourceOwner {
+		r.log.Warn("ssl: the domain owner's Cloudflare token cannot reach the zone — using the server's token",
+			"domain", name, "zone", route.Zone)
+	}
+	if tokErr != nil {
+		return route // decided without every token: not cached
+	}
+
+	ttl := dns01RouteCacheTTL
+	if route.Provider == dns01.ProviderNone {
+		ttl = dns01RouteNegativeCacheTTL // re-check a mid-fix delegation soon (GH #1221)
+	}
+	r.dns01RouteMu.Lock()
+	if r.dns01RouteCache == nil {
+		r.dns01RouteCache = map[string]dns01CachedRoute{}
+	}
+	r.dns01RouteCache[name] = dns01CachedRoute{route: route, version: set.Version, expires: time.Now().Add(ttl)}
+	r.dns01RouteMu.Unlock()
+	return route
+}
+
+// tryDNS01OrPark handles the LE branch for a fronted domain: issue via
+// DNS-01 when a provider is available, else park with a clear reason.
+//
+// Parking mirrors selfSignAndWaitForDNS: self-signed fallback so HTTPS
+// answers, pending_acme_retry with retry_count UNCHANGED (no ACME attempt
+// was made, so no LE quota was spent and the #1049 cap must not tick), and
+// a daily re-check. A real DNS-01 failure, by contrast, goes through
+// fallbackToSelfSignAndRetry and counts toward the cap like any other
+// spent LE attempt.
+func (r *Reconciler) tryDNS01OrPark(ctx context.Context, domain *models.Domain, cert *models.SSLCertificate, srv *models.ServerSettings, staging bool) {
+	route := r.dns01Route(ctx, srv, domain.Name)
+	if route.Provider == dns01.ProviderNone {
+		fallbackCertPath, fallbackKeyPath, fallbackExpiresAt := r.ensureSelfSignFallback(ctx, domain, cert)
+		nextRetry := time.Now().UTC().Add(dns01NoProviderRecheck)
+		reason := "fronted by a CDN/proxy, and DNS-01 is not available: " + route.Reason +
+			" — HTTP-01 cannot reach this origin, so Let's Encrypt is not attempted (no quota spent); re-checked daily"
+		_ = r.sslCerts.UpdateAfterACMEFailure(ctx, cert.ID, reason, nextRetry, cert.RetryCount, fallbackCertPath, fallbackKeyPath, fallbackExpiresAt)
+		r.log.Warn("ssl: fronted domain has no DNS-01 provider — parked",
+			"domain", domain.Name, "reason", route.Reason, "next_check_at", nextRetry.Format(time.RFC3339))
+		return
+	}
+
+	issueCtx, cancel := context.WithTimeout(ctx, dns01IssueTimeout)
+	defer cancel()
+	sans := []string{domain.Name, "www." + domain.Name}
+	// Same lineage name as the HTTP-01 path (--cert-name <domain>), so the
+	// two methods share one certbot lineage: certbot persists the manual
+	// hooks in the renewal conf and `certbot renew` / ssl.renew keeps
+	// renewing it unattended, whichever method issued last.
+	attemptStart := time.Now()
+	raw, err := r.agent.Call(issueCtx, "ssl.issue_dns01", map[string]any{
+		"cert_name": domain.Name,
+		"sans":      sans,
+		"email":     srv.AdminEmail,
+		"staging":   staging,
+	})
+	if err != nil {
+		// JAB-407: the panel→agent socket read can time out (issueCtx is capped
+		// by the 2-minute per-domain SSL budget) while certbot — which runs
+		// DETACHED from the request context (exec.Command, not CommandContext) —
+		// keeps going and finishes issuing agent-side. A read timeout is
+		// therefore not proof of failure. Re-check the lineage for a FRESH cert
+		// before spending a self-sign fallback + 5-minute backoff + an
+		// acmeMaxRetries tick on an attempt that may have succeeded.
+		if isAgentDeadlineError(err) {
+			if info, ok := r.confirmDNS01IssuedAfterTimeout(domain.Name, sans, attemptStart); ok {
+				r.recordDNS01Issued(ctx, domain, cert, route, info)
+				return
+			}
+		}
+		r.log.Warn("ssl: dns-01 issue failed", "domain", domain.Name, "provider", route.Provider, "zone", route.Zone, "err", err)
+		r.fallbackToSelfSignAndRetry(ctx, domain, cert, firstLine(err.Error()))
+		return
+	}
+	issued, expires, ok := parseSSLIssueResult(raw, r.log, domain.Name)
+	if !ok {
+		msg := "agent returned unparseable ssl.issue_dns01 result"
+		_ = r.sslCerts.UpdateStatus(ctx, cert.ID, models.SSLStatusFailed, &msg)
+		return
+	}
+	var res sslIssueResult
+	_ = json.Unmarshal(raw, &res)
+	if err := r.sslCerts.UpdateAfterIssuance(ctx, cert.ID, issued, expires, res.CertPath, res.KeyPath); err != nil {
+		r.log.Error("ssl: write dns-01 issuance failed", "domain", domain.Name, "err", err)
+		return
+	}
+	_ = r.sslCerts.SetIssueMethod(ctx, cert.ID, issueMethodDNS01)
+	r.log.Info("ssl: issued via dns-01", "domain", domain.Name, "provider", string(route.Provider), "zone", route.Zone, "expires_at", expires.Format(time.RFC3339))
+}
+
+// JAB-407 post-timeout confirmation tunables. Vars, not consts, so tests can
+// shrink the grace/poll to run instantly.
+var (
+	// dns01PostTimeoutGrace bounds how long we keep polling the agent for a cert
+	// that certbot may still be writing after the issue call timed out. certbot
+	// runs detached, so this catches a completion that lands within the grace;
+	// anything slower falls through to the normal self-sign + backoff, and the
+	// backoff retry converges as before — strictly no worse than today.
+	dns01PostTimeoutGrace = 90 * time.Second
+	// dns01PostTimeoutPoll is the gap between cert_info probes during the grace.
+	dns01PostTimeoutPoll = 10 * time.Second
+	// dns01CertInfoTimeout bounds a single ssl.cert_info call (a local file read
+	// on the agent — fast).
+	dns01CertInfoTimeout = 15 * time.Second
+)
+
+// dns01FreshnessSkew is how far before the attempt a confirmed cert's NotBefore
+// may sit and still count as "issued during this attempt". Let's Encrypt
+// backdates NotBefore by up to one hour, and the renewal path reaches the same
+// issuance code with a valid OLD cert already on the lineage (months-old
+// NotBefore); 2h cleanly separates a just-issued cert from a stale one without
+// tripping on LE's backdating.
+const dns01FreshnessSkew = 2 * time.Hour
+
+// sslCertInfoResult mirrors the agent's ssl.cert_info response.
+type sslCertInfoResult struct {
+	Exists     bool     `json:"exists"`
+	NotBefore  string   `json:"not_before"`
+	NotAfter   string   `json:"not_after"`
+	Serial     string   `json:"serial"`
+	DNSNames   []string `json:"dns_names"`
+	CoversSANs bool     `json:"covers_sans"`
+	CertPath   string   `json:"cert_path"`
+	KeyPath    string   `json:"key_path"`
+}
+
+// isAgentDeadlineError reports whether err is the panel→agent read/deadline
+// timeout (the JAB-407 case), as opposed to a real agent-side failure or a
+// reconciler shutdown. A shutdown surfaces as context.Canceled and must NOT
+// trigger the re-check.
+func isAgentDeadlineError(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
+		return false
+	}
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, os.ErrDeadlineExceeded)
+}
+
+// confirmDNS01IssuedAfterTimeout polls ssl.cert_info for a bounded grace and
+// returns the cert IFF a FRESH, valid, SAN-covering cert has appeared on the
+// lineage since attemptStart. Every other outcome — no cert yet after the
+// grace, a stale cert (a failed renewal), an agent that does not know the
+// command (version skew), any agent error, or the grace elapsing — returns
+// ok=false, so the caller falls back exactly as before and a genuine failure
+// still ticks the acmeMaxRetries cap and respects Let's Encrypt rate limits.
+//
+// The poll runs on a fresh context.Background(), NOT the reconciler tick ctx:
+// the tick's 2-minute per-domain SSL budget was already consumed by the issue
+// call that just timed out, so a poll bound to it would return instantly and
+// defeat the recovery. The wall-clock grace keeps it bounded regardless.
+func (r *Reconciler) confirmDNS01IssuedAfterTimeout(certName string, sans []string, attemptStart time.Time) (sslCertInfoResult, bool) {
+	deadline := time.Now().Add(dns01PostTimeoutGrace)
+	for {
+		cctx, cancel := context.WithTimeout(context.Background(), dns01CertInfoTimeout)
+		raw, err := r.agent.Call(cctx, "ssl.cert_info", map[string]any{"cert_name": certName, "sans": sans})
+		cancel()
+		if err != nil {
+			var ae *agent.AgentError
+			if errors.As(err, &ae) && ae.Code == agent.CodeUnknownCommand {
+				return sslCertInfoResult{}, false // old agent: can never confirm — fall back now
+			}
+			// transient/other error: keep trying within the grace.
+		} else {
+			var info sslCertInfoResult
+			if json.Unmarshal(raw, &info) == nil && r.dns01CertIsFreshlyIssued(info, attemptStart) {
+				return info, true
+			}
+		}
+		if time.Now().After(deadline) {
+			return sslCertInfoResult{}, false
+		}
+		time.Sleep(dns01PostTimeoutPoll)
+	}
+}
+
+// dns01CertIsFreshlyIssued decides whether info describes a cert this attempt
+// just issued: it exists, covers the requested SANs, is currently valid, and
+// its NotBefore is within dns01FreshnessSkew of the attempt (so a stale cert
+// left by a previous issuance is rejected).
+func (r *Reconciler) dns01CertIsFreshlyIssued(info sslCertInfoResult, attemptStart time.Time) bool {
+	if !info.Exists || !info.CoversSANs {
+		return false
+	}
+	nb, err := time.Parse(time.RFC3339, info.NotBefore)
+	if err != nil {
+		return false
+	}
+	na, err := time.Parse(time.RFC3339, info.NotAfter)
+	if err != nil {
+		return false
+	}
+	return na.After(time.Now()) && nb.After(attemptStart.Add(-dns01FreshnessSkew))
+}
+
+// recordDNS01Issued writes the ssl_certificates row to issued from a cert the
+// agent confirmed after a post-timeout re-check — mirroring the normal success
+// path (dns-01 issue) so the reconciler treats it identically: no backoff, no
+// cap tick, the right cert paths, issue method DNS-01.
+func (r *Reconciler) recordDNS01Issued(ctx context.Context, domain *models.Domain, cert *models.SSLCertificate, route dns01.Route, info sslCertInfoResult) {
+	issued, _ := time.Parse(time.RFC3339, info.NotBefore)
+	expires, _ := time.Parse(time.RFC3339, info.NotAfter)
+	if err := r.sslCerts.UpdateAfterIssuance(ctx, cert.ID, issued, expires, info.CertPath, info.KeyPath); err != nil {
+		r.log.Error("ssl: write dns-01 post-timeout issuance failed", "domain", domain.Name, "err", err)
+		return
+	}
+	_ = r.sslCerts.SetIssueMethod(ctx, cert.ID, issueMethodDNS01)
+	r.log.Info("ssl: dns-01 issue confirmed after panel read timeout — recorded without backoff",
+		"domain", domain.Name, "provider", string(route.Provider), "zone", route.Zone, "expires_at", expires.Format(time.RFC3339))
+}
+
+// dns01 routing state on the Reconciler (fields declared here to keep the
+// JAB-235 surface in one file; the struct lives in reconciler.go).
+type dns01State struct {
+	dns01SSOKey     *ssokey.Key
+	dns01UserTokens repository.UserCloudflareTokenRepository
+	dns01RouteMu    sync.Mutex
+	dns01RouteCache map[string]dns01CachedRoute
+	// JAB-237 fronted-apex cache for the vhost path — see apexFronted.
+	frontedMu    sync.Mutex
+	frontedCache map[string]frontedEntry
+	// test seams — nil in production
+	dns01LookupNS   func(ctx context.Context, name string) ([]string, bool)
+	dns01ZoneFinder dns01.ZoneFinder // replaces every token's finder
+	dns01NewFinder  func(token string) dns01.ZoneFinder
+}
+
+// frontedCacheTTL bounds how long an apex-fronted decision is reused by the
+// vhost renderer before re-asking public DNS.
+const frontedCacheTTL = 15 * time.Minute
+
+type frontedEntry struct {
+	fronted bool
+	expires time.Time
+}
+
+// apexFronted reports whether name's apex publicly resolves somewhere that
+// is not this box — the vhost renderer's view of frontedByCDN (JAB-237).
+//
+// Cache rule, load-bearing: a DEFINITIVE lookup (public DNS answered)
+// updates the cache; an INCONCLUSIVE one (every resolver unreachable) keeps
+// the last known value and extends its TTL. Without that, a resolver blip
+// would flip fronted domains to "not fronted", re-render their vhosts
+// :80-only, and 520 every Cloudflare-Full zone until the resolvers return —
+// the exact outage this fix exists for. A cold cache + inconclusive answer
+// falls back to "not fronted" (the pre-JAB-237 rendering); accepted
+// residual, called out in the PR.
+func (r *Reconciler) apexFronted(ctx context.Context, name string) bool {
+	now := time.Now()
+	r.frontedMu.Lock()
+	entry, cached := r.frontedCache[name]
+	r.frontedMu.Unlock()
+	if cached && now.Before(entry.expires) {
+		return entry.fronted
+	}
+
+	var ourAddrs []string
+	if r.serverSettings != nil {
+		srvCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		if srv, err := r.settingsGet(srvCtx); err == nil && srv != nil {
+			if srv.PublicIPv4 != "" {
+				ourAddrs = append(ourAddrs, srv.PublicIPv4)
+			}
+			if srv.PublicIPv6 != "" {
+				ourAddrs = append(ourAddrs, srv.PublicIPv6)
+			}
+		}
+		cancel()
+	}
+
+	lookupCtx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	addrs, queried := r.dnsPreflight(lookupCtx, name)
+	cancel()
+
+	if !queried || len(ourAddrs) == 0 {
+		// Inconclusive (or we don't know our own IP): keep the last known
+		// value alive rather than flapping; cold cache reads not-fronted.
+		if cached {
+			r.frontedMu.Lock()
+			entry.expires = now.Add(frontedCacheTTL)
+			r.frontedCache[name] = entry
+			r.frontedMu.Unlock()
+			return entry.fronted
+		}
+		return false
+	}
+
+	fronted := frontedByCDN(addrs, ourAddrs)
+	r.frontedMu.Lock()
+	if r.frontedCache == nil {
+		r.frontedCache = map[string]frontedEntry{}
+	}
+	r.frontedCache[name] = frontedEntry{fronted: fronted, expires: now.Add(frontedCacheTTL)}
+	r.frontedMu.Unlock()
+	return fronted
+}

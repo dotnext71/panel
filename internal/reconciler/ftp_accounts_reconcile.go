@@ -1,0 +1,378 @@
+package reconciler
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strings"
+	"time"
+
+	"github.com/dotnext-panel/dotnext/internal/ftpsync"
+	"github.com/dotnext-panel/dotnext/internal/models"
+)
+
+// FTP/SFTP subaccount convergence (GH #1053 step 3,
+// plans/gh1053-ftp-accounts.md). DB rows are the truth; the host's passwd
+// aliases, dotnext-ftp memberships, lock states, and the sshd dotnext-xfer
+// drop-in all converge to them every tick (hash-gated to a no-op in steady
+// state, force-resynced on a bounded interval to heal out-of-band drift).
+//
+// The API paths do their host mutations synchronously (create/delete talk
+// to the agent first, row second), so this pass is the drift healer:
+// missing aliases after a DR restore, hand-run userdel, group edits, or a
+// stale drop-in all get repaired here.
+
+const ftpAccountsReDispatchInterval = 15 * time.Minute
+
+// desiredFtpHash covers every reconcile input: each row's identity +
+// flags + home, the owning tenant's username (renames change the
+// rendered config without touching ftp_accounts rows), and the owner's id:
+// an account deleted and restored under the same username comes back with
+// the same rows and a new id, and its subaccounts must be recreated on the
+// next pass, not at the gate's audit (GH #1993).
+func desiredFtpHash(rows []models.FtpAccount, tenantByUserID map[string]string) string {
+	lines := make([]string, 0, len(rows))
+	for _, a := range rows {
+		lines = append(lines, strings.Join([]string{
+			a.ID, a.Username, a.UserID, tenantByUserID[a.UserID], a.HomePath,
+			fmt.Sprintf("%t|%t|%t|%t", a.FTPAccess, a.SFTPAccess, a.WebDAVAccess, a.IsEnabled),
+			// GH #1145: isolation mode + jail path change the rendered sshd
+			// chroot and the recreate params, so they must move the hash.
+			fmt.Sprintf("%t|%s", a.Isolated, a.JailPath),
+		}, "^"))
+	}
+	sort.Strings(lines)
+	sum := sha256.Sum256([]byte(strings.Join(lines, "\n") + "\nn=" + fmt.Sprint(len(lines))))
+	return hex.EncodeToString(sum[:])
+}
+
+// randomThrowawayPassword returns a high-entropy password for recreating a
+// drifted alias whose real password lives only in the lost /etc/shadow
+// entry. Nobody knows it — the account exists but cannot authenticate
+// until the tenant resets the password through the panel. That is the
+// correct DR posture: silently minting a KNOWN password would be worse.
+func randomThrowawayPassword() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("entropy: %w", err)
+	}
+	return hex.EncodeToString(buf), nil
+}
+
+type agentFtpListEntry struct {
+	Username      string `json:"username"`
+	HomePath      string `json:"home_path"`
+	FTPAccess     bool   `json:"ftp_access"`
+	Locked        bool   `json:"locked"`
+	WebdavEnabled bool   `json:"webdav_enabled"` // GH #1146: worker drop-in present
+}
+
+// The effective-access projection (owner eligibility + per-tenant
+// EffectiveEnabled) lives in internal/ftpsync as the SHARED implementation the
+// reconciler and the API's immediate syncHostAccess both call, so the two
+// dispatch sites emit identical effective-access sets (JAB-276). See
+// ftpsync.OwnerEligibility / ftpsync.EffectiveEnabled.
+
+// ftpEligHash folds owner eligibility into the reconcile hash so a
+// suspension or package downgrade forces a re-dispatch instead of being
+// masked by the steady-state cache.
+func ftpEligHash(elig map[string]ftpsync.Eligibility) string {
+	keys := make([]string, 0, len(elig))
+	for k := range elig {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, k := range keys {
+		e := elig[k]
+		fmt.Fprintf(&b, "%s=%t:%d;", k, e.Eligible, e.Cap)
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return hex.EncodeToString(sum[:])
+}
+
+// reconcileFtpAccounts converges host state to the ftp_accounts table.
+// Never returns an error — SSL-reconciler convention: log and let the
+// rest of the tick proceed.
+func (r *Reconciler) reconcileFtpAccounts(ctx context.Context) {
+	if r.ftpAccounts == nil || r.users == nil || r.agent == nil {
+		return
+	}
+	// Stamp the sshd_sync generation BEFORE reading the rows. The agent's
+	// stale-drop gate is only sound if stamp order precedes read order (see the
+	// same hoist in the API's syncHostAccess): a sync that could override a
+	// concurrent revocation carries a higher generation, so it stamped — and
+	// therefore read — after that revocation committed, so its own snapshot
+	// already reflects the revocation. Both dispatch sites share one counter.
+	gen := ftpsync.NextGeneration()
+	rows, err := r.ftpAccounts.List(ctx)
+	if err != nil {
+		r.log.Error("ftp: list accounts failed", "err", err)
+		return
+	}
+
+	// Resolve tenant usernames once; drop rows whose owner has no Linux
+	// identity (deleted user mid-flight, admin rows) with a warning —
+	// they cannot converge and must not kill the pass.
+	tenantByUserID := map[string]string{}
+	rowsByTenant := map[string][]models.FtpAccount{}
+	eligByTenant := map[string]ftpsync.Eligibility{}
+	for _, a := range rows {
+		uname, ok := tenantByUserID[a.UserID]
+		if !ok {
+			u, uerr := r.users.FindByID(ctx, a.UserID)
+			if uerr != nil || u == nil || u.Username == nil || *u.Username == "" {
+				r.log.Warn("ftp: account owner has no linux username — skipping row", "account", a.Username, "user_id", a.UserID)
+				tenantByUserID[a.UserID] = ""
+				continue
+			}
+			uname = *u.Username
+			tenantByUserID[a.UserID] = uname
+			eligByTenant[uname] = ftpsync.OwnerEligibility(ctx, r.packages, u)
+		}
+		if uname == "" {
+			continue
+		}
+		rowsByTenant[uname] = append(rowsByTenant[uname], a)
+	}
+
+	fullHash := desiredFtpHash(rows, tenantByUserID) + ftpEligHash(eligByTenant)
+	d := r.phaseDecide(ctx, PhaseFTPAccounts, "all", fullHash, time.Now(), false)
+	if d == decisionSkip {
+		return
+	}
+
+	converged := true
+	for tenant, accts := range rowsByTenant {
+		if !r.reconcileFtpTenant(ctx, tenant, accts, eligByTenant[tenant]) {
+			converged = false
+		}
+	}
+
+	// Global stray sweep. The per-tenant diff above only sees tenants that
+	// still HAVE rows — a manual row delete (or a tenant whose last row
+	// vanished out-of-band) would leave a rowless alias that is a working
+	// credential with no panel handle (proven live on dotnexttests). One
+	// ftpaccount.list_all IPC catches every alias host-wide.
+	if !r.sweepStrayFtpAliases(ctx, rows) {
+		converged = false
+	}
+
+	// Render the sshd drop-in through the shared projection so this periodic pass
+	// and the API immediate-sync emit identical jail + start-dir entries
+	// (JAB-276 AC3 — one renderer, no per-site divergence).
+	desired := ftpsync.RenderDesiredAccounts(rowsByTenant, eligByTenant)
+	if _, err := r.agent.Call(ctx, "ftpaccount.sshd_sync", map[string]any{
+		"accounts":   desired,
+		"generation": gen,
+	}); err != nil {
+		r.log.Warn("ftp: sshd_sync failed (will retry next pass)", "err", err)
+		converged = false
+	}
+
+	// Files of deleted isolated accounts, in the background
+	// (ftp_orphan_files.go). Doesn't affect convergence.
+	r.kickFtpOrphanSweep(ctx, rows, tenantByUserID)
+
+	if converged {
+		r.phaseApplied(ctx, PhaseFTPAccounts, "all", fullHash, time.Now(), d)
+	} else {
+		r.phaseFailed(ctx, PhaseFTPAccounts)
+	}
+}
+
+// sweepStrayFtpAliases removes host subaccount aliases that no ftp_accounts
+// row accounts for, across ALL tenants — including tenants with zero
+// remaining rows, which the per-tenant diff can never see. Returns false on
+// failure so the hash gate stays open.
+func (r *Reconciler) sweepStrayFtpAliases(ctx context.Context, rows []models.FtpAccount) bool {
+	raw, err := r.agent.Call(ctx, "ftpaccount.list_all", map[string]any{})
+	if err != nil {
+		r.log.Warn("ftp: list_all failed (stray sweep skipped)", "err", err)
+		return false
+	}
+	var resp struct {
+		Accounts []struct {
+			TenantUsername string `json:"tenant_username"`
+			Username       string `json:"username"`
+		} `json:"accounts"`
+		// Pattern-matching passwd entries WITHOUT the panel's GECOS
+		// ownership marker — operator property the agent refused to
+		// classify as ours. Surfaced, never touched.
+		SkippedUnmarked int `json:"skipped_unmarked"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		r.log.Warn("ftp: list_all parse failed", "err", err)
+		return false
+	}
+	if resp.SkippedUnmarked > 0 {
+		r.log.Warn("ftp: passwd entries look like subaccount aliases but lack the ownership marker — left untouched (operator-managed?)", "count", resp.SkippedUnmarked)
+	}
+	wanted := map[string]struct{}{}
+	for _, a := range rows {
+		wanted[a.Username] = struct{}{}
+	}
+	ok := true
+	for _, h := range resp.Accounts {
+		if _, want := wanted[h.Username]; want {
+			continue
+		}
+		if _, err := r.agent.Call(ctx, "ftpaccount.delete", map[string]any{
+			"tenant_username": h.TenantUsername,
+			"username":        h.Username,
+		}); err != nil {
+			r.log.Warn("ftp: stray alias removal failed", "account", h.Username, "err", err)
+			ok = false
+			continue
+		}
+		r.log.Info("ftp: removed stray subaccount with no panel row", "account", h.Username, "tenant", h.TenantUsername)
+	}
+	return ok
+}
+
+// reconcileFtpTenant diffs one tenant's desired rows against the host's
+// passwd view and repairs drift. Returns false when any repair failed
+// (keeps the hash gate open so the next tick retries).
+func (r *Reconciler) reconcileFtpTenant(ctx context.Context, tenant string, accts []models.FtpAccount, elig ftpsync.Eligibility) bool {
+	// JAB-254/258: owner eligibility overrides each row's own IsEnabled —
+	// a suspended owner or a package that dropped the feature locks every
+	// alias; an over-cap downgrade locks the newest excess.
+	eff := ftpsync.EffectiveEnabled(accts, elig)
+	raw, err := r.agent.Call(ctx, "ftpaccount.list", map[string]any{"tenant_username": tenant})
+	if err != nil {
+		r.log.Warn("ftp: host list failed", "tenant", tenant, "err", err)
+		return false
+	}
+	var listResp struct {
+		Accounts []agentFtpListEntry `json:"accounts"`
+	}
+	if err := json.Unmarshal(raw, &listResp); err != nil {
+		r.log.Warn("ftp: host list parse failed", "tenant", tenant, "err", err)
+		return false
+	}
+	host := map[string]agentFtpListEntry{}
+	for _, h := range listResp.Accounts {
+		host[h.Username] = h
+	}
+	desired := map[string]models.FtpAccount{}
+	for _, a := range accts {
+		desired[a.Username] = a
+	}
+
+	ok := true
+	// Missing or drifted aliases.
+	for name, want := range desired {
+		got, exists := host[name]
+		if !exists {
+			pw, perr := randomThrowawayPassword()
+			if perr != nil {
+				r.log.Error("ftp: throwaway password", "err", perr)
+				return false
+			}
+			createParams := map[string]any{
+				"tenant_username": tenant,
+				"username":        name,
+				"home_path":       want.HomePath,
+				"password":        pw,
+				"ftp_access":      want.FTPAccess,
+				"webdav_access":   want.WebDAVAccess,
+				// GH #1361: if an account restore staged this account's original
+				// /etc/shadow hash, the agent uses it instead of the throwaway
+				// above so the login password survives. No staged file (the
+				// normal drift-repair case) → the throwaway stands + a reset is
+				// required, exactly as before.
+				"prefer_restore_credential": true,
+			}
+			// GH #1145: an isolated row must be recreated ISOLATED, not as a
+			// legacy same-uid alias — otherwise a DR restore silently drops the
+			// kernel boundary. Reuse the row's STORED uid (never re-allocate:
+			// the uid is the row's identity and its owned files carry it).
+			if want.Isolated {
+				if r.quotaMount == "" || want.UID == nil {
+					r.log.Warn("ftp: cannot recreate isolated alias without a quota mount and stored uid — leaving absent", "account", name)
+					ok = false
+					continue
+				}
+				createParams["isolated"] = true
+				createParams["uid"] = *want.UID
+				createParams["quota_mb"] = want.QuotaMB
+				createParams["quota_mount"] = r.quotaMount
+				createParams["jail_path"] = want.JailPath
+			}
+			if _, err := r.agent.Call(ctx, "ftpaccount.create", createParams); err != nil {
+				r.log.Warn("ftp: recreate missing alias failed", "account", name, "err", err)
+				ok = false
+				continue
+			}
+			r.log.Info("ftp: recreated missing subaccount — password reset required before it can log in", "account", name, "tenant", tenant)
+			got = agentFtpListEntry{Username: name, FTPAccess: want.FTPAccess, Locked: false, WebdavEnabled: want.WebDAVAccess}
+		}
+		enabled := eff[name]
+		// Ineligible/over-cap => also drop the dotnext-ftp group so the
+		// vsftpd PAM gate closes, not just the shadow lock.
+		wantFTP := want.FTPAccess && enabled
+		// GH #1146: converge the WebDAV worker too. wantWebdav requires the account
+		// be enabled — a disabled/suspended account serves no protocol. WebdavEnabled
+		// (drop-in presence) is the host truth; a mismatch heals a failed API
+		// enable/disable, including the JAB-256-class "should be off but is live".
+		wantWebdav := want.WebDAVAccess && enabled
+		wantLocked := !enabled
+		if got.FTPAccess != wantFTP || got.Locked != wantLocked || got.WebdavEnabled != wantWebdav {
+			if _, err := r.agent.Call(ctx, "ftpaccount.set_access", map[string]any{
+				"tenant_username": tenant,
+				"username":        name,
+				"ftp_access":      wantFTP,
+				"webdav_access":   wantWebdav,
+				"enabled":         enabled,
+			}); err != nil {
+				r.log.Warn("ftp: access drift repair failed", "account", name, "err", err)
+				ok = false
+			}
+		}
+	}
+	// GH #1145: isolated jails are plain bind mounts — NOT reboot-persistent.
+	// Re-assert each enabled isolated account's mount every pass (idempotent:
+	// ensure_jail no-ops when already mounted). The in-memory dispatch cache
+	// clears on panel restart, so the first tick after a reboot runs this and
+	// self-heals the mounts before the tenant notices an empty jail.
+	for _, a := range accts {
+		if !a.Isolated || a.JailPath == "" || !eff[a.Username] {
+			continue
+		}
+		if _, err := r.agent.Call(ctx, "ftpaccount.ensure_jail", map[string]any{
+			"tenant_username": tenant,
+			"username":        a.Username,
+			"home_path":       a.HomePath,
+			"jail_path":       a.JailPath,
+		}); err != nil {
+			r.log.Warn("ftp: ensure_jail failed (mount may be stale until next pass)", "account", a.Username, "err", err)
+			ok = false
+		}
+	}
+
+	// Stray-alias removal deliberately does NOT live here: the per-tenant
+	// diff can only see tenants that still have rows. sweepStrayFtpAliases
+	// (one ftpaccount.list_all per pass) owns stray removal host-wide.
+
+	// M12 chroot precondition: sshd only chroots into a root-owned home.
+	// Tenants who never used SFTP themselves may still have a
+	// tenant-owned /home/<tenant>; flip it via the existing M12 verb when
+	// this tenant has at least one SFTP-enabled subaccount.
+	for _, a := range accts {
+		if eff[a.Username] && a.SFTPAccess {
+			if _, err := r.agent.Call(ctx, "ssh.user.home_chown", map[string]any{
+				"username": tenant,
+				"mode":     "sftp",
+			}); err != nil {
+				r.log.Warn("ftp: tenant home chroot-perms flip failed", "tenant", tenant, "err", err)
+				ok = false
+			}
+			break
+		}
+	}
+	return ok
+}

@@ -1,0 +1,373 @@
+// MCPSetupGuide — a companion to the API Tokens page that turns a token into a
+// working dotnext-mcp setup, as a four-step wizard: it lets the tenant assemble
+// one or more DotNext instances (this panel is pre-filled), generates the
+// panels.json for the dotnext-mcp server, and shows the one-line registration
+// for the major MCP clients. No new backend — it reuses the token minted on
+// the Tokens tab.
+//
+// Security: tokens entered here are assembled into the config IN THE BROWSER and
+// are never sent to or stored by the panel. The generated config is a secret —
+// treat the copied text / downloaded file like a password.
+import { useMemo, useState, type JSX } from "react";
+import {
+  Alert,
+  Button,
+  Input,
+  Segmented,
+  Space,
+  Steps,
+  Typography,
+} from "antd";
+import {
+  ApiOutlined,
+  ArrowLeftOutlined,
+  ArrowRightOutlined,
+  CloudServerOutlined,
+  DeleteOutlined,
+  DownloadOutlined,
+  PlusOutlined,
+} from "@icons";
+
+const { Paragraph, Text, Link } = Typography;
+
+interface Instance {
+  name: string;
+  url: string;
+  token: string;
+}
+
+const DEFAULT_PATH = "~/.config/dotnext-mcp/panels.json";
+
+const CodeBlock = ({ text }: { text: string }): JSX.Element => (
+  <Paragraph
+    copyable={{ text }}
+    style={{
+      background: "var(--ant-color-fill-tertiary, #f5f5f5)",
+      padding: "8px 12px",
+      borderRadius: 6,
+      fontFamily: "monospace",
+      whiteSpace: "pre-wrap",
+      marginBottom: 0,
+    }}
+  >
+    {text}
+  </Paragraph>
+);
+
+type ClientKey =
+  | "claude-code"
+  | "claude-desktop"
+  | "codex"
+  | "opencode"
+  | "kimi";
+
+type AccessMode = "read" | "write";
+
+// clientSnippet returns the registration for a client that reads the default
+// panels.json (so no env is needed for config). If access is "write", the
+// snippet also sets DOTNEXT_MCP_ALLOW_WRITE=1 to enable mutating tools.
+function clientSnippet(client: ClientKey, access: AccessMode): string {
+  const write = access === "write";
+  switch (client) {
+    case "claude-code":
+      return `claude mcp add dotnext${write ? " --env DOTNEXT_MCP_ALLOW_WRITE=1" : ""} -- dotnext-mcp`;
+    case "claude-desktop":
+      return [
+        "// claude_desktop_config.json",
+        "{",
+        '  "mcpServers": {',
+        write
+          ? '    "dotnext": { "command": "dotnext-mcp", "env": { "DOTNEXT_MCP_ALLOW_WRITE": "1" } }'
+          : '    "dotnext": { "command": "dotnext-mcp" }',
+        "  }",
+        "}",
+      ].join("\n");
+    case "codex":
+      return [
+        "# ~/.codex/config.toml",
+        "[mcp_servers.dotnext]",
+        'command = "dotnext-mcp"',
+        ...(write ? ["", "[mcp_servers.dotnext.env]", 'DOTNEXT_MCP_ALLOW_WRITE = "1"'] : []),
+      ].join("\n");
+    case "opencode":
+      return [
+        "// opencode.json",
+        "{",
+        '  "mcp": {',
+        write
+          ? '    "dotnext": { "type": "local", "command": ["dotnext-mcp"], "environment": { "DOTNEXT_MCP_ALLOW_WRITE": "1" }, "enabled": true }'
+          : '    "dotnext": { "type": "local", "command": ["dotnext-mcp"], "enabled": true }',
+        "  }",
+        "}",
+      ].join("\n");
+    case "kimi":
+      return `kimi mcp add --transport stdio dotnext${write ? " -e DOTNEXT_MCP_ALLOW_WRITE=1" : ""} -- dotnext-mcp`;
+  }
+}
+
+export function MCPSetupGuide(): JSX.Element {
+  const origin =
+    typeof window !== "undefined" ? window.location.origin : "https://<panel-host>";
+  const [step, setStep] = useState(0);
+  const [instances, setInstances] = useState<Instance[]>([
+    { name: "default", url: `${origin}/api/v1`, token: "" },
+  ]);
+  const [client, setClient] = useState<ClientKey>("claude-code");
+  const [access, setAccess] = useState<AccessMode>("read");
+
+  const panelsJson = useMemo(
+    () =>
+      JSON.stringify(
+        instances.map((i) => ({
+          name: i.name.trim() || "default",
+          url: i.url.trim(),
+          token: i.token.trim(),
+        })),
+        null,
+        2,
+      ) + "\n",
+    [instances],
+  );
+
+  const patchAt = (idx: number, patch: Partial<Instance>): void =>
+    setInstances((prev) => prev.map((it, i) => (i === idx ? { ...it, ...patch } : it)));
+  const addRow = (): void =>
+    setInstances((prev) => [
+      ...prev,
+      { name: `panel-${prev.length + 1}`, url: "", token: "" },
+    ]);
+  const removeRow = (idx: number): void =>
+    setInstances((prev) => prev.filter((_, i) => i !== idx));
+
+  const download = (): void => {
+    const blob = new Blob([panelsJson], { type: "application/json" });
+    const href = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = href;
+    a.download = "panels.json";
+    a.click();
+    URL.revokeObjectURL(href);
+  };
+
+  const ready = instances.every((i) => i.url.trim() && i.token.trim());
+
+  // The wizard gates forward navigation only where a later step would be
+  // useless without the earlier one: the config step needs every instance
+  // filled in. Backward navigation (and revisiting) is always free.
+  const canNext = step !== 1 || ready;
+
+  const stepBody = ((): JSX.Element => {
+    switch (step) {
+      case 0:
+        return (
+          <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+            <Alert
+              type="info"
+              showIcon
+              icon={<CloudServerOutlined />}
+              message="dotnext-mcp exposes this panel's API as tools an AI assistant can use."
+              description={
+                <>
+                  It authenticates with an API token and inherits your account's
+                  isolation — it can only touch resources you own. It is{" "}
+                  <Text strong>read-only by default</Text>; mutating tools are
+                  opt-in and destructive ones ask for confirmation. Install it
+                  from{" "}
+                  <Link
+                    href="https://github.com/dotnext71/panel-mcp"
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    github.com/dotnext-panel/dotnext-mcp
+                  </Link>
+                  .
+                </>
+              }
+            />
+            <Paragraph style={{ marginBottom: 0 }}>
+              First, create an API token on the <Text strong>Tokens</Text> tab (a
+              read-only token is safest — Custom → the read permissions you
+              want). The plaintext <Text code>dnt_…</Text> is shown once — copy
+              it, you'll paste it in the next step.
+            </Paragraph>
+          </Space>
+        );
+      case 1:
+        return (
+          <Space direction="vertical" size="small" style={{ width: "100%" }}>
+            <Paragraph type="secondary" style={{ marginBottom: 8 }}>
+              This panel is pre-filled — paste its token. Add more dotNext panels
+              to manage a fleet from one place; each needs its own token from
+              that panel.
+            </Paragraph>
+            {instances.map((it, idx) => (
+              <Space.Compact key={idx} style={{ width: "100%" }} block>
+                <Input
+                  style={{ width: 150 }}
+                  placeholder="name"
+                  value={it.name}
+                  onChange={(e) => patchAt(idx, { name: e.target.value })}
+                />
+                <Input
+                  placeholder="https://panel:8443/api/v1"
+                  value={it.url}
+                  onChange={(e) => patchAt(idx, { url: e.target.value })}
+                />
+                <Input.Password
+                  placeholder="jat_… token"
+                  value={it.token}
+                  onChange={(e) => patchAt(idx, { token: e.target.value })}
+                />
+                <Button
+                  icon={<DeleteOutlined />}
+                  danger
+                  disabled={instances.length === 1}
+                  onClick={() => removeRow(idx)}
+                  aria-label="Remove instance"
+                />
+              </Space.Compact>
+            ))}
+            <Button icon={<PlusOutlined />} onClick={addRow}>
+              Add instance
+            </Button>
+            {!ready && (
+              <Alert
+                type="warning"
+                showIcon
+                message="Fill in a URL and token for every instance to continue."
+              />
+            )}
+          </Space>
+        );
+      case 2:
+        return (
+          <Space direction="vertical" size="small" style={{ width: "100%" }}>
+            <Paragraph type="secondary" style={{ marginBottom: 8 }}>
+              Save this as <Text code>{DEFAULT_PATH}</Text> (mode 600) on the
+              machine that runs the assistant. dotnext-mcp finds it there
+              automatically.
+            </Paragraph>
+            <CodeBlock text={panelsJson} />
+            <Button icon={<DownloadOutlined />} onClick={download}>
+              Download panels.json
+            </Button>
+            <Alert
+              type="warning"
+              showIcon
+              icon={<ApiOutlined />}
+              message="The generated config contains your tokens."
+              description="It is assembled here in your browser and never sent to the panel. Treat the copied text and the downloaded file like a password."
+            />
+          </Space>
+        );
+      default:
+        return (
+          <Space direction="vertical" size="small" style={{ width: "100%" }}>
+            <Paragraph type="secondary" style={{ marginBottom: 8 }}>
+              Because the config is at the default path, no environment variables
+              are needed for it. (Saved elsewhere? Add{" "}
+              <Text code>--env DOTNEXT_PANELS_FILE=/your/path</Text>.)
+            </Paragraph>
+
+            <div>
+              <Text type="secondary" style={{ marginRight: 8 }}>
+                Access:
+              </Text>
+              <Segmented<AccessMode>
+                value={access}
+                onChange={(v) => setAccess(v)}
+                options={[
+                  { label: "Read-only", value: "read" },
+                  { label: "Read-write", value: "write" },
+                ]}
+              />
+            </div>
+            {access === "write" ? (
+              <Alert
+                type="warning"
+                showIcon
+                message="Read-write enables mutating tools (create/update)."
+                description={
+                  <>
+                    Destructive tools (delete, restore, password) still require
+                    an explicit <Text code>confirm: true</Text> per call. To
+                    preview every write before it runs, also add{" "}
+                    <Text code>DOTNEXT_MCP_DRY_RUN=1</Text>.
+                  </>
+                }
+              />
+            ) : (
+              <Paragraph type="secondary" style={{ marginBottom: 0 }}>
+                Read-only exposes only list/get tools — the assistant can see
+                your account but change nothing.
+              </Paragraph>
+            )}
+
+            <Segmented<ClientKey>
+              value={client}
+              onChange={(v) => setClient(v)}
+              options={[
+                { label: "Claude Code", value: "claude-code" },
+                { label: "Claude Desktop", value: "claude-desktop" },
+                { label: "Codex", value: "codex" },
+                { label: "OpenCode", value: "opencode" },
+                { label: "Kimi", value: "kimi" },
+              ]}
+            />
+            <CodeBlock text={clientSnippet(client, access)} />
+            <Alert
+              type="success"
+              showIcon
+              message="That's it — restart your MCP client and it will pick up the dotnext tools."
+            />
+          </Space>
+        );
+    }
+  })();
+
+  // A tab of the Personal API Tokens card, so a titled section, not a card of
+  // its own (GH #2244).
+  return (
+    <section>
+      <Typography.Title level={5} style={{ marginTop: 0 }}>
+        Use this panel from an AI assistant (MCP)
+      </Typography.Title>
+      <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+        <Steps
+          size="small"
+          current={step}
+          onChange={(next) => {
+            // Free to go back; forward only one step at a time and only when
+            // the current step's gate is satisfied.
+            if (next < step || (next === step + 1 && canNext)) setStep(next);
+          }}
+          items={[
+            { title: "Get a token" },
+            { title: "Your instances" },
+            { title: "Save the config" },
+            { title: "Register" },
+          ]}
+        />
+
+        {stepBody}
+
+        <Space>
+          {step > 0 && (
+            <Button icon={<ArrowLeftOutlined />} onClick={() => setStep(step - 1)}>
+              Back
+            </Button>
+          )}
+          {step < 3 && (
+            <Button
+              type="primary"
+              disabled={!canNext}
+              onClick={() => setStep(step + 1)}
+            >
+              Next <ArrowRightOutlined />
+            </Button>
+          )}
+        </Space>
+      </Space>
+    </section>
+  );
+}

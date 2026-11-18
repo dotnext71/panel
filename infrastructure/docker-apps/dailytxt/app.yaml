@@ -1,0 +1,43 @@
+slug: dailytxt
+tenant_installable: true
+name: DailyTxt
+tags: ["Productivity"]
+version: "2.6.4"
+description: |
+  Self-hosted, end-to-end encrypted diary application. Plain text +
+  attachments, fully encrypted client-side. Single container with
+  file-system storage.
+icon: icon.svg
+upstream: https://github.com/PhiTux/DailyTxt
+documentation: https://github.com/PhiTux/DailyTxt#readme
+
+image_channel: phitux/dailytxt:2.6.4@sha256:a55a38ca85790262d6e59b9d14a758d183d56a634f6023365f9c53c34620d046
+update_mode: manual
+
+resources:
+  cpu: "0.5"
+  memory: "256m"
+  pids: 200
+
+volumes:
+  - name: data
+    container_path: /app/data
+
+ports:
+  - name: http
+    container_port: 80
+    protocol: tcp
+    default_enabled: true
+    default_bind: loopback
+    default_reverse_proxy: true
+    health_path: /
+
+env:
+  - name: SECRET_TOKEN
+    secret: true
+    generate: password64
+  - name: ALLOW_REGISTRATION
+    value: "true"
+  - name: ADMIN_PASSWORD
+    secret: true
+    generate: password32

@@ -1,0 +1,338 @@
+// mailbox_autoresponder.go — M6.5 Step 3 autoresponder HTTP handlers.
+//
+// Wire contract: GET/PUT/DELETE /mailboxes/:mbid/autoresponder
+// The DB row is truth; the autoresponder converges into the mailbox's single
+// active Sieve script (with any forwards) via mailbox.sieve.apply (GH #1795).
+
+package api
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/dotnext-panel/dotnext/internal/agent"
+	"github.com/dotnext-panel/dotnext/internal/auth"
+	"github.com/dotnext-panel/dotnext/internal/autoresponderops"
+	"github.com/dotnext-panel/dotnext/internal/forwarderops"
+	"github.com/dotnext-panel/dotnext/internal/ginctx"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+)
+
+// MailboxAutoresponderHandlerConfig wires the repos + agent this handler needs.
+type MailboxAutoresponderHandlerConfig struct {
+	Mailboxes      repository.MailboxRepository
+	Domains        repository.DomainRepository
+	Autoresponders repository.EmailAutoresponderRepository
+	// Forwarders is read so the autoresponder converges into the SAME single
+	// active Sieve script as the mailbox's forwards (GH #1795 — one active
+	// script per account).
+	Forwarders repository.EmailForwarderRepository
+	Agent      agent.AgentInterface
+}
+
+// autoresponderResponse is the JSON envelope the panel UI consumes.
+type autoresponderResponse struct {
+	MailboxID string     `json:"mailbox_id"`
+	Enabled   bool       `json:"enabled"`
+	FromDate  *time.Time `json:"from_date"`
+	ToDate    *time.Time `json:"to_date"`
+	Subject   *string    `json:"subject"`
+	TextBody  *string    `json:"text_body"`
+	HTMLBody  *string    `json:"html_body"`
+	UpdatedAt time.Time  `json:"updated_at"`
+	// Warning is set (JAB-346 criterion 5) when the desired state was saved but
+	// the inline agent push failed; the reconciler re-asserts shortly. Omitted
+	// on a clean push.
+	Warning string `json:"warning,omitempty"`
+}
+
+type autoresponderUpdateRequest struct {
+	Enabled  bool       `json:"enabled"`
+	FromDate *time.Time `json:"from_date"`
+	ToDate   *time.Time `json:"to_date"`
+	Subject  *string    `json:"subject"`
+	TextBody *string    `json:"text_body"`
+	HTMLBody *string    `json:"html_body"`
+}
+
+type mailboxAutoresponderHandler struct {
+	cfg MailboxAutoresponderHandlerConfig
+}
+
+// RegisterMailboxAutoresponderRoutes mounts the endpoints under g.
+// Called from routes_m65.go's registerAutoresponderRoutes.
+func RegisterMailboxAutoresponderRoutes(g *gin.RouterGroup, cfg MailboxAutoresponderHandlerConfig) {
+	if cfg.Autoresponders == nil {
+		return
+	}
+	h := &mailboxAutoresponderHandler{cfg: cfg}
+	g.GET("/mailboxes/:mbid/autoresponder", h.get)
+	g.PUT("/mailboxes/:mbid/autoresponder", h.put)
+	g.DELETE("/mailboxes/:mbid/autoresponder", h.del)
+	g.GET("/domains/:id/autoresponders", h.listByDomain)
+	g.GET("/mail/autoresponders", h.listAllOwner)
+}
+
+func (h *mailboxAutoresponderHandler) loadMailboxWithAuth(ctx context.Context, id string, claims *auth.AccessClaims) (*models.Mailbox, *models.Domain, error) {
+	mb, err := h.cfg.Mailboxes.FindByID(ctx, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	dom, err := h.cfg.Domains.FindByID(ctx, mb.DomainID)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !claims.IsAdmin && dom.UserID != claims.UserID {
+		return nil, nil, errMailboxForbidden
+	}
+	return mb, dom, nil
+}
+
+// listByDomain returns every autoresponder for the domain's mailboxes,
+// keyed by mailbox id (GH #240). The Mailboxes tab fans this out once per
+// domain rather than one GET per mailbox.
+func (h *mailboxAutoresponderHandler) listByDomain(c *gin.Context) {
+	ctx := c.Request.Context()
+	claims := ginctx.Claims(c)
+	dom, err := h.cfg.Domains.FindByID(ctx, c.Param("id"))
+	if err != nil {
+		if isNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	if !claims.IsAdmin && dom.UserID != claims.UserID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
+	rows, err := h.cfg.Autoresponders.ListByDomain(ctx, dom.ID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	out := make(map[string]autoresponderResponse, len(rows))
+	for i := range rows {
+		ar := rows[i]
+		out[ar.MailboxID] = autoresponderResponse{
+			MailboxID: ar.MailboxID,
+			Enabled:   ar.Enabled,
+			FromDate:  ar.FromDate,
+			ToDate:    ar.ToDate,
+			Subject:   ar.Subject,
+			TextBody:  ar.TextBody,
+			HTMLBody:  ar.HTMLBody,
+			UpdatedAt: ar.UpdatedAt,
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"data": out})
+}
+
+// listAllOwner returns every autoresponder for the mailboxes across all the
+// domains the caller owns, keyed by mailbox id (JAB-370 Selection). The
+// cross-domain Mailboxes tab reads this ONE owner-scoped request instead of
+// fanning out one listByDomain per email-enabled domain.
+//
+// The owner is taken from the Kratos session claims and NEVER widened — unlike
+// listByDomain there is deliberately no admin cross-tenant branch. The tab's
+// mailbox rows come from /me/mailboxes (owner-scoped for admins too), so the
+// autoresponder projection must match, or an admin's client-side
+// mailbox->autoresponder join would receive another tenant's rows. Mirrors
+// listWorkspace's isolation and the sibling mailbox-group-memberships bulk list.
+func (h *mailboxAutoresponderHandler) listAllOwner(c *gin.Context) {
+	ctx := c.Request.Context()
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+	rows, err := h.cfg.Autoresponders.ListByUserID(ctx, claims.UserID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	out := make(map[string]autoresponderResponse, len(rows))
+	for i := range rows {
+		ar := rows[i]
+		out[ar.MailboxID] = autoresponderResponse{
+			MailboxID: ar.MailboxID,
+			Enabled:   ar.Enabled,
+			FromDate:  ar.FromDate,
+			ToDate:    ar.ToDate,
+			Subject:   ar.Subject,
+			TextBody:  ar.TextBody,
+			HTMLBody:  ar.HTMLBody,
+			UpdatedAt: ar.UpdatedAt,
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"data": out})
+}
+
+func (h *mailboxAutoresponderHandler) get(c *gin.Context) {
+	ctx := c.Request.Context()
+	claims := ginctx.Claims(c)
+	mb, _, err := h.loadMailboxWithAuth(ctx, c.Param("mbid"), claims)
+	if err != nil {
+		// Reuse mailbox handler's writeLoadErr via generic mapping.
+		if isNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+			return
+		}
+		if errors.Is(err, errMailboxForbidden) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+
+	ar, err := h.cfg.Autoresponders.FindByMailboxID(ctx, mb.ID)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			// Not set — return empty shape with defaults.
+			c.JSON(http.StatusOK, autoresponderResponse{
+				MailboxID: mb.ID,
+				Enabled:   false,
+				UpdatedAt: time.Time{},
+			})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	c.JSON(http.StatusOK, autoresponderResponse{
+		MailboxID: ar.MailboxID,
+		Enabled:   ar.Enabled,
+		FromDate:  ar.FromDate,
+		ToDate:    ar.ToDate,
+		Subject:   ar.Subject,
+		TextBody:  ar.TextBody,
+		HTMLBody:  ar.HTMLBody,
+		UpdatedAt: ar.UpdatedAt,
+	})
+}
+
+func (h *mailboxAutoresponderHandler) put(c *gin.Context) {
+	ctx := c.Request.Context()
+	claims := ginctx.Claims(c)
+	mb, _, err := h.loadMailboxWithAuth(ctx, c.Param("mbid"), claims)
+	if err != nil {
+		if isNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+			return
+		}
+		if errors.Is(err, errMailboxForbidden) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+
+	var req autoresponderUpdateRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_body"})
+		return
+	}
+
+	email := mb.LocalPart + "@" + mustDomainName(ctx, h.cfg.Domains, mb.DomainID)
+	// DB write only (nil push): the autoresponder no longer has its own agent
+	// command — it converges into the mailbox's single active Sieve script
+	// alongside any forwards (GH #1795), below.
+	ar, _, err := autoresponderops.Set(ctx,
+		autoresponderops.Deps{Autoresponders: h.cfg.Autoresponders},
+		autoresponderops.SetInput{
+			MailboxID:    mb.ID,
+			MailboxEmail: email,
+			Enabled:      req.Enabled,
+			Subject:      req.Subject,
+			TextBody:     req.TextBody,
+			HTMLBody:     req.HTMLBody,
+			FromDate:     req.FromDate,
+			ToDate:       req.ToDate,
+		}, nil)
+	if err != nil {
+		if errors.Is(err, autoresponderops.ErrContentRequired) || errors.Is(err, autoresponderops.ErrInvalidDateRange) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_autoresponder", "detail": err.Error()})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+
+	warning := h.convergeSieve(ctx, mb.ID, email)
+
+	c.JSON(http.StatusOK, autoresponderResponse{
+		MailboxID: ar.MailboxID,
+		Enabled:   ar.Enabled,
+		FromDate:  ar.FromDate,
+		ToDate:    ar.ToDate,
+		Subject:   ar.Subject,
+		TextBody:  ar.TextBody,
+		HTMLBody:  ar.HTMLBody,
+		UpdatedAt: ar.UpdatedAt,
+		Warning:   warning,
+	})
+}
+
+// convergeSieve pushes the mailbox's full server-side rule state (forwards +
+// this autoresponder) to Stalwart as one active Sieve script (GH #1795). It is
+// best-effort: the DB is truth, so a convergence failure becomes a structured
+// warning the caller surfaces, never a 5xx. Returns "convergence_failed" on
+// error, "" on success.
+func (h *mailboxAutoresponderHandler) convergeSieve(ctx context.Context, mailboxID, email string) string {
+	if err := forwarderops.Converge(ctx, h.cfg.Agent, h.cfg.Forwarders, h.cfg.Autoresponders, mailboxID, email); err != nil {
+		slog.Warn("mailbox.sieve.apply: convergence failed", "mailbox_id", mailboxID, "err", err)
+		return "convergence_failed"
+	}
+	return ""
+}
+
+func (h *mailboxAutoresponderHandler) del(c *gin.Context) {
+	ctx := c.Request.Context()
+	claims := ginctx.Claims(c)
+	mb, _, err := h.loadMailboxWithAuth(ctx, c.Param("mbid"), claims)
+	if err != nil {
+		if isNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+			return
+		}
+		if errors.Is(err, errMailboxForbidden) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	email := mb.LocalPart + "@" + mustDomainName(ctx, h.cfg.Domains, mb.DomainID)
+	if err := autoresponderops.Clear(ctx,
+		autoresponderops.Deps{Autoresponders: h.cfg.Autoresponders},
+		mb.ID, email, nil); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	// Re-converge the mailbox's Sieve without the (now cleared) autoresponder,
+	// so a remaining forward stays active and the vacation block is dropped.
+	_ = h.convergeSieve(ctx, mb.ID, email)
+	c.JSON(http.StatusNoContent, nil)
+}
+
+// mustDomainName resolves a domain name by id; returns "" on error.
+// Callers are best-effort pushes — Stalwart rejects empty domain names.
+func mustDomainName(ctx context.Context, domains repository.DomainRepository, domainID string) string {
+	if domains == nil {
+		return ""
+	}
+	d, err := domains.FindByID(ctx, domainID)
+	if err != nil || d == nil {
+		return ""
+	}
+	return d.Name
+}

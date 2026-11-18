@@ -1,0 +1,67 @@
+slug: nextcloud
+popularity: 100
+name: Nextcloud
+tags: ["File sharing"]
+version: "35.0.2"
+# Release track (GH #1956): Nextcloud upgrades one major at a time. Update
+# moves a 34 install to 35, and a 33 install to 34 first; a 34 install keeps
+# the 34 image on an env or domain edit.
+track: "35"
+update_from: ["34"]
+description: |
+  Self-hosted productivity platform: file sync, calendar, contacts,
+  office docs, video calls. Two services: PHP-FPM app container +
+  bundled MariaDB. Redis omitted in v1 -- add manually post-install
+  if you need it.
+icon: icon.svg
+upstream: https://github.com/nextcloud/server
+documentation: https://docs.nextcloud.com/
+
+image_channel: nextcloud:35-apache@sha256:e0b1a2af52c82c07b7a0e8e59878bd8769e704447734d5d238a836982f51b9c8
+held_tracks:
+  - track: "34"
+    version: "34.0.4"
+    image_channel: nextcloud:34-apache@sha256:72f5cc3347042dd5dcad72edc376b19d0e042194af344a549820affd04804c8f
+    update_from: ["33"]
+update_mode: manual
+
+resources:
+  cpu: "2.0"
+  memory: "1g"
+  pids: 500
+
+volumes:
+  - name: nextcloud
+    container_path: /var/www/html
+  - name: db
+    container_path: /var/lib/mysql
+
+ports:
+  - name: http
+    container_port: 80
+    protocol: tcp
+    default_enabled: true
+    default_bind: loopback
+    default_reverse_proxy: true
+    health_path: /status.php
+
+env:
+  - name: MYSQL_DATABASE
+    value: "nextcloud"
+  - name: MYSQL_USER
+    value: "nextcloud"
+  - name: MYSQL_PASSWORD
+    secret: true
+    generate: password32
+  - name: MYSQL_ROOT_PASSWORD
+    secret: true
+    generate: password32
+  - name: NEXTCLOUD_ADMIN_USER
+    value: "dotnext"
+  - name: NEXTCLOUD_ADMIN_PASSWORD
+    secret: true
+    generate: password32
+
+# Operator-supplied SMTP (GH #322): auto-injects standard SMTP_* install fields;
+# compose maps them to this app's SMTP env.
+smtp: true

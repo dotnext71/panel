@@ -1,0 +1,456 @@
+package reconciler
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log/slog"
+	"testing"
+
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+	"github.com/dotnext-panel/dotnext/internal/ssokey"
+)
+
+type sendmailAgentCall struct {
+	method string
+	params map[string]any
+}
+
+type fakeSendmailAgent struct {
+	calls      []sendmailAgentCall
+	failEnsure bool
+}
+
+func (f *fakeSendmailAgent) Call(_ context.Context, method string, params interface{}) (json.RawMessage, error) {
+	m, _ := params.(map[string]any)
+	f.calls = append(f.calls, sendmailAgentCall{method: method, params: m})
+	if method == "sendmail.cred.ensure" && f.failEnsure {
+		return nil, fmt.Errorf("agent down")
+	}
+	return json.RawMessage(`{"ok":true}`), nil
+}
+
+func (f *fakeSendmailAgent) byMethod(method string) []sendmailAgentCall {
+	var out []sendmailAgentCall
+	for _, c := range f.calls {
+		if c.method == method {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+type fakeSendmailDomainRepo struct {
+	repository.DomainRepository
+	rows []models.Domain
+}
+
+func (f *fakeSendmailDomainRepo) List(context.Context, repository.ListOptions) ([]models.Domain, int64, error) {
+	return f.rows, int64(len(f.rows)), nil
+}
+
+type fakeSendmailUserRepo struct {
+	repository.UserRepository
+	users map[string]*models.User
+}
+
+func (f *fakeSendmailUserRepo) FindByID(_ context.Context, id string) (*models.User, error) {
+	u, ok := f.users[id]
+	if !ok {
+		return nil, repository.ErrNotFound
+	}
+	return u, nil
+}
+
+type fakeSendmailMailboxRepo struct {
+	repository.MailboxRepository
+	byEmail map[string]*models.Mailbox
+	// domainNames lets Create key byEmail like the real DB trigger would
+	// (local_part@domains.name), so a second tick FINDS the created row.
+	domainNames map[string]string
+	created     []*models.Mailbox
+	rotated     []string
+}
+
+func (f *fakeSendmailMailboxRepo) FindByEmail(_ context.Context, email string) (*models.Mailbox, error) {
+	mb, ok := f.byEmail[email]
+	if !ok {
+		return nil, repository.ErrNotFound
+	}
+	return mb, nil
+}
+
+func (f *fakeSendmailMailboxRepo) Create(_ context.Context, mb *models.Mailbox) error {
+	f.created = append(f.created, mb)
+	f.byEmail[mb.LocalPart+"@"+f.domainNames[mb.DomainID]] = mb
+	return nil
+}
+
+func (f *fakeSendmailMailboxRepo) UpdatePasswordHashAndEnc(_ context.Context, id, hash string, enc []byte) error {
+	f.rotated = append(f.rotated, id)
+	for _, mb := range f.byEmail {
+		if mb.ID == id {
+			mb.PasswordHash = hash
+			mb.PasswordEnc = enc
+		}
+	}
+	return nil
+}
+
+func sendmailTestReconciler(agent *fakeSendmailAgent, mailboxes *fakeSendmailMailboxRepo, domains []models.Domain) *Reconciler {
+	key := ssokey.Key{}
+	for i := range key {
+		key[i] = byte(i)
+	}
+	return &Reconciler{
+		domains: &fakeSendmailDomainRepo{rows: domains},
+		users: &fakeSendmailUserRepo{users: map[string]*models.User{
+			"u1": {ID: "u1", Username: strPtr("alice")},
+			"u2": {ID: "u2", Username: nil}, // no Linux account
+			// Panel-primary shape: admin WITH a synthesized DB username that
+			// has no OS counterpart (testserver E2E found the warn-loop).
+			"u3": {ID: "u3", Username: strPtr("user_01krhrna2zmp"), IsAdmin: true},
+		}},
+		serverSettings: &fakeSettingsRepo{srv: &models.ServerSettings{Hostname: "panel.example.tld", MailEnabled: true}},
+		// GH #2056: "Website sends email" per package.
+		packages: &wmPackageRepo{rows: []models.HostingPackage{
+			{ID: "p-on", WebsiteSendsEmail: true},
+			{ID: "p-off", WebsiteSendsEmail: false},
+		}},
+		agent:          agent,
+		mailboxes:      mailboxes,
+		sendmailSSOKey: &key,
+		// The relay mailbox create clears its address on the mail server
+		// first (mailboxops fails closed without a registry).
+		mailAddrRegistry: &fakeAliasRegistry{},
+		log:              slog.New(slog.DiscardHandler),
+	}
+}
+
+func TestReconcileSendmailCreds_ProvisionsAndCaches(t *testing.T) {
+	agent := &fakeSendmailAgent{}
+	mailboxes := &fakeSendmailMailboxRepo{
+		byEmail:     map[string]*models.Mailbox{},
+		domainNames: map[string]string{"d1": "site.tld", "d2": "mailless.tld"},
+	}
+	r := sendmailTestReconciler(agent, mailboxes, []models.Domain{
+		{OwnershipState: verifiedOwnership, ID: "d1", Name: "site.tld", UserID: "u1", EmailEnabled: true},
+		{OwnershipState: verifiedOwnership, ID: "d2", Name: "mailless.tld", UserID: "u1", EmailEnabled: false},
+	})
+	ctx := context.Background()
+
+	r.reconcileSendmailCreds(ctx)
+
+	// Both domains — including EmailEnabled=false — get a SendOnly mailbox.
+	if len(mailboxes.created) != 2 {
+		t.Fatalf("created %d mailboxes, want 2", len(mailboxes.created))
+	}
+	for _, mb := range mailboxes.created {
+		if !mb.SendOnly {
+			t.Errorf("relay mailbox %s must be SendOnly", mb.ID)
+		}
+		if !mb.System {
+			// GH #1056: the relay must be flagged System so the mailbox
+			// lists filter it out — an operator never created it.
+			t.Errorf("relay mailbox %s must be System", mb.ID)
+		}
+		if mb.LocalPart != "noreply" {
+			t.Errorf("local part = %q", mb.LocalPart)
+		}
+		if len(mb.PasswordEnc) == 0 {
+			t.Errorf("relay mailbox %s missing sealed password", mb.ID)
+		}
+	}
+
+	ensures := agent.byMethod("sendmail.cred.ensure")
+	if len(ensures) != 2 {
+		t.Fatalf("cred.ensure calls = %d, want 2", len(ensures))
+	}
+	first := ensures[0].params
+	if first["username"] != "alice" || first["host"] != "mail.panel.example.tld" {
+		t.Errorf("unexpected ensure params: %v", first)
+	}
+	if first["email"] != "noreply@site.tld" || first["domain"] != "site.tld" {
+		t.Errorf("unexpected ensure identity: %v", first)
+	}
+	if pw, _ := first["password"].(string); pw == "" {
+		t.Error("ensure carried empty password")
+	}
+	if len(agent.byMethod("mailbox.create")) != 2 {
+		t.Error("Stalwart registry notify missing")
+	}
+
+	// Steady state: fingerprint cache suppresses all calls.
+	before := len(agent.calls)
+	r.reconcileSendmailCreds(ctx)
+	if len(agent.calls) != before {
+		t.Fatalf("steady-state tick made %d extra calls", len(agent.calls)-before)
+	}
+}
+
+// TestReconcileSendmailCreds_MailHostnameOverride pins the JAB-390 wiring:
+// a set server_settings.mail_hostname override repoints the relay identity
+// host — resolved through models.EffectiveMailHostname — independent of the
+// panel hostname. Swapping the reconciler back to PanelMailHostname(srv.Hostname)
+// yields "mail.panel.example.tld" and reddens this test.
+func TestReconcileSendmailCreds_MailHostnameOverride(t *testing.T) {
+	agent := &fakeSendmailAgent{}
+	mailboxes := &fakeSendmailMailboxRepo{
+		byEmail:     map[string]*models.Mailbox{},
+		domainNames: map[string]string{"d1": "site.tld"},
+	}
+	r := sendmailTestReconciler(agent, mailboxes, []models.Domain{
+		{OwnershipState: verifiedOwnership, ID: "d1", Name: "site.tld", UserID: "u1", EmailEnabled: true},
+	})
+	override := "mail.example.com"
+	r.serverSettings = &fakeSettingsRepo{srv: &models.ServerSettings{
+		Hostname: "panel.example.tld", MailEnabled: true, MailHostname: &override,
+	}}
+
+	r.reconcileSendmailCreds(context.Background())
+
+	ensures := agent.byMethod("sendmail.cred.ensure")
+	if len(ensures) != 1 {
+		t.Fatalf("cred.ensure calls = %d, want 1", len(ensures))
+	}
+	if got := ensures[0].params["host"]; got != "mail.example.com" {
+		t.Errorf("relay host = %v, want mail.example.com (mail_hostname override honoured)", got)
+	}
+}
+
+func TestReconcileSendmailCreds_ExistingSealedPasswordReused(t *testing.T) {
+	agent := &fakeSendmailAgent{}
+	key := ssokey.Key{}
+	for i := range key {
+		key[i] = byte(i)
+	}
+	enc, err := key.Seal([]byte("known-plaintext"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mailboxes := &fakeSendmailMailboxRepo{byEmail: map[string]*models.Mailbox{
+		"noreply@site.tld": {ID: "mb1", LocalPart: "noreply", PasswordEnc: enc, SendOnly: true},
+	}}
+	r := sendmailTestReconciler(agent, mailboxes, []models.Domain{
+		{OwnershipState: verifiedOwnership, ID: "d1", Name: "site.tld", UserID: "u1"},
+	})
+
+	r.reconcileSendmailCreds(context.Background())
+
+	if len(mailboxes.created) != 0 || len(mailboxes.rotated) != 0 {
+		t.Fatalf("existing sealed mailbox must be reused (created=%d rotated=%d)", len(mailboxes.created), len(mailboxes.rotated))
+	}
+	ensures := agent.byMethod("sendmail.cred.ensure")
+	if len(ensures) != 1 || ensures[0].params["password"] != "known-plaintext" {
+		t.Fatalf("cred.ensure must carry the unsealed password, got %v", ensures)
+	}
+}
+
+func TestReconcileSendmailCreds_LegacyRowRotates(t *testing.T) {
+	agent := &fakeSendmailAgent{}
+	mailboxes := &fakeSendmailMailboxRepo{byEmail: map[string]*models.Mailbox{
+		"noreply@site.tld": {ID: "mb1", LocalPart: "noreply", PasswordEnc: nil, SendOnly: true},
+	}}
+	r := sendmailTestReconciler(agent, mailboxes, []models.Domain{
+		{OwnershipState: verifiedOwnership, ID: "d1", Name: "site.tld", UserID: "u1"},
+	})
+
+	r.reconcileSendmailCreds(context.Background())
+
+	if len(mailboxes.rotated) != 1 {
+		t.Fatalf("legacy row must rotate, rotated=%v", mailboxes.rotated)
+	}
+	if len(agent.byMethod("mailbox.set_password")) != 1 {
+		t.Error("rotate must invalidate the Stalwart auth cache")
+	}
+	if len(agent.byMethod("sendmail.cred.ensure")) != 1 {
+		t.Error("cred.ensure missing after rotate")
+	}
+}
+
+func TestReconcileSendmailCreds_SkipsAndRetries(t *testing.T) {
+	agent := &fakeSendmailAgent{failEnsure: true}
+	mailboxes := &fakeSendmailMailboxRepo{
+		byEmail:     map[string]*models.Mailbox{},
+		domainNames: map[string]string{"d1": "site.tld", "d-admin": "adminsite.tld"},
+	}
+	r := sendmailTestReconciler(agent, mailboxes, []models.Domain{
+		{OwnershipState: verifiedOwnership, ID: "d-nouser", Name: "nouser.tld", UserID: "u2"}, // no Linux user
+		{OwnershipState: verifiedOwnership, ID: "d-admin", Name: "panelhost.tld", UserID: "u3"},                                  // admin w/ synthesized username
+		{OwnershipState: verifiedOwnership, ID: "d1", Name: "site.tld", UserID: "u1"},
+	})
+	ctx := context.Background()
+
+	r.reconcileSendmailCreds(ctx)
+	if n := len(agent.byMethod("sendmail.cred.ensure")); n != 1 {
+		t.Fatalf("no-OS-user and admin domains must be skipped (ensure calls=%d)", n)
+	}
+	if len(mailboxes.created) != 1 {
+		t.Fatalf("skipped domains must not get relay mailboxes (created=%d)", len(mailboxes.created))
+	}
+
+	// Failed ensure is retried next tick (not cached as done).
+	agent.failEnsure = false
+	r.reconcileSendmailCreds(ctx)
+	if n := len(agent.byMethod("sendmail.cred.ensure")); n != 2 {
+		t.Fatalf("failed domain must retry (ensure calls=%d, want 2)", n)
+	}
+	// And after success, steady state.
+	r.reconcileSendmailCreds(ctx)
+	if n := len(agent.byMethod("sendmail.cred.ensure")); n != 2 {
+		t.Fatalf("converged domain re-called (ensure calls=%d)", n)
+	}
+}
+
+func TestReconcileSendmailCreds_HumanNoreplyNeverTouched(t *testing.T) {
+	agent := &fakeSendmailAgent{}
+	// Migrated-account shape: a REAL noreply@ with an imported hash and no
+	// PasswordEnc. Rotating it would break the owner's IMAP/webmail login.
+	human := &models.Mailbox{ID: "mb-human", LocalPart: "noreply", PasswordHash: "imported", PasswordEnc: nil, SendOnly: false}
+	mailboxes := &fakeSendmailMailboxRepo{
+		byEmail:     map[string]*models.Mailbox{"noreply@site.tld": human},
+		domainNames: map[string]string{"d1": "site.tld"},
+	}
+	r := sendmailTestReconciler(agent, mailboxes, []models.Domain{
+		{OwnershipState: verifiedOwnership, ID: "d1", Name: "site.tld", UserID: "u1"},
+	})
+
+	r.reconcileSendmailCreds(context.Background())
+
+	if len(mailboxes.rotated) != 0 {
+		t.Fatal("human noreply@ was rotated — this breaks the owner's login")
+	}
+	if human.PasswordHash != "imported" {
+		t.Fatal("human noreply@ hash changed")
+	}
+	// The fallback identity carries the relay instead.
+	if len(mailboxes.created) != 1 || mailboxes.created[0].LocalPart != "dotnext-noreply" {
+		t.Fatalf("expected dotnext-noreply fallback, created=%+v", mailboxes.created)
+	}
+	ensures := agent.byMethod("sendmail.cred.ensure")
+	if len(ensures) != 1 || ensures[0].params["email"] != "dotnext-noreply@site.tld" {
+		t.Fatalf("cred must carry the fallback identity, got %v", ensures)
+	}
+}
+
+func TestReconcileSendmailCreds_BothNamesHumanSkips(t *testing.T) {
+	agent := &fakeSendmailAgent{}
+	mailboxes := &fakeSendmailMailboxRepo{
+		byEmail: map[string]*models.Mailbox{
+			"noreply@site.tld":        {ID: "h1", LocalPart: "noreply", SendOnly: false},
+			"dotnext-noreply@site.tld": {ID: "h2", LocalPart: "dotnext-noreply", SendOnly: false},
+		},
+		domainNames: map[string]string{"d1": "site.tld"},
+	}
+	r := sendmailTestReconciler(agent, mailboxes, []models.Domain{
+		{OwnershipState: verifiedOwnership, ID: "d1", Name: "site.tld", UserID: "u1"},
+	})
+	ctx := context.Background()
+
+	r.reconcileSendmailCreds(ctx)
+	if len(mailboxes.created) != 0 || len(mailboxes.rotated) != 0 || len(agent.byMethod("sendmail.cred.ensure")) != 0 {
+		t.Fatal("domain with both names taken must be skipped entirely")
+	}
+	// And the skip is cached — no per-tick warn/probe churn.
+	r.reconcileSendmailCreds(ctx)
+	if len(agent.calls) != 0 {
+		t.Fatal("skipped domain must stay quiet on later ticks")
+	}
+}
+
+func TestReconcileSendmailCreds_SkippedWhenMailModuleDisabled(t *testing.T) {
+	// GH #1417: with the mail module off there is no Stalwart to authenticate
+	// against, so the reconciler must create no noreply@ relay mailboxes (they
+	// would otherwise surface under Email in Disk Usage and link to a page the
+	// tenant can't reach).
+	agent := &fakeSendmailAgent{}
+	mailboxes := &fakeSendmailMailboxRepo{
+		byEmail:     map[string]*models.Mailbox{},
+		domainNames: map[string]string{"d1": "site.tld"},
+	}
+	r := sendmailTestReconciler(agent, mailboxes, []models.Domain{
+		{OwnershipState: verifiedOwnership, ID: "d1", Name: "site.tld", UserID: "u1", EmailEnabled: true},
+	})
+	r.serverSettings = &fakeSettingsRepo{srv: &models.ServerSettings{Hostname: "panel.example.tld", MailEnabled: false}}
+
+	r.reconcileSendmailCreds(context.Background())
+
+	if len(mailboxes.created) != 0 {
+		t.Fatalf("mail module disabled: no relay mailbox may be created (created=%d)", len(mailboxes.created))
+	}
+	if len(agent.calls) != 0 {
+		t.Fatalf("mail module disabled: no agent calls expected, got %v", agent.calls)
+	}
+}
+
+func TestReconcileSendmailCreds_NoHostnameNoop(t *testing.T) {
+	agent := &fakeSendmailAgent{}
+	mailboxes := &fakeSendmailMailboxRepo{byEmail: map[string]*models.Mailbox{}}
+	r := sendmailTestReconciler(agent, mailboxes, []models.Domain{
+		{OwnershipState: verifiedOwnership, ID: "d1", Name: "site.tld", UserID: "u1"},
+	})
+	r.serverSettings = &fakeSettingsRepo{srv: &models.ServerSettings{Hostname: ""}}
+
+	r.reconcileSendmailCreds(context.Background())
+	if len(agent.calls) != 0 {
+		t.Fatalf("no hostname must be a no-op, calls=%v", agent.calls)
+	}
+}
+
+// GH #2056: a site whose package doesn't let it send email gets no relay
+// identity: its cred file is removed and the relay password rotated (the old
+// one sat in a file the site could read). Turning the package flag back on
+// hands the rotated password to a new cred file. No package at all keeps the
+// identity: only the smarthost is a privileged feature.
+func TestSendmailCreds_FollowThePackagesWebsiteMailFlag(t *testing.T) {
+	agent := &fakeSendmailAgent{}
+	mailboxes := &fakeSendmailMailboxRepo{
+		byEmail:     map[string]*models.Mailbox{},
+		domainNames: map[string]string{"d1": "site.tld"},
+	}
+	r := sendmailTestReconciler(agent, mailboxes, []models.Domain{
+		{OwnershipState: verifiedOwnership, ID: "d1", Name: "site.tld", UserID: "u1"},
+	})
+	owner := r.users.(*fakeSendmailUserRepo).users["u1"]
+	ctx := context.Background()
+
+	owner.PackageID = strPtr("p-on")
+	r.reconcileSendmailCreds(ctx)
+	ensures := agent.byMethod("sendmail.cred.ensure")
+	if len(ensures) != 1 {
+		t.Fatalf("a package with website mail: %d ensures, want 1", len(ensures))
+	}
+	oldPassword := ensures[0].params["password"]
+
+	owner.PackageID = strPtr("p-off")
+	r.reconcileSendmailCreds(ctx)
+	if removes := agent.byMethod("sendmail.cred.remove"); len(removes) != 1 || removes[0].params["domain"] != "site.tld" {
+		t.Fatalf("a package without website mail must lose the cred file, got %+v", removes)
+	}
+	if len(mailboxes.rotated) != 1 {
+		t.Fatalf("its relay password must be rotated, got %d rotations", len(mailboxes.rotated))
+	}
+
+	owner.PackageID = strPtr("p-on")
+	r.reconcileSendmailCreds(ctx)
+	ensures = agent.byMethod("sendmail.cred.ensure")
+	if len(ensures) != 2 || ensures[1].params["password"] == oldPassword {
+		t.Fatalf("turning website mail back on must restore the cred with the rotated password, got %d ensures", len(ensures))
+	}
+}
+
+// GH #2056: without the package list the loop changes nothing (fail closed),
+// rather than provisioning identities it can't check.
+func TestSendmailCreds_NoPackageListChangesNothing(t *testing.T) {
+	agent := &fakeSendmailAgent{}
+	mailboxes := &fakeSendmailMailboxRepo{byEmail: map[string]*models.Mailbox{}, domainNames: map[string]string{"d1": "site.tld"}}
+	r := sendmailTestReconciler(agent, mailboxes, []models.Domain{
+		{OwnershipState: verifiedOwnership, ID: "d1", Name: "site.tld", UserID: "u1"},
+	})
+	r.packages = nil
+	r.reconcileSendmailCreds(context.Background())
+	if n := len(agent.byMethod("sendmail.cred.ensure")); n != 0 {
+		t.Fatalf("ensures = %d, want 0", n)
+	}
+}

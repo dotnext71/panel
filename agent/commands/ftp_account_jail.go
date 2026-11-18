@@ -1,0 +1,530 @@
+package commands
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
+
+	"github.com/dotnext-panel/dotnext/agentwire"
+	"github.com/dotnext-panel/dotnext/internal/filesafe"
+)
+
+// GH #1145 / JAB-252 + JAB-253 — TRUE (separate-uid) isolation for an FTP/SFTP
+// subaccount.
+//
+// The legacy model (ftp_account.go) makes a subaccount a same-uid alias
+// chrooted to the tenant home: an SFTP credential scoped to a sub-dir can `..`
+// out to the whole account (JAB-252), and a mutable-home symlink escapes the
+// vsftpd chroot (JAB-253). An ISOLATED subaccount instead gets:
+//
+//   - its OWN uid (allocated monotonically by the panel, never reused) and its
+//     own primary group — kernel identity separation from the tenant AND from
+//     sibling subaccounts;
+//   - a ROOT-OWNED jail dir (/var/lib/dotnext-ftp-jails/<tenant>/<label>,
+//     root:root 0755) whose ONLY writable content is the selected sub-tree,
+//     bind-mounted in at a root-owned mountpoint. The jail satisfies sshd's
+//     root-owned-chroot-chain rule AND vsftpd's secure-chroot rule, so it is
+//     the chroot for BOTH protocols; `..` from the mountpoint hits the empty
+//     root-owned jail root, never a sibling or ancestor;
+//   - POSIX ACLs granting the sub-uid AND the tenant-uid rwX on the exposed
+//     sub-tree (with default ACLs so new files inherit), so the tenant keeps
+//     managing files the sub writes under its own uid;
+//   - a per-uid disk quota (the split allocation) so a separate uid cannot
+//     escape the tenant's package quota and fill the disk.
+//
+// The mount is a plain bind mount created by the agent. The agent runs as root
+// in the HOST mount namespace (install.sh keeps PrivateTmp / ProtectKernel* /
+// PrivateMounts OFF for it — proven on dotnexttests), so the bind mount is
+// host-global and visible to a fresh sshd/vsftpd login with no namespace-escape
+// machinery. It does NOT survive reboot; the panel reconciler re-establishes it
+// each tick (DB-is-truth, ftpaccount.ensure_jail). There is no boot-time unit,
+// so after a reboot an isolated account cannot log in until the first tick.
+
+// ftpJailRootDefault is the parent of every per-subaccount jail. Root-owned,
+// outside any tenant-writable tree.
+const ftpJailRootDefault = "/var/lib/dotnext-ftp-jails"
+
+// ftpJailMountpoint is the fixed name of the bind-mount target inside each
+// jail. The session start dir is always "/<ftpJailMountpoint>".
+const ftpJailMountpoint = "data"
+
+// isolatedPasswdHome is the /etc/passwd home written for an isolated subaccount.
+// The "/./" marker (honoured by vsftpd's passwd_chroot_enable=YES, install.sh)
+// splits the string into the chroot root — the root-owned jail — and the
+// post-chroot start dir, the bind-mounted "/<ftpJailMountpoint>". This gives a
+// plain-FTP login the same landing dir sshd gives via `internal-sftp -d /data`
+// (GH #1720); vsftpd has no per-user start dir of its own and would otherwise
+// dump the user at the empty jail root. It is built literally, NOT with
+// filepath.Join, which would collapse the "/./" and destroy the marker.
+func isolatedPasswdHome(jailPath string) string {
+	return jailPath + "/./" + ftpJailMountpoint
+}
+
+// isolatedHomeNeedsRehome reports whether an isolated subaccount's current
+// /etc/passwd home must be rewritten to the GH #1720 "/./" landing form. An
+// account created before the fix carries the bare jail root and needs the
+// re-home; one already carrying the marker does not. ensure_jail runs this
+// every reconcile tick so pre-fix accounts self-heal fleet-wide.
+func isolatedHomeNeedsRehome(currentHome, jailPath string) (want string, need bool) {
+	want = isolatedPasswdHome(jailPath)
+	return want, currentHome != want
+}
+
+// vsftpdConfPath is the rendered vsftpd config, overridable in tests.
+func vsftpdConfPath() string {
+	if p := os.Getenv("DOTNEXT_VSFTPD_CONF"); p != "" {
+		return p
+	}
+	return "/etc/vsftpd.conf"
+}
+
+// vsftpdHonoursPasswdChroot reports whether the host's vsftpd enables
+// passwd_chroot_enable — i.e. whether a "/./" marker in a passwd home is honoured
+// as a chroot split (jail root before the marker, start dir after). It gates the
+// GH #1720 re-home: when the directive is absent (a host that has not run the
+// install converge_vsftpd_passwd_chroot yet, or a hand-edited conf), re-homing an
+// isolated account to the "/./" form would instead make vsftpd chroot into the
+// tenant-writable /data — a downgrade of the isolation floor. Fail closed: any
+// read error or a missing directive returns false, leaving the safe bare-jail home.
+func vsftpdHonoursPasswdChroot() bool {
+	b, err := os.ReadFile(vsftpdConfPath())
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		if strings.TrimSpace(line) == "passwd_chroot_enable=YES" {
+			return true
+		}
+	}
+	return false
+}
+
+// ftpSubaccountUIDMin is the floor of the reserved, never-reused uid range for
+// isolated subaccounts (must match migration 000267's allocator base). 1e9 is
+// ABOVE the rootless-container subuid delegation ceiling (SUB_UID_MAX, 6.001e8
+// on Debian/Ubuntu) — a uid inside the subuid span (100000..SUB_UID_MAX) would
+// share host identity + quota with a tenant's user-namespace mapping. The agent
+// re-checks this floor — it never trusts the panel's allocated uid blindly.
+const ftpSubaccountUIDMin = 1000000000
+
+func ftpJailRoot() string {
+	if p := os.Getenv("DOTNEXT_FTP_JAIL_ROOT"); p != "" {
+		return p
+	}
+	return ftpJailRootDefault
+}
+
+// ftpJailPathFor derives the canonical jail path for a subaccount. The panel
+// stores and sends the same value (jail_path); the agent re-derives and
+// requires an exact match so a caller can never point the chroot elsewhere.
+func ftpJailPathFor(tenant *ftpTenant, username string) string {
+	return filepath.Join(ftpJailRoot(), tenant.Username, username)
+}
+
+// validateIsolatedCreate re-validates every panel-supplied field for the
+// isolated path. The agent never trusts the panel just because it is localhost.
+func validateIsolatedCreate(p ftpAccountCreateParams, tenant *ftpTenant) *agentwire.AgentError {
+	if p.UID < ftpSubaccountUIDMin {
+		return &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: fmt.Sprintf("isolated uid %d is below the reserved floor %d", p.UID, ftpSubaccountUIDMin),
+		}
+	}
+	if int(p.UID) == tenant.UID {
+		return &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: fmt.Sprintf("isolated uid %d collides with the tenant uid", p.UID),
+		}
+	}
+	if p.QuotaMB == 0 {
+		// An unlimited separate uid escapes the tenant's package quota and can
+		// fill the disk — the disk-fill hole the split allocation closes.
+		return &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: "isolated account requires a non-zero quota_mb (unlimited separate uid = disk-fill hole)",
+		}
+	}
+	if p.QuotaMount == "" {
+		return &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: "isolated account requires quota_mount for per-uid setquota",
+		}
+	}
+	// The panel-supplied jail_path must be EXACTLY the canonical path — no
+	// caller-chosen chroot root.
+	want := ftpJailPathFor(tenant, p.Username)
+	if p.JailPath != want {
+		return &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: fmt.Sprintf("jail_path %q is not the canonical jail %q", p.JailPath, want),
+		}
+	}
+	return nil
+}
+
+// provisionIsolatedJail builds the full isolated account: jail skeleton, bind
+// mount, own-uid user, ACL grant, and per-uid quota. It returns a rollback that
+// undoes every step performed so far; the caller runs it on any later failure.
+// The mountpoint-relative start dir is always "/<ftpJailMountpoint>".
+func provisionIsolatedJail(ctx context.Context, tenant *ftpTenant, p ftpAccountCreateParams) (rollback func(), aerr *agentwire.AgentError) {
+	if aerr := validateIsolatedCreate(p, tenant); aerr != nil {
+		return nil, aerr
+	}
+	// Preflight the host precondition BEFORE any mutation: an isolated account
+	// gets a per-uid setquota cap, which fails on a mount that has no filesystem
+	// quota (the disk-quota module was never installed — GH #1053, altomarketing).
+	// Discovering that at the setquota step (5) would leave a half-built jail to
+	// tear down and surface as an opaque "internal"; failing fast here returns an
+	// actionable code the panel maps to "enable disk quota, or create a shared
+	// account".
+	if !quotaEnabledOn(ctx, p.QuotaMount) {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeFailedPrecondition,
+			Message: fmt.Sprintf("filesystem disk quota is not enabled on %s — isolated FTP accounts need it for their per-account disk cap. Enable the disk-quota module, or create a shared account instead.", p.QuotaMount),
+		}
+	}
+
+	jail := p.JailPath
+	mountpoint := filepath.Join(jail, ftpJailMountpoint)
+
+	var undo []func()
+	rollback = func() {
+		for i := len(undo) - 1; i >= 0; i-- {
+			undo[i]()
+		}
+	}
+	fail := func(e *agentwire.AgentError) (func(), *agentwire.AgentError) {
+		rollback()
+		return nil, e
+	}
+
+	// 1. Root-owned jail skeleton (root:root 0755). MkdirAll is safe here —
+	// the jail root is outside any tenant-writable tree, so no symlink race.
+	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
+		return fail(&agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("create jail %q: %v", mountpoint, err)})
+	}
+	// Single undo for the whole jail+mount: teardownIsolatedJail unmounts
+	// safely (blind unmount-until-EINVAL) BEFORE removing the tree, so
+	// rollback can never RemoveAll through a live bind mount into tenant data.
+	undo = append(undo, func() { _ = teardownIsolatedJail(ctx, jail) })
+	if err := os.Chown(jail, 0, 0); err != nil {
+		return fail(&agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("chown jail %q root: %v", jail, err)})
+	}
+	if err := os.Chmod(jail, 0o755); err != nil {
+		return fail(&agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("chmod jail %q: %v", jail, err)})
+	}
+	// Mountpoint must be root-owned too: a failed/absent mount then exposes an
+	// EMPTY root-owned dir, never tenant data by accident (fail-closed).
+	if err := os.Chown(mountpoint, 0, 0); err != nil {
+		return fail(&agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("chown mountpoint %q root: %v", mountpoint, err)})
+	}
+
+	// 2. Bind-mount the selected sub-tree into the jail (host namespace).
+	// CRITICAL (JAB-251-class): the tenant home is tenant-writable, so the
+	// selected pathname must NOT be re-resolved at mount time — a swapped
+	// symlink component would bind an arbitrary directory (e.g. /etc) into the
+	// jail. Open the dir escape-proof via openat2(RESOLVE_BENEATH) and pin it
+	// by fd, then bind the fd's inode through /proc/self/fd. The kernel
+	// resolves the magic symlink to the pinned inode with no pathname walk.
+	scope, serr := filesafe.NewScope(tenant.Username, tenant.Username, []string{tenant.HomeDir})
+	if serr != nil {
+		return fail(&agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("home scope for %q: %v", tenant.HomeDir, serr)})
+	}
+	srcFd, oerr := scope.OpenDirInScope(p.HomePath)
+	if oerr != nil {
+		return fail(&agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: fmt.Sprintf("confined open of selected dir %q: %v", p.HomePath, oerr)})
+	}
+	srcMagic := fmt.Sprintf("/proc/self/fd/%d", srcFd.Fd())
+	if err := syscall.Mount(srcMagic, mountpoint, "", syscall.MS_BIND, ""); err != nil {
+		srcFd.Close()
+		return fail(&agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("bind-mount selected dir -> %q: %v", mountpoint, err)})
+	}
+	// The mount holds its own ref to the inode; the fd is no longer needed.
+	srcFd.Close()
+
+	// 3. Own-uid user (NO --non-unique), own primary group, nologin, GECOS
+	// marker. --no-create-home: the jail already exists.
+	//
+	// GH #1720: the passwd home carries a "/./" marker (isolatedPasswdHome) so
+	// vsftpd — with passwd_chroot_enable=YES (install.sh) — chroots to the
+	// root-owned jail root and then lands the session in the bind-mounted /data,
+	// matching the start dir sshd gives via `internal-sftp -d /data`. vsftpd has
+	// no per-user start dir of its own; without the marker it dumps the user at
+	// the empty, unwritable jail root, which reads as a locked directory. The
+	// chroot is still the root-owned jail (the marker only sets where inside it
+	// the session starts), so the "chroot for BOTH protocols is the jail" design
+	// above holds. --no-create-home means useradd never touches the path.
+	uidStr := strconv.FormatUint(uint64(p.UID), 10)
+	useraddArgs := []string{
+		"--uid", uidStr,
+		"--user-group", // own primary group — member of NO tenant group
+		"--home-dir", isolatedPasswdHome(jail),
+		"--no-create-home",
+		"--shell", "/usr/sbin/nologin",
+		"--comment", ftpAliasGecosFor(tenant.Username),
+		p.Username,
+	}
+	if out, err := execCommandContext(ctx, "useradd", useraddArgs...).CombinedOutput(); err != nil {
+		return fail(&agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("useradd (isolated) %q: %v: %s", p.Username, err, strings.TrimSpace(string(out)))})
+	}
+	undo = append(undo, func() { _ = execCommandContext(ctx, "userdel", "-f", p.Username).Run() })
+
+	// 4. ACLs on the JAIL-SIDE mountpoint (never the tenant pathname). The jail
+	// chain is root-owned so the argument cannot be swapped, and the mount has
+	// pinned the inode, so `setfacl -R <jail>/data` recurses over exactly the
+	// intended tree. Grant the sub-uid rwX and keep the tenant-uid rwX (the sub
+	// writes as its own uid; the tenant must still manage those files). Default
+	// ACLs (-d) make new files inherit both. Uppercase X = execute only where
+	// already applicable (dirs / already-exec files). GNU setfacl -R skips
+	// symlinks encountered during recursion by default.
+	spec := fmt.Sprintf("u:%d:rwX,u:%d:rwX", p.UID, tenant.UID)
+	if out, err := execCommandContext(ctx, "setfacl", "-R", "-m", spec, mountpoint).CombinedOutput(); err != nil {
+		return fail(&agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("setfacl -R %q: %v: %s", mountpoint, err, strings.TrimSpace(string(out)))})
+	}
+	if out, err := execCommandContext(ctx, "setfacl", "-dR", "-m", spec, mountpoint).CombinedOutput(); err != nil {
+		return fail(&agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("setfacl -dR %q: %v: %s", mountpoint, err, strings.TrimSpace(string(out)))})
+	}
+
+	// 5. Per-uid quota (the split cap). setquota block counts are 1KB units.
+	blocks := strconv.FormatUint(uint64(p.QuotaMB)*1024, 10)
+	if out, err := execCommandContext(ctx, "setquota", "-u", p.Username, blocks, blocks, "0", "0", p.QuotaMount).CombinedOutput(); err != nil {
+		return fail(&agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("setquota (isolated) %q: %v: %s", p.Username, err, strings.TrimSpace(string(out)))})
+	}
+
+	return rollback, nil
+}
+
+// quotaEnabledOn reports whether user disk quota is active on mount. `quotaon
+// -pu` prints the current state without changing anything; a line containing
+// "is on" means user quota is active.
+//
+// The exit code is deliberately IGNORED. On the fleet OS (Debian 13, observed
+// live), `quotaon -p` does NOT exit 0 on success — it returns a non-zero status
+// even when quota is fully enabled ("... is on (enforced)", exit 1), so the old
+// `if err != nil { return false }` was a false negative that made every isolated
+// FTP create fail its precondition and the panel's Isolated toggle read
+// unavailable, despite `setquota` working. Parse the printed state instead.
+//
+// This does NOT relax the disk-fill guard: the precheck is only a fast, friendly
+// fail — the authoritative cap is provisionIsolatedJail step 5's setquota, whose
+// failure rolls the whole account back, so an uncapped isolated account can never
+// exist regardless of this check. And the parse still fails closed on every
+// error mode: a missing binary or a run error leaves empty/error output (no "is
+// on"), and "is off" does not contain "is on".
+func quotaEnabledOn(ctx context.Context, mount string) bool {
+	out, _ := execCommandContext(ctx, "quotaon", "-pu", mount).CombinedOutput()
+	return strings.Contains(string(out), "is on")
+}
+
+// ftpIsolationStatusHandler reports whether isolated FTP accounts can be
+// provisioned on this host — i.e. filesystem disk quota is enabled on the
+// panel's quota mount (GH #1171). The panel caches this to default the UI's
+// "Isolated" toggle OFF where quota can't enforce the per-account cap, instead
+// of defaulting on and failing at create time.
+func ftpIsolationStatusHandler(ctx context.Context, raw json.RawMessage) (any, error) {
+	var p struct {
+		QuotaMount string `json:"quota_mount"`
+	}
+	if err := json.Unmarshal(raw, &p); err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: fmt.Sprintf("invalid params: %v", err),
+		}
+	}
+	return map[string]any{
+		"available":   p.QuotaMount != "" && quotaEnabledOn(ctx, p.QuotaMount),
+		"quota_mount": p.QuotaMount,
+	}, nil
+}
+
+// isPathMounted reports whether path is currently a mount target, by scanning
+// /proc/self/mountinfo (field 5 = mount point). Reliable on same-filesystem
+// bind mounts where st_dev does not change at the mountpoint — the stat-based
+// probe that the teardown bug taught us not to trust.
+func isPathMounted(path string) (bool, error) {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 5 {
+			continue
+		}
+		// Field 5 (index 4) is the mount point; mountinfo octal-escapes
+		// space/tab/newline/backslash. Jail paths are validated to contain
+		// none, but unescape for correctness against other mounts.
+		if unescapeMountinfo(f[4]) == path {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func unescapeMountinfo(s string) string {
+	if !strings.Contains(s, `\`) {
+		return s
+	}
+	r := strings.NewReplacer(`\040`, " ", `\011`, "\t", `\012`, "\n", `\134`, `\`)
+	return r.Replace(s)
+}
+
+// ftpEnsureJailHandler (ftpaccount.ensure_jail) idempotently re-establishes an
+// isolated account's bind mount when the jail exists but is unmounted — the
+// post-reboot state (bind mounts are not persistent) and after a manual umount.
+// The panel reconciler calls it every tick for isolated rows, so a reboot
+// self-heals within one tick without a boot-time DB reader. It NEVER creates
+// the account or the uid; those must already exist (a genuinely missing alias
+// is the reconciler's recreate path, not this one).
+func ftpEnsureJailHandler(ctx context.Context, params json.RawMessage) (any, error) {
+	var p struct {
+		TenantUsername string `json:"tenant_username"`
+		Username       string `json:"username"`
+		HomePath       string `json:"home_path"`
+		JailPath       string `json:"jail_path"`
+	}
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: fmt.Sprintf("failed to parse params: %v", err)}
+	}
+	tenant, aerr := resolveFtpTenant(p.TenantUsername)
+	if aerr != nil {
+		return nil, aerr
+	}
+	// Must be an existing isolated subaccount of this tenant.
+	u, aerr := requireFtpSubaccount(tenant, p.Username)
+	if aerr != nil {
+		return nil, aerr
+	}
+	if uid, _ := strconv.Atoi(u.Uid); uid < ftpSubaccountUIDMin {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: fmt.Sprintf("account %q is not isolated (uid below reserved range)", p.Username)}
+	}
+	if p.JailPath != ftpJailPathFor(tenant, p.Username) {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: fmt.Sprintf("jail_path %q is not the canonical jail", p.JailPath)}
+	}
+	// GH #1720: isolated accounts created before the "/./" landing fix carry a
+	// bare-jail passwd home. Once the host gains passwd_chroot_enable=YES, vsftpd
+	// finds no "/./" marker in that home and chroots to the whole jail root,
+	// dumping the session at the empty, unwritable dir (the "locked directory"
+	// the reporter saw). Re-home to the marker form so the next login lands in
+	// /data — matching what the create path now writes and what sshd already
+	// gives via `internal-sftp -d /data`. usermod -d (no -m) rewrites only the
+	// passwd home field: it never moves files, and the change takes effect on the
+	// next login, so live sessions are undisturbed. The reconciler calls this
+	// every tick, so the whole fleet self-heals. Best effort: a transient usermod
+	// failure must not block the mount reconcile below (the reboot self-heal) —
+	// the next tick retries the re-home.
+	if want, need := isolatedHomeNeedsRehome(u.HomeDir, p.JailPath); need {
+		// Fail-closed gate: only re-home to the "/./" form on a host whose vsftpd
+		// actually honours passwd_chroot_enable. Without it, the marker home makes
+		// vsftpd chroot into the tenant-writable /data instead of the root-owned
+		// jail root — an isolation-floor downgrade. The bare-jail home is the safe
+		// current state, so skipping (and retrying next tick, once `dotnext update`
+		// has rendered the directive) never downgrades the boundary.
+		if !vsftpdHonoursPasswdChroot() {
+			slog.Warn("ftp: isolated subaccount needs the GH #1720 /data re-home but this host's vsftpd lacks passwd_chroot_enable=YES — leaving the bare-jail home (fail-closed; run `dotnext update` to render the directive, then it self-heals next tick)",
+				"account", p.Username)
+		} else if out, err := execCommandContext(ctx, "usermod", "-d", want, p.Username).CombinedOutput(); err != nil {
+			slog.Warn("ftp: usermod -d re-home of isolated subaccount failed — session still lands at the jail root until this succeeds (GH #1720; retried next reconcile tick)",
+				"account", p.Username, "want_home", want, "err", err, "output", strings.TrimSpace(string(out)))
+		}
+	}
+	mountpoint := filepath.Join(p.JailPath, ftpJailMountpoint)
+	mounted, err := isPathMounted(mountpoint)
+	if err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("check mount %q: %v", mountpoint, err)}
+	}
+	if mounted {
+		return map[string]any{"mounted": true, "changed": false}, nil
+	}
+	// Jail dir persists on disk across reboots; ensure the skeleton then rebind
+	// the confined source (openat2 RESOLVE_BENEATH -> /proc/self/fd), same as
+	// the create path.
+	if err := os.MkdirAll(mountpoint, 0o755); err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("ensure jail %q: %v", mountpoint, err)}
+	}
+	_ = os.Chown(p.JailPath, 0, 0)
+	_ = os.Chmod(p.JailPath, 0o755)
+	_ = os.Chown(mountpoint, 0, 0)
+	scope, serr := filesafe.NewScope(tenant.Username, tenant.Username, []string{tenant.HomeDir})
+	if serr != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("home scope: %v", serr)}
+	}
+	srcFd, oerr := scope.OpenDirInScope(p.HomePath)
+	if oerr != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: fmt.Sprintf("confined open of selected dir %q: %v", p.HomePath, oerr)}
+	}
+	err = syscall.Mount(fmt.Sprintf("/proc/self/fd/%d", srcFd.Fd()), mountpoint, "", syscall.MS_BIND, "")
+	srcFd.Close()
+	if err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("re-bind jail %q: %v", mountpoint, err)}
+	}
+	return map[string]any{"mounted": true, "changed": true}, nil
+}
+
+// teardownIsolatedJail unmounts and removes a subaccount jail. Used by the
+// create rollback, the delete verb, and the reconciler's fail-closed path.
+// Idempotent. It NEVER touches the bind-mount SOURCE (tenant data) — only the
+// jail overlay.
+//
+// CRITICAL data-safety invariant: on the fleet, /home is not a separate mount,
+// so a bind mount is SAME-DEVICE — st_dev does not change at the mountpoint and
+// there is no reliable stat-based "is it mounted" probe. We therefore unmount
+// BLIND, looping until the kernel returns EINVAL ("not mounted"), and only
+// RemoveAll once the mount is provably gone. If unmount fails for any other
+// reason we abort WITHOUT removing — a stranded empty jail is recoverable by
+// the reconciler; a RemoveAll that recurses through a live bind mount would
+// delete the tenant's real files.
+// ftpJailUnmount is the umount2(2) seam for teardownIsolatedJail — a package var
+// so a test can drive the unprivileged-container errno (EPERM) without root.
+var ftpJailUnmount = syscall.Unmount
+
+func teardownIsolatedJail(ctx context.Context, jailPath string) *agentwire.AgentError {
+	if jailPath == "" {
+		return nil
+	}
+	mountpoint := filepath.Join(jailPath, ftpJailMountpoint)
+	// Existence guard (GH #1226 / Nightly CI). A bind mount can only exist on a
+	// mountpoint that EXISTS, so an absent mountpoint means there is nothing to
+	// unmount — and we must not issue umount2() on it: an unprivileged caller
+	// (a CI container without CAP_SYS_ADMIN) gets EPERM, not ENOENT, because the
+	// kernel checks the capability before the path, turning this idempotent
+	// teardown into a hard failure. This is a pure EXISTENCE check on a fixed
+	// path — NOT the unreliable "is it mounted" stat-probe the blind loop below
+	// deliberately avoids: a mountpoint that EXISTS is still unmounted blind, so
+	// the same-device data-safety invariant is untouched.
+	switch _, statErr := os.Lstat(mountpoint); {
+	case statErr == nil:
+		// MNT_DETACH: lazy unmount removes the mount from the tree immediately
+		// (new lookups see the underlying empty dir) even if a session holds
+		// it, so the subsequent RemoveAll cannot descend into the source.
+		for {
+			err := ftpJailUnmount(mountpoint, syscall.MNT_DETACH)
+			if err == nil {
+				continue // detached one layer; loop for any stacked binds
+			}
+			// EINVAL = not a mountpoint (anymore); ENOENT = it vanished mid-
+			// teardown. Both mean "nothing mounted here" — safe to remove.
+			if errors.Is(err, syscall.EINVAL) || errors.Is(err, syscall.ENOENT) {
+				break
+			}
+			return &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("unmount jail %q: %v", mountpoint, err)}
+		}
+	case errors.Is(statErr, os.ErrNotExist):
+		// Mountpoint absent — nothing mounted. Fall through to RemoveAll, which
+		// is itself a no-op when jailPath is also absent (the common idempotent
+		// "delete an account that was never provisioned" path).
+	default:
+		return &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("stat jail mountpoint %q: %v", mountpoint, statErr)}
+	}
+	if err := os.RemoveAll(jailPath); err != nil {
+		return &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("remove jail %q: %v", jailPath, err)}
+	}
+	return nil
+}

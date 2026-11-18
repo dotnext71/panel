@@ -1,0 +1,378 @@
+// ModulesCard.test.tsx — M353 module install-on-enable status rendering.
+// The card must reflect the real install state per module (not just the flag):
+// an enabled module that isn't installed+active shows "not installed" + Retry,
+// while an installed+active one shows "active". This is the whole point of Step
+// 4 — surfacing that a flag-on module can still be down, and offering recovery.
+import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+vi.mock("../../../apiClient", () => ({
+  apiClient: { get: vi.fn(), patch: vi.fn(), post: vi.fn() },
+}));
+
+const errorToast = vi.hoisted(() => vi.fn());
+vi.mock("../../../lib/feedback", () => ({
+  feedback: { message: { success: vi.fn(), error: errorToast, info: vi.fn(), warning: vi.fn() } },
+}));
+
+import { apiClient } from "../../../apiClient";
+import { ModulesCard } from "./ModulesCard";
+
+const mockGet = apiClient.get as ReturnType<typeof vi.fn>;
+const mockPatch = apiClient.patch as ReturnType<typeof vi.fn>;
+
+type Flags = Partial<Record<"dns_enabled" | "mail_enabled" | "security_enabled" | "quota_enabled" | "api_enabled", boolean>>;
+
+// serve answers the card's two GETs with these flags and module statuses.
+const serve = (flags: Flags, modules: Record<string, Record<string, unknown>>) => {
+  mockGet.mockImplementation((url: string) => {
+    if (url === "/admin/settings") {
+      return Promise.resolve({
+        data: { dns_enabled: true, mail_enabled: true, security_enabled: true, quota_enabled: true, api_enabled: true, ...flags },
+      });
+    }
+    if (url === "/admin/settings/modules/status") return Promise.resolve({ data: { modules } });
+    return Promise.resolve({ data: {} });
+  });
+};
+
+const up = { installed: true, active: true };
+const mailSwitch = () => screen.getByRole("switch", { name: /Mail server/ });
+
+describe("ModulesCard install status", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("shows 'active' for an installed+active module and 'not installed' + Retry for an enabled-but-down one", async () => {
+    mockGet.mockImplementation((url: string) => {
+      if (url === "/admin/settings") {
+        return Promise.resolve({
+          data: { dns_enabled: true, mail_enabled: true, security_enabled: false, quota_enabled: true, api_enabled: true },
+        });
+      }
+      if (url === "/admin/settings/modules/status") {
+        return Promise.resolve({
+          data: {
+            modules: {
+              dns: { installed: true, active: true },
+              mail: { installed: false, active: false }, // enabled but down
+              quota: { installed: true, active: true },
+            },
+          },
+        });
+      }
+      return Promise.resolve({ data: {} });
+    });
+
+    render(<ModulesCard />);
+
+    // dns is installed+active -> "active"; mail is enabled-but-down -> Retry.
+    await waitFor(() => expect(screen.getAllByText("active").length).toBeGreaterThan(0));
+    expect(screen.getByText("not installed")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+  });
+});
+
+// GH #2056: a failed install showed "installing" for five minutes, then "not
+// installed", with the reason only in the panel log.
+describe("ModulesCard install errors", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("shows why the last install failed and where its log is", async () => {
+    serve({}, {
+      dns: up,
+      mail: {
+        installed: false, active: false, installing: false,
+        last_error: "the DNS module must be installed first. Enable DNS, then mail.",
+        last_error_at: "2026-10-09T10:00:00Z",
+        install_log: "/var/log/dotnext/install-2026-10-09_10-00-00.log",
+      },
+      security: up, quota: up,
+    });
+    render(<ModulesCard />);
+    expect(await screen.findByText(/the DNS module must be installed first\. Enable DNS, then mail\./)).toBeInTheDocument();
+    expect(screen.getByText("/var/log/dotnext/install-2026-10-09_10-00-00.log")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /retry/i })).toBeInTheDocument();
+  });
+
+  it("shows an install the agent reports as running, even one this page didn't start", async () => {
+    serve({}, { dns: { installed: false, active: false, installing: true }, mail: up, security: up, quota: up });
+    render(<ModulesCard />);
+    expect(await screen.findByText(/installing/)).toBeInTheDocument();
+    expect(screen.queryByText("not installed")).not.toBeInTheDocument();
+  });
+
+  it("stops waiting and shows the reason as soon as the agent reports a new failed install", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const old = { installed: false, active: false, last_error: "an older failure", last_error_at: "2026-10-01T00:00:00Z" };
+      const at = (mail: object) => ({ dns: up, mail, security: up, quota: up });
+      const sequence = [
+        at(old), // page load
+        at(old), // the install hasn't started yet: the older failure is still the last one
+        at({ ...old, installing: true }), // running; the record still holds the older failure
+        at({ installed: false, active: false, installing: true, last_error: "the first attempt failed", last_error_at: "2026-10-09T19:59:00Z" }), // a second install queued behind a failed one
+        at({ installed: false, active: false, last_error: "stalwart download failed (exit 22)", last_error_at: "2026-10-09T20:00:00Z" }),
+      ];
+      let n = 0;
+      mockGet.mockImplementation((url: string) => {
+        if (url === "/admin/settings") return Promise.resolve({ data: { dns_enabled: true, mail_enabled: false, security_enabled: true, quota_enabled: true, api_enabled: true } });
+        if (url === "/admin/settings/modules/status") return Promise.resolve({ data: { modules: sequence[Math.min(n++, sequence.length - 1)] } });
+        return Promise.resolve({ data: {} });
+      });
+      mockPatch.mockResolvedValue({ data: {} });
+      render(<ModulesCard />);
+      await waitFor(() => expect(mailSwitch()).not.toBeDisabled());
+      fireEvent.click(mailSwitch());
+      for (let poll = 1; poll <= 3; poll += 1) {
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(screen.getByText(/installing/)).toBeInTheDocument();
+        expect(screen.queryByText(/Last install failed/)).not.toBeInTheDocument();
+      }
+      await vi.advanceTimersByTimeAsync(5000); // the new failure
+      expect(await screen.findByText("Last install failed: stalwart download failed (exit 22)")).toBeInTheDocument();
+      expect(screen.queryByText(/installing/)).not.toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows the server's reason when turning a module on is refused", async () => {
+    serve({ mail_enabled: false }, { dns: up, mail: { installed: false, active: false }, security: up, quota: up });
+    mockPatch.mockRejectedValue({ response: { status: 409, data: { error: "dns_not_ready", detail: "Mail needs the DNS module running." } } });
+    render(<ModulesCard />);
+    await waitFor(() => expect(mailSwitch()).not.toBeDisabled());
+    fireEvent.click(mailSwitch());
+    await waitFor(() => expect(errorToast).toHaveBeenCalledWith(expect.stringContaining("Mail needs the DNS module running.")));
+  });
+
+  it("shows the server's reason when a Retry is refused", async () => {
+    // DNS stopped after the card last looked: the card offers Retry, the panel refuses it.
+    serve({}, { dns: up, mail: { installed: false, active: false }, security: up, quota: up });
+    (apiClient.post as ReturnType<typeof vi.fn>).mockRejectedValue({ response: { status: 409, data: { error: "dns_not_ready", detail: "Wait until DNS shows active, then turn on mail." } } });
+    render(<ModulesCard />);
+    fireEvent.click(await screen.findByRole("button", { name: /retry/i }));
+    await waitFor(() => expect(errorToast).toHaveBeenCalledWith(expect.stringContaining("Wait until DNS shows active, then turn on mail.")));
+  });
+});
+
+// GH #2101: when the card couldn't read the settings, it showed every module On
+// and "not installed" (REST API too), which was not the server's state.
+describe("ModulesCard when the panel doesn't answer", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("says the settings couldn't be loaded instead of showing every module On, and Reload reads them again", async () => {
+    let settingsFail = true;
+    mockGet.mockImplementation((url: string) => {
+      if (url === "/admin/settings") {
+        if (settingsFail) return Promise.reject({ response: { status: 502 } });
+        return Promise.resolve({ data: { dns_enabled: false, mail_enabled: false, security_enabled: true, quota_enabled: true, api_enabled: false } });
+      }
+      if (url === "/admin/settings/modules/status") return Promise.resolve({ data: { modules: { security: up, quota: up } } });
+      return Promise.resolve({ data: {} });
+    });
+    render(<ModulesCard />);
+    expect(await screen.findByText(/Couldn't load the module settings/)).toBeInTheDocument();
+    expect(screen.queryAllByRole("switch")).toHaveLength(0);
+    expect(screen.queryByText("not installed")).not.toBeInTheDocument();
+
+    settingsFail = false;
+    fireEvent.click(screen.getByRole("button", { name: /reload/i }));
+    await waitFor(() => expect(screen.getByRole("switch", { name: /REST API/ })).not.toBeChecked());
+    expect(screen.getByRole("switch", { name: /DNS server/ })).not.toBeChecked();
+    expect(screen.getByRole("switch", { name: /Security/ })).toBeChecked();
+    expect(screen.queryByText(/Couldn't load the module settings/)).not.toBeInTheDocument();
+  });
+
+  it("treats a reply without the module settings as a failed load", async () => {
+    mockGet.mockImplementation((url: string) => {
+      if (url === "/admin/settings") return Promise.resolve({ data: "<html>502 Bad Gateway</html>" });
+      if (url === "/admin/settings/modules/status") return Promise.resolve({ data: { modules: {} } });
+      return Promise.resolve({ data: {} });
+    });
+    render(<ModulesCard />);
+    expect(await screen.findByText(/Couldn't load the module settings/)).toBeInTheDocument();
+    expect(screen.queryAllByRole("switch")).toHaveLength(0);
+  });
+
+  it("shows 'status unknown' for a module the agent didn't report, without a Retry", async () => {
+    // The panel leaves out a module whose agent probe failed.
+    serve({ mail_enabled: false }, { dns: up, security: up });
+    render(<ModulesCard />);
+    expect(await screen.findByText("status unknown")).toBeInTheDocument();
+    expect(screen.queryByText("not installed")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /retry/i })).not.toBeInTheDocument();
+  });
+
+  it("shows 'status unknown' for every enabled module when the status can't be read", async () => {
+    mockGet.mockImplementation((url: string) => {
+      if (url === "/admin/settings") {
+        return Promise.resolve({ data: { dns_enabled: true, mail_enabled: true, security_enabled: true, quota_enabled: true, api_enabled: true } });
+      }
+      if (url === "/admin/settings/modules/status") return Promise.reject({ response: { status: 502 } });
+      return Promise.resolve({ data: {} });
+    });
+    render(<ModulesCard />);
+    await waitFor(() => expect(screen.getAllByText("status unknown")).toHaveLength(4));
+    expect(screen.queryByText("not installed")).not.toBeInTheDocument();
+  });
+});
+
+// GH #2056: mail's install needs DNS installed and running, so the Mail switch
+// doesn't start an install that is sure to fail.
+describe("ModulesCard mail needs DNS", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  it("keeps Mail off while DNS is off", async () => {
+    serve({ dns_enabled: false, mail_enabled: false }, { dns: { installed: false, active: false }, mail: { installed: false, active: false }, security: up, quota: up });
+    render(<ModulesCard />);
+    expect(await screen.findByText(/Turn on DNS first/)).toBeInTheDocument();
+    expect(mailSwitch()).toBeDisabled();
+  });
+
+  it("keeps Mail off while DNS is on but not running yet", async () => {
+    serve({ mail_enabled: false }, { dns: { installed: true, active: false }, mail: { installed: false, active: false }, security: up, quota: up });
+    render(<ModulesCard />);
+    expect(await screen.findByText(/DNS isn't running yet/)).toBeInTheDocument();
+    expect(mailSwitch()).toBeDisabled();
+  });
+
+  it("lets Mail be turned on once DNS is running", async () => {
+    serve({ mail_enabled: false }, { dns: up, mail: { installed: false, active: false }, security: up, quota: up });
+    render(<ModulesCard />);
+    await waitFor(() => expect(mailSwitch()).not.toBeDisabled());
+    expect(screen.queryByText(/Turn on DNS first|DNS isn't running yet/)).not.toBeInTheDocument();
+  });
+
+  it("always lets Mail be turned off", async () => {
+    serve({ dns_enabled: false, mail_enabled: true }, { dns: { installed: false, active: false }, mail: up, security: up, quota: up });
+    render(<ModulesCard />);
+    await waitFor(() => expect(mailSwitch()).toBeChecked());
+    expect(mailSwitch()).not.toBeDisabled();
+  });
+
+  it("holds mail's Retry until DNS is running", async () => {
+    serve({}, { dns: { installed: true, active: false }, mail: { installed: false, active: false }, security: up, quota: up });
+    render(<ModulesCard />);
+    const retries = await screen.findAllByRole("button", { name: /retry/i });
+    // dns (down) and mail (down) both offer Retry; only mail's waits for DNS.
+    expect(retries).toHaveLength(2);
+    expect(retries[0]).not.toBeDisabled();
+    expect(retries[1]).toBeDisabled();
+    expect(screen.getByText(/DNS isn't running yet/)).toBeInTheDocument();
+  });
+});
+
+
+// GH #2101: DNS and Mail stayed on "installing…" after their installs finished,
+// until the page was reloaded. The card stopped reading the status once the
+// service was up, but the install was still running (the agent said
+// installing), so the last read it kept said installing.
+describe("ModulesCard follows an install to its end", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const dnsSwitch = () => screen.getByRole("switch", { name: /DNS server/ });
+
+  // serveSequence answers each status read with the next DNS status, then
+  // keeps answering with the last one. It returns the number of status reads.
+  const serveSequence = (flags: Flags, dns: object[]) => {
+    let n = 0;
+    mockGet.mockImplementation((url: string) => {
+      if (url === "/admin/settings") {
+        return Promise.resolve({
+          data: { dns_enabled: true, mail_enabled: false, security_enabled: true, quota_enabled: true, api_enabled: true, ...flags },
+        });
+      }
+      if (url === "/admin/settings/modules/status") {
+        const d = dns[Math.min(n++, dns.length - 1)];
+        return Promise.resolve({ data: { modules: { dns: d, mail: { installed: false, active: false }, security: up, quota: up } } });
+      }
+      return Promise.resolve({ data: {} });
+    });
+    mockPatch.mockResolvedValue({ data: {} });
+    return () => n;
+  };
+
+  const expectDNSActive = () =>
+    waitFor(() => {
+      expect(screen.queryByText(/installing/)).not.toBeInTheDocument();
+      // dns, security and quota
+      expect(screen.getAllByText("active")).toHaveLength(3);
+    });
+
+  it("keeps reading the status while the install runs on after the service is up", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const down = { installed: false, active: false };
+      serveSequence({ dns_enabled: false }, [
+        down, // page load
+        { ...up, installing: true }, // PowerDNS started; the install is still running
+        { ...up, installing: true },
+        up, // the install finished
+      ]);
+      render(<ModulesCard />);
+      await waitFor(() => expect(dnsSwitch()).not.toBeDisabled());
+      fireEvent.click(dnsSwitch());
+      for (let poll = 1; poll <= 2; poll += 1) {
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(screen.getByText(/installing/)).toBeInTheDocument();
+      }
+      await vi.advanceTimersByTimeAsync(5000);
+      await expectDNSActive();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("follows an install that was already running when the page opened", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      serveSequence({}, [
+        { installed: false, active: false, installing: true }, // page load
+        { ...up, installing: true },
+        up,
+      ]);
+      render(<ModulesCard />);
+      expect(await screen.findByText(/installing/)).toBeInTheDocument();
+      await vi.advanceTimersByTimeAsync(5000);
+      expect(screen.getByText(/installing/)).toBeInTheDocument();
+      await vi.advanceTimersByTimeAsync(5000);
+      await expectDNSActive();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps following an install that runs longer than five minutes", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const running = { installed: false, active: false, installing: true };
+      serveSequence({ dns_enabled: false }, [{ installed: false, active: false }, ...Array(70).fill(running), up]);
+      render(<ModulesCard />);
+      await waitFor(() => expect(dnsSwitch()).not.toBeDisabled());
+      fireEvent.click(dnsSwitch());
+      await vi.advanceTimersByTimeAsync(70 * 5000);
+      expect(screen.getByText(/installing/)).toBeInTheDocument();
+      await vi.advanceTimersByTimeAsync(5000);
+      await expectDNSActive();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops reading after five minutes when the agent never reports the install", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const reads = serveSequence({ dns_enabled: false }, [{ installed: false, active: false }]);
+      render(<ModulesCard />);
+      await waitFor(() => expect(dnsSwitch()).not.toBeDisabled());
+      fireEvent.click(dnsSwitch());
+      await vi.advanceTimersByTimeAsync(60 * 5000);
+      expect(await screen.findByText("not installed")).toBeInTheDocument();
+      const after = reads();
+      await vi.advanceTimersByTimeAsync(10 * 5000);
+      expect(reads()).toBe(after);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});

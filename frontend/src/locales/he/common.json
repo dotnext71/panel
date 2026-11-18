@@ -1,0 +1,690 @@
+{
+  "nav": {
+    "admin": {
+      "dashboard": "לוח בקרה",
+      "dashboard_desc": "סקירת השרת וסטטיסטיקות מהירות",
+      "users": "משתמשים",
+      "users_desc": "ניהול משתמשי הפאנל, הפעלות והתחזות",
+      "domains": "דומייני אתרים",
+      "domains_desc": "כל דומייני האתרים של כל המשתמשים",
+      "mail": "דואר",
+      "mail_desc": "תיבות דואר, העברות ודואר בדפדפן",
+      "packages": "חבילות אחסון",
+      "packages_desc": "תוכניות אחסון ומגבלות",
+      "ssl": "מנהל SSL",
+      "ssl_desc": "תעודות SSL והנפקתן",
+      "applications": "אפליקציות",
+      "applications_desc": "התקנת אפליקציות בלחיצה אחת (WordPress ועוד)",
+      "docker-apps": "אפליקציות Docker",
+      "docker-apps_desc": "חנות האפליקציות של Docker",
+      "settings": "הגדרות שרת",
+      "settings_desc": "הגדרות כלל-שרתיות ומודולים אופציונליים",
+      "server-status": "מצב השרת",
+      "server-status_desc": "שירותים, משאבים ותקינות בזמן אמת",
+      "cache": "מטמון",
+      "cache_desc": "כלי מטמון של Redis ו-WordPress",
+      "security": "אבטחה",
+      "security_desc": "CrowdSec, סריקת נוזקות וחומת אש",
+      "backups": "גיבויים",
+      "backups_desc": "יעדי גיבוי ותזמונים",
+      "php-pools": "מנהל PHP",
+      "php-pools_desc": "גרסאות PHP ומאגרי FPM",
+      "dns": "אזורי DNS",
+      "dns_desc": "אזורי DNS מוסמכים ורשומות",
+      "ips": "כתובות IP",
+      "ips_desc": "כתובות IP מנוהלות של השרת",
+      "notifications": "התראות",
+      "notifications_desc": "התראות וערוצי התראה",
+      "updates": "עדכונים",
+      "updates_desc": "עדכוני פאנל וחבילות מערכת",
+      "automation": "גישת API לשרת",
+      "automation_desc": "אסימוני API כלליים והרשאות עבור אוטומציות",
+      "api-tokens": "אסימוני API אישיים",
+      "api-tokens_desc": "מפתחות REST API",
+      "migrations": "הגירות",
+      "migrations_desc": "ייבוא חשבונות מ-cPanel, HestiaCP או DirectAdmin",
+      "terminal": "מסוף",
+      "terminal_desc": "מסוף לשרת דרך הדפדפן",
+      "logs": "יומנים וסטטיסטיקות",
+      "logs_desc": "יומני גישה ושגיאות לצד סטטיסטיקות",
+      "cron": "Cron",
+      "cron_desc": "משימות Cron מתוזמנות",
+      "support": "תמיכה",
+      "support_desc": "אבחון ופנייה לתמיכה"
+    },
+    "user": {
+      "dashboard": "לוח בקרה",
+      "domains": "דומייני אתרים",
+      "mail": "דואר",
+      "applications": "אפליקציות",
+      "python-apps": "אפליקציות Python",
+      "docker-apps": "אפליקציות Docker",
+      "databases": "מסדי נתונים",
+      "disk-usage": "שימוש בדיסק",
+      "files": "קבצים",
+      "logs": "יומנים וסטטיסטיקות",
+      "ssh-keys": "מפתחות SSH",
+      "api-tokens": "אסימוני API אישיים",
+      "dns": "DNS",
+      "ssl": "מנהל SSL",
+      "php-settings": "הגדרות PHP",
+      "cron": "Cron",
+      "backups": "גיבוי ושחזור",
+      "group": {
+        "hosting": "אחסון",
+        "services": "שירותים",
+        "tools": "כלים",
+        "account": "חשבון"
+      }
+    }
+  },
+  "login": {
+    "flowError": "לא ניתן להתחיל את תהליך ההתחברות. ודאו ששירות הזהויות פועל ורעננו את הדף.",
+    "hostnameWarningTitle": "התחברו באמצעות שם המארח, לא כתובת ה-IP",
+    "hostnameWarningDescription": "ספק הזהויות מקושר לשם המארח של הפאנל, ולכן התחברות דרך כתובת ה-IP של השרת לא תעבוד. פתחו את הפאנל לפי שם המארח (הכתובת שהוצגה בסיום ההתקנה) ונסו שוב.",
+    "hostnameWarningOpenLink": "פתחו את הפאנל בכתובת {{hostname}}",
+    "noCredentialMethod": "לא מוגדרת כרגע שיטת אימות עבור החשבון שלכם. פנו למנהל המערכת.",
+    "fieldRequired": "שדה חובה",
+    "identifierHint": "השתמשו בשם המשתמש, לא בכתובת האימייל.",
+    "totpHint": "הזינו את הקוד בן 6 הספרות מאפליקציית האימות.",
+    "backupCodeHint": "הזינו אחד מקודי הגיבוי שלכם.",
+    "webauthnHint": "השתמשו במפתח האבטחה כדי להתחבר.",
+    "submitVerify": "אימות",
+    "submitSignIn": "התחברות"
+  },
+  "menu": {
+    "profile": "פרופיל",
+    "language": "שפה",
+    "sign_out": "התנתקות",
+    "dark_mode": "מצב כהה"
+  },
+  "dashboard": {
+    "stats": {
+      "users": "סך המשתמשים",
+      "domains": "דומייני אתרים פעילים",
+      "mailboxes": "תיבות דואר"
+    },
+    "health": {
+      "healthy": "תקין",
+      "critical": "{{count}} קריטיות",
+      "warning_one": "אזהרה אחת",
+      "warning_two": "שתי אזהרות",
+      "warning_many": "{{count}} אזהרות",
+      "warning_other": "{{count}} אזהרות"
+    },
+    "server_ip": "כתובת IP של השרת:",
+    "summary": "סיכום כללי. למדדים חיים, שירותים, רשת ותהליכים ראו מצב השרת.",
+    "view_server_status": "הצגת מצב השרת ←",
+    "view_all": "הצג הכול",
+    "recent_users": "משתמשים אחרונים",
+    "recent_domains": "דומייני אתרים אחרונים",
+    "recent_apps": "אפליקציות אחרונות",
+    "packages": "חבילות אחסון",
+    "empty": {
+      "users": "אין עדיין משתמשים",
+      "domains": "אין עדיין דומייני אתרים",
+      "apps": "אין עדיין אפליקציות",
+      "packages": "אין עדיין חבילות"
+    },
+    "col": {
+      "username": "שם משתמש",
+      "role": "תפקיד",
+      "domain": "דומיין",
+      "name": "שם",
+      "type": "סוג",
+      "ssh": "SSH"
+    },
+    "role": {
+      "admin": "מנהל",
+      "user": "משתמש"
+    },
+    "ssh": {
+      "on": "פעיל",
+      "off": "כבוי"
+    },
+    "alert": {
+      "title_one": "בעיה קריטית אחת בשרת",
+      "title_two": "שתי בעיות קריטיות בשרת",
+      "title_many": "{{count}} בעיות קריטיות בשרת",
+      "title_other": "{{count}} בעיות קריטיות בשרת",
+      "action": "פתחו את מצב השרת לבדיקה ←"
+    }
+  },
+  "users": {
+    "actions": {
+      "login_as": "התחברות כמשתמש",
+      "edit": "עריכה",
+      "reset_2fa": "איפוס אימות דו-שלבי",
+      "reset_password": "איפוס סיסמה",
+      "suspend": "השעיה",
+      "unsuspend": "ביטול השעיה",
+      "delete": "מחיקה"
+    },
+    "error": {
+      "login_as": "לא ניתן להתחיל התחברות כמשתמש זה"
+    },
+    "filter": {
+      "all": "הכול",
+      "active": "פעילים",
+      "suspended": "מושעים"
+    },
+    "empty": {
+      "users": "אין עדיין משתמשים",
+      "admins": "אין עדיין מנהלים"
+    },
+    "cta": {
+      "create_user": "יצירת משתמש",
+      "create_admin": "יצירת מנהל"
+    },
+    "col": {
+      "username": "שם משתמש",
+      "name": "שם",
+      "package": "חבילה",
+      "created": "נוצר",
+      "disk_usage": "שימוש בדיסק",
+      "actions": "פעולות"
+    },
+    "suspended": "מושעה",
+    "suspended_on": "בתאריך {{date}}",
+    "suspend_reason": "סיבה: {{reason}}",
+    "tab": {
+      "users": "משתמשים",
+      "admins": "מנהלים",
+      "sessions": "הפעלות"
+    },
+    "search": {
+      "users": "חיפוש לפי אימייל, שם משתמש או שם",
+      "admins": "חיפוש לפי אימייל או שם"
+    }
+  },
+  "adminapplicationlist": {
+    "actions": "פעולות",
+    "created": "נוצר",
+    "domain": "דומיין",
+    "owner": "בעלים",
+    "status": "סטטוס",
+    "version": "גרסה"
+  },
+  "adminauditlist": {
+    "action": "פעולה",
+    "result": "תוצאה",
+    "target": "יעד"
+  },
+  "adminautomationtokenspage": {
+    "actions": "פעולות",
+    "created": "נוצר",
+    "last_used": "שימוש אחרון",
+    "name": "שם",
+    "status": "סטטוס"
+  },
+  "backuplogstab": {
+    "status": "סטטוס",
+    "user_id": "מזהה משתמש"
+  },
+  "createbackupdrawer": {
+    "content": "תוכן",
+    "create_backup": "יצירת גיבוי",
+    "destination": "יעד",
+    "type": "סוג",
+    "user": "משתמש"
+  },
+  "destinationstab": {
+    "actions": "פעולות",
+    "enabled": "מופעל",
+    "name": "שם"
+  },
+  "schedulestab": {
+    "actions": "פעולות",
+    "enabled": "מופעל",
+    "last_run": "הרצה אחרונה",
+    "next_run": "הרצה הבאה",
+    "users": "משתמשים"
+  },
+  "fleetcachedoctor": {
+    "refresh": "רענון",
+    "repair": "תיקון"
+  },
+  "admincreatecronmodal": {
+    "name": "שם",
+    "schedule": "תזמון"
+  },
+  "admincronlist": {
+    "no_cron_jobs_yet": "אין עדיין משימות Cron"
+  },
+  "databaseuserdrawer": {
+    "username": "שם משתמש"
+  },
+  "databaseuserslist": {
+    "actions": "פעולות",
+    "created": "נוצר",
+    "user": "משתמש"
+  },
+  "databasecreate": {
+    "name": "שם"
+  },
+  "databaselist": {
+    "actions": "פעולות",
+    "created": "נוצר",
+    "database": "מסד נתונים",
+    "no_databases_yet": "אין עדיין מסדי נתונים",
+    "user_id": "מזהה משתמש"
+  },
+  "dnszonesoverviewpage": {
+    "actions": "פעולות",
+    "domain_name": "שם דומיין",
+    "expiration": "תפוגה",
+    "owner": "בעלים"
+  },
+  "admindockerappspage": {
+    "running": "פועל",
+    "stopped": "נעצר"
+  },
+  "backupsdrawer": {
+    "backups": "גיבויים",
+    "restore": "שחזור"
+  },
+  "editdrawer": {
+    "domain": "דומיין",
+    "memory": "זיכרון",
+    "select_a_domain": "בחירת דומיין"
+  },
+  "envsection": {
+    "copy": "העתקה",
+    "regenerate": "יצירה מחדש"
+  },
+  "installdrawer": {
+    "domain": "דומיין",
+    "memory": "זיכרון",
+    "select_a_domain": "בחירת דומיין"
+  },
+  "maintenancetab": {
+    "containers": "קונטיינרים",
+    "disk_usage": "שימוש בדיסק",
+    "images": "תמונות",
+    "volumes": "אמצעי אחסון"
+  },
+  "domaincreate": {
+    "name": "שם",
+    "select_a_user": "בחירת משתמש",
+    "user": "משתמש"
+  },
+  "domaindirectoryprivacysection": {
+    "delete": "מחיקה",
+    "password": "סיסמה",
+    "path": "נתיב",
+    "user": "משתמש",
+    "username": "שם משתמש"
+  },
+  "domainedit": {
+    "name": "שם"
+  },
+  "domainemailsection": {
+    "copy_value": "העתקת ערך"
+  },
+  "domainipaclsection": {
+    "action": "פעולה",
+    "comment": "הערה",
+    "delete": "מחיקה",
+    "priority": "עדיפות"
+  },
+  "domainlist": {
+    "actions": "פעולות",
+    "domain": "דומיין",
+    "no_domains_yet": "אין עדיין דומייני אתרים",
+    "status": "סטטוס",
+    "user": "משתמש"
+  },
+  "domainmailboxessection": {
+    "create": "יצירה",
+    "create_mailbox": "יצירת תיבת דואר",
+    "domain": "דומיין",
+    "password": "סיסמה"
+  },
+  "domainsslsection": {
+    "install": "התקנה"
+  },
+  "adminiplist": {
+    "actions": "פעולות",
+    "address": "כתובת",
+    "default": "ברירת מחדל",
+    "label": "תווית",
+    "status": "סטטוס"
+  },
+  "adminmailpage": {
+    "new_password": "סיסמה חדשה",
+    "set_password": "הגדרת סיסמה"
+  },
+  "mailthrottlespage": {
+    "enabled": "מופעל",
+    "scope": "היקף"
+  },
+  "adminmigrationdetailpage": {
+    "ended": "הסתיים",
+    "error": "שגיאה",
+    "last_error": "שגיאה אחרונה",
+    "started": "התחיל"
+  },
+  "adminmigrationspage": {
+    "ended": "הסתיים",
+    "source": "מקור",
+    "started": "התחיל",
+    "state": "מצב"
+  },
+  "createmigrationwizard": {
+    "review": "סקירה"
+  },
+  "channelstab": {
+    "actions": "פעולות",
+    "enabled": "מופעל",
+    "kind": "סוג",
+    "name": "שם"
+  },
+  "dlqtab": {
+    "clear": "ניקוי"
+  },
+  "eventstab": {
+    "description": "תיאור",
+    "enabled": "מופעל",
+    "event": "אירוע",
+    "severity": "חומרה"
+  },
+  "historytab": {
+    "clear": "ניקוי",
+    "event": "אירוע",
+    "read": "קריאה",
+    "severity": "חומרה",
+    "show_details": "הצג פרטים",
+    "time": "זמן",
+    "title": "כותרת"
+  },
+  "packagecreate": {
+    "name": "שם"
+  },
+  "packageedit": {
+    "name": "שם"
+  },
+  "packagelist": {
+    "actions": "פעולות",
+    "created": "נוצר",
+    "domains": "דומיינים",
+    "email": "אימייל",
+    "name": "שם"
+  },
+  "phpextensionstab": {
+    "action": "פעולה",
+    "installed": "מותקן",
+    "status": "סטטוס"
+  },
+  "versionstab": {
+    "actions": "פעולות",
+    "default": "ברירת מחדל",
+    "status": "סטטוס"
+  },
+  "phppooledit": {
+    "kind": "סוג",
+    "value": "ערך"
+  },
+  "adminsecurityaide": {
+    "category": "קטגוריה",
+    "last_check": "בדיקה אחרונה",
+    "rebuild": "בנייה מחדש"
+  },
+  "adminsecurityapparmor": {
+    "flip": "היפוך",
+    "mode": "מצב"
+  },
+  "adminsecuritycrowdsec": {
+    "apply": "החלה",
+    "cancel": "ביטול",
+    "description": "תיאור",
+    "duration": "משך",
+    "enabled": "מופעל",
+    "events": "אירועים",
+    "provider": "ספק",
+    "reason": "סיבה",
+    "remove": "הסרה",
+    "scope": "היקף",
+    "source": "מקור",
+    "started": "התחיל",
+    "type": "סוג",
+    "value": "ערך"
+  },
+  "adminsecurityegress": {
+    "actions": "פעולות",
+    "comment": "הערה",
+    "port": "פורט",
+    "reason": "סיבה",
+    "state": "מצב",
+    "user": "משתמש"
+  },
+  "adminsecuritymalware": {
+    "filename": "שם קובץ",
+    "settings": "הגדרות"
+  },
+  "adminsecuritysnuffleupagus": {
+    "action": "פעולה",
+    "disable": "השבתה"
+  },
+  "adminsecurityufw": {
+    "action": "פעולה",
+    "cancel": "ביטול",
+    "continue": "המשך",
+    "delete": "מחיקה",
+    "port": "פורט",
+    "status": "סטטוס"
+  },
+  "crowdsectestipcard": {
+    "unban": "ביטול חסימה"
+  },
+  "egressmaturepromotion": {
+    "promote": "קידום"
+  },
+  "accountskeletoncard": {
+    "add": "הוספה",
+    "path": "נתיב"
+  },
+  "databaseadminsections": {
+    "actions": "פעולות",
+    "apply": "החלה",
+    "host": "מארח",
+    "kill": "סיום",
+    "state": "מצב",
+    "time": "זמן",
+    "user": "משתמש"
+  },
+  "nspawnimagescard": {
+    "version": "גרסה"
+  },
+  "pagetemplatescard": {
+    "cancel": "ביטול",
+    "save": "שמירה"
+  },
+  "panelsslcard": {
+    "hostname": "שם מארח"
+  },
+  "stalwartwebadmincard": {
+    "done": "הושלם"
+  },
+  "webmailtogglecard": {
+    "webmail": "דואר בדפדפן"
+  },
+  "dnsorphanrepaircard": {
+    "cancel": "Cancel",
+    "delete_all_orphan_records": "Delete all orphan records?",
+    "delete_permanently": "Delete permanently",
+    "no_orphan_records_found": "No orphan PowerDNS records found.",
+    "this_is_irreversible_it_removes_the_pdns_rows": "This is irreversible — it removes the orphaned PowerDNS rows (records, DNSSEC keys, metadata) and purges the pdns caches for the affected names. Scan first and review the list."
+  },
+  "domainrepaircard": {
+    "cancel": "ביטול",
+    "select_a_user": "בחירת משתמש"
+  },
+  "repaircard": {
+    "cancel": "ביטול",
+    "run": "הרצה"
+  },
+  "userreset2faaction": {
+    "reset": "איפוס"
+  },
+  "userresetpasswordaction": {
+    "done": "הושלם",
+    "reset": "איפוס"
+  },
+  "myprofile": {
+    "email": "אימייל",
+    "full_name": "שם מלא",
+    "member_since": "חבר מאז",
+    "role": "תפקיד",
+    "security": "אבטחה",
+    "user_id": "מזהה משתמש",
+    "username": "שם משתמש"
+  },
+  "myprofilebackupcard": {
+    "destination": "יעד"
+  },
+  "myprofileschedulecard": {
+    "destination": "יעד"
+  },
+  "userdashboard": {
+    "databases": "מסדי נתונים",
+    "domains": "דומייני אתרים",
+    "mailboxes": "תיבות דואר"
+  },
+  "accountactivity": {
+    "result": "תוצאה",
+    "target": "יעד"
+  },
+  "userapitokenspage": {
+    "create": "יצירה",
+    "name": "שם"
+  },
+  "cloneapplicationmodal": {
+    "select_a_domain": "בחירת דומיין"
+  },
+  "installapplicationmodal": {
+    "copy": "העתקה",
+    "domain": "דומיין",
+    "no_domains_yet": "אין עדיין דומיינים",
+    "select_a_domain": "בחירת דומיין"
+  },
+  "userapplicationlist": {
+    "actions": "פעולות",
+    "created": "נוצר",
+    "domain": "דומיין",
+    "failed": "נכשל",
+    "in_progress": "בתהליך",
+    "ready": "מוכן"
+  },
+  "createcronmodal": {
+    "name": "שם",
+    "schedule": "תזמון"
+  },
+  "quicksetupmodal": {
+    "copy": "העתקה"
+  },
+  "userdatabasedrawer": {
+    "create_database": "יצירת מסד נתונים",
+    "name": "שם"
+  },
+  "userdatabaselist": {
+    "actions": "פעולות",
+    "created": "נוצר",
+    "database": "מסד נתונים",
+    "size": "גודל"
+  },
+  "userdnszonesoverviewpage": {
+    "actions": "פעולות",
+    "domain_name": "שם דומיין",
+    "expiration": "תפוגה"
+  },
+  "userdockerappspage": {
+    "running": "פועל",
+    "stopped": "נעצר"
+  },
+  "userdomaindrawer": {
+    "add_domain": "הוספת דומיין",
+    "domain_name": "שם דומיין",
+    "document_root": "תיקיית השורש",
+    "document_root_hint": "המיקום שממנו מוגשים הקבצים של הדומיין הזה. השאירו ריק לערך ברירת המחדל. הנתיב חייב להישאר בתוך התיקייה של הדומיין עצמו."
+  },
+  "userdomainlist": {
+    "actions": "פעולות",
+    "domain": "דומיין",
+    "status": "סטטוס"
+  },
+  "filemanagerpage": {
+    "apply": "החלה",
+    "create": "יצירה",
+    "move": "העברה",
+    "rename": "שינוי שם",
+    "save": "שמירה"
+  },
+  "autoreplymodal": {
+    "save": "שמירה"
+  },
+  "createmailboxwizardmodal": {
+    "create_mailbox": "יצירת תיבת דואר",
+    "display_name": "שם תצוגה",
+    "domain": "דומיין",
+    "email_address": "כתובת אימייל",
+    "password": "סיסמה",
+    "select_a_domain": "בחירת דומיין"
+  },
+  "catchalltab": {
+    "domain": "דומיין",
+    "save": "שמירה"
+  },
+  "disclaimertab": {
+    "edit": "עריכה",
+    "save": "שמירה"
+  },
+  "forwarderstab": {
+    "add_forwarder": "הוספת העברה",
+    "create": "יצירה",
+    "remove": "הסרה",
+    "type": "סוג"
+  },
+  "mailboxestab": {
+    "new_password": "סיסמה חדשה",
+    "no_mailboxes_yet": "אין עדיין תיבות דואר",
+    "set_password": "הגדרת סיסמה"
+  },
+  "sharedfolderstab": {
+    "remove": "הסרה",
+    "share": "שיתוף"
+  },
+  "userphpsettingspage": {
+    "domain": "דומיין",
+    "select_a_domain": "בחירת דומיין"
+  },
+  "pythonappspage": {
+    "create": "יצירה",
+    "domain": "דומיין",
+    "name": "שם",
+    "select_a_domain": "בחירת דומיין",
+    "status": "סטטוס",
+    "type": "סוג"
+  },
+  "usersshkeyspage": {
+    "add_ssh_key": "הוספת מפתח SSH",
+    "name": "שם",
+    "public_key": "מפתח ציבורי",
+    "yes": "כן"
+  },
+  "domainnginxoptionsmodal": {
+    "save": "שמירה"
+  },
+  "notificationbell": {
+    "clear": "ניקוי",
+    "notifications": "התראות"
+  },
+  "sslmanagertable": {
+    "status": "סטטוס",
+    "yes": "כן"
+  },
+  "settings": {
+    "hostname": "שם מארח",
+    "select_timezone": "בחירת אזור זמן",
+    "timezone": "אזור זמן"
+  }
+}

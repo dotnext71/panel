@@ -1,0 +1,2073 @@
+package commands
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"os/user"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"text/template"
+
+	"github.com/dotnext-panel/dotnext/agentwire"
+	"github.com/dotnext-panel/dotnext/internal/filesafe"
+	"github.com/dotnext-panel/dotnext/internal/frontcontroller"
+	"github.com/dotnext-panel/dotnext/internal/phpenv"
+	"github.com/dotnext-panel/dotnext/internal/skelpath"
+)
+
+// domainCreateParams is the input shape for domain.create.
+type domainCreateParams struct {
+	Username   string `json:"username"`
+	Domain     string `json:"domain"`
+	DocRoot    string `json:"doc_root"`
+	HasPHP     bool   `json:"has_php"`
+	PHPVersion string `json:"php_version"`
+	// FPMSocket is the FPM Unix socket the vhost's fastcgi_pass targets
+	// (GH #329 per-domain PHP version). Empty ⇒ the legacy per-user socket
+	// /run/php/dotnext-<user>/fpm.sock, so older callers stay byte-identical.
+	FPMSocket          string `json:"fpm_socket,omitempty"`
+	CustomDirectives   string `json:"custom_directives"`
+	RedirectDirectives string `json:"redirect_directives"`
+	RuleDirectives     string `json:"rule_directives"`
+	// PHPFallback (GH #1999) is the try_files fallback of the default
+	// `location /` on a PHP domain, from the domain's front_controller rule,
+	// e.g. "/index.php?mod=$uri&$args". Empty (or invalid, after the agent
+	// re-validates it) renders the default "/index.php?$query_string", so the
+	// vhost stays byte-identical.
+	PHPFallback   string `json:"php_fallback,omitempty"`
+	IndexPriority string `json:"index_priority"`
+	// IsEnabled controls whether the vhost serves the tenant's docroot
+	// (true) or a branded "site disabled" placeholder (false). Pointer
+	// so omitted fields default to true (backwards compat).
+	IsEnabled *bool `json:"is_enabled"`
+	// InterceptErrors (GH #879) — show the branded 500 page for PHP
+	// application 5xx responses. A PHP fatal returns 500 with an EMPTY body
+	// (display_errors off), so without interception visitors get the
+	// browser's raw error screen. false ⇒ vhost byte-identical.
+	InterceptErrors bool `json:"intercept_errors"`
+	// PathInfo (GH #962) — emit an extra PATH_INFO location for front-controller
+	// PHP apps (osTicket, …) that route through /script.php/extra/path URLs.
+	// false ⇒ vhost byte-identical (feature off).
+	PathInfo bool `json:"path_info"`
+	// RedirectHTTPS (GH #896) — whether the :80 vhost force-redirects to HTTPS
+	// (and, with it, whether the :443 block renders at all). The reconciler
+	// sets it false while an LE/auto-mode domain is still parked on its
+	// self-signed BOOTSTRAP placeholder, so the site serves plain HTTP + the
+	// ACME challenge (no cert-authority warning, no HSTS hard-fail) until a
+	// trusted cert issues. Pointer so a pre-#896 panel that omits the field
+	// falls back to the historical "redirect whenever a cert is present".
+	RedirectHTTPS *bool `json:"redirect_https,omitempty"`
+	// ServeHTTPS (JAB-237) — whether the :443 server block renders at all,
+	// decoupled from RedirectHTTPS. A CDN-fronted domain must serve :443
+	// even on its self-signed bootstrap cert (Cloudflare Full connects to
+	// origin :443 and 520s on a closed port; the browser never sees the
+	// origin cert, so the GH #896 warning rationale does not apply) while
+	// NOT redirecting :80 (an origin 301 loops CF Flexible zones). Pointer:
+	// a panel that omits the field gets the historical coupled behaviour
+	// (serve exactly when redirecting).
+	ServeHTTPS *bool `json:"serve_https,omitempty"`
+	// CacheEnabled (ADR-0108) — per-domain nginx FastCGI micro-cache
+	// opt-in. false ⇒ vhost byte-identical to the pre-0108 shape.
+	CacheEnabled bool   `json:"cache_enabled"`
+	CachePath    string `json:"cache_path,omitempty"`
+	// CachePaths (GH #601): union of every cache-enabled install's path prefix
+	// on this domain. When set, drives a multi-path gate; empty falls back to
+	// the single CachePath so older callers stay byte-identical.
+	CachePaths []string `json:"cache_paths,omitempty"`
+	// CacheBypassPaths (GH #616): per-install URL-exclusion prefixes merged across
+	// the domain (profile defaults + user list), resolved by the panel. The agent
+	// RE-SANITIZES before rendering (config-injection trust boundary). A cookie
+	// allowlist was intentionally NOT added — it would re-open the #416/#419
+	// fail-open class on the shared microcache.
+	CacheBypassPaths []string `json:"cache_bypass_paths,omitempty"`
+	// CacheTTLSeconds (Gitea #596) — per-domain page-cache validity. 0 = use
+	// the default. Drives fastcgi_cache_valid; background_update keeps it fresh.
+	CacheTTLSeconds int `json:"cache_ttl_seconds,omitempty"`
+	// CacheQueryAllowlist (migration 000230): query-param names that get their
+	// own page-cache entry (e.g. "paged"). Empty ⇒ vhost byte-identical (feature
+	// off). The agent RE-sanitizes before rendering (config-injection boundary,
+	// like CacheBypassPaths).
+	CacheQueryAllowlist []string `json:"cache_query_allowlist,omitempty"`
+
+	// Preview URL (temp URL): when set, the vhost gains an extra server
+	// block serving the same docroot under <slug>.preview.<hostname>.
+	// PreviewCertPath/KeyPath point at the shared *.preview.<hostname>
+	// wildcard pair; empty (or missing on disk) renders the preview block
+	// HTTP-only — same graceful degradation as the main vhost.
+	PreviewHost     string `json:"preview_host,omitempty"`
+	PreviewCertPath string `json:"preview_cert_path,omitempty"`
+	PreviewKeyPath  string `json:"preview_key_path,omitempty"`
+	// OwnershipGate (GH #1816 / ADR-0170) is set while the owner has not yet
+	// proven control of the name. The real-name server blocks then drop
+	// (444) every request that does not carry it in X-DotNext-Preview-Gate,
+	// a header only the preview block's proxy sends. Lowercase hex; empty
+	// renders the vhost exactly as before.
+	OwnershipGate string `json:"ownership_gate,omitempty"`
+	SSLCertPath   string `json:"ssl_cert_path"`
+	SSLKeyPath    string `json:"ssl_key_path"`
+	// PHP INI overrides: omitted if not set on the domain.
+	PHPMemoryLimit       string `json:"php_memory_limit,omitempty"`
+	PHPUploadMaxFilesize string `json:"php_upload_max_filesize,omitempty"`
+	PHPPostMaxSize       string `json:"php_post_max_size,omitempty"`
+	PHPMaxInputVars      int    `json:"php_max_input_vars,omitempty"`
+	PHPMaxExecutionTime  int    `json:"php_max_execution_time,omitempty"`
+	PHPMaxInputTime      int    `json:"php_max_input_time,omitempty"`
+	// GH #1332 per-domain runtime directives. PHPDisplayErrors is a plain bool:
+	// absent/false => the safe default (display_errors=Off, always pinned — see
+	// buildPHPValueParam). PHPErrorReporting is a *int bitmask (nil => not set;
+	// 0 is a meaningful "report nothing"). PHPTimezone "" => not set.
+	PHPDisplayErrors  bool   `json:"php_display_errors,omitempty"`
+	PHPErrorReporting *int   `json:"php_error_reporting,omitempty"`
+	PHPTimezone       string `json:"php_timezone,omitempty"`
+	// PHPPoolValues (GH #1701) are the bound pool's own ini overrides for the
+	// per-domain value directives, keyed by directive. A directive the domain
+	// leaves unset is pinned to this value (phpInheritedValuePins).
+	PHPPoolValues map[string]string `json:"php_pool_values,omitempty"`
+	// GH #1701 Slice 2: log_errors / file_uploads / short_open_tag. nil => the
+	// panel has no value (neither the domain nor its pool sets one); the agent
+	// then pins the box php.ini baseline instead (resolvePHPFlagPins).
+	PHPLogErrors    *bool `json:"php_log_errors,omitempty"`
+	PHPFileUploads  *bool `json:"php_file_uploads,omitempty"`
+	PHPShortOpenTag *bool `json:"php_short_open_tag,omitempty"`
+	// PHPFlagsInheritUnknown: the panel could not read the pool's flag
+	// overrides, so the inherited value is unknown. Pin only the values sent;
+	// pinning the php.ini baseline could undo a pool's php_admin_flag.
+	PHPFlagsInheritUnknown bool `json:"php_flags_inherit_unknown,omitempty"`
+	// GH #1701 Slice 3: the domain's own open_basedir (stored token form, see
+	// internal/phpbasedir) and allow_url_fopen, rendered through
+	// PHP_ADMIN_VALUE. ""/nil => pin the inherited value (php_admin_pins.go).
+	PHPOpenBasedir   string `json:"php_open_basedir,omitempty"`
+	PHPAllowURLFopen *bool  `json:"php_allow_url_fopen,omitempty"`
+	// EnvVars are per-domain environment variables (GH #1332 item 14), rendered
+	// as fastcgi_param in the PHP location. Keys are re-validated against the
+	// shared phpenv denylist here (defense in depth) before rendering.
+	EnvVars []domainEnvVarParam `json:"env_vars,omitempty"`
+	// M18 per-domain HTTP limits. DomainID is required when either
+	// RateLimitRPS or ConnectionLimit is set so the zone-name tag
+	// matches the declaration in 00-dotnext-ratelimits.conf. All three
+	// default to zero/empty which produces no directives (backwards
+	// compatible with existing domain.create callers).
+	DomainID        string `json:"domain_id,omitempty"`
+	RateLimitRPS    uint32 `json:"rate_limit_rps,omitempty"`
+	ConnectionLimit uint32 `json:"connection_limit,omitempty"`
+	// BlockAICrawlers refuses the AI crawlers in 00-dotnext-bots.conf
+	// ($dotnext_ai_crawler); BlockListedUserAgents the admin's server-wide
+	// list ($dotnext_blocked_ua). Both false renders no directive.
+	BlockAICrawlers       bool `json:"block_ai_crawlers,omitempty"`
+	BlockListedUserAgents bool `json:"block_listed_user_agents,omitempty"`
+	// M24 per-domain listen IPs. Empty string ⇒ "all interfaces" (the
+	// pre-M24 listen 80 / listen [::]:80 behaviour). When set, the
+	// renderer emits explicit listen <ipv4>:80; / listen [<ipv6>]:80;
+	// directives. The vhost template guards each line with an explicit
+	// if/else so an unset IPv6 still renders `listen [::]:80;` rather
+	// than the invalid `listen []:80;`.
+	ListenIPv4 string `json:"listen_ipv4,omitempty"`
+	ListenIPv6 string `json:"listen_ipv6,omitempty"`
+
+	// M28 — operator-editable default index body. Empty string falls
+	// back to defaultIndexTemplate below. Go text/template syntax with
+	// {{.Domain}}, {{.Username}}, {{.DocRoot}} placeholders.
+	DefaultIndexTemplate string `json:"default_index_template,omitempty"`
+
+	// GH #465 — the account docroot skeleton: operator-defined starter files
+	// laid into a fresh docroot on create. Each file's RelPath is validated
+	// again here (defense in depth) and never overwrites an existing path.
+	Skeleton []skeletonFileParam `json:"skeleton,omitempty"`
+
+	// M36 per-domain IP allow/deny rules. Already sorted by the panel
+	// (priority ASC, created_at ASC). Each rule renders as one nginx
+	// `allow <cidr>;` / `deny <cidr>;` directive in priority order
+	// inside the server block.
+	IPACLs []domainIPACLRule `json:"ip_acls,omitempty"`
+
+	// GH #1625 web domain aliases: additional hostnames added to the
+	// vhost's server_name so the domain's docroot answers on them too.
+	// The agent RE-SANITIZES every entry against domainRegex before
+	// rendering (config-injection trust boundary, like CacheBypassPaths)
+	// — a value that isn't a clean FQDN is DROPPED, never emitted raw
+	// into server_name. Empty ⇒ vhost byte-identical (feature off).
+	Aliases []string `json:"aliases,omitempty"`
+
+	// M50 per-directory password protection. Each rule produces one
+	// htpasswd file under /etc/dotnext/dir-privacy/<rule_id>.htpasswd
+	// and one `location ^~ <path>/ { auth_basic ...; }` block inside the
+	// vhost. DirectoryPrivacyRuleIDs is the full set of rule IDs panel
+	// knows about for this domain — the agent uses it to detect orphaned
+	// htpasswd files (rule deleted on panel, file still on disk).
+	DirectoryPrivacyRules   []directoryPrivacyRule `json:"directory_privacy_rules,omitempty"`
+	DirectoryPrivacyRuleIDs []string               `json:"directory_privacy_rule_ids,omitempty"`
+}
+
+// domainIPACLRule is one allow/deny entry. CIDR is canonicalised by
+// the panel (bare IP → /32 or /128). Action is "allow" or "deny" —
+// validated at the API boundary; agent rejects anything else as a
+// defensive measure.
+type domainIPACLRule struct {
+	CIDR   string `json:"cidr"`
+	Action string `json:"action"`
+}
+
+// domainCreateResponse is the output shape for domain.create.
+type domainCreateResponse struct {
+	Domain     string `json:"domain"`
+	DocRoot    string `json:"doc_root"`
+	ConfigPath string `json:"config_path"`
+}
+
+// domainRegex validates domain name format (lowercase hostname).
+// Pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$
+var domainRegex = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$`)
+
+// ownershipGateRegex validates the ownership gate (GH #1816): lowercase hex
+// only, as the value is written into an nginx if() condition.
+var ownershipGateRegex = regexp.MustCompile(`^[0-9a-f]{32,64}$`)
+
+// vhostTemplate is the nginx vhost configuration template.
+//
+// Listen-IP rendering note (M24): each `listen` line uses an explicit
+// `{{if .X}}...{{else}}...{{end}}`. The naive `listen {{if .X}}{{.X}}:{{end}}80;`
+// shape renders the invalid `listen :80;` when X is empty, so we keep
+// the bracketed [::] / bare 80 fallbacks separately. See plans/m24-ip-manager.md
+// review F-H-3.
+const vhostTemplate = `{{define "ownershipgate"}}{{ if .OwnershipGate }}    # GH #1816: ownership of this name is not proven yet. Only the preview
+    # URL's proxy sends this header; every other request is dropped with no
+    # response (444), ACME challenges included.
+    if ($http_x_dotnext_preview_gate != "{{.OwnershipGate}}") { return 444; }
+{{ end }}{{end}}{{define "panelhostguard"}}{{ if .PanelHostGuard }}    # A request naming the panel never reaches a domain, not even on the
+    # domain's own address (panelHostGuard).
+    if ($http_host ~* "{{.PanelHostGuard}}") { return 421; }
+{{ end }}{{end}}{{define "servebody"}}{{ if .IsEnabled }}
+    root {{.DocRoot}};
+    # JAB-183: refuse to follow a symlink whose owner differs from the owner of
+    # the thing it points at. Docroots are 2750 <user>:www-data and homes are
+    # 0750 <user>:www-data, so the nginx worker (www-data) can traverse and read
+    # EVERY tenant's tree. Without this a tenant could symlink from their own
+    # docroot into another tenant's, name it .txt so the URI never matches the
+    # PHP location, and have nginx serve the target verbatim -- wp-config.php
+    # included. The PHP path is already confined by open_basedir; this is the
+    # matching confinement for nginx's own static serving.
+    #
+    # if_not_owner (rather than a blanket 'on') is deliberate: a tenant symlinking
+    # inside their own tree -- Laravel's public/storage, release-directory
+    # deploys -- has matching owner on both ends and keeps working. Everything the
+    # agent writes into a docroot is chowned to the tenant, so same-owner is the
+    # norm for legitimate content. from=$document_root skips checks above the
+    # docroot.
+    #
+    # Operator note: a rejection surfaces in the domain error log as
+    #   openat() "..." failed (40: Too many levels of symbolic links)
+    # at [crit]. That message is ELOOP from the kernel and does NOT mean a
+    # symlink loop -- it is this directive refusing a cross-owner link. If a
+    # legitimate app trips it, chown the link and its target to the same user
+    # rather than removing this line.
+    disable_symlinks if_not_owner from=$document_root;
+    {{.IndexDirective}}
+{{ if .DefaultPage }}
+    # GH #2422: a site with no index file gets DotNext's default page, served
+    # from outside the docroot, so there is no placeholder for the tenant to
+    # delete. The index directive ends with this URI, so nginx comes here
+    # only when none of the site's own index files exist. Only the site root
+    # gets the page: an index-less subfolder keeps its 403.
+    location = /dotnext-default-page.html {
+        internal;
+        if ($request_uri !~ "^/(\?.*)?$") { return 403; }
+        expires -1;
+        alias {{.DefaultPage}};
+    }
+{{ end }}
+    {{.IPACLDirectives}}
+    {{.DirectoryPrivacyDirectives}}
+
+{{ if not .RootOverridden }}
+    location / {
+{{ if .HasPHP }}
+        try_files $uri $uri/ {{.TryFilesFallback}};
+{{ else }}
+        try_files $uri $uri/ =404;
+{{ end }}
+    }
+
+    # Branded error pages (M28 page templates). error_page fires ONLY on
+    # NATIVE nginx errors: a missing static file (try_files =404), a denied
+    # directory (403), or an upstream 50x. fastcgi_intercept_errors is
+    # OFF by default, so a real app (WordPress, etc.) keeps its own 404
+    # — its index.php runs and owns the response. A no-app PHP domain hits
+    # the index.php existence guard below, which yields a
+    # native 404 that lands here. Files are converged from the editable
+    # page_template rows into /var/www/dotnext-errors by the reconciler.
+    # The per-domain intercept_errors toggle (GH #879) turns interception
+    # on inside the PHP locations for the 5xx codes only.
+    error_page 404 /dotnext-err-404.html;
+    error_page 403 /dotnext-err-403.html;
+    error_page 500 502 503 504 /dotnext-err-500.html;
+    location = /dotnext-err-404.html { internal; root /var/www/dotnext-errors; }
+    location = /dotnext-err-403.html { internal; root /var/www/dotnext-errors; }
+    location = /dotnext-err-500.html { internal; root /var/www/dotnext-errors; }
+{{ if and .InterceptErrors .HasPHP }}
+    # GH #879: with interception on, the PHP locations carry a 50x-ONLY
+    # error_page set (so FPM 404s pass through to the app). That also
+    # detaches their try_files =404 existence guard from the branded 404 —
+    # so the guard falls back HERE instead, where the full-status branded
+    # 404 is back in scope.
+    location @dotnext_missing {
+        error_page 404 /dotnext-err-404.html;
+        return 404;
+    }
+{{ end }}
+{{ end }}
+{{ if .CacheEnabled }}
+    # Long-cache static assets (immutable content; 30 days).
+    location ~* \.(?:css|js|jpe?g|png|gif|ico|svg|webp|woff2?|ttf|eot)$ {
+        expires 30d;
+        add_header Cache-Control "public, immutable";
+        access_log off;
+    }
+    # Short-cache static HTML (300s / 5 min). Long enough to satisfy
+    # third-party freshness audits, short enough that edits surface
+    # within minutes; ETag + Last-Modified still give instant 304
+    # revalidation on unchanged content. PHP responses use the
+    # separate FastCGI micro-cache (60s) below, not this block.
+    # Without this, a domain with cache_enabled=true but a static
+    # site (no PHP) responds with no Cache-Control header at all —
+    # third-party caching audits (e.g. requestmetrics.com) flag
+    # "no Cache-Control" + "heuristic freshness" warnings even
+    # though caching IS enabled on the domain. PHP responses still
+    # get the server-side FastCGI cache via the location ~ \.php$
+    # block below (with X-DotNext-Cache header). Plain HTML hits
+    # only this; it does not enable server-side caching.
+    location ~* \.html?$ {
+        expires 5m;
+        add_header Cache-Control "public, max-age=300" always;
+    }
+{{ end }}
+{{ if and .HasPHP (not .RootOverridden) }}
+    # Front-controller with an existence guard: when index.php is absent
+    # (domain has no app installed) try_files yields a native 404 instead
+    # of PHP-FPM's bare "File not found", so the branded error_page shows.
+    # When it exists the app runs and owns its own error pages.
+    location = /index.php {
+{{ if .InterceptErrors }}
+        try_files $uri @dotnext_missing;
+{{ else }}
+        try_files $uri =404;
+{{ end }}
+        fastcgi_pass unix:{{.FPMSocket}};
+        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+        include fastcgi_params;
+{{ if .InterceptErrors }}
+        # GH #879: branded 500 for application errors. A PHP fatal returns
+        # 500 with an empty body, so visitors otherwise get the browser's
+        # raw error screen. error_page is redefined location-scoped with
+        # ONLY the 5xx codes — the inherited 404/403 set is replaced here,
+        # so the app keeps its own 404/403 pages (interception only fires
+        # for codes that have a matching error_page in this location).
+        fastcgi_intercept_errors on;
+        error_page 500 502 503 504 /dotnext-err-500.html;
+{{ end }}
+{{ if .PHPValueParam }}
+        fastcgi_param PHP_VALUE "{{.PHPValueParam}}";
+{{ end }}{{ if .PHPAdminValueParam }}
+        fastcgi_param PHP_ADMIN_VALUE "{{.PHPAdminValueParam}}";
+{{ end }}{{ if .EnvParams }}
+{{.EnvParams}}
+{{ end }}
+{{ if .CacheEnabled }}
+        # Fail-CLOSED page-cache gate (Gitea #416/#419): cache ONLY genuinely
+        # anonymous GETs. Default to skip; allow only when there is NO cookie or
+        # the cookie is exclusively known-benign analytics/consent. Auth, session,
+        # language, currency, membership, A/B, and any unknown cookie therefore
+        # bypass — so a member/paywall page or the wrong i18n/device variant is
+        # never stored and served cross-visitor (the old denylist was fail-open).
+        set $dotnext_skip 1;
+        if ($http_cookie = "") { set $dotnext_skip 0; }
+        if ($http_cookie ~* "^(?:\s*(?:_ga[\w-]*|_gid|_gat[\w-]*|_gcl[\w-]*|__utm[\w-]*|__gads|__gpi|_fbp|_fbc|_pk_[\w-]*|_hj[\w-]*|_clck|_clsk|_dc_gtm[\w-]*|cookie_consent[\w-]*|cookie_?notice[\w-]*|cookielawinfo[\w-]*|euconsent[\w-]*|wordpress_test_cookie)=[^;]*;?\s*)+$") { set $dotnext_skip 0; }
+        if ($request_method = POST) { set $dotnext_skip 1; }
+        # Gitea #610: bypass only when the query has a non-tracking (content-
+        # affecting) param. Tracking-only (utm_*/gclid/fbclid/…) and empty query
+        # strings are cacheable; $dotnext_qs_kind is set by the strict map in
+        # dotnext-fastcgi-cache.conf. The path-only cache_key below collapses all
+        # tracking variants onto the clean-URL entry.
+{{if .CacheQAllowRegex}}        # cache-query-allowlist (migration 000230): only queries made ENTIRELY of
+        # allowlisted params (non-empty values) cache; any other query param
+        # bypasses. Replaces the shared qs_kind=other line for this domain. Only
+        # ever SETS skip=1 — an allowlisted page relies on the earlier no-cookie
+        # rule for skip=0, so logged-in users stay bypassed.
+        set $dotnext_qs_dirty 1;
+        if ($query_string ~ "{{.CacheQAllowRegex}}") { set $dotnext_qs_dirty 0; }
+        if ($query_string = "") { set $dotnext_qs_dirty 0; }
+        if ($dotnext_qs_dirty) { set $dotnext_skip 1; }{{else}}        if ($dotnext_qs_kind = other) { set $dotnext_skip 1; }{{end}}
+        if ($request_uri ~* "/wp-admin/|/wp-login|/xmlrpc\.php|/wp-cron\.php|/wp-json/|/cart|/checkout|/my-account|/wc-api/|/edd-api/{{.CacheExtraBypass}}") { set $dotnext_skip 1; }
+{{ if ne .CacheGate "" }}        # Gitea #420/#601: cache only within the cache-enabled install path(s) on
+        # this domain (union of every cached install's prefix); other (non-WP,
+        # differently-authed) apps on the same domain are never cached.
+        # Gate on $dotnext_cache_path — the ORIGINAL request path with the query
+        # stripped (Codeberg #5). $uri would be /index.php after the try_files
+        # rewrite (collapsing every permalink); $request_uri keeps the query which
+        # broke the subdir homepage anchor (GH #629). $dotnext_cache_path fixes both
+        # and mirrors the cache_key below.
+        if ($dotnext_cache_path !~ "^{{.CacheGate}}(/|$)") { set $dotnext_skip 1; }
+{{ end }}        fastcgi_cache {{.CacheKeyZone}};
+        # Gitea #610: path-only key (no query) so tracking-param variants
+        # collapse onto one entry. Safe because only empty/tracking-only queries
+        # reach caching (others bypass via $dotnext_qs_kind above).
+{{if .CacheQAllowNames}}        # cache-query-allowlist: fold allowlisted args into the key in a fixed
+        # (panel-sorted) order so ?a=1&b=2 and ?b=2&a=1 collapse; non-allowlisted
+        # args never enter the key.
+        set $dotnext_qkey "";
+{{range .CacheQAllowNames}}        if ($arg_{{.}}) { set $dotnext_qkey "${dotnext_qkey}{{.}}=$arg_{{.}}&"; }
+{{end}}        # Only add the "?" separator when an allowlisted arg is actually present,
+        # so a query-less page keys as plain $dotnext_cache_path (byte-identical to
+        # the non-allowlist key AND targeted-purge-safe — post-edit purge computes
+        # md5(scheme+method+host+path) with no trailing "?"). Query variants are
+        # cleared by whole-domain purge (host-match) or TTL, not targeted purge.
+        set $dotnext_qsep "";
+        if ($dotnext_qkey != "") { set $dotnext_qsep "?"; }
+        fastcgi_cache_key "$scheme$request_method$host$dotnext_cache_path$dotnext_qsep$dotnext_qkey";{{else}}        fastcgi_cache_key "$scheme$request_method$host$dotnext_cache_path";{{end}}
+        fastcgi_cache_valid 200 301 {{.CacheTTL}};
+        fastcgi_cache_bypass $dotnext_skip $http_authorization;
+        # GH #637: also skip STORING when the backend opted out via Cache-Control
+        # (no-cache/no-store/private). $dotnext_upstream_nocache is set by the map
+        # in dotnext-fastcgi-cache.conf from $upstream_http_cache_control.
+        fastcgi_no_cache $dotnext_skip $dotnext_upstream_nocache $http_authorization $dotnext_vary_nocache;
+        fastcgi_cache_use_stale error timeout updating http_500 http_503;
+        fastcgi_cache_lock on;
+        # Gitea #596: serve the stale copy instantly (~100ms) on expiry and
+        # refresh in the background, instead of blocking the visitor on the
+        # full synchronous PHP regen. Pairs with use_stale ... updating above.
+        fastcgi_cache_background_update on;
+        fastcgi_cache_revalidate on;
+        access_log /var/log/nginx/jcache-{{.Domain}}.log jcache buffer=8k flush=5s;
+        add_header X-DotNext-Cache $upstream_cache_status always;
+        # JAB-70: re-declare security headers (a location's add_header suppresses
+        # server-scope ones).
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        # Do NOT advertise public/CDN caching for dynamic PHP responses (Gitea
+        # #417): the origin micro-cache is purgeable but browser/CDN copies are
+        # not, and a skip-miss must never be amplified to Cloudflare scale. The
+        # speedup is the server-side micro-cache only; clients always revalidate.
+        fastcgi_hide_header Cache-Control;
+        add_header Cache-Control "private, no-cache, max-age=0" always;
+{{ end }}
+    }
+    location ~ \.php$ {
+        # Existence guard (JAB-187). Without it a request for
+        # /upload.jpg/x.php matches this location on the URI suffix, and PHP's
+        # cgi.fix_pathinfo walk-back would execute the uploaded .jpg. php-fpm's
+        # security.limit_extensions = .php (infrastructure/php/dotnext-php-pool.conf.tmpl)
+        # already rejects that, so this is the second lock on the same door --
+        # it must not be removed on the assumption the pool setting is enough.
+{{ if .InterceptErrors }}
+        try_files $uri @dotnext_missing;
+{{ else }}
+        try_files $uri =404;
+{{ end }}
+        fastcgi_pass unix:{{.FPMSocket}};
+        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+        include fastcgi_params;
+{{ if .InterceptErrors }}
+        # GH #879: branded 500 for application errors (see the identical
+        # block in location = /index.php).
+        fastcgi_intercept_errors on;
+        error_page 500 502 503 504 /dotnext-err-500.html;
+{{ end }}
+{{ if .PHPValueParam }}
+        fastcgi_param PHP_VALUE "{{.PHPValueParam}}";
+{{ end }}{{ if .PHPAdminValueParam }}
+        fastcgi_param PHP_ADMIN_VALUE "{{.PHPAdminValueParam}}";
+{{ end }}{{ if .EnvParams }}
+{{.EnvParams}}
+{{ end }}
+{{ if .CacheEnabled }}
+        # Fail-CLOSED page-cache gate (Gitea #416/#419): cache ONLY genuinely
+        # anonymous GETs. Default to skip; allow only when there is NO cookie or
+        # the cookie is exclusively known-benign analytics/consent. Auth, session,
+        # language, currency, membership, A/B, and any unknown cookie therefore
+        # bypass — so a member/paywall page or the wrong i18n/device variant is
+        # never stored and served cross-visitor (the old denylist was fail-open).
+        set $dotnext_skip 1;
+        if ($http_cookie = "") { set $dotnext_skip 0; }
+        if ($http_cookie ~* "^(?:\s*(?:_ga[\w-]*|_gid|_gat[\w-]*|_gcl[\w-]*|__utm[\w-]*|__gads|__gpi|_fbp|_fbc|_pk_[\w-]*|_hj[\w-]*|_clck|_clsk|_dc_gtm[\w-]*|cookie_consent[\w-]*|cookie_?notice[\w-]*|cookielawinfo[\w-]*|euconsent[\w-]*|wordpress_test_cookie)=[^;]*;?\s*)+$") { set $dotnext_skip 0; }
+        if ($request_method = POST) { set $dotnext_skip 1; }
+        # Gitea #610: bypass only when the query has a non-tracking (content-
+        # affecting) param. Tracking-only (utm_*/gclid/fbclid/…) and empty query
+        # strings are cacheable; $dotnext_qs_kind is set by the strict map in
+        # dotnext-fastcgi-cache.conf. The path-only cache_key below collapses all
+        # tracking variants onto the clean-URL entry.
+{{if .CacheQAllowRegex}}        # cache-query-allowlist (migration 000230): only queries made ENTIRELY of
+        # allowlisted params (non-empty values) cache; any other query param
+        # bypasses. Replaces the shared qs_kind=other line for this domain. Only
+        # ever SETS skip=1 — an allowlisted page relies on the earlier no-cookie
+        # rule for skip=0, so logged-in users stay bypassed.
+        set $dotnext_qs_dirty 1;
+        if ($query_string ~ "{{.CacheQAllowRegex}}") { set $dotnext_qs_dirty 0; }
+        if ($query_string = "") { set $dotnext_qs_dirty 0; }
+        if ($dotnext_qs_dirty) { set $dotnext_skip 1; }{{else}}        if ($dotnext_qs_kind = other) { set $dotnext_skip 1; }{{end}}
+        if ($request_uri ~* "/wp-admin/|/wp-login|/xmlrpc\.php|/wp-cron\.php|/wp-json/|/cart|/checkout|/my-account|/wc-api/|/edd-api/{{.CacheExtraBypass}}") { set $dotnext_skip 1; }
+{{ if ne .CacheGate "" }}        # Gitea #420/#601: cache only within the cache-enabled install path(s) on
+        # this domain (union of every cached install's prefix); other (non-WP,
+        # differently-authed) apps on the same domain are never cached.
+        # Gate on $dotnext_cache_path — the ORIGINAL request path with the query
+        # stripped (Codeberg #5). $uri would be /index.php after the try_files
+        # rewrite (collapsing every permalink); $request_uri keeps the query which
+        # broke the subdir homepage anchor (GH #629). $dotnext_cache_path fixes both
+        # and mirrors the cache_key below.
+        if ($dotnext_cache_path !~ "^{{.CacheGate}}(/|$)") { set $dotnext_skip 1; }
+{{ end }}        fastcgi_cache {{.CacheKeyZone}};
+        # Gitea #610: path-only key (no query) so tracking-param variants
+        # collapse onto one entry. Safe because only empty/tracking-only queries
+        # reach caching (others bypass via $dotnext_qs_kind above).
+{{if .CacheQAllowNames}}        # cache-query-allowlist: fold allowlisted args into the key in a fixed
+        # (panel-sorted) order so ?a=1&b=2 and ?b=2&a=1 collapse; non-allowlisted
+        # args never enter the key.
+        set $dotnext_qkey "";
+{{range .CacheQAllowNames}}        if ($arg_{{.}}) { set $dotnext_qkey "${dotnext_qkey}{{.}}=$arg_{{.}}&"; }
+{{end}}        # Only add the "?" separator when an allowlisted arg is actually present,
+        # so a query-less page keys as plain $dotnext_cache_path (byte-identical to
+        # the non-allowlist key AND targeted-purge-safe — post-edit purge computes
+        # md5(scheme+method+host+path) with no trailing "?"). Query variants are
+        # cleared by whole-domain purge (host-match) or TTL, not targeted purge.
+        set $dotnext_qsep "";
+        if ($dotnext_qkey != "") { set $dotnext_qsep "?"; }
+        fastcgi_cache_key "$scheme$request_method$host$dotnext_cache_path$dotnext_qsep$dotnext_qkey";{{else}}        fastcgi_cache_key "$scheme$request_method$host$dotnext_cache_path";{{end}}
+        fastcgi_cache_valid 200 301 {{.CacheTTL}};
+        fastcgi_cache_bypass $dotnext_skip $http_authorization;
+        # GH #637: also skip STORING when the backend opted out via Cache-Control
+        # (no-cache/no-store/private). $dotnext_upstream_nocache is set by the map
+        # in dotnext-fastcgi-cache.conf from $upstream_http_cache_control.
+        fastcgi_no_cache $dotnext_skip $dotnext_upstream_nocache $http_authorization $dotnext_vary_nocache;
+        fastcgi_cache_use_stale error timeout updating http_500 http_503;
+        fastcgi_cache_lock on;
+        # Gitea #596: serve the stale copy instantly (~100ms) on expiry and
+        # refresh in the background, instead of blocking the visitor on the
+        # full synchronous PHP regen. Pairs with use_stale ... updating above.
+        fastcgi_cache_background_update on;
+        fastcgi_cache_revalidate on;
+        access_log /var/log/nginx/jcache-{{.Domain}}.log jcache buffer=8k flush=5s;
+        add_header X-DotNext-Cache $upstream_cache_status always;
+        # JAB-70: re-declare security headers (a location's add_header suppresses
+        # server-scope ones).
+        add_header Strict-Transport-Security "max-age=31536000" always;
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        # Do NOT advertise public/CDN caching for dynamic PHP responses (Gitea
+        # #417): the origin micro-cache is purgeable but browser/CDN copies are
+        # not, and a skip-miss must never be amplified to Cloudflare scale. The
+        # speedup is the server-side micro-cache only; clients always revalidate.
+        fastcgi_hide_header Cache-Control;
+        add_header Cache-Control "private, no-cache, max-age=0" always;
+{{ end }}
+    }
+{{ if .EnablePathInfo }}
+    # PATH_INFO for front-controller PHP apps (GH #962): osTicket
+    # (/scp/ajax.php/…) and similar route through /script.php/extra/path URLs,
+    # which the end-anchored  location ~ \.php$  above never matches — so they
+    # 400/404 without this. Fires ONLY for a real .php followed by a further
+    # /segment, so plain .php and clean URLs stay on the default handler. The
+    # -f existence guard is the JAB-187 second lock (the pool's
+    # security.limit_extensions = .php is the first): it refuses a walk-back
+    # onto an uploaded non-.php file before the request can reach FPM. The
+    # regex is non-greedy so /a.php/b.php/c splits on the FIRST .php.
+    location ~ ^(?<dotnext_pi_script>.+?\.php)(?<dotnext_pi_suffix>/.+)$ {
+        if (!-f $realpath_root$dotnext_pi_script) { return 404; }
+        fastcgi_pass unix:{{.FPMSocket}};
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $realpath_root$dotnext_pi_script;
+        fastcgi_param PATH_INFO $dotnext_pi_suffix;
+{{ if .PHPValueParam }}        fastcgi_param PHP_VALUE "{{.PHPValueParam}}";
+{{ end }}{{ if .PHPAdminValueParam }}        fastcgi_param PHP_ADMIN_VALUE "{{.PHPAdminValueParam}}";
+{{ end }}{{ if .EnvParams }}
+{{.EnvParams}}
+{{ end }}    }
+{{ end }}{{ end }}
+
+    access_log /var/log/nginx/{{.Domain}}-access.log;
+    error_log /var/log/nginx/{{.Domain}}-error.log;
+
+    # Per-install rewrites (e.g. Drupal/Joomla subdir pretty-URL routing).
+    # Written by the per-CMS install handler; reloaded on install/delete.
+    # nginx tolerates a missing directory here — no file = no include.
+    include /etc/nginx/dotnext/{{.Domain}}/*.conf;
+
+    {{.RedirectDirectives}}
+    {{.RuleDirectives}}
+    {{.CustomDirectives}}
+    {{.RateLimitDirectives}}
+{{ else }}
+    # Domain is administratively disabled. Serve the branded
+    # disabled page instead of the tenant's docroot. Keep access
+    # logs under the normal filename so ops can still see hits.
+    root /var/www/dotnext-disabled;
+    index index.html;
+    access_log /var/log/nginx/{{.Domain}}-access.log;
+    error_log /var/log/nginx/{{.Domain}}-error.log;
+    location / { try_files /index.html =503; }
+{{ end }}{{end}}server {
+{{ if .ListenIPv4 }}    listen {{.ListenIPv4}}:80;
+{{ else }}    listen 80;
+{{ end }}{{ if .ListenIPv6 }}    listen [{{.ListenIPv6}}]:80;
+{{ else }}    listen [::]:80;
+{{ end }}    server_name {{.Domain}} www.{{.Domain}}{{.ExtraServerNames}};
+{{ template "panelhostguard" . }}{{ template "ownershipgate" . }}{{ if .IsEnabled }}
+    # ACME HTTP-01 webroot. Must be a location block — a server-level
+    # redirect fires in nginx SERVER_REWRITE phase BEFORE FIND_CONFIG,
+    # so a server-scoped redirect short-circuits every request
+    # including /.well-known/acme-challenge/, and Let's Encrypt's
+    # challenge fetch bounces to https where LE refuses to follow.
+    # Scoping the redirect to a location block instead pushes it into
+    # the per-location REWRITE phase, after FIND_CONFIG has had a
+    # chance to pick the ^~ ACME match. Webroot mirrors
+    # panel-api/internal/reconciler.IssueDomainCert (-w domain.DocRoot).
+    # Incident 2026-04-26: dotnext.site stuck in pending_acme_retry on
+    # first VPS install — first under the no-ACME-location vhost, then
+    # again after we added the location but kept the server-scoped
+    # redirect that won the rewrite race.
+    location ^~ /.well-known/acme-challenge/ {
+        default_type "text/plain";
+        root {{.DocRoot}};
+        try_files $uri =404;
+        # M50: if Directory Privacy with path "/" applied auth_basic at
+        # server scope, override here so the ACME validator can reach
+        # the challenge token without a 401.
+        auth_basic off;
+    }
+{{ end }}
+{{ if .RedirectHTTPS }}
+    # Redirect HTTP to HTTPS once a TRUSTED cert is serving. Gated on
+    # RedirectHTTPS (not merely "a cert exists") so a fresh LE-mode domain
+    # still on its self-signed bootstrap placeholder does NOT 301 browsers
+    # into a cert-authority warning (GH #896/#887); it falls to the else
+    # branch below and serves the docroot over plain HTTP. Decoupled from the
+    # :443 block itself (JAB-237): a CDN-fronted domain serves :443 WITHOUT
+    # this redirect — Cloudflare owns the client-side https redirect, and an
+    # origin 301 loops CF Flexible zones. Scoped to the default location so
+    # the ^~ ACME location above wins for challenge paths.
+    location / {
+        return 301 https://$host$request_uri;
+    }
+{{ else }}
+    # JAB-271: no force-redirect on :80 -> serve the real docroot over plain
+    # HTTP (what the CF-Flexible / grey-cloud / pre-redirect visitor hits),
+    # the SAME site config as :443. Without this the :80 block had neither a
+    # redirect nor a docroot and fell through to nginx's compiled-in
+    # /usr/share/nginx/html ("Welcome to nginx").
+{{ template "servebody" . }}
+{{ end }}
+}
+{{ if .ServeHTTPS }}
+
+server {
+{{ if .ListenIPv4 }}    listen {{.ListenIPv4}}:443 ssl{{.HTTP2Param}};
+{{ else }}    listen 443 ssl{{.HTTP2Param}};
+{{ end }}{{ if .ListenIPv6 }}    listen [{{.ListenIPv6}}]:443 ssl{{.HTTP2Param}};
+{{ else }}    listen [::]:443 ssl{{.HTTP2Param}};
+{{ end }}{{ if .HTTP2Directive }}    {{.HTTP2Directive}}
+{{ end }}    # HTTP/2 is version-aware (GH #292): the listen ... http2
+    # parameter on nginx <1.25.1 (where the standalone directive is an
+    # unknown-directive error), the http2 on directive on >=1.25.1
+    # (where the listen parameter is deprecated and warns every reload).
+    server_name {{.Domain}} www.{{.Domain}}{{.ExtraServerNames}};
+{{ template "panelhostguard" . }}{{ template "ownershipgate" . }}    ssl_certificate {{.SSLCertPath}};
+    ssl_certificate_key {{.SSLKeyPath}};
+    # JAB-69: modern TLS + Mozilla-intermediate ciphers (no 3DES/RC4/CBC-weak).
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    # JAB-70: baseline security headers (location / inherits these; cache-status
+    # locations that set their own add_header re-declare them below).
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+{{ template "servebody" . }}
+}
+{{ end }}
+{{- if .PreviewHost }}
+
+# Preview URL — reverse-proxies this domain's OWN vhost with the real
+# Host header, so canonical-URL apps (WordPress etc.) never see a host
+# mismatch and never redirect away. Location headers, cookie domains and
+# absolute URLs in bodies (including the JSON-escaped form Elementor
+# stores) are rewritten to the preview host. Pattern proven in
+# production on the hostsclick preview fleet; adapted here for the
+# local hairpin (SNI to our own vhost, self-signed backend tolerated —
+# proxy_ssl_verify defaults off). X-Robots-Tag keeps previews out of
+# search indexes.
+server {
+{{ if .ListenIPv4 }}    listen {{.ListenIPv4}}:80;
+{{ else }}    listen 80;
+{{ end }}{{ if .ListenIPv6 }}    listen [{{.ListenIPv6}}]:80;
+{{ else }}    listen [::]:80;
+{{ end }}    server_name {{.PreviewHost}};
+{{ template "panelhostguard" . }}{{ if .PreviewCertPath }}
+    location / {
+        return 301 https://$host$request_uri;
+    }
+}
+
+server {
+{{ if .ListenIPv4 }}    listen {{.ListenIPv4}}:443 ssl{{.HTTP2Param}};
+{{ else }}    listen 443 ssl{{.HTTP2Param}};
+{{ end }}{{ if .ListenIPv6 }}    listen [{{.ListenIPv6}}]:443 ssl{{.HTTP2Param}};
+{{ else }}    listen [::]:443 ssl{{.HTTP2Param}};
+{{ end }}{{ if .HTTP2Directive }}    {{.HTTP2Directive}}
+{{ end }}    server_name {{.PreviewHost}};
+{{ template "panelhostguard" . }}    ssl_certificate {{.PreviewCertPath}};
+    ssl_certificate_key {{.PreviewKeyPath}};
+    ssl_protocols TLSv1.2 TLSv1.3;
+{{ end }}
+    add_header X-Robots-Tag "noindex, nofollow" always;
+    client_max_body_size 64m;
+    access_log /var/log/nginx/{{.Domain}}-preview-access.log;
+    error_log /var/log/nginx/{{.Domain}}-preview-error.log;
+
+    location / {
+        proxy_pass {{.PreviewUpstream}};
+        proxy_set_header Host {{.Domain}};
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+{{ if .OwnershipGate }}        proxy_set_header X-DotNext-Preview-Gate {{.OwnershipGate}};
+{{ end }}{{ if .SSLCertPath }}        proxy_ssl_server_name on;
+        proxy_ssl_name {{.Domain}};
+{{ end }}        proxy_redirect http://www.{{.Domain}} http://$http_host;
+        proxy_redirect https://www.{{.Domain}} https://$http_host;
+        proxy_redirect http://{{.Domain}} http://$http_host;
+        proxy_redirect https://{{.Domain}} https://$http_host;
+        proxy_cookie_domain www.{{.Domain}} $host;
+        proxy_cookie_domain {{.Domain}} $host;
+
+        # Body rewrite: plain and JSON-escaped absolute URLs, apex + www.
+        # Upstream compression must be off for sub_filter to see the
+        # bytes; gunzip re-inflates anything that slips through.
+        sub_filter_types text/plain text/css text/xml application/javascript application/x-javascript text/javascript application/json application/ld+json image/svg+xml;
+        sub_filter 'http://www.{{.Domain}}' 'http://$http_host';
+        sub_filter 'https://www.{{.Domain}}' 'https://$http_host';
+        sub_filter 'http://{{.Domain}}' 'http://$http_host';
+        sub_filter 'https://{{.Domain}}' 'https://$http_host';
+        sub_filter 'http:\/\/www.{{.Domain}}' 'http:\/\/$http_host';
+        sub_filter 'https:\/\/www.{{.Domain}}' 'https:\/\/$http_host';
+        sub_filter 'http:\/\/{{.Domain}}' 'http:\/\/$http_host';
+        sub_filter 'https:\/\/{{.Domain}}' 'https:\/\/$http_host';
+        sub_filter_once off;
+        gunzip on;
+        proxy_set_header Accept-Encoding "";
+    }
+}
+{{ end }}`
+
+// domainPanelHostGuard is panelHostGuard for a domain's vhost, whose names are
+// domain, www.domain and the alias names (aliasServerNames, space-joined).
+func domainPanelHostGuard(domain, aliasServerNames string) string {
+	return panelHostGuard(append([]string{domain, "www." + domain}, strings.Fields(aliasServerNames)...)...)
+}
+
+type vhostData struct {
+	Domain string
+	// ExtraServerNames (GH #1625) is the sanitized web-domain-alias
+	// suffix appended after "{{.Domain}} www.{{.Domain}}" in server_name
+	// — a leading-space-joined list (" a.com b.com") or "" when none.
+	// Already re-validated against domainRegex by sanitizeAliasServerNames.
+	ExtraServerNames string
+	PreviewHost      string
+	PreviewCertPath  string
+	PreviewKeyPath   string
+	PreviewUpstream  string
+	// OwnershipGate: see domainCreateParams.OwnershipGate. Validated
+	// against ownershipGateRegex before it reaches the template.
+	OwnershipGate      string
+	PanelHostGuard     string // the Host pattern every server block refuses (panelHostGuard); "" for none
+	DocRoot            string
+	HasPHP             bool
+	PHPVersion         string
+	Username           string
+	FPMSocket          string
+	IndexDirective     string
+	RedirectDirectives string
+	RuleDirectives     string
+	CustomDirectives   string
+	IsEnabled          bool
+	SSLCertPath        string
+	SSLKeyPath         string
+	// RedirectHTTPS (GH #896) gates ONLY the :80→:443 redirect since
+	// JAB-237. ServeHTTPS gates the :443 server block; when false the
+	// shared tail (root/PHP/locations) attaches to the :80 server so the
+	// docroot is served over plain HTTP — the self-signed bootstrap
+	// window. Both always false when SSLCertPath is empty, and a redirect
+	// without a :443 block is coerced off (301 to a dead port).
+	RedirectHTTPS        bool
+	ServeHTTPS           bool
+	PHPMemoryLimit       string
+	PHPUploadMaxFilesize string
+	PHPPostMaxSize       string
+	PHPMaxInputVars      int
+	PHPMaxExecutionTime  int
+	PHPMaxInputTime      int
+	PHPValueParam        string // fastcgi_param PHP_VALUE directive content
+	PHPAdminValueParam   string // GH #1701 Slice 3: fastcgi_param PHP_ADMIN_VALUE content
+	EnvParams            string // GH #1332 item 14: fastcgi_param env-var lines
+	// RateLimitDirectives is the fully-rendered per-vhost rate/conn
+	// limit block (may span 0–2 lines). Computed by the caller via
+	// BuildRateLimitDirectives; interpolated verbatim. Never contains
+	// user-controllable data — both the rps value and the zone name
+	// (which embeds the ULID) are panel-controlled.
+	RateLimitDirectives string
+	// M24 listen IPs. Empty string = all-interfaces fallback handled by
+	// the template's explicit if/else. Plain string (validated by
+	// panel-api before reaching the agent) so the template stays simple.
+	ListenIPv4 string
+	ListenIPv6 string
+	// HTTP/2 form selected per host nginx version (GH #292).
+	HTTP2Param     string // " http2" on nginx <1.25.1, "" on >=1.25.1
+	HTTP2Directive string // "" on nginx <1.25.1, "http2 on;" on >=1.25.1
+	// M36 IP allow/deny — pre-rendered nginx directives. One line per
+	// rule, "allow <cidr>;" or "deny <cidr>;", in priority order. Empty
+	// string when the domain has no ACLs (zero overhead). Sits inside
+	// the server block so it applies to every location.
+	IPACLDirectives string
+	// M50 directory privacy — pre-rendered `location ^~ <path>/ {
+	// auth_basic ...; auth_basic_user_file ...; }` blocks, one per
+	// rule. Empty string when the domain has no privacy rules.
+	DirectoryPrivacyDirectives string
+	// InterceptErrors (GH #879) — branded 500 for PHP app 5xx. Renders
+	// fastcgi_intercept_errors + a 50x-only location-scoped error_page in
+	// the PHP locations. false ⇒ byte-identical.
+	InterceptErrors bool
+	// EnablePathInfo (GH #962) — render an extra PATH_INFO location for
+	// front-controller PHP apps (osTicket, …). false ⇒ byte-identical.
+	EnablePathInfo bool
+	// ADR-0108 FastCGI micro-cache. All three are panel/agent-controlled
+	// (never user data). When CacheEnabled is false the template emits
+	// none of the cache/static directives → byte-identical to pre-0108.
+	CacheEnabled     bool
+	CachePath        string // Gitea #420: page-cache path prefix ("/" = whole domain)
+	CacheGate        string // Gitea #601: regex body for the multi-path gate ("" = whole domain, no gate)
+	CacheExtraBypass string // Gitea #616: "|/path|..." suffix appended to the built-in bypass regex ("" = none)
+	// CacheQAllowRegex ("" = feature off ⇒ byte-identical): anchored $query_string
+	// match for allowlist-only queries. CacheQAllowNames: sorted allowlisted
+	// param names driving the canonical $arg_<name> key builder (migration 000230).
+	CacheQAllowRegex  string
+	CacheQAllowNames  []string
+	CacheKeyZone      string
+	CacheTTL          string
+	CacheTTLSeconds   int // numeric form of CacheTTL for Cache-Control max-age
+	CacheClientMaxAge int // client Cache-Control max-age (browser/CDN); decoupled from server TTL
+	// RootOverridden is true when CustomDirectives contain a
+	// `location /` block (any modifier — exact, prefix, regex). The
+	// template omits its own default `location /` + `location ~ \.php$`
+	// blocks in that case so the user's custom directives become the
+	// authoritative routing for the whole domain. Use case: panel UI
+	// "reverse proxy domain to upstream X" without hand-rolling a
+	// /etc/nginx/conf.d/* override that lives outside the reconciler.
+	RootOverridden bool
+	// PHPFallback is the panel-supplied front controller fallback (GH #1999),
+	// unvalidated. The template renders it through TryFilesFallback only.
+	PHPFallback string
+
+	// DefaultPage (GH #2422) is the domain's file in defaultPagesDir that the
+	// index directive's last entry serves; empty renders no location for it.
+	DefaultPage string
+}
+
+// TryFilesFallback is the last try_files argument of the default `location /`
+// on a PHP domain (GH #1999). It validates at render time, so a vhostData that
+// never set PHPFallback, or got an invalid one, renders the default
+// "/index.php?$query_string".
+func (d vhostData) TryFilesFallback() string {
+	fallback, _ := sanitizePHPFallback(d.PHPFallback)
+	return fallback
+}
+
+// sanitizePHPFallback re-validates the panel-supplied front controller
+// fallback (GH #1999) at the agent's trust boundary: it renders unquoted as
+// the last try_files argument, so only a value in the frontcontroller grammar
+// (one nginx token, allowlisted variables) gets through. Anything else falls
+// back to the default rather than failing the whole vhost; the error says why.
+func sanitizePHPFallback(fallback string) (string, error) {
+	if fallback == "" {
+		return frontcontroller.Default, nil
+	}
+	if _, _, err := frontcontroller.Parse(fallback); err != nil {
+		return frontcontroller.Default, err
+	}
+	return fallback, nil
+}
+
+// indexDirectiveFor maps the panel's index_priority enum to the concrete
+// nginx `index ...;` directive. Unknown values fall back to the prior
+// hardcoded behaviour so a mis-plumbed reconciler can't silently break
+// a tenant's site. Every variant ends with defaultPageURI (GH #2422): nginx
+// reaches it only when none of the site's own index files exist.
+func indexDirectiveFor(priority string) string {
+	files := "index.html index.php"
+	switch priority {
+	case "php_first":
+		files = "index.php index.html"
+	case "html_only":
+		files = "index.html"
+	case "php_only":
+		files = "index.php"
+	case "full":
+		files = "index.php index.html index.htm"
+	}
+	return "index " + files + " " + defaultPageURI + ";"
+}
+
+// pathsUnderHome returns each directory from docRoot up to but NOT
+// including /home/<user>, ordered from deepest to shallowest. Used to
+// chown every intermediate directory the panel creates so tenant data
+// never gets stranded under root ownership.
+//
+// Returns nil if docRoot doesn't live under the expected home dir —
+// the caller should already have validated this upstream.
+func pathsUnderHome(username, docRoot string) []string {
+	homeDir := "/home/" + username
+	if !strings.HasPrefix(docRoot, homeDir+"/") {
+		return nil
+	}
+	var paths []string
+	cur := docRoot
+	for cur != homeDir && cur != "/" && cur != "." {
+		paths = append(paths, cur)
+		cur = filepath.Dir(cur)
+	}
+	return paths
+}
+
+// phpTimezoneRE is a defense-in-depth guard on the per-domain date.timezone
+// value before it is rendered into the PHP_VALUE line (which joins directives
+// with "\n"). panel-api already validates against the tz database, but a value
+// that isn't a plain tz identifier is dropped here rather than risk injecting a
+// directive. Covers "Area/City", "UTC", "Etc/GMT+5", etc.
+var phpTimezoneRE = regexp.MustCompile(`^[A-Za-z0-9_+/-]{1,64}$`)
+
+// phpSizeRE guards the per-domain memory_limit, upload_max_filesize and
+// post_max_size the same way. The panel's PHP settings page checks them, but a
+// domain restored from a backup never passed that page, and the value lands
+// inside the double-quoted PHP_VALUE string. Accepts every size that page
+// accepts, plus PHP's -1 (no limit) and lower-case units.
+var phpSizeRE = regexp.MustCompile(`^(-1|[0-9]{1,8}[KMGkmg]?)$`)
+
+// domainEnvVarParam is one per-domain environment variable from the panel.
+type domainEnvVarParam struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+
+// buildEnvParams renders per-domain env vars as nginx fastcgi_param lines (GH
+// #1332 item 14). Returns "" for a non-PHP domain or no vars. Each key is
+// re-validated against the shared phpenv denylist (a PHP_ADMIN_VALUE key would
+// escape the FPM sandbox) and each value is escaped for the double-quoted nginx
+// string — a bad entry is skipped, never rendered raw. One directive per line.
+func buildEnvParams(hasPHP bool, envVars []domainEnvVarParam) string {
+	if !hasPHP || len(envVars) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, kv := range envVars {
+		if err := phpenv.ValidKey(kv.Key); err != nil {
+			continue
+		}
+		if err := phpenv.ValidValue(kv.Value); err != nil {
+			continue
+		}
+		b.WriteString("        fastcgi_param ")
+		b.WriteString(kv.Key)
+		b.WriteString(` "`)
+		b.WriteString(phpenv.Escape(kv.Value))
+		b.WriteString("\";\n")
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+// buildPHPValueParam assembles a fastcgi_param PHP_VALUE directive from per-domain
+// INI overrides. Returns empty string for a non-PHP domain (no PHP_VALUE line).
+// For a PHP domain it ALWAYS emits display_errors (GH #1332): a value set via
+// PHP_VALUE sticks on the reused FPM worker and would otherwise bleed into a
+// sibling domain on the same per-user pool that sets none — display_errors
+// leaking is information disclosure (box-drilled on .60). Default Off pins it
+// safely and neutralizes any error_reporting/date.timezone bleed too.
+// Format: key1=val1\nkey2=val2.
+func buildPHPValueParam(hasPHP bool, memLimit, uploadMax, postMax string, maxInputVars, maxExecTime, maxInputTime int, displayErrors bool, errorReporting *int, timezone string) string {
+	if !hasPHP {
+		return ""
+	}
+	var parts []string
+	// Always pinned — see the function comment (GH #1332). Default Off.
+	if displayErrors {
+		parts = append(parts, "display_errors=On")
+	} else {
+		parts = append(parts, "display_errors=Off")
+	}
+	if phpSizeRE.MatchString(memLimit) {
+		parts = append(parts, "memory_limit="+memLimit)
+	}
+	if phpSizeRE.MatchString(uploadMax) {
+		parts = append(parts, "upload_max_filesize="+uploadMax)
+	}
+	if phpSizeRE.MatchString(postMax) {
+		parts = append(parts, "post_max_size="+postMax)
+	}
+	if maxInputVars > 0 {
+		parts = append(parts, "max_input_vars="+strconv.Itoa(maxInputVars))
+	}
+	if maxExecTime > 0 {
+		parts = append(parts, "max_execution_time="+strconv.Itoa(maxExecTime))
+	}
+	if maxInputTime > 0 {
+		parts = append(parts, "max_input_time="+strconv.Itoa(maxInputTime))
+	}
+	// error_reporting is an int bitmask; 0 (report nothing) is meaningful, so a
+	// non-nil pointer is the emit gate, not >0. strconv.Itoa keeps it injection-free.
+	if errorReporting != nil {
+		parts = append(parts, "error_reporting="+strconv.Itoa(*errorReporting))
+	}
+	if timezone != "" && phpTimezoneRE.MatchString(timezone) {
+		parts = append(parts, "date.timezone="+timezone)
+	}
+	return strings.Join(parts, "\n")
+}
+
+// writeVhost generates and writes the nginx vhost configuration, then tests and reloads nginx.
+// This is the core logic shared by domain.create and domain.enable/disable.
+// If the config content is unchanged, nginx reload is skipped for efficiency.
+// cachePathSegmentRE bounds the page-cache path prefix to a single safe segment
+// under root (Gitea #420 / nginx-template-injection guard).
+var cachePathSegmentRE = regexp.MustCompile(`^/[a-z0-9][a-z0-9_-]{0,63}$`)
+
+// sanitizeCachePath re-validates the page-cache path prefix at the agent (the
+// nginx config-generation trust boundary): it is rendered verbatim into the
+// regex `^<path>(/|$)`, so anything that is not "/" or a single safe segment
+// falls back to "/" (whole domain, no scoping) and can never inject nginx
+// directives or break the regex — regardless of what the panel sent.
+// clampCacheTTL bounds the per-domain page-cache validity (Gitea #596). 0 (or
+// unset) → the 600s default; otherwise clamped to [10s, 24h] so a bad panel
+// value can never render a degenerate fastcgi_cache_valid.
+func clampCacheTTL(s int) int {
+	switch {
+	case s <= 0:
+		return 600
+	case s < 10:
+		return 10
+	case s > 86400:
+		return 86400
+	default:
+		return s
+	}
+}
+
+func sanitizeCachePath(p string) string {
+	if p != "/" && !cachePathSegmentRE.MatchString(p) {
+		return "/"
+	}
+	return p
+}
+
+// cachePathMultiSegRE bounds a page-cache path to one or more safe segments
+// (GH #601 allows nested installs like /shop/eu, which the single-segment
+// cachePathSegmentRE rejects). Same char class per segment.
+var cachePathMultiSegRE = regexp.MustCompile(`^/[a-z0-9][a-z0-9_-]{0,63}(?:/[a-z0-9][a-z0-9_-]{0,63})*$`)
+
+// bypassPathRE / bypassCookieRE bound user-provided page-cache rules (GH #616)
+// to characters that can never break out of the nginx `~* "..."` string or
+// inject a regex operator. The agent RE-VALIDATES even though the panel already
+// checked (defense in depth — the config-generation trust boundary). Anything
+// with a quote, backslash, space, brace, paren, pipe, dollar, or control char
+// is rejected outright; the survivors are additionally QuoteMeta'd so a literal
+// "." matches "." rather than any char.
+var (
+	bypassPathRE = regexp.MustCompile(`^/[A-Za-z0-9._/-]{0,127}$`)
+)
+
+// sanitizeBypassPaths turns user URL-exclusion prefixes into a safe regex
+// alternation SUFFIX ("|/private|/account") appended to the built-in bypass set,
+// or "" if none survive. Invalid entries are dropped (fail-safe), never escaped
+// into the config raw.
+func sanitizeBypassPaths(paths []string) string {
+	seen := map[string]bool{}
+	parts := make([]string, 0, len(paths))
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if !bypassPathRE.MatchString(p) || seen[p] {
+			continue
+		}
+		seen[p] = true
+		parts = append(parts, regexp.QuoteMeta(p))
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "|" + strings.Join(parts, "|")
+}
+
+// sanitizeAliasServerNames re-validates the panel-supplied web domain
+// aliases (GH #1625) at the agent's config-generation trust boundary and
+// returns a server_name SUFFIX (" alias1 alias2", leading space) or ""
+// when none survive. Each entry is lower-cased, trimmed, and matched
+// against domainRegex — the SAME FQDN shape used for the primary domain
+// — so a value carrying a space, semicolon, brace, or newline (which
+// would break out of the `server_name ...;` directive) is DROPPED, never
+// emitted raw. Fail-closed, de-duplicated, and skips the primary domain
+// and www.<primary> (already in the hardcoded server_name) so no name is
+// listed twice.
+func sanitizeAliasServerNames(domain string, aliases []string) string {
+	primary := strings.ToLower(strings.TrimSpace(domain))
+	skip := map[string]bool{primary: true, "www." + primary: true}
+	seen := map[string]bool{}
+	names := make([]string, 0, len(aliases))
+	for _, a := range aliases {
+		a = strings.ToLower(strings.TrimSpace(a))
+		if a == "" || skip[a] || seen[a] || !domainRegex.MatchString(a) {
+			continue
+		}
+		seen[a] = true
+		names = append(names, a)
+	}
+	if len(names) == 0 {
+		return ""
+	}
+	return " " + strings.Join(names, " ")
+}
+
+// cacheQueryParamRE bounds an allowlist entry at the agent trust boundary:
+// lower-case alnum + underscore, 1-32 chars — the same guard the panel applies,
+// re-checked here so a name can never carry regex metacharacters into the
+// rendered config. Mirrors the sanitizeBypassPaths fail-safe.
+var cacheQueryParamRE = regexp.MustCompile(`^[a-z0-9_]{1,32}$`)
+
+// sanitizeCacheQueryAllowlist re-validates, lower-cases, de-dups, and sorts the
+// panel-supplied allowlist. Invalid entries are dropped fail-safe. Returns the
+// surviving sorted names (nil = feature off).
+func sanitizeCacheQueryAllowlist(names []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		n = strings.ToLower(strings.TrimSpace(n))
+		if !cacheQueryParamRE.MatchString(n) || seen[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	sort.Strings(out)
+	return out
+}
+
+// cacheQueryAllowRegex builds the anchored nginx regex that matches a query
+// string composed ONLY of allowlisted params with NON-EMPTY values, e.g.
+// `^(?:(?:paged|s)=[^&]+)(?:&(?:paged|s)=[^&]+)*$`. The value class is `[^&]+`
+// (non-empty) so it agrees with `if ($arg_<name>)` in the key builder — an
+// empty value (`?paged=`) is treated as dirty and bypasses, never colliding
+// with the base path. "" when no names (feature off). names must already be
+// sanitized (no regex metachars).
+func cacheQueryAllowRegex(names []string) string {
+	if len(names) == 0 {
+		return ""
+	}
+	alt := strings.Join(names, "|")
+	return `^(?:(?:` + alt + `)=[^&]+)(?:&(?:` + alt + `)=[^&]+)*$`
+}
+
+// buildCacheGate returns the regex BODY for the page-cache path gate
+// `^<body>(/|$)`, or "" meaning "no gate → cache the whole domain".
+//
+// GH #601: a domain can host several cache-enabled installs; paths is the union
+// of their path prefixes. Rules, in order:
+//   - any path is "/" (a root install) ⇒ whole domain cached ⇒ "" (no gate).
+//   - otherwise build an alternation of the VALID paths: each is sanitized
+//     INDIVIDUALLY (advisor); a path that doesn't match is SKIPPED (fail-safe
+//     under-cache), never collapsed to "/" (which would over-cache the domain).
+//   - if paths is empty or yields nothing usable, fall back to the single
+//     cache_path's legacy behaviour so callers stay byte-identical.
+func buildCacheGate(paths []string, fallback string) string {
+	singleGate := func() string {
+		fb := sanitizeCachePath(fallback)
+		if fb == "/" || fb == "" {
+			return ""
+		}
+		return "(" + regexp.QuoteMeta(fb) + ")"
+	}
+	if len(paths) == 0 {
+		return singleGate()
+	}
+	seen := map[string]bool{}
+	valid := make([]string, 0, len(paths))
+	for _, p := range paths {
+		p = strings.TrimSpace(p)
+		if p == "/" {
+			return "" // a root install caches everything
+		}
+		if !cachePathMultiSegRE.MatchString(p) || seen[p] {
+			continue // skip invalid/dupe — fail safe (under-cache), never "/"
+		}
+		seen[p] = true
+		valid = append(valid, regexp.QuoteMeta(p))
+	}
+	if len(valid) == 0 {
+		return singleGate()
+	}
+	return "(" + strings.Join(valid, "|") + ")"
+}
+
+// limitDirectives renders the vhost's server-level request limits: the rate
+// and connection limits, then the user-agent blocks, which ride in the same
+// template slot. A user-agent block needs 00-dotnext-bots.conf to exist, so
+// it is written (with an empty admin list) when it does not yet.
+func limitDirectives(p domainCreateParams) (string, error) {
+	out := BuildRateLimitDirectives(p.DomainID, p.RateLimitRPS, p.ConnectionLimit)
+	bots := BuildBotDirectives(p.BlockAICrawlers, p.BlockListedUserAgents)
+	if bots == "" {
+		return out, nil
+	}
+	if err := ensureNginxBotsFragment(); err != nil {
+		return "", &agentwire.AgentError{
+			Code:    agentwire.CodeInternal,
+			Message: fmt.Sprintf("write %s: %v", nginxBotsFragment, err),
+		}
+	}
+	return out + bots, nil
+}
+
+func writeVhost(ctx context.Context, username, domain, docRoot, phpVersion, redirectDirectives, ruleDirectives, customDirectives, rateLimitDirectives, ipACLDirectives, dirPrivacyDirectives, indexPriority string, isEnabled, hasPHP bool, sslCertPath, sslKeyPath, phpMemLimit, phpUploadMax, phpPostMax string, phpMaxInputVars, phpMaxExecTime, phpMaxInputTime int, phpDisplayErrors bool, phpErrorReporting *int, phpTimezone string, envVars []domainEnvVarParam, listenIPv4, listenIPv6 string, cacheEnabled bool, cachePath string, cachePaths []string, cacheBypassPaths []string, cacheTTLSeconds int, cacheQueryAllowlist []string, fpmSocket string, previewHost, previewCertPath, previewKeyPath string, interceptErrors, pathInfo, redirectHTTPS, serveHTTPS bool, aliases []string, phpFlags phpFlagPins, ownershipGate, phpFallback string) (string, error) {
+	// GH #1625: re-sanitize the panel-supplied aliases HERE (trust
+	// boundary) into the server_name suffix — never render them raw.
+	aliasServerNames := sanitizeAliasServerNames(domain, aliases)
+	cacheGate := buildCacheGate(cachePaths, cachePath)        // GH #601: multi-path gate body ("" = whole domain)
+	cacheExtraBypass := sanitizeBypassPaths(cacheBypassPaths) // GH #616: safe "|/path" suffix
+	cacheQAllowNames := sanitizeCacheQueryAllowlist(cacheQueryAllowlist)
+	cacheQAllowRegex := cacheQueryAllowRegex(cacheQAllowNames)
+	cachePath = sanitizeCachePath(cachePath)
+	cacheTTLSeconds = clampCacheTTL(cacheTTLSeconds)
+	// GH #329: default to the legacy per-user socket when the caller didn't
+	// specify one, so the vhost is byte-identical for default-pool domains.
+	if fpmSocket == "" {
+		fpmSocket = fmt.Sprintf("/run/php/dotnext-%s/fpm.sock", username)
+	}
+	// SSL cert may be referenced by the DB (ssl_cert_path set) but MISSING
+	// on disk — most commonly after a reinstall wiped /etc/letsencrypt while
+	// the panel DB kept the cert row. Emitting the 443 block with
+	// `ssl_certificate <missing-file>` makes `nginx -t` fail, and the
+	// rollback below then removes the WHOLE vhost — including the port-80
+	// ACME location — so the cert can never be re-obtained (GH #213: a full
+	// reinstall left the apex vhost absent, the HTTP-01 challenge 404'd, and
+	// the cert was stuck pending forever). Fall back to an HTTP-only vhost
+	// when the cert is absent; the reconciler's port-80 ACME location then
+	// re-issues the cert and the next reconcile pass restores the 443 block.
+	if sslCertPath != "" {
+		if _, statErr := os.Stat(sslCertPath); statErr != nil {
+			sslCertPath = ""
+			sslKeyPath = ""
+		}
+	}
+	// GH #896/#213: the redirect + :443 block only renders when RedirectHTTPS
+	// is set, and a redirect is meaningless (and #213-dangerous) without a cert
+	// file on disk. If the stat-fallback above just zeroed the cert path, force
+	// the redirect off too so we never emit `ssl_certificate <empty>;` — the
+	// :80 ACME location + docroot then serve HTTP-only until the cert re-lands.
+	if sslCertPath == "" {
+		redirectHTTPS = false
+		serveHTTPS = false
+	}
+	// A :80→:443 redirect without a :443 block would 301 every visitor
+	// into a connection refused — never render that combination.
+	if !serveHTTPS {
+		redirectHTTPS = false
+	}
+	// Same missing-file fallback for the preview wildcard pair: the shared
+	// *.preview.<hostname> cert may not be issued yet when the first
+	// preview-enabled domain converges — serve the preview HTTP-only until
+	// the reconciler's ACME sweep lands it.
+	if previewCertPath != "" {
+		if _, statErr := os.Stat(previewCertPath); statErr != nil {
+			previewCertPath = ""
+			previewKeyPath = ""
+		}
+	}
+	// The preview block only renders for enabled domains — a disabled
+	// domain's preview must go dark with it.
+	if !isEnabled {
+		previewHost = ""
+	}
+	// Preview upstream: hairpin into this domain's own vhost. Prefer the
+	// domain's bound listen IP (an IP-scoped listen won't answer on
+	// loopback); https whenever the main vhost serves TLS (post
+	// stat-guard, so a self-signed fallback pair counts) — the backend
+	// then sees is_ssl() true and never protocol-redirects into a loop.
+	previewUpstream := ""
+	if previewHost != "" {
+		upstreamAddr := "127.0.0.1"
+		if listenIPv4 != "" {
+			upstreamAddr = listenIPv4
+		}
+		// Hairpin to https only when the main vhost actually serves a :443
+		// block — ServeHTTPS (GH #896 bootstrap window / JAB-237 split).
+		// During the HTTP-only window the preview must proxy over http or
+		// it would hit a dead :443.
+		if serveHTTPS {
+			previewUpstream = "https://" + upstreamAddr + ":443"
+		} else {
+			previewUpstream = "http://" + upstreamAddr + ":80"
+		}
+	}
+
+	// The PHP error log pinned below lives in ~/logs, which must exist before
+	// the first request or PHP falls back to FastCGI stderr (php_error_log.go).
+	// The rotation stanza is written here too, not only on pool apply: an
+	// active pool is not re-applied until something changes it.
+	if hasPHP {
+		if _, err := ensureUserLogsDir(username); err != nil {
+			log.Printf("domain.create: %s: tenant logs dir: %v", domain, err)
+		} else if err := writePHPErrorLogrotate(username); err != nil {
+			log.Printf("domain.create: %s: PHP error log rotation: %v", domain, err)
+		}
+	}
+
+	// Generate vhost configuration
+	tmpl, err := template.New("vhost").Parse(vhostTemplate)
+	if err != nil {
+		return "", fmt.Errorf("template parse failed: %w", err)
+	}
+
+	h2 := nginxHTTP2()
+	vhostData := vhostData{
+		Domain:                     domain,
+		ExtraServerNames:           aliasServerNames,
+		PreviewHost:                previewHost,
+		PreviewCertPath:            previewCertPath,
+		PreviewKeyPath:             previewKeyPath,
+		PreviewUpstream:            previewUpstream,
+		OwnershipGate:              ownershipGate,
+		PanelHostGuard:             domainPanelHostGuard(domain, aliasServerNames),
+		HTTP2Param:                 h2.Param,
+		HTTP2Directive:             h2.Directive,
+		DocRoot:                    docRoot,
+		HasPHP:                     hasPHP,
+		PHPVersion:                 phpVersion,
+		Username:                   username,
+		FPMSocket:                  fpmSocket,
+		IndexDirective:             indexDirectiveFor(indexPriority),
+		DefaultPage:                defaultPagePath(domain),
+		RedirectDirectives:         redirectDirectives,
+		RuleDirectives:             ruleDirectives,
+		CustomDirectives:           customDirectives,
+		RateLimitDirectives:        rateLimitDirectives,
+		IPACLDirectives:            ipACLDirectives,
+		DirectoryPrivacyDirectives: dirPrivacyDirectives,
+		IsEnabled:                  isEnabled,
+		SSLCertPath:                sslCertPath,
+		SSLKeyPath:                 sslKeyPath,
+		RedirectHTTPS:              redirectHTTPS,
+		ServeHTTPS:                 serveHTTPS,
+		PHPMemoryLimit:             phpMemLimit,
+		PHPUploadMaxFilesize:       phpUploadMax,
+		PHPPostMaxSize:             phpPostMax,
+		PHPMaxInputVars:            phpMaxInputVars,
+		PHPMaxExecutionTime:        phpMaxExecTime,
+		PHPMaxInputTime:            phpMaxInputTime,
+		PHPValueParam:              withPHPErrorLog(withPHPFlagPins(buildPHPValueParam(hasPHP, phpMemLimit, phpUploadMax, phpPostMax, phpMaxInputVars, phpMaxExecTime, phpMaxInputTime, phpDisplayErrors, phpErrorReporting, phpTimezone), phpFlags), phpErrorLogPath(username, domain)),
+		PHPAdminValueParam:         buildPHPAdminValueParam(hasPHP, phpFlags.Admin),
+		EnvParams:                  buildEnvParams(hasPHP, envVars),
+		ListenIPv4:                 listenIPv4,
+		ListenIPv6:                 listenIPv6,
+		InterceptErrors:            interceptErrors,
+		EnablePathInfo:             pathInfo,
+		CacheEnabled:               cacheEnabled,
+		CachePath:                  cachePath,
+		CacheGate:                  cacheGate,
+		CacheExtraBypass:           cacheExtraBypass,
+		CacheQAllowRegex:           cacheQAllowRegex,
+		CacheQAllowNames:           cacheQAllowNames,
+		CacheKeyZone:               "dotnext_fcgi",
+		CacheTTL:                   fmt.Sprintf("%ds", cacheTTLSeconds),
+		CacheTTLSeconds:            cacheTTLSeconds,
+		CacheClientMaxAge:          300,
+		// RootOverridden tracks whether ANY user-controlled directive
+		// block declares `location /`. Both raw `customDirectives`
+		// (admin Raw Directives tab) and `ruleDirectives` (compiled
+		// from nginx_rules; Rule Builder proxy_pass with path=`/` is
+		// the common case) can collide with the template's default
+		// `location /`. Without checking both, a Rule Builder
+		// proxy_pass to `/` renders TWO `location /` blocks ->
+		// nginx -t emerg "duplicate location /" -> vhost rollback ->
+		// tenant domain falls through to a sibling vhost (the first
+		// specific-IP listener, usually a mail vhost). Caught
+		// 2026-06-04 on vpsjournal.com/yacht.vpsjournal.com.
+		RootOverridden: directivesOverrideRoot(customDirectives, ruleDirectives),
+		PHPFallback:    phpFallback,
+	}
+	if _, err := sanitizePHPFallback(phpFallback); err != nil {
+		log.Printf("domain.create %s: ignoring invalid php_fallback: %v", domain, err)
+	}
+
+	var vhostConfig bytes.Buffer
+	if err := tmpl.Execute(&vhostConfig, vhostData); err != nil {
+		return "", fmt.Errorf("template execute failed: %w", err)
+	}
+
+	configPath := filepath.Join("/etc/nginx/sites-available", domain+".conf")
+	enabledPath := filepath.Join("/etc/nginx/sites-enabled", domain+".conf")
+	wantBytes := vhostConfig.Bytes()
+
+	// Content-hash gate. The reconciler calls writeVhost on EVERY
+	// per-domain pass (~60s ticks). Without this gate, every tick
+	// rewrites every vhost + reloads nginx — puzzle's diagnostic
+	// saw 181 reloads/hr = constant Lua reinit = ~340 MB PSS bloat.
+	// Check before write: if the live file already matches AND the
+	// symlink already points at it, no write + no reload needed.
+	// JAB-71: hold the global nginx mutex across the whole decide→write→test→
+	// reload below, so a concurrent handler can't write a broken vhost between
+	// our `nginx -t` passing and our reload.
+	nginxOpMu.Lock()
+	defer nginxOpMu.Unlock()
+
+	existingBytes, readErr := os.ReadFile(configPath)
+	linkOK := false
+	if target, lerr := os.Readlink(enabledPath); lerr == nil && target == configPath {
+		linkOK = true
+	}
+	// GH #1701: the app snippets' PHP locations carry the same per-domain PHP
+	// values as the vhost's, and (GH #329) pass to the vhost's pool
+	// (php_pins_snippets.go). Their files ride the same gate, nginx -t and
+	// rollback as the vhost.
+	snippetSocket := ""
+	if vhostData.HasPHP {
+		snippetSocket = vhostData.FPMSocket
+	}
+	pinChanges := planPHPPinFiles(filepath.Join(nginxDotNextDir, domain), domain, username, renderPHPPinParams(vhostData), snippetSocket)
+	if readErr == nil && bytes.Equal(existingBytes, wantBytes) && linkOK && len(pinChanges) == 0 {
+		return configPath, nil
+	}
+	if err := applyPinFileChanges(pinChanges); err != nil {
+		return "", err
+	}
+	pinsTested := false
+	defer func() {
+		if !pinsTested {
+			revertPinFileChanges(pinChanges)
+		}
+	}()
+
+	// Write vhost configuration atomically (temp file + rename).
+	tmpFile := configPath + ".tmp"
+	if err := os.WriteFile(tmpFile, wantBytes, 0644); err != nil {
+		return "", fmt.Errorf("write config failed: %w", err)
+	}
+	if err := os.Rename(tmpFile, configPath); err != nil {
+		os.Remove(tmpFile)
+		return "", fmt.Errorf("rename config failed: %w", err)
+	}
+
+	// Create symlink to sites-enabled (always present for enabled or disabled domains).
+	if !linkOK {
+		os.Remove(enabledPath) // Remove if already exists
+		if err := os.Symlink(configPath, enabledPath); err != nil {
+			return "", fmt.Errorf("symlink failed: %w", err)
+		}
+	}
+
+	// Test nginx configuration.
+	testCmd := execCommandContext(ctx, "nginx", "-t")
+	var testOutput bytes.Buffer
+	testCmd.Stdout = &testOutput
+	testCmd.Stderr = &testOutput
+	if err := testCmd.Run(); err != nil {
+		// nginx rejected the newly-rendered vhost. Restore the last-good config
+		// if one existed so the domain keeps serving; only tear down a brand-new
+		// vhost that has no prior config to fall back to. Either way, surface the
+		// original rejection so the bad directive is reported on every ~60s tick.
+		// Put the snippet files back first: the restore below re-tests the
+		// last-good vhost, which must not fail on this pass's snippet change.
+		revertPinFileChanges(pinChanges)
+		pinsTested = true
+		restoreVhostAfterFailedTest(ctx, configPath, enabledPath, existingBytes, readErr == nil, linkOK)
+		return "", nginxTestFailure("domain.vhost", testOutput.String())
+	}
+	pinsTested = true
+
+	// Reload nginx.
+	reloadCmd := execCommandContext(ctx, "systemctl", "reload", "nginx")
+	var reloadOutput bytes.Buffer
+	reloadCmd.Stdout = &reloadOutput
+	reloadCmd.Stderr = &reloadOutput
+	if err := reloadCmd.Run(); err != nil {
+		return "", fmt.Errorf("systemctl reload nginx failed: %s", reloadOutput.String())
+	}
+
+	return configPath, nil
+}
+
+// restoreVhostAfterFailedTest recovers from an `nginx -t` failure inside
+// writeVhost. The reconciler calls writeVhost on every ~60s tick, so a vhost
+// whose newly-rendered content nginx rejects must NOT be deleted: nginx only
+// includes sites-enabled/*, so removing the file darkens the domain — it falls
+// through to a sibling or mail vhost on the next reboot or external reload — and
+// the failure recurs every tick while the bad value sits in the control-plane
+// DB. Instead restore the last-good config that was on disk before this pass.
+//
+//   - No prior config (hadConfig false): nothing to fall back to. Remove the
+//     brand-new vhost so a rejected first render is not left half-applied.
+//   - Prior config existed: rewrite it atomically and restore the exact prior
+//     symlink state, then re-run `nginx -t`. The old config normally passes, so
+//     the domain keeps serving last-good. If it now fails too (e.g. a cert file
+//     the old config referenced has since vanished), there is no safe state to
+//     hold — remove both, matching the pre-fix behaviour for that case.
+//
+// The caller still returns the ORIGINAL nginxTestFailure, so the tenant sees the
+// bad-directive error rather than the retest output. Runs under nginxOpMu, held
+// by the caller. Returns true when a config was left in place (last-good
+// restored), false when both files were removed.
+func restoreVhostAfterFailedTest(ctx context.Context, configPath, enabledPath string, existingBytes []byte, hadConfig, linkedBefore bool) bool {
+	if !hadConfig {
+		os.Remove(enabledPath)
+		os.Remove(configPath)
+		return false
+	}
+
+	// Restore the last-good content atomically (temp file + rename) so an
+	// external `nginx -s reload` (e.g. a certbot deploy hook) can never observe
+	// a half-written file through the restore window.
+	tmpFile := configPath + ".tmp"
+	if err := os.WriteFile(tmpFile, existingBytes, 0644); err != nil {
+		os.Remove(tmpFile)
+		os.Remove(enabledPath)
+		os.Remove(configPath)
+		return false
+	}
+	if err := os.Rename(tmpFile, configPath); err != nil {
+		os.Remove(tmpFile)
+		os.Remove(enabledPath)
+		os.Remove(configPath)
+		return false
+	}
+
+	// Restore the exact prior symlink state. If the domain was not linked before
+	// this pass, remove the symlink writeVhost created — do not "improve" state
+	// on a failure path. If it was linked, the symlink targets configPath (a
+	// path, not an inode), so the restored content is already live under it.
+	if !linkedBefore {
+		os.Remove(enabledPath)
+	}
+
+	// Re-validate the restored config. The last-good config almost always
+	// passes; if it does not, there is nothing safe to keep.
+	testCmd := execCommandContext(ctx, "nginx", "-t")
+	var discard bytes.Buffer
+	testCmd.Stdout = &discard
+	testCmd.Stderr = &discard
+	if err := testCmd.Run(); err != nil {
+		os.Remove(enabledPath)
+		os.Remove(configPath)
+		return false
+	}
+	return true
+}
+
+// resolveHTTPSFlags maps the wire params to the two vhost gates (JAB-237).
+// redirect_https absent → historical default (redirect iff a cert path is
+// set). serve_https absent (pre-JAB-237 panel) → coupled to the redirect,
+// which is the exact historical behaviour. The redirect⇒serve coercion
+// lives in writeVhost next to the cert stat-guard.
+func resolveHTTPSFlags(p *domainCreateParams) (redirectHTTPS, serveHTTPS bool) {
+	redirectHTTPS = p.SSLCertPath != ""
+	if p.RedirectHTTPS != nil {
+		redirectHTTPS = *p.RedirectHTTPS
+	}
+	serveHTTPS = redirectHTTPS
+	if p.ServeHTTPS != nil {
+		serveHTTPS = *p.ServeHTTPS
+	}
+	return redirectHTTPS, serveHTTPS
+}
+
+// docRootUnsafeChars are the bytes a document root may not carry: each would
+// end the `root` directive, open or close a block, start a comment or a
+// variable, quote the value, or split the line. This is a denylist on purpose:
+// existing rows may hold any well-formed path, and a tight allowlist here
+// would fail every reconcile of every domain.
+const docRootUnsafeChars = ";{}#$\"'\\ \t\r\n\x7f"
+
+// validateDocRootForNginx rejects a doc_root that would change the nginx config
+// it is rendered into (the `root` directive and the ACME location both use it).
+func validateDocRootForNginx(docRoot string) error {
+	if strings.Contains(docRoot, "..") {
+		return fmt.Errorf("path traversal not allowed")
+	}
+	for _, r := range docRoot {
+		if r < 0x20 || strings.ContainsRune(docRootUnsafeChars, r) {
+			return fmt.Errorf("character %q not allowed", r)
+		}
+	}
+	return nil
+}
+
+func domainCreateHandler(ctx context.Context, params json.RawMessage) (any, error) {
+	var p domainCreateParams
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: fmt.Sprintf("failed to parse params: %v", err),
+		}
+	}
+
+	// Validate domain format
+	if !domainRegex.MatchString(p.Domain) {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: fmt.Sprintf("invalid domain %q: must match ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$", p.Domain),
+		}
+	}
+
+	// Preview host is panel-derived (<slug>.preview.<hostname>) but
+	// validated like any hostname as defense in depth — it lands in a
+	// server_name directive.
+	if p.PreviewHost != "" && !domainRegex.MatchString(p.PreviewHost) {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: fmt.Sprintf("invalid preview_host %q", p.PreviewHost),
+		}
+	}
+
+	// GH #1816: the ownership gate lands in an nginx if() condition.
+	if p.OwnershipGate != "" && !ownershipGateRegex.MatchString(p.OwnershipGate) {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: "invalid ownership_gate: must be 32-64 lowercase hex characters",
+		}
+	}
+
+	// Validate username format
+	if !usernameRegex.MatchString(p.Username) {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: fmt.Sprintf("invalid username %q: must match ^[a-z_][a-z0-9_-]{0,31}$", p.Username),
+		}
+	}
+
+	// Validate doc_root starts with /home/
+	if !bytes.HasPrefix([]byte(p.DocRoot), []byte("/home/")) {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: fmt.Sprintf("invalid doc_root %q: must start with /home/", p.DocRoot),
+		}
+	}
+	if err := validateDocRootForNginx(p.DocRoot); err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInvalidArgument,
+			Message: fmt.Sprintf("invalid doc_root %q: %v", p.DocRoot, err),
+		}
+	}
+
+	// Provision the docroot through a filesafe scope rooted at the tenant's own
+	// home (Gitea #476). doc_root components (domains/<domain>/public_html) are
+	// tenant-controlled; a pre-planted symlink would let a plain root mkdir -p /
+	// chown / chmod be redirected outside the home subtree (or into another
+	// tenant). openat2 RESOLVE_BENEATH refuses any symlinked component and binds
+	// the path to /home/<user>.
+	homeDir := "/home/" + p.Username
+	docScope, scErr := filesafe.NewScope(p.Username, p.Username, []string{homeDir})
+	if scErr != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: "scope init: " + scErr.Error()}
+	}
+	docrootCreated, err := docScope.MkdirInScope(p.DocRoot, true, 0o755)
+	if err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInternal,
+			Message: fmt.Sprintf("mkdir failed: %v", err),
+		}
+	}
+
+	// Resolve uid (tenant) + gid (www-data) for the fd-based chown.
+	docUser, duErr := user.Lookup(p.Username)
+	if duErr != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeFailedPrecondition, Message: fmt.Sprintf("user %q not found: %v", p.Username, duErr)}
+	}
+	docUID, _ := parseUID(docUser)
+	wwwGID, wgErr := lookupGroup("www-data")
+	if wgErr != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: "lookup www-data: " + wgErr.Error()}
+	}
+
+	// Chown + chmod every directory we created under /home/<user>/, not just
+	// the leaf — via directory fds (fchown/fchmod, symlink-safe). 2750: the
+	// setgid bit makes files the app (PHP-FPM, group=<user>) later creates
+	// inherit the docroot's www-data group, so nginx can read uploads (GH
+	// #194-adjacent). os.ModeSetgid is the portable spelling of the 02000 bit.
+	for _, dir := range pathsUnderHome(p.Username, p.DocRoot) {
+		df, derr := docScope.OpenDirInScope(dir)
+		if derr != nil {
+			return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("open %s: %v", dir, derr)}
+		}
+		if err := df.Chown(docUID, wwwGID); err != nil {
+			_ = df.Close()
+			return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("chown %s: %v", dir, err)}
+		}
+		if err := df.Chmod(os.ModeSetgid | 0o750); err != nil {
+			_ = df.Close()
+			return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("chmod %s: %v", dir, err)}
+		}
+		_ = df.Close()
+	}
+
+	// GH #465: lay the operator's account skeleton into the fresh docroot.
+	// Never clobbers an existing path; a bad file warns but doesn't fail
+	// create.
+	for _, w := range layAccountSkeleton(docScope, docrootCreated, p.DocRoot, p.Username, docUID, wwwGID, p.Skeleton) {
+		log.Printf("domain.create: skeleton %s: %s", p.Domain, w)
+	}
+
+	// GH #2422: the default page for a site with no index file is served
+	// by nginx from outside the docroot (the index directive's last entry),
+	// so nothing is written into the tenant's folder for them to delete.
+	// Rendered on every converge so an edited page template reaches every
+	// domain; written only when it changed.
+	if werr := writeDefaultPage(p.Username, p.Domain, p.DocRoot, p.DefaultIndexTemplate); werr != nil {
+		// non-fatal — the vhost still works; a site with no index file
+		// answers 404 until the page is written.
+		log.Printf("domain.create: failed to write the default page for %s: %v", p.Domain, werr)
+	}
+
+	// Default IsEnabled to true if not provided (backwards compatibility)
+	isEnabled := true
+	if p.IsEnabled != nil {
+		isEnabled = *p.IsEnabled
+	}
+
+	rateLimitDirectives, err := limitDirectives(p)
+	if err != nil {
+		return nil, err
+	}
+	ipACLDirectives := buildIPACLDirectives(p.IPACLs)
+	// M50: write htpasswd files first; on failure, do NOT write the vhost
+	// (leaves nginx pointing at non-existent files = nginx -t fails).
+	if _, err := syncDirectoryPrivacyFiles(p.DirectoryPrivacyRules, p.DirectoryPrivacyRuleIDs); err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInternal,
+			Message: err.Error(),
+		}
+	}
+	dirPrivacyDirectives := buildDirectoryPrivacyDirectives(p.DirectoryPrivacyRules)
+	// GH #896: default to the historical "redirect whenever a cert is present"
+	// so a pre-#896 panel that omits redirect_https keeps working. A current
+	// panel always sends the field; writeVhost still forces it false if the
+	// cert file turns out to be missing on disk (#213).
+	redirectHTTPS, serveHTTPS := resolveHTTPSFlags(&p)
+	phpFlags := phpFlagPinsForParams(ctx, &p)
+	configPath, err := writeVhost(ctx, p.Username, p.Domain, p.DocRoot, p.PHPVersion, p.RedirectDirectives, p.RuleDirectives, p.CustomDirectives, rateLimitDirectives, ipACLDirectives, dirPrivacyDirectives, p.IndexPriority, isEnabled, p.HasPHP, p.SSLCertPath, p.SSLKeyPath, p.PHPMemoryLimit, p.PHPUploadMaxFilesize, p.PHPPostMaxSize, p.PHPMaxInputVars, p.PHPMaxExecutionTime, p.PHPMaxInputTime, p.PHPDisplayErrors, p.PHPErrorReporting, p.PHPTimezone, p.EnvVars, p.ListenIPv4, p.ListenIPv6, p.CacheEnabled, p.CachePath, p.CachePaths, p.CacheBypassPaths, p.CacheTTLSeconds, p.CacheQueryAllowlist, p.FPMSocket, p.PreviewHost, p.PreviewCertPath, p.PreviewKeyPath, p.InterceptErrors, p.PathInfo, redirectHTTPS, serveHTTPS, p.Aliases, phpFlags, p.OwnershipGate, p.PHPFallback)
+	if err != nil {
+		return nil, &agentwire.AgentError{
+			Code:    agentwire.CodeInternal,
+			Message: err.Error(),
+		}
+	}
+
+	// #430 interim: self-healing re-tighten of docroot secrets (wp-config.php /
+	// .env) to 0600 every reconcile — backfills existing installs + re-tightens
+	// anything widened via the file manager.
+	hardenSensitiveFilesInScope(p.Username, p.DocRoot)
+
+	return domainCreateResponse{
+		Domain:     p.Domain,
+		DocRoot:    p.DocRoot,
+		ConfigPath: configPath,
+	}, nil
+}
+
+// skeletonFileParam is one account-skeleton file on the domain.create wire.
+// Content marshals as base64 (Go's []byte JSON encoding).
+type skeletonFileParam struct {
+	RelPath string `json:"rel_path"`
+	Content []byte `json:"content"`
+}
+
+// layAccountSkeleton writes the skeleton tree only when THIS call actually
+// created the docroot. domain.create is re-run by the reconciler every tick;
+// an unconditional write resurrected every skeleton file the user had deleted
+// (the #465 reopen — "I press delete ... when refreshing the file reappears").
+// O_EXCL in writeSkeleton protects edited files but not deleted ones;
+// docrootCreated is the "this is a new account/domain" signal.
+func layAccountSkeleton(scope *filesafe.Scope, docrootCreated bool, docRoot, username string, docUID, wwwGID int, files []skeletonFileParam) []string {
+	if !docrootCreated || len(files) == 0 {
+		return nil
+	}
+	return writeSkeleton(scope, docRoot, username, docUID, wwwGID, files)
+}
+
+// writeSkeleton lays each skeleton file into the fresh docroot through the
+// symlink-safe scope: re-validate the path (defense in depth — a poisoned DB
+// row must not escape the docroot), create parent dirs chowned <user>:www-data
+// + setgid, and write the file with O_EXCL|O_NOFOLLOW so it NEVER clobbers an
+// existing path or follows a planted symlink, then chown <user>:www-data 0644.
+// A bad file is collected as a warning; it must not fail the whole
+// domain.create.
+func writeSkeleton(scope *filesafe.Scope, docRoot, username string, docUID, wwwGID int, files []skeletonFileParam) []string {
+	var warns []string
+	for _, f := range files {
+		if err := skelpath.Validate(f.RelPath); err != nil {
+			warns = append(warns, fmt.Sprintf("%q rejected: %v", f.RelPath, err))
+			continue
+		}
+		target := filepath.Join(docRoot, f.RelPath)
+		if rel, rerr := filepath.Rel(docRoot, target); rerr != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+			warns = append(warns, fmt.Sprintf("%q escapes docroot", f.RelPath))
+			continue
+		}
+		// No clobber: skip a path that already exists (real content, a re-run).
+		if _, err := os.Lstat(target); err == nil {
+			continue
+		}
+		// Create parent dirs symlink-safely, then chown/setgid every dir on the
+		// chain (idempotent for ones that already existed).
+		if _, err := scope.MkdirInScope(filepath.Dir(target), true, 0o755); err != nil {
+			warns = append(warns, fmt.Sprintf("mkdir for %q: %v", f.RelPath, err))
+			continue
+		}
+		for _, dir := range pathsUnderHome(username, filepath.Dir(target)) {
+			df, derr := scope.OpenDirInScope(dir)
+			if derr != nil {
+				continue
+			}
+			_ = df.Chown(docUID, wwwGID)
+			_ = df.Chmod(os.ModeSetgid | 0o750)
+			_ = df.Close()
+		}
+		fh, oerr := scope.Open(target, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o644)
+		if oerr != nil {
+			warns = append(warns, fmt.Sprintf("create %q: %v", f.RelPath, oerr))
+			continue
+		}
+		if _, werr := fh.Write(f.Content); werr != nil {
+			_ = fh.Close()
+			warns = append(warns, fmt.Sprintf("write %q: %v", f.RelPath, werr))
+			continue
+		}
+		_ = fh.Chmod(0o644) // O_CREATE perm is umask-masked; force 0644
+		_ = fh.Close()
+		if cerr := scope.ChownToUser(target, docUID, wwwGID); cerr != nil {
+			warns = append(warns, fmt.Sprintf("chown %q: %v", f.RelPath, cerr))
+		}
+	}
+	return warns
+}
+
+// defaultPagesDir holds the page nginx serves for a site with no index file
+// (GH #2422): one file per domain, outside every docroot. root:www-data, so
+// nginx's workers read it and no tenant can write it. Tests point it, and
+// defaultPageGroup, at their own.
+var (
+	defaultPagesDir  = "/var/www/dotnext-default-pages"
+	defaultPageGroup = "www-data"
+)
+
+// defaultPageURI is the index directive's last entry: nginx makes an internal
+// redirect to it when none of the site's own index files exist, and the
+// vhost's exact location for it serves the domain's file from defaultPagesDir.
+const defaultPageURI = "/dotnext-default-page.html"
+
+func defaultPagePath(domain string) string {
+	return filepath.Join(defaultPagesDir, domain+".html")
+}
+
+// writeDefaultPage renders the default page of domain into defaultPagesDir,
+// rewriting it only when it changed. customTmpl is the admin's page template;
+// empty or malformed means the built-in. The page is public, so the built-in
+// names only the domain; a custom template can still use {{.Username}} and
+// {{.DocRoot}}. domain is expected pre-validated (domainRegex) by the caller.
+func writeDefaultPage(username, domain, docRoot, customTmpl string) error {
+	const builtin = `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{.Domain}}</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; max-width: 640px; margin: 4rem auto; padding: 0 1.25rem; color: #222; line-height: 1.5; }
+    h1 { color: #1976d2; margin-bottom: 0.25em; }
+    .muted { color: #666; margin-top: 0; }
+    code { background: #f5f5f5; padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.92em; font-family: ui-monospace, Menlo, Consolas, monospace; }
+    hr { border: none; border-top: 1px solid #eee; margin: 2rem 0; }
+    small { color: #888; }
+  </style>
+</head>
+<body>
+  <h1>{{.Domain}}</h1>
+  <p class="muted">This domain is hosted by DotNext Panel. The site is provisioned and waiting for its content.</p>
+</body>
+</html>
+`
+
+	tmplBody := builtin
+	if strings.TrimSpace(customTmpl) != "" {
+		tmplBody = customTmpl
+	}
+	t, err := template.New("index").Parse(tmplBody)
+	if err != nil {
+		// Malformed operator template — don't crash domain.create;
+		// fall back to the built-in so the site still shows something.
+		t, err = template.New("index").Parse(builtin)
+		if err != nil {
+			return fmt.Errorf("parse template: %w", err)
+		}
+	}
+	data := struct {
+		Domain, Username, DocRoot string
+	}{Domain: domain, Username: username, DocRoot: docRoot}
+	var page bytes.Buffer
+	if err := t.Execute(&page, data); err != nil {
+		return fmt.Errorf("execute template: %w", err)
+	}
+
+	gid, err := lookupGroup(defaultPageGroup)
+	if err != nil {
+		return fmt.Errorf("lookup %s: %w", defaultPageGroup, err)
+	}
+	if err := os.MkdirAll(defaultPagesDir, 0o750); err != nil {
+		return fmt.Errorf("create %s: %w", defaultPagesDir, err)
+	}
+	if err := os.Chown(defaultPagesDir, -1, gid); err != nil {
+		return fmt.Errorf("chown %s: %w", defaultPagesDir, err)
+	}
+	if err := os.Chmod(defaultPagesDir, 0o750); err != nil {
+		return fmt.Errorf("chmod %s: %w", defaultPagesDir, err)
+	}
+
+	path := defaultPagePath(domain)
+	if cur, err := os.ReadFile(path); err == nil && bytes.Equal(cur, page.Bytes()) {
+		return nil
+	}
+	// Temp file + rename, so nginx never serves a half-written page.
+	tmp, err := os.CreateTemp(defaultPagesDir, ".page.*.tmp")
+	if err != nil {
+		return fmt.Errorf("create temp: %w", err)
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName) // cleanup if rename fails
+	if _, err := tmp.Write(page.Bytes()); err != nil {
+		tmp.Close()
+		return fmt.Errorf("write temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temp: %w", err)
+	}
+	if err := os.Chown(tmpName, -1, gid); err != nil {
+		return fmt.Errorf("chown: %w", err)
+	}
+	if err := os.Chmod(tmpName, 0o640); err != nil {
+		return fmt.Errorf("chmod: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("rename: %w", err)
+	}
+	return nil
+}
+
+func init() {
+	Default.Register("domain.create", domainCreateHandler)
+}
+
+// buildIPACLDirectives renders the M36 per-domain ACL list into a
+// fragment of nginx directives — one line per rule. Inserted into the
+// vhost server block so allow/deny applies to every location.
+//
+// Sanitises both fields: only rules with action ∈ {allow, deny} and
+// CIDR matching a permissive ASCII subset (digits, dots, colons,
+// hex, slash) reach the file. Anything else is silently dropped.
+//
+// Empty input → empty string (zero overhead, no comment line).
+func buildIPACLDirectives(rules []domainIPACLRule) string {
+	if len(rules) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("# M36 per-domain ACLs (priority order)\n")
+	for _, r := range rules {
+		action := r.Action
+		if action != "allow" && action != "deny" {
+			continue
+		}
+		cidr := strings.TrimSpace(r.CIDR)
+		if !validACLCIDR(cidr) {
+			continue
+		}
+		sb.WriteString("    ")
+		sb.WriteString(action)
+		sb.WriteString(" ")
+		sb.WriteString(cidr)
+		sb.WriteString(";\n")
+	}
+	return sb.String()
+}
+
+// validACLCIDR is a defensive whitelist of characters allowed in a
+// CIDR string. The panel validates with net.ParseCIDR before storage,
+// so this is belt-and-braces against a corrupted DB row containing
+// shell/nginx metacharacters that could escape the directive.
+func validACLCIDR(s string) bool {
+	if s == "" || len(s) > 64 {
+		return false
+	}
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+		case r >= 'a' && r <= 'f':
+		case r >= 'A' && r <= 'F':
+		case r == '.' || r == ':' || r == '/':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// rootLocationRE matches a `location /` block opening for any nginx
+// modifier where the URI is exactly "/" (a single slash, not "/foo").
+// Used by writeVhost to detect when custom directives override the
+// default root location so the template can omit its own (duplicate
+// `location /` is an nginx parse error). Supports:
+//
+//	location /             { ... }   prefix match
+//	location = /           { ... }   exact match
+//	location ^~ /          { ... }   preferential prefix
+//	location ~ /           { ... }   regex (rare but legal)
+//	location ~* /          { ... }   case-insensitive regex
+//
+// Anchored to a line boundary so a comment line containing the literal
+// text doesn't fire a false positive.
+var rootLocationRE = regexp.MustCompile(`(?m)(?:^|\n)\s*location\s+(?:(?:=|\^~|~\*?)\s+)?/\s*\{`)
+
+// customDirectivesOverrideRoot reports whether s declares its own
+// `location /` block. When true, writeVhost passes RootOverridden=true
+// to the template and the default `location /` + `location ~ \.php$`
+// blocks are omitted from the rendered vhost so the operator's custom
+// routing wins. Empty string and whitespace-only strings return false.
+func customDirectivesOverrideRoot(s string) bool {
+	if strings.TrimSpace(s) == "" {
+		return false
+	}
+	return rootLocationRE.MatchString(s)
+}
+
+// directivesOverrideRoot reports whether any of the supplied directive
+// blocks declares its own `location /`. Used by writeVhost to combine
+// the raw custom-directives textarea AND the compiled nginx_rules
+// (Rule Builder) into a single override signal. Either source can
+// produce a `location /` block (rule type=proxy_pass + path="/" is the
+// common Rule Builder case), and missing either source means a silent
+// "duplicate location /" emerg the next time nginx -t runs.
+func directivesOverrideRoot(blocks ...string) bool {
+	for _, b := range blocks {
+		if customDirectivesOverrideRoot(b) {
+			return true
+		}
+	}
+	return false
+}

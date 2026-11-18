@@ -1,0 +1,543 @@
+package api
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"testing"
+
+	"github.com/alicebob/miniredis/v2"
+	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
+	"github.com/stretchr/testify/require"
+
+	"github.com/dotnext-panel/dotnext/internal/auth"
+	"github.com/dotnext-panel/dotnext/internal/ginctx"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/notifications"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+)
+
+// --- fakes ---
+
+type fakeChannelsRepo struct {
+	mu   sync.Mutex
+	rows map[string]*models.NotificationChannel
+}
+
+func (f *fakeChannelsRepo) Create(_ context.Context, ch *models.NotificationChannel) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.rows == nil {
+		f.rows = map[string]*models.NotificationChannel{}
+	}
+	dup := *ch
+	f.rows[ch.ID] = &dup
+	return nil
+}
+func (f *fakeChannelsRepo) Update(_ context.Context, ch *models.NotificationChannel) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.rows[ch.ID]; !ok {
+		return repository.ErrNotFound
+	}
+	dup := *ch
+	f.rows[ch.ID] = &dup
+	return nil
+}
+func (f *fakeChannelsRepo) Delete(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.rows[id]; !ok {
+		return repository.ErrNotFound
+	}
+	delete(f.rows, id)
+	return nil
+}
+func (f *fakeChannelsRepo) FindByID(_ context.Context, id string) (*models.NotificationChannel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	ch, ok := f.rows[id]
+	if !ok {
+		return nil, repository.ErrNotFound
+	}
+	out := *ch
+	return &out, nil
+}
+func (f *fakeChannelsRepo) ListAll(_ context.Context, _ repository.ListOptions) ([]models.NotificationChannel, int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]models.NotificationChannel, 0, len(f.rows))
+	for _, r := range f.rows {
+		out = append(out, *r)
+	}
+	return out, int64(len(out)), nil
+}
+func (f *fakeChannelsRepo) FindEnabledByKind(context.Context, string) ([]models.NotificationChannel, error) {
+	return nil, nil
+}
+func (f *fakeChannelsRepo) FindEnabledAll(context.Context) ([]models.NotificationChannel, error) {
+	return nil, nil
+}
+
+func (f *fakeChannelsRepo) FindEnabledServerWide(context.Context) ([]models.NotificationChannel, error) {
+	return nil, nil
+}
+
+func (f *fakeChannelsRepo) ListByUser(_ context.Context, userID string) ([]models.NotificationChannel, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]models.NotificationChannel, 0)
+	for _, r := range f.rows {
+		if r.UserID != nil && *r.UserID == userID {
+			out = append(out, *r)
+		}
+	}
+	return out, nil
+}
+
+func (f *fakeChannelsRepo) SealAllPlaintext(context.Context) (int, error) { return 0, nil }
+
+// --- test plumbing ---
+
+func newAdminCtx() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ginctx.SetClaims(c, &auth.AccessClaims{UserID: "admin1", IsAdmin: true})
+		c.Next()
+	}
+}
+
+func newUserCtx() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ginctx.SetClaims(c, &auth.AccessClaims{UserID: "u1", IsAdmin: false})
+		c.Next()
+	}
+}
+
+func newChannelsRouter(t *testing.T, repo repository.NotificationChannelRepository, queue *notifications.Queue, auth gin.HandlerFunc) *gin.Engine {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	g := r.Group("/api/v1")
+	if auth != nil {
+		g.Use(auth)
+	}
+	RegisterNotificationsChannelsRoutes(g, NotificationsChannelsHandlerConfig{
+		Channels: repo,
+		Queue:    queue,
+	})
+	return r
+}
+
+func newQueueForChannelTest(t *testing.T) (*notifications.Queue, *miniredis.Miniredis) {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	c := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = c.Close() })
+	return notifications.NewQueue(c), mr
+}
+
+func doNotifJSON(t *testing.T, r *gin.Engine, method, path string, body any) *httptest.ResponseRecorder {
+	t.Helper()
+	var reader *bytes.Reader
+	if body != nil {
+		b, err := json.Marshal(body)
+		require.NoError(t, err)
+		reader = bytes.NewReader(b)
+	} else {
+		reader = bytes.NewReader(nil)
+	}
+	req := httptest.NewRequest(method, path, reader)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec
+}
+
+// --- tests ---
+
+func TestChannels_Create_SlackHappy(t *testing.T) {
+	t.Parallel()
+	repo := &fakeChannelsRepo{}
+	r := newChannelsRouter(t, repo, nil, newAdminCtx())
+	rec := doNotifJSON(t, r, http.MethodPost, "/api/v1/admin/notifications/channels", map[string]any{
+		"name":   "Ops Slack",
+		"kind":   "slack",
+		"config": map[string]any{"url": "https://hooks.slack.com/services/T/B/X"},
+	})
+	require.Equal(t, http.StatusCreated, rec.Code, rec.Body.String())
+	var out models.NotificationChannel
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &out))
+	require.NotEmpty(t, out.ID)
+	require.True(t, out.Enabled)
+}
+
+func TestChannels_Create_UnknownKindIs422(t *testing.T) {
+	t.Parallel()
+	repo := &fakeChannelsRepo{}
+	r := newChannelsRouter(t, repo, nil, newAdminCtx())
+	rec := doNotifJSON(t, r, http.MethodPost, "/api/v1/admin/notifications/channels", map[string]any{
+		"name":   "bogus",
+		"kind":   "nope",
+		"config": map[string]any{},
+	})
+	require.Equal(t, http.StatusUnprocessableEntity, rec.Code)
+}
+
+func TestChannels_Create_WebhookShortHMACIs422(t *testing.T) {
+	t.Parallel()
+	repo := &fakeChannelsRepo{}
+	r := newChannelsRouter(t, repo, nil, newAdminCtx())
+	rec := doNotifJSON(t, r, http.MethodPost, "/api/v1/admin/notifications/channels", map[string]any{
+		"name":   "wh",
+		"kind":   "webhook",
+		"config": map[string]any{"url": "https://panel/x", "hmac_secret": "short"},
+	})
+	require.Equal(t, http.StatusUnprocessableEntity, rec.Code)
+	require.Contains(t, rec.Body.String(), "hmac_secret")
+}
+
+func TestChannels_Create_NtfyNonHTTPURLIs422(t *testing.T) {
+	t.Parallel()
+	repo := &fakeChannelsRepo{}
+	r := newChannelsRouter(t, repo, nil, newAdminCtx())
+	rec := doNotifJSON(t, r, http.MethodPost, "/api/v1/admin/notifications/channels", map[string]any{
+		"name":   "n",
+		"kind":   "ntfy",
+		"config": map[string]any{"url": "ws://x"},
+	})
+	require.Equal(t, http.StatusUnprocessableEntity, rec.Code)
+}
+
+func TestChannels_Create_NonAdminIs403(t *testing.T) {
+	t.Parallel()
+	repo := &fakeChannelsRepo{}
+	r := newChannelsRouter(t, repo, nil, newUserCtx())
+	rec := doNotifJSON(t, r, http.MethodPost, "/api/v1/admin/notifications/channels", map[string]any{
+		"name":   "x",
+		"kind":   "slack",
+		"config": map[string]any{"url": "https://x"},
+	})
+	require.Equal(t, http.StatusForbidden, rec.Code)
+}
+
+func TestChannels_List(t *testing.T) {
+	t.Parallel()
+	repo := &fakeChannelsRepo{rows: map[string]*models.NotificationChannel{
+		"a": {ID: "a", Name: "Ops", Kind: "slack", Enabled: true, Config: models.NotificationChannelConfig{URL: "https://x"}},
+	}}
+	r := newChannelsRouter(t, repo, nil, newAdminCtx())
+	rec := doNotifJSON(t, r, http.MethodGet, "/api/v1/admin/notifications/channels", nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp channelListResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Equal(t, 1, resp.Total)
+	require.Len(t, resp.Data, 1)
+	require.Equal(t, 1, resp.Page)
+	require.Greater(t, resp.PageSize, 0)
+}
+
+func TestChannels_Update_Partial(t *testing.T) {
+	t.Parallel()
+	repo := &fakeChannelsRepo{rows: map[string]*models.NotificationChannel{
+		"a": {ID: "a", Name: "Ops", Kind: "slack", Enabled: true, Config: models.NotificationChannelConfig{URL: "https://x"}},
+	}}
+	r := newChannelsRouter(t, repo, nil, newAdminCtx())
+	enabled := false
+	rec := doNotifJSON(t, r, http.MethodPatch, "/api/v1/admin/notifications/channels/a", map[string]any{"enabled": enabled})
+	require.Equal(t, http.StatusOK, rec.Code)
+	row, err := repo.FindByID(context.Background(), "a")
+	require.NoError(t, err)
+	require.False(t, row.Enabled)
+	require.Equal(t, "Ops", row.Name) // untouched
+}
+
+// JAB-171 phase 4e: an admin can disable ANY channel, including a tenant-owned
+// one (admin override) — the admin surface is not ownership-scoped.
+func TestChannels_AdminCanDisableTenantChannel(t *testing.T) {
+	t.Parallel()
+	uid := "tenant1"
+	repo := &fakeChannelsRepo{rows: map[string]*models.NotificationChannel{
+		"t": {ID: "t", Name: "TenantNtfy", Kind: "ntfy", Enabled: true, UserID: &uid, Config: models.NotificationChannelConfig{URL: "https://ntfy.sh/x"}},
+	}}
+	r := newChannelsRouter(t, repo, nil, newAdminCtx())
+	rec := doNotifJSON(t, r, http.MethodPatch, "/api/v1/admin/notifications/channels/t", map[string]any{"enabled": false})
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	row, err := repo.FindByID(context.Background(), "t")
+	require.NoError(t, err)
+	require.False(t, row.Enabled, "admin must be able to disable a tenant channel")
+	require.NotNil(t, row.UserID)
+}
+
+// mapUserRepo resolves users by id (unlike the single-user fakeUserRepo), so a
+// test can prove an admin edit forces a tenant email channel to the ROW OWNER's
+// address rather than the admin caller's.
+type mapUserRepo struct {
+	repository.UserRepository
+	users map[string]*models.User
+}
+
+func (m *mapUserRepo) FindByID(_ context.Context, id string) (*models.User, error) {
+	u, ok := m.users[id]
+	if !ok {
+		return nil, nil
+	}
+	return u, nil
+}
+
+func newChannelsRouterU(t *testing.T, repo repository.NotificationChannelRepository, users repository.UserRepository, auth gin.HandlerFunc) *gin.Engine {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	g := r.Group("/api/v1")
+	if auth != nil {
+		g.Use(auth)
+	}
+	RegisterNotificationsChannelsRoutes(g, NotificationsChannelsHandlerConfig{
+		Channels: repo,
+		Users:    users,
+	})
+	return r
+}
+
+// JAB-308 AC1/AC2: an admin edit of a tenant-owned email channel must re-force
+// the own-address / local-submission invariant, so an admin can't repoint a
+// tenant's email channel at an arbitrary destination or a custom SMTP relay.
+// The forcing must target the ROW OWNER's address, not the admin caller's, and
+// must run after secret-preservation (a stored SMTP password gets cleared, not
+// re-hydrated back onto a forced-local channel).
+func TestChannels_AdminEditTenantEmail_ReforcesOwnerAddress(t *testing.T) {
+	t.Parallel()
+	uid := "u1"
+	repo := &fakeChannelsRepo{rows: map[string]*models.NotificationChannel{
+		"t": {ID: "t", Name: "TenantMail", Kind: "email", Enabled: true, UserID: &uid,
+			Config: models.NotificationChannelConfig{
+				ToEmail: "u1@example.com", FromEmail: "u1@example.com", SMTPMode: "local",
+				SMTPPassword: "old-secret", // stored secret; forcing must clear it, not preserve rehydrate it
+			}},
+	}}
+	users := &mapUserRepo{users: map[string]*models.User{
+		"u1":     {ID: "u1", Email: "u1@example.com"},
+		"admin1": {ID: "admin1", Email: "admin@example.com"},
+	}}
+	r := newChannelsRouterU(t, repo, users, newAdminCtx())
+
+	// Admin tries to repoint the tenant channel at an arbitrary destination +
+	// custom relay; omit smtp_password so PreserveEmptySecrets would re-hydrate
+	// the stored one — the forcing must still clear it (order: preserve→force).
+	rec := doNotifJSON(t, r, http.MethodPatch, "/api/v1/admin/notifications/channels/t", map[string]any{
+		"config": map[string]any{
+			"to_email":   "victim@evil.com",
+			"from_email": "spoof@evil.com",
+			"smtp_mode":  "smtp",
+			"smtp_host":  "10.0.0.1",
+			"smtp_port":  2525,
+		},
+	})
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	row, err := repo.FindByID(context.Background(), "t")
+	require.NoError(t, err)
+	require.Equal(t, "u1@example.com", row.Config.ToEmail, "must force to the ROW OWNER address")
+	require.NotEqual(t, "admin@example.com", row.Config.ToEmail, "must NOT force to the admin caller's address")
+	require.Equal(t, "u1@example.com", row.Config.FromEmail)
+	require.Equal(t, "local", row.Config.SMTPMode)
+	require.Empty(t, row.Config.SMTPHost, "custom relay host must be discarded")
+	require.Empty(t, row.Config.SMTPPassword, "stored secret must be cleared by forcing, not re-hydrated")
+	require.NotContains(t, rec.Body.String(), "evil.com")
+}
+
+// A server-wide (unowned) email channel is NOT a tenant channel, so an admin
+// keeps full control of its destination and custom SMTP relay.
+func TestChannels_AdminEditServerWideEmail_KeepsCustomRelay(t *testing.T) {
+	t.Parallel()
+	repo := &fakeChannelsRepo{rows: map[string]*models.NotificationChannel{
+		"s": {ID: "s", Name: "OpsMail", Kind: "email", Enabled: true, // UserID nil = server-wide
+			Config: models.NotificationChannelConfig{ToEmail: "ops@corp.example", FromEmail: "ops@corp.example", SMTPMode: "smtp", SMTPHost: "smtp.corp.example", SMTPPort: 587}},
+	}}
+	users := &mapUserRepo{users: map[string]*models.User{}}
+	r := newChannelsRouterU(t, repo, users, newAdminCtx())
+
+	rec := doNotifJSON(t, r, http.MethodPatch, "/api/v1/admin/notifications/channels/s", map[string]any{
+		"config": map[string]any{
+			"to_email":   "ops2@corp.example",
+			"from_email": "ops2@corp.example",
+			"smtp_mode":  "smtp",
+			"smtp_host":  "smtp2.corp.example",
+			"smtp_port":  2587,
+		},
+	})
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	row, err := repo.FindByID(context.Background(), "s")
+	require.NoError(t, err)
+	require.Equal(t, "ops2@corp.example", row.Config.ToEmail, "server-wide channel keeps its destination")
+	require.Equal(t, "smtp2.corp.example", row.Config.SMTPHost, "server-wide channel keeps a custom relay")
+	require.Equal(t, "smtp", row.Config.SMTPMode)
+}
+
+// A tenant email channel whose owner has no account address can't be forced to a
+// safe destination, so the edit is refused (422) rather than persisting the
+// arbitrary destination the admin supplied.
+func TestChannels_AdminEditTenantEmail_OwnerNoAddressIs422(t *testing.T) {
+	t.Parallel()
+	uid := "u1"
+	repo := &fakeChannelsRepo{rows: map[string]*models.NotificationChannel{
+		"t": {ID: "t", Name: "TenantMail", Kind: "email", Enabled: true, UserID: &uid,
+			Config: models.NotificationChannelConfig{ToEmail: "u1@example.com", FromEmail: "u1@example.com", SMTPMode: "local"}},
+	}}
+	users := &mapUserRepo{users: map[string]*models.User{"u1": {ID: "u1", Email: ""}}}
+	r := newChannelsRouterU(t, repo, users, newAdminCtx())
+
+	rec := doNotifJSON(t, r, http.MethodPatch, "/api/v1/admin/notifications/channels/t", map[string]any{
+		"config": map[string]any{"to_email": "victim@evil.com", "from_email": "victim@evil.com"},
+	})
+	require.Equal(t, http.StatusUnprocessableEntity, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "no_account_email")
+	row, err := repo.FindByID(context.Background(), "t")
+	require.NoError(t, err)
+	require.Equal(t, "u1@example.com", row.Config.ToEmail, "row must not be persisted on rejection")
+}
+
+// With no Users repo wired (a deploy misconfiguration), an admin cannot resolve
+// a tenant channel's owner to re-force its address, so editing a tenant email
+// channel's config fails closed (503) rather than persisting an unforced
+// destination. Uses the pre-existing harness, which never wired Users — exactly
+// the scenario the fail-closed branch guards.
+func TestChannels_AdminEditTenantEmail_NoUsersRepoIs503(t *testing.T) {
+	t.Parallel()
+	uid := "u1"
+	repo := &fakeChannelsRepo{rows: map[string]*models.NotificationChannel{
+		"t": {ID: "t", Name: "TenantMail", Kind: "email", Enabled: true, UserID: &uid,
+			Config: models.NotificationChannelConfig{ToEmail: "u1@example.com", FromEmail: "u1@example.com", SMTPMode: "local"}},
+	}}
+	r := newChannelsRouter(t, repo, nil, newAdminCtx()) // no Users repo
+	rec := doNotifJSON(t, r, http.MethodPatch, "/api/v1/admin/notifications/channels/t", map[string]any{
+		"config": map[string]any{"to_email": "victim@evil.com", "from_email": "victim@evil.com"},
+	})
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+	row, err := repo.FindByID(context.Background(), "t")
+	require.NoError(t, err)
+	require.Equal(t, "u1@example.com", row.Config.ToEmail, "row must not be persisted when forcing can't run")
+}
+
+func TestChannels_Delete(t *testing.T) {
+	t.Parallel()
+	repo := &fakeChannelsRepo{rows: map[string]*models.NotificationChannel{
+		"a": {ID: "a", Name: "Ops", Kind: "slack"},
+	}}
+	r := newChannelsRouter(t, repo, nil, newAdminCtx())
+	rec := doNotifJSON(t, r, http.MethodDelete, "/api/v1/admin/notifications/channels/a", nil)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+	_, err := repo.FindByID(context.Background(), "a")
+	require.True(t, errors.Is(err, repository.ErrNotFound))
+}
+
+func TestChannels_Test_PublishesEnvelope(t *testing.T) {
+	t.Parallel()
+	q, mr := newQueueForChannelTest(t)
+	repo := &fakeChannelsRepo{rows: map[string]*models.NotificationChannel{
+		"a": {ID: "a", Name: "Ops", Kind: "slack", Enabled: true, Config: models.NotificationChannelConfig{URL: "https://x"}},
+	}}
+	r := newChannelsRouter(t, repo, q, newAdminCtx())
+	rec := doNotifJSON(t, r, http.MethodPost, "/api/v1/admin/notifications/channels/a/test", nil)
+	require.Equal(t, http.StatusAccepted, rec.Code, rec.Body.String())
+	entries, err := mr.DB(0).Stream("dotnext:notifications:queue")
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+}
+
+func TestChannels_Test_NoQueueReturns503(t *testing.T) {
+	t.Parallel()
+	repo := &fakeChannelsRepo{rows: map[string]*models.NotificationChannel{
+		"a": {ID: "a", Name: "Ops", Kind: "slack"},
+	}}
+	r := newChannelsRouter(t, repo, nil, newAdminCtx())
+	rec := doNotifJSON(t, r, http.MethodPost, "/api/v1/admin/notifications/channels/a/test", nil)
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+}
+
+func TestChannels_Broadcast_Happy(t *testing.T) {
+	t.Parallel()
+	q, mr := newQueueForChannelTest(t)
+	repo := &fakeChannelsRepo{}
+	r := newChannelsRouter(t, repo, q, newAdminCtx())
+	rec := doNotifJSON(t, r, http.MethodPost, "/api/v1/admin/notifications/broadcast", map[string]any{
+		"title":    "Maintenance window",
+		"body":     "Panel restart at 02:00 UTC",
+		"severity": "info",
+	})
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	entries, err := mr.DB(0).Stream("dotnext:notifications:queue")
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+}
+
+func TestChannels_Broadcast_BadSeverityIs422(t *testing.T) {
+	t.Parallel()
+	q, _ := newQueueForChannelTest(t)
+	repo := &fakeChannelsRepo{}
+	r := newChannelsRouter(t, repo, q, newAdminCtx())
+	rec := doNotifJSON(t, r, http.MethodPost, "/api/v1/admin/notifications/broadcast", map[string]any{
+		"title":    "t",
+		"severity": "hmm",
+	})
+	require.Equal(t, http.StatusUnprocessableEntity, rec.Code)
+}
+
+func TestChannels_Broadcast_DeeplinkOutsidePanelIs422(t *testing.T) {
+	t.Parallel()
+	q, mr := newQueueForChannelTest(t)
+	repo := &fakeChannelsRepo{}
+	r := newChannelsRouter(t, repo, q, newAdminCtx())
+	for _, link := range []string{"https://example.test/x", "//example.test", "javascript:alert(1)"} {
+		rec := doNotifJSON(t, r, http.MethodPost, "/api/v1/admin/notifications/broadcast", map[string]any{
+			"title":    "t",
+			"severity": "info",
+			"deeplink": link,
+		})
+		require.Equal(t, http.StatusUnprocessableEntity, rec.Code, link)
+	}
+	require.False(t, mr.Exists("dotnext:notifications:queue"), "nothing queued")
+
+	rec := doNotifJSON(t, r, http.MethodPost, "/api/v1/admin/notifications/broadcast", map[string]any{
+		"title":    "t",
+		"severity": "info",
+		"deeplink": "/admin/updates",
+	})
+	require.Equal(t, http.StatusAccepted, rec.Code)
+	entries, err := mr.DB(0).Stream("dotnext:notifications:queue")
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	require.Contains(t, entries[0].Values, "/admin/updates")
+}
+
+// JAB-171 phase 3: a channel's secret is never echoed by create or list.
+func TestChannels_Create_SecretNotEchoed(t *testing.T) {
+	t.Parallel()
+	repo := &fakeChannelsRepo{}
+	r := newChannelsRouter(t, repo, nil, newAdminCtx())
+	rec := doNotifJSON(t, r, http.MethodPost, "/api/v1/admin/notifications/channels", map[string]any{
+		"name":   "tg",
+		"kind":   "telegram",
+		"config": map[string]any{"bot_token": "123:SUPER-SECRET", "chat_id": "42"},
+	})
+	require.Equal(t, http.StatusCreated, rec.Code, rec.Body.String())
+	require.NotContains(t, rec.Body.String(), "SUPER-SECRET", "create must not echo the bot token")
+	require.NotContains(t, rec.Body.String(), "bot_token")
+}
+
+func TestChannels_List_SecretNotEchoed(t *testing.T) {
+	t.Parallel()
+	repo := &fakeChannelsRepo{rows: map[string]*models.NotificationChannel{
+		"a": {ID: "a", Name: "tg", Kind: "telegram", Enabled: true,
+			Config: models.NotificationChannelConfig{BotToken: "enc:1:sealedvalue", ChatID: "42"}},
+	}}
+	r := newChannelsRouter(t, repo, nil, newAdminCtx())
+	rec := doNotifJSON(t, r, http.MethodGet, "/api/v1/admin/notifications/channels", nil)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.NotContains(t, rec.Body.String(), "sealedvalue", "list must not echo the sealed secret")
+	require.Contains(t, rec.Body.String(), "\"chat_id\":\"42\"", "public config fields should still appear")
+}

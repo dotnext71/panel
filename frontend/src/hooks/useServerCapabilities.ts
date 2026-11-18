@@ -1,0 +1,88 @@
+// useServerCapabilities — shared, cached read of the opt-in feature flags the
+// panel gates UI on (GH #229 + gap-audit #1). Backed by GET
+// /me/server-capabilities. Used by the layouts to filter the sidebar AND by
+// CapabilityRoute to gate the routes themselves, so a deep-link to a disabled
+// feature redirects instead of rendering a page that immediately 403s.
+import { useQuery } from "@tanstack/react-query";
+
+import { apiClient } from "../apiClient";
+
+export interface ServerCapabilities {
+  postgres_enabled: boolean;
+  docker_marketplace_enabled: boolean;
+  docker_apps_user_enabled: boolean;
+  python_apps_enabled: boolean;
+  /** ADR-0175: Node.js apps on the Application Manager (node_apps_enabled). */
+  node_apps_enabled: boolean;
+  tenant_domain_options_enabled: boolean;
+  tenant_docroot_editable: boolean;
+  dns_enabled: boolean;
+  mail_enabled: boolean;
+  security_enabled: boolean;
+  quota_enabled: boolean;
+  api_enabled: boolean;
+  /** GH #515: admin web terminal (root_terminal_enabled). Gates the Terminal nav entry. */
+  root_terminal_enabled: boolean;
+  /** GH #1184: admin File Manager (whole filesystem). Gates the Admin Files nav entry. */
+  admin_file_manager_enabled: boolean;
+  /** GH #361: the server's public IPv4, for the dashboard. "" when unset. */
+  public_ipv4: string;
+  /** GH #361: the server's public IPv6, for the dashboard. "" when unset. */
+  public_ipv6: string;
+  /** GH #331: this box is a DR standby (read-only replica). Drives the banner. */
+  is_standby: boolean;
+  /** GH #331: human label for the primary this standby replicates. "" when unset. */
+  dr_peer_label: string;
+  /** GH #1053: caller's package includes FTP/SFTP subaccounts. Gates the page + nav. */
+  ftp_accounts_enabled: boolean;
+  /** GH #1053: server-level FTP opt-in — drives "SFTP only" vs "FTPS + SFTP" copy. */
+  ftp_server_enabled: boolean;
+  /** GH #1171: isolated (separate-uid, quota-capped) FTP accounts can be provisioned
+   * here (filesystem disk quota is enabled). Drives the create form's Isolated default. */
+  ftp_isolation_available: boolean;
+  /** The "Ask DotNext" support chat in the admin panel (Server Settings -> General). */
+  support_chat_admin: boolean;
+  /** The "Ask DotNext" support chat in the client panels. */
+  support_chat_clients: boolean;
+  /** GH #2276: the caller's package includes Composer runs. Gates the domain's Composer tab. */
+  composer_enabled: boolean;
+  /** GH #2277: the caller's package includes Git deploy. Gates the domain's Git tab. */
+  git_deploy_enabled: boolean;
+}
+
+export function useServerCapabilities() {
+  return useQuery<ServerCapabilities>({
+    queryKey: ["server-capabilities"],
+    queryFn: async () => {
+      const { data } = await apiClient.get<Partial<ServerCapabilities>>("/me/server-capabilities");
+      return {
+        postgres_enabled: !!data.postgres_enabled,
+        docker_marketplace_enabled: !!data.docker_marketplace_enabled,
+        docker_apps_user_enabled: !!data.docker_apps_user_enabled,
+        python_apps_enabled: !!data.python_apps_enabled,
+        node_apps_enabled: !!data.node_apps_enabled,
+        tenant_domain_options_enabled: !!data.tenant_domain_options_enabled,
+        tenant_docroot_editable: !!data.tenant_docroot_editable,
+        dns_enabled: data.dns_enabled !== false,
+        mail_enabled: data.mail_enabled !== false,
+        security_enabled: data.security_enabled !== false,
+        quota_enabled: data.quota_enabled !== false,
+        api_enabled: data.api_enabled !== false,
+        root_terminal_enabled: !!data.root_terminal_enabled,
+        admin_file_manager_enabled: !!data.admin_file_manager_enabled,
+        public_ipv4: data.public_ipv4 ?? "",
+        public_ipv6: data.public_ipv6 ?? "",
+        is_standby: !!data.is_standby,
+        dr_peer_label: data.dr_peer_label ?? "",
+        ftp_accounts_enabled: !!data.ftp_accounts_enabled,
+        ftp_server_enabled: !!data.ftp_server_enabled,
+        ftp_isolation_available: !!data.ftp_isolation_available,
+        support_chat_admin: !!data.support_chat_admin,
+        support_chat_clients: !!data.support_chat_clients,
+        composer_enabled: !!data.composer_enabled,
+        git_deploy_enabled: !!data.git_deploy_enabled,
+      };
+    },
+    staleTime: 60_000,
+  });
+}

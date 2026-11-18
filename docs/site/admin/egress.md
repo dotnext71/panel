@@ -1,0 +1,74 @@
+# Per-User Egress Firewall
+
+Security → Egress. nftables + cgroup v2 vmap rules that restrict each user's outbound traffic.
+
+## Why per-user egress matters
+
+A compromised tenant whose PHP scripts can call any external host becomes an excellent platform for outbound abuse (command-and-control, credential stuffing, spam-relay). Restricting outbound at the per-user cgroup level bounds the damage even when the host application is owned.
+
+## Default policy
+
+Per-user, the nftables ruleset:
+
+- **Allows** `:443/tcp` to anywhere (HTTPS — legitimate API use).
+- **Allows** `:587/tcp` and `:465/tcp` to the panel's own mail host (so PHP scripts can submit mail).
+- **Allows** `:993/tcp` to the panel's own mail host (IMAP submission of replies, if needed).
+- **Allows** `:53/udp` and `:53/tcp` to `127.0.0.1` (the loopback recursor).
+- **Drops** everything else.
+
+The package's `egress_policy` field selects this default or `unrestricted` (no per-user filtering).
+
+## Per-user overrides
+
+Users → Edit → Egress allows the admin to:
+
+- Permit specific destination CIDRs on specific ports.
+- Permit FQDN-based destinations (resolved at apply time; refreshed on a daily timer).
+- Block specific ports / destinations even when otherwise allowed.
+
+Each rule is namespaced per-user; no rule from one user can affect another.
+
+## Implementation
+
+- Each user runs in their own systemd slice (`dotnext.slice/dotnext-user.slice/dotnext-user-<username>.slice`).
+- nftables uses a `meta cgroupv2` match against the slice id.
+- A vmap maps `cgroupv2-id → ruleset` for O(1) classification.
+- The reconciler converges the ruleset on each tick.
+
+The setup was live-verified with the drop counter incrementing on a blocked port and `:443` continuing to work.
+
+## Per-page surface
+
+- **Per-user table** — current policy, exception count, drop count (last hour, 24 h).
+- **Per-user drill-in** — the active ruleset rendered as a readable summary plus the raw nftables fragment.
+- **Test connectivity** — pick a user and a destination; the page invokes a one-shot agent call that runs the same nftables decision against the simulated socket and returns "allowed" or "dropped".
+
+## Learning mode, the drops list and alerts
+
+A user in **learning** is not blocked. Each new connection outside the allowlist is allowed, logged and counted once; packets of a connection already allowed are not counted again. An **enforced** user's packets outside the allowlist are dropped, logged and counted.
+
+Click a user's drop count under Security → Egress to see the recent flows. Each row says **Blocked** (enforced) or **Allowed (learning)**, with an **Allow** button that adds the destination to the user's allowlist. During the learning soak, use it to allow what the user's apps need before the policy is enforced. The list comes from the kernel log: at most 5 lines per user per minute, and it rotates with journald.
+
+The **Outbound traffic outside the allowlist (burst)** alert (`egress.drop.burst`) fires when a user's count passes the threshold (default 50) between two checks, about a minute apart. Its text names the user and says whether the traffic was blocked or, in learning mode, allowed. It fires at most once per user every 15 minutes.
+
+A **dead letter** tag on an alert under Notifications → History is about delivery, not egress: the alert could not reach one of its channels after the retries. Notifications → Dead Letter lists those alerts.
+
+## Notes
+
+- nftables rules are stateless at the layer the panel manages; established connections are not interrupted when a rule changes.
+- A user's per-user PHP-FPM pool inherits the slice automatically — no extra wiring per pool.
+- The egress firewall does not interpose between the user and inbound traffic; inbound firewalling is [UFW](./ufw-baseline.md) plus [CrowdSec Decisions](./crowdsec-decisions.md).
+- An app's loopback port (Python or Node.js app, Docker app, reverse-proxy domain) can be opened only by the account that owns the app and by system users such as nginx. Other accounts are dropped, whatever their egress state; see [Security](../security.md#per-user-egress-firewall).
+
+## CLI
+
+```bash
+dotnext-cli per-user-egress summary                  # policy state counts and pending requests
+dotnext-cli per-user-egress get <email-or-id>        # one user's policy
+dotnext-cli per-user-egress set-policy <email-or-id> --state enforced --allow 140.82.112.0/20,443,tcp
+dotnext-cli per-user-egress requests                 # requests tenants sent from the panel
+dotnext-cli per-user-egress approve <request-id>
+dotnext-cli per-user-egress deny <request-id>
+```
+
+`set-policy` replaces the user's whole allow list. `--state` is `off`, `learning` or `enforced`, and each `--allow` is `CIDR[,PORT[,PROTO]]`.

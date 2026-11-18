@@ -1,0 +1,333 @@
+// `dotnext migrate reap-secrets` cobra subcommand. Walks
+// migration_jobs WHERE state IN ('done','failed','cancelled') +
+// deletes the per-job env file at /etc/dotnext/migration-
+// secrets/<job-id>.env (if present).
+//
+// Closes the M35 ADR-0094 §"tracked risks" gap: per-job source
+// credentials previously persisted across job-terminal state with
+// no scheduled wipe. Reaper run by dotnext-migration-secrets-reap.timer
+// (daily 04:30 UTC + jitter), idempotent; missing files are
+// non-fatal.
+//
+// Operator can run on demand via: dotnext migrate reap-secrets
+package panelcmd
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+)
+
+const (
+	migrationSecretsDir = "/etc/dotnext/migration-secrets"
+	migrationStagingDir = "/var/lib/dotnext-migrations"
+	// migrationStagingMaxAge — terminal jobs whose tarball + extracted
+	// tree have been on disk longer than this get reaped. 7 days gives
+	// the operator a generous window to download the cpmove for forensics
+	// or re-attempt a manual fixup before disk goes away. Override via
+	// `--staging-max-age` flag for one-shot operator runs.
+	migrationStagingMaxAge = 7 * 24 * time.Hour
+	// orphanSecretGrace — a <job-id>.env with no job row is left alone
+	// until it is at least this old, in case its row is not committed yet.
+	// Far longer than that window, far shorter than the daily cadence.
+	orphanSecretGrace = time.Hour
+)
+
+func newMigrateReapSecretsCmd() *cobra.Command {
+	var dryRun bool
+	var stagingMaxAge time.Duration
+	cmd := &cobra.Command{
+		Use:   "reap-secrets",
+		Short: "Wipe per-job migration-secrets env files + stale tarball/extracted dirs",
+		Long: `Walks migration_jobs WHERE state IN
+('done','failed','cancelled') and deletes the matching env file
+at /etc/dotnext/migration-secrets/<job-id>.env. Same pass
+removes the per-job tarball + extracted tree under
+/var/lib/dotnext-migrations/<id>/ when the job's ended_at is older
+than --staging-max-age (default 7 days). Idempotent — missing
+files don't fail. Run by dotnext-migration-secrets-reap.timer on a
+daily cadence; operator can also invoke directly.`,
+		PreRunE: requireDB,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx, cancel := context.WithTimeout(cmd.Context(), 5*time.Minute)
+			defer cancel()
+			repo := repository.NewMigrationJobRepository(sharedDB)
+			pageSize := 200
+			page := 1
+			deleted := 0
+			scanned := 0
+			// JAB-155: track every job ID that still has a row so the orphan
+			// sweep below can tell a stranded (row-deleted) staging dir from
+			// a live one.
+			live := map[string]struct{}{}
+			for {
+				rows, total, err := repo.List(ctx, page, pageSize)
+				if err != nil {
+					return fmt.Errorf("list migration jobs: %w", err)
+				}
+				for _, row := range rows {
+					scanned++
+					live[row.ID] = struct{}{}
+					if !isTerminal(row.State) {
+						continue
+					}
+					secretReapOK := secretReapDue(row.State, row.EndedAt, row.UpdatedAt, stagingMaxAge, time.Now())
+					path := filepath.Join(migrationSecretsDir, row.ID+".env")
+					if secretReapOK {
+						if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+							if dryRun {
+								fmt.Fprintf(cmd.OutOrStdout(), "[dry-run] would remove %s (job state=%s)\n", path, row.State)
+								deleted++
+							} else if err := os.Remove(path); err != nil {
+								fmt.Fprintf(cmd.ErrOrStderr(), "remove %s: %v\n", path, err)
+							} else {
+								deleted++
+							}
+						}
+					}
+					// Staging dir: tarball + extracted tree. Reap when
+					// the job has been terminal long enough (ended_at +
+					// stagingMaxAge < now). Operator can `--staging-max-age 0`
+					// to wipe immediately.
+					stagingPath := filepath.Join(migrationStagingDir, row.ID)
+					if info, sErr := os.Stat(stagingPath); sErr == nil && info.IsDir() {
+						ref := row.EndedAt
+						if ref == nil || ref.IsZero() {
+							ref = &row.UpdatedAt
+						}
+						age := time.Since(*ref)
+						if age < stagingMaxAge {
+							continue
+						}
+						if dryRun {
+							fmt.Fprintf(cmd.OutOrStdout(), "[dry-run] would rm -rf %s (state=%s age=%s)\n", stagingPath, row.State, age.Truncate(time.Hour))
+							deleted++
+							continue
+						}
+						if rErr := os.RemoveAll(stagingPath); rErr != nil {
+							fmt.Fprintf(cmd.ErrOrStderr(), "rm -rf %s: %v\n", stagingPath, rErr)
+							continue
+						}
+						deleted++
+					}
+				}
+				if int64(page*pageSize) >= total || len(rows) == 0 {
+					break
+				}
+				page++
+			}
+
+			// JAB-155: orphan sweep. The row-driven pass above only reaps
+			// staging for jobs that still have a migration_jobs row. When a
+			// row is hard-deleted (admin removed the job, or a wizard draft
+			// was cleaned), its /var/lib/dotnext-migrations/<id>/ tree is left
+			// stranded and invisible to that pass — on a test host this
+			// stranded ~6GB across 5 dirs and pushed / to 95% full.
+			deleted += reapOrphanStaging(migrationStagingDir, live, stagingMaxAge, dryRun, cmd.OutOrStdout(), cmd.ErrOrStderr())
+
+			// Orphan secrets: same stranding for <job-id>.env (the REST
+			// destroy path cannot unlink it — see reapOrphanSecrets). Each
+			// candidate is re-checked against the DB rather than trusting
+			// the paged snapshot above.
+			rowExists := func(id string) (bool, error) {
+				if _, ok := live[id]; ok {
+					return true, nil
+				}
+				if _, err := repo.FindByID(ctx, id); err != nil {
+					if errors.Is(err, repository.ErrNotFound) {
+						return false, nil
+					}
+					return false, err
+				}
+				return true, nil
+			}
+			deleted += reapOrphanSecrets(migrationSecretsDir, rowExists, orphanSecretGrace, dryRun, cmd.OutOrStdout(), cmd.ErrOrStderr())
+
+			fmt.Fprintf(cmd.OutOrStdout(), "scanned=%d deleted=%d (dry-run=%v)\n", scanned, deleted, dryRun)
+			// ADR-0095 decision 5 — also reap draft migration_jobs
+			// older than 24h. Drafts are created by the wizard at Step
+			// 1; an operator who closes the tab without finishing
+			// leaves a row behind. 24h is a generous "not coming back"
+			// window. Hard-delete (no per-job secrets to wipe; secrets
+			// only land at Step 2 which flips state out of draft).
+			cutoff := time.Now().Add(-24 * time.Hour)
+			if dryRun {
+				fmt.Fprintf(cmd.OutOrStdout(), "[dry-run] would reap draft jobs older than %s\n", cutoff.Format(time.RFC3339))
+			} else {
+				if n, err := repo.CancelDraftsOlderThan(ctx, cutoff); err != nil {
+					fmt.Fprintf(cmd.ErrOrStderr(), "reap drafts: %v\n", err)
+				} else if n > 0 {
+					fmt.Fprintf(cmd.OutOrStdout(), "reaped %d draft job(s) older than 24h\n", n)
+				}
+			}
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&dryRun, "dry-run", false, "List would-delete paths without removing them")
+	cmd.Flags().DurationVar(&stagingMaxAge, "staging-max-age", migrationStagingMaxAge,
+		"Reap /var/lib/dotnext-migrations/<id>/ only when the job has been terminal at least this long (default 168h = 7d; pass 0 to wipe immediately)")
+	return cmd
+}
+
+// reapOrphanStaging removes per-job staging dirs under stagingDir whose ID has
+// no entry in live (the set of job IDs that still have a migration_jobs row)
+// and whose mtime is older than maxAge. The mtime guard protects an in-flight
+// extraction whose job row is not committed yet. Returns the number of dirs
+// removed (or, under dryRun, that would be removed). Missing stagingDir is not
+// an error. Split out from the command for direct testing. (JAB-155)
+func reapOrphanStaging(stagingDir string, live map[string]struct{}, maxAge time.Duration, dryRun bool, out, errw io.Writer) int {
+	entries, err := os.ReadDir(stagingDir)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(errw, "readdir %s: %v\n", stagingDir, err)
+		}
+		return 0
+	}
+	deleted := 0
+	for _, e := range entries {
+		if !e.IsDir() {
+			continue
+		}
+		if _, ok := live[e.Name()]; ok {
+			continue // job row still exists — handled by the row-driven pass
+		}
+		p := filepath.Join(stagingDir, e.Name())
+		info, iErr := e.Info()
+		if iErr != nil {
+			continue
+		}
+		age := time.Since(info.ModTime())
+		if age < maxAge {
+			continue
+		}
+		if dryRun {
+			fmt.Fprintf(out, "[dry-run] would rm -rf %s (orphan: no job row, age=%s)\n", p, age.Truncate(time.Hour))
+			deleted++
+			continue
+		}
+		if rmErr := os.RemoveAll(p); rmErr != nil {
+			fmt.Fprintf(errw, "rm -rf %s: %v\n", p, rmErr)
+			continue
+		}
+		deleted++
+	}
+	return deleted
+}
+
+// reapOrphanSecrets removes <job-id>.env source-credential files under
+// secretsDir whose migration_jobs row no longer exists and whose mtime is
+// older than grace. Returns the number removed (or, under dryRun, that would
+// be removed). Missing secretsDir is not an error.
+//
+// Orphans come from the REST destroy path: it deletes the row first and then
+// asks the Agent to wipe the secret (migration.secrets_wipe, JAB-357). When
+// that call fails (the Agent is down or unwired, where the panel's own unlink
+// fails in the root:dotnext 0750 secrets dir), the row-driven pass above can
+// never see the file again. This root sweep is what reclaims those
+// credentials.
+//
+// Deliberately narrow: only regular files named <26-char job id>.env.
+// Host-key pins (.known_hosts), directories, symlinks and any other name are
+// left alone. rowExists is asked per candidate (not a paged snapshot), and a
+// lookup error keeps the file — without proof the job is gone, deleting could
+// strand a live migration mid-run. grace protects a secret written just
+// before its row is committed. Split out from the command for direct testing.
+func reapOrphanSecrets(secretsDir string, rowExists func(id string) (bool, error), grace time.Duration, dryRun bool, out, errw io.Writer) int {
+	entries, err := os.ReadDir(secretsDir)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			fmt.Fprintf(errw, "readdir %s: %v\n", secretsDir, err)
+		}
+		return 0
+	}
+	deleted := 0
+	for _, e := range entries {
+		if !e.Type().IsRegular() {
+			continue
+		}
+		id, ok := strings.CutSuffix(e.Name(), ".env")
+		if !ok || !isJobIDToken(id) {
+			continue
+		}
+		info, iErr := e.Info()
+		if iErr != nil {
+			continue
+		}
+		age := time.Since(info.ModTime())
+		if age < grace {
+			continue
+		}
+		exists, lErr := rowExists(id)
+		if lErr != nil {
+			fmt.Fprintf(errw, "look up migration job %s: %v (secret kept)\n", id, lErr)
+			continue
+		}
+		if exists {
+			continue // job row still exists — handled by the row-driven pass
+		}
+		p := filepath.Join(secretsDir, e.Name())
+		if dryRun {
+			fmt.Fprintf(out, "[dry-run] would remove %s (orphan: no job row, age=%s)\n", p, age.Truncate(time.Minute))
+			deleted++
+			continue
+		}
+		if rmErr := os.Remove(p); rmErr != nil && !errors.Is(rmErr, os.ErrNotExist) {
+			fmt.Fprintf(errw, "remove %s: %v\n", p, rmErr)
+			continue
+		}
+		deleted++
+	}
+	return deleted
+}
+
+// isJobIDToken accepts a 26-character alphanumeric token — the ULID shape of
+// a migration_jobs id, the same rule migrate.WipeJobSecret enforces.
+func isJobIDToken(s string) bool {
+	if len(s) != 26 {
+		return false
+	}
+	for _, r := range s {
+		if !(r >= '0' && r <= '9' || r >= 'A' && r <= 'Z' || r >= 'a' && r <= 'z') {
+			return false
+		}
+	}
+	return true
+}
+
+// secretReapDue decides whether a terminal job's source-secret env file
+// (/etc/dotnext/migration-secrets/<id>.env, holding the SSH password/key)
+// should be reaped now. A FAILED job is retryable, so its secret is kept until
+// the same age grace as staging (GH #746) — otherwise every failed import
+// strands the retry, which must then re-upload creds AND re-pull. Other
+// terminal states (done/degraded/cancelled) are finished, so their secret reaps
+// immediately (security: don't leave source creds around longer than needed).
+func secretReapDue(state string, endedAt *time.Time, updatedAt time.Time, grace time.Duration, now time.Time) bool {
+	if state != models.MigrationStateFailed {
+		return true
+	}
+	ref := endedAt
+	if ref == nil || ref.IsZero() {
+		ref = &updatedAt
+	}
+	return now.Sub(*ref) >= grace
+}
+
+func isTerminal(state string) bool {
+	switch state {
+	// JAB-49: degraded is terminal (ended_at stamped) — its SSH secret + staging
+	// must be reaped like done/failed/cancelled.
+	case models.MigrationStateDone, models.MigrationStateDegraded, models.MigrationStateFailed, models.MigrationStateCancelled:
+		return true
+	}
+	return false
+}

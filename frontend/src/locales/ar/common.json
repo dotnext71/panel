@@ -1,0 +1,680 @@
+{
+  "nav": {
+    "admin": {
+      "dashboard": "لوحة التحكم",
+      "dashboard_desc": "نظرة عامة على الخادم وإحصاءات سريعة",
+      "users": "المستخدمون",
+      "users_desc": "إدارة مستخدمي اللوحة والجلسات وانتحال الهوية",
+      "domains": "نطاقات الويب",
+      "domains_desc": "جميع نطاقات الويب لكل المستخدمين",
+      "mail": "البريد",
+      "mail_desc": "صناديق البريد وعمليات إعادة التوجيه وبريد الويب",
+      "packages": "باقات الاستضافة",
+      "packages_desc": "خطط الاستضافة والحدود",
+      "ssl": "مدير SSL",
+      "ssl_desc": "شهادات SSL وإصدارها",
+      "applications": "التطبيقات",
+      "applications_desc": "تثبيت التطبيقات بنقرة واحدة (WordPress والمزيد)",
+      "docker-apps": "تطبيقات Docker",
+      "docker-apps_desc": "متجر تطبيقات Docker",
+      "settings": "إعدادات الخادم",
+      "settings_desc": "إعدادات عامة للخادم ووحدات اختيارية",
+      "server-status": "حالة الخادم",
+      "server-status_desc": "الخدمات والموارد والحالة في الوقت الفعلي",
+      "cache": "التخزين المؤقت",
+      "cache_desc": "أدوات التخزين المؤقت لـ Redis وWordPress",
+      "security": "الأمان",
+      "security_desc": "CrowdSec وفحص البرامج الضارة وجدار الحماية",
+      "backups": "النسخ الاحتياطية",
+      "backups_desc": "وجهات النسخ الاحتياطي وجداوله",
+      "php-pools": "مدير PHP",
+      "php-pools_desc": "إصدارات PHP ومجمعات FPM",
+      "dns": "مناطق DNS",
+      "dns_desc": "مناطق DNS الموثوقة والسجلات",
+      "ips": "عناوين IP",
+      "ips_desc": "عناوين IP المُدارة للخادم",
+      "notifications": "الإشعارات",
+      "notifications_desc": "التنبيهات وقنوات الإشعارات",
+      "updates": "التحديثات",
+      "updates_desc": "تحديثات اللوحة وحزم النظام",
+      "automation": "وصول واجهة برمجة تطبيقات الخادم",
+      "automation_desc": "رموز واجهة برمجة التطبيقات العامة للخادم والنطاقات للأتمتة",
+      "api-tokens": "رموز واجهة برمجة التطبيقات الشخصية",
+      "api-tokens_desc": "مفاتيح واجهة REST API",
+      "migrations": "عمليات الترحيل",
+      "migrations_desc": "استيراد الحسابات من cPanel أو HestiaCP أو DirectAdmin",
+      "terminal": "الطرفية",
+      "terminal_desc": "طرفية ويب إلى الخادم",
+      "logs": "السجلات والإحصاءات",
+      "logs_desc": "سجلات الوصول والأخطاء بالإضافة إلى الإحصاءات",
+      "cron": "Cron",
+      "cron_desc": "مهام Cron المجدولة",
+      "support": "الدعم",
+      "support_desc": "التشخيص والتواصل مع الدعم"
+    },
+    "user": {
+      "dashboard": "لوحة التحكم",
+      "domains": "نطاقات الويب",
+      "mail": "البريد",
+      "applications": "التطبيقات",
+      "python-apps": "تطبيقات Python",
+      "docker-apps": "تطبيقات Docker",
+      "databases": "قواعد البيانات",
+      "disk-usage": "استخدام القرص",
+      "files": "الملفات",
+      "logs": "السجلات والإحصاءات",
+      "ssh-keys": "مفاتيح SSH",
+      "api-tokens": "رموز واجهة برمجة التطبيقات الشخصية",
+      "dns": "DNS",
+      "ssl": "مدير SSL",
+      "php-settings": "إعدادات PHP",
+      "cron": "Cron",
+      "backups": "النسخ الاحتياطي/الاستعادة",
+      "group": {
+        "hosting": "الاستضافة",
+        "services": "الخدمات",
+        "tools": "الأدوات",
+        "account": "الحساب"
+      }
+    }
+  },
+  "login": {
+    "flowError": "تعذّر بدء عملية تسجيل الدخول. تأكد من تشغيل خدمة الهوية ثم أعد تحميل الصفحة.",
+    "hostnameWarningTitle": "سجّل الدخول باستخدام اسم المضيف وليس عنوان IP",
+    "hostnameWarningDescription": "موفّر الهوية مرتبط باسم مضيف اللوحة، لذا لن يعمل تسجيل الدخول عبر عنوان IP الخاص بالخادم. افتح اللوحة عبر اسم المضيف (الرابط المعروض بعد التثبيت) وحاول مرة أخرى.",
+    "hostnameWarningOpenLink": "افتح اللوحة على {{hostname}}",
+    "noCredentialMethod": "لا توجد حاليًا طريقة اعتماد مُهيأة لحسابك. يرجى التواصل مع المسؤول.",
+    "fieldRequired": "مطلوب",
+    "identifierHint": "استخدم اسم المستخدم الخاص بك وليس بريدك الإلكتروني.",
+    "totpHint": "أدخل الرمز المكوّن من 6 أرقام من تطبيق المصادقة.",
+    "backupCodeHint": "أدخل أحد رموز النسخ الاحتياطي الخاصة بك.",
+    "webauthnHint": "استخدم مفتاح الأمان لتسجيل الدخول.",
+    "submitVerify": "تحقّق",
+    "submitSignIn": "تسجيل الدخول"
+  },
+  "menu": {
+    "profile": "الملف الشخصي",
+    "language": "اللغة",
+    "sign_out": "تسجيل الخروج"
+  },
+  "dashboard": {
+    "stats": {
+      "users": "إجمالي المستخدمين",
+      "domains": "نطاقات الويب النشطة",
+      "mailboxes": "صناديق البريد"
+    },
+    "health": {
+      "healthy": "سليم",
+      "critical": "{{count}} حرج",
+      "warning_zero": "{{count}} تحذيرات",
+      "warning_one": "{{count}} تحذير",
+      "warning_two": "{{count}} تحذيران",
+      "warning_few": "{{count}} تحذيرات",
+      "warning_many": "{{count}} تحذيرًا",
+      "warning_other": "{{count}} تحذيرات"
+    },
+    "server_ip": "‏IP الخادم:",
+    "summary": "ملخص عام. للاطلاع على المقاييس الحية والخدمات والشبكة والعمليات، راجع حالة الخادم.",
+    "view_server_status": "عرض حالة الخادم ←",
+    "view_all": "عرض الكل",
+    "recent_users": "المستخدمون الأخيرون",
+    "recent_domains": "نطاقات الويب الأخيرة",
+    "recent_apps": "التطبيقات الأخيرة",
+    "packages": "باقات الاستضافة",
+    "empty": {
+      "users": "لا يوجد مستخدمون بعد",
+      "domains": "لا توجد نطاقات ويب بعد",
+      "apps": "لا توجد تطبيقات بعد",
+      "packages": "لا توجد باقات بعد"
+    },
+    "col": {
+      "username": "اسم المستخدم",
+      "role": "الدور",
+      "domain": "النطاق",
+      "name": "الاسم",
+      "type": "النوع",
+      "ssh": "SSH"
+    },
+    "role": {
+      "admin": "مسؤول",
+      "user": "مستخدم"
+    },
+    "ssh": {
+      "on": "مفعّل",
+      "off": "معطّل"
+    },
+    "alert": {
+      "title_zero": "‏{{count}} مشكلات حرجة على المضيف",
+      "title_one": "مشكلة حرجة واحدة على المضيف: {{count}}",
+      "title_two": "مشكلتان حرجتان على المضيف: {{count}}",
+      "title_few": "‏{{count}} مشكلات حرجة على المضيف",
+      "title_many": "‏{{count}} مشكلة حرجة على المضيف",
+      "title_other": "‏{{count}} مشكلات حرجة على المضيف",
+      "action": "افتح حالة الخادم للتحقيق ←"
+    }
+  },
+  "users": {
+    "actions": {
+      "login_as": "تسجيل الدخول كمستخدم",
+      "edit": "تعديل",
+      "reset_password": "إعادة تعيين كلمة المرور",
+      "suspend": "تعليق",
+      "unsuspend": "إلغاء التعليق",
+      "delete": "حذف"
+    },
+    "filter": {
+      "active": "نشط",
+      "suspended": "مُعلَّق"
+    },
+    "empty": {
+      "users": "لا يوجد مستخدمون بعد"
+    },
+    "cta": {
+      "create_user": "إنشاء مستخدم"
+    },
+    "col": {
+      "username": "اسم المستخدم",
+      "name": "الاسم",
+      "package": "الحزمة",
+      "created": "تم الإنشاء",
+      "disk_usage": "استخدام القرص",
+      "actions": "الإجراءات"
+    },
+    "suspended": "مُعلَّق",
+    "tab": {
+      "users": "المستخدمون",
+      "admins": "المسؤولون",
+      "sessions": "الجلسات"
+    }
+  },
+  "adminapplicationlist": {
+    "actions": "الإجراءات",
+    "created": "تم الإنشاء",
+    "domain": "النطاق",
+    "owner": "المالك",
+    "status": "الحالة",
+    "version": "الإصدار"
+  },
+  "adminauditlist": {
+    "action": "الإجراء",
+    "result": "النتيجة",
+    "target": "الهدف"
+  },
+  "adminautomationtokenspage": {
+    "actions": "الإجراءات",
+    "created": "تم الإنشاء",
+    "last_used": "آخر استخدام",
+    "name": "الاسم",
+    "status": "الحالة"
+  },
+  "backuplogstab": {
+    "status": "الحالة",
+    "user_id": "معرّف المستخدم"
+  },
+  "createbackupdrawer": {
+    "content": "المحتوى",
+    "create_backup": "إنشاء نسخة احتياطية",
+    "destination": "الوجهة",
+    "type": "النوع",
+    "user": "المستخدم"
+  },
+  "destinationstab": {
+    "actions": "الإجراءات",
+    "enabled": "مُمكَّن",
+    "name": "الاسم"
+  },
+  "schedulestab": {
+    "actions": "الإجراءات",
+    "enabled": "مُمكَّن",
+    "last_run": "آخر تشغيل",
+    "next_run": "التشغيل التالي",
+    "users": "المستخدمون"
+  },
+  "fleetcachedoctor": {
+    "refresh": "تحديث",
+    "repair": "إصلاح"
+  },
+  "admincreatecronmodal": {
+    "name": "الاسم",
+    "schedule": "الجدول"
+  },
+  "admincronlist": {
+    "no_cron_jobs_yet": "لا توجد مهام cron بعد"
+  },
+  "databaseuserdrawer": {
+    "username": "اسم المستخدم"
+  },
+  "databaseuserslist": {
+    "actions": "الإجراءات",
+    "created": "تم الإنشاء",
+    "user": "المستخدم"
+  },
+  "databasecreate": {
+    "name": "الاسم"
+  },
+  "databaselist": {
+    "actions": "الإجراءات",
+    "created": "تم الإنشاء",
+    "database": "قاعدة بيانات",
+    "no_databases_yet": "لا توجد قواعد بيانات بعد",
+    "user_id": "معرّف المستخدم"
+  },
+  "dnszonesoverviewpage": {
+    "actions": "الإجراءات",
+    "domain_name": "اسم النطاق",
+    "expiration": "انتهاء الصلاحية",
+    "owner": "المالك"
+  },
+  "admindockerappspage": {
+    "running": "قيد التشغيل",
+    "stopped": "متوقف"
+  },
+  "backupsdrawer": {
+    "backups": "النسخ الاحتياطية",
+    "restore": "استعادة"
+  },
+  "editdrawer": {
+    "domain": "النطاق",
+    "memory": "الذاكرة",
+    "select_a_domain": "اختر نطاقًا"
+  },
+  "envsection": {
+    "copy": "نسخ",
+    "regenerate": "إعادة توليد"
+  },
+  "installdrawer": {
+    "domain": "النطاق",
+    "memory": "الذاكرة",
+    "select_a_domain": "اختر نطاقًا"
+  },
+  "maintenancetab": {
+    "containers": "الحاويات",
+    "disk_usage": "استخدام القرص",
+    "images": "الصور",
+    "volumes": "وحدات التخزين"
+  },
+  "domaincreate": {
+    "name": "الاسم",
+    "select_a_user": "اختر مستخدمًا",
+    "user": "المستخدم"
+  },
+  "domaindirectoryprivacysection": {
+    "delete": "حذف",
+    "password": "كلمة المرور",
+    "path": "المسار",
+    "user": "المستخدم",
+    "username": "اسم المستخدم"
+  },
+  "domainedit": {
+    "name": "الاسم"
+  },
+  "domainemailsection": {
+    "copy_value": "نسخ القيمة"
+  },
+  "domainipaclsection": {
+    "action": "الإجراء",
+    "comment": "تعليق",
+    "delete": "حذف",
+    "priority": "الأولوية"
+  },
+  "domainlist": {
+    "actions": "الإجراءات",
+    "domain": "النطاق",
+    "no_domains_yet": "لا توجد نطاقات ويب بعد",
+    "status": "الحالة",
+    "user": "المستخدم"
+  },
+  "domainmailboxessection": {
+    "create": "إنشاء",
+    "create_mailbox": "إنشاء صندوق بريد",
+    "domain": "النطاق",
+    "password": "كلمة المرور"
+  },
+  "domainsslsection": {
+    "install": "تثبيت"
+  },
+  "adminiplist": {
+    "actions": "الإجراءات",
+    "address": "العنوان",
+    "default": "الافتراضي",
+    "label": "التسمية",
+    "status": "الحالة"
+  },
+  "adminmailpage": {
+    "new_password": "كلمة مرور جديدة",
+    "set_password": "تعيين كلمة المرور"
+  },
+  "mailthrottlespage": {
+    "enabled": "مُمكَّن",
+    "scope": "النطاق"
+  },
+  "adminmigrationdetailpage": {
+    "ended": "انتهى",
+    "error": "خطأ",
+    "last_error": "آخر خطأ",
+    "started": "بدأ"
+  },
+  "adminmigrationspage": {
+    "ended": "انتهى",
+    "source": "المصدر",
+    "started": "بدأ",
+    "state": "الحالة"
+  },
+  "createmigrationwizard": {
+    "review": "مراجعة"
+  },
+  "channelstab": {
+    "actions": "الإجراءات",
+    "enabled": "مُمكَّن",
+    "kind": "النوع",
+    "name": "الاسم"
+  },
+  "dlqtab": {
+    "clear": "مسح"
+  },
+  "eventstab": {
+    "description": "الوصف",
+    "enabled": "مُمكَّن",
+    "event": "الحدث",
+    "severity": "الخطورة"
+  },
+  "historytab": {
+    "clear": "مسح",
+    "event": "الحدث",
+    "read": "قراءة",
+    "severity": "الخطورة",
+    "show_details": "عرض التفاصيل",
+    "time": "الوقت",
+    "title": "العنوان"
+  },
+  "packagecreate": {
+    "name": "الاسم"
+  },
+  "packageedit": {
+    "name": "الاسم"
+  },
+  "packagelist": {
+    "actions": "الإجراءات",
+    "created": "تم الإنشاء",
+    "domains": "النطاقات",
+    "email": "البريد الإلكتروني",
+    "name": "الاسم"
+  },
+  "phpextensionstab": {
+    "action": "الإجراء",
+    "installed": "مثبَّت",
+    "status": "الحالة"
+  },
+  "versionstab": {
+    "actions": "الإجراءات",
+    "default": "الافتراضي",
+    "status": "الحالة"
+  },
+  "phppooledit": {
+    "kind": "النوع",
+    "value": "القيمة"
+  },
+  "adminsecurityaide": {
+    "category": "الفئة",
+    "last_check": "آخر فحص",
+    "rebuild": "إعادة بناء"
+  },
+  "adminsecurityapparmor": {
+    "flip": "قلب",
+    "mode": "الوضع"
+  },
+  "adminsecuritycrowdsec": {
+    "apply": "تطبيق",
+    "cancel": "إلغاء",
+    "description": "الوصف",
+    "duration": "المدة",
+    "enabled": "مُمكَّن",
+    "events": "الأحداث",
+    "provider": "المزوّد",
+    "reason": "السبب",
+    "remove": "إزالة",
+    "scope": "النطاق",
+    "source": "المصدر",
+    "started": "بدأ",
+    "type": "النوع",
+    "value": "القيمة"
+  },
+  "adminsecurityegress": {
+    "actions": "الإجراءات",
+    "comment": "تعليق",
+    "port": "المنفذ",
+    "reason": "السبب",
+    "state": "الحالة",
+    "user": "المستخدم"
+  },
+  "adminsecuritymalware": {
+    "filename": "اسم الملف",
+    "settings": "الإعدادات"
+  },
+  "adminsecuritysnuffleupagus": {
+    "action": "الإجراء",
+    "disable": "تعطيل"
+  },
+  "adminsecurityufw": {
+    "action": "الإجراء",
+    "cancel": "إلغاء",
+    "continue": "متابعة",
+    "delete": "حذف",
+    "port": "المنفذ",
+    "status": "الحالة"
+  },
+  "crowdsectestipcard": {
+    "unban": "إلغاء الحظر"
+  },
+  "egressmaturepromotion": {
+    "promote": "ترقية"
+  },
+  "accountskeletoncard": {
+    "add": "إضافة",
+    "path": "المسار"
+  },
+  "databaseadminsections": {
+    "actions": "الإجراءات",
+    "apply": "تطبيق",
+    "host": "المضيف",
+    "kill": "إنهاء",
+    "state": "الحالة",
+    "time": "الوقت",
+    "user": "المستخدم"
+  },
+  "nspawnimagescard": {
+    "version": "الإصدار"
+  },
+  "pagetemplatescard": {
+    "cancel": "إلغاء",
+    "save": "حفظ"
+  },
+  "panelsslcard": {
+    "hostname": "اسم المضيف"
+  },
+  "stalwartwebadmincard": {
+    "done": "تم"
+  },
+  "webmailtogglecard": {
+    "webmail": "بريد الويب"
+  },
+  "dnsorphanrepaircard": {
+    "cancel": "Cancel",
+    "delete_all_orphan_records": "Delete all orphan records?",
+    "delete_permanently": "Delete permanently",
+    "no_orphan_records_found": "No orphan PowerDNS records found.",
+    "this_is_irreversible_it_removes_the_pdns_rows": "This is irreversible — it removes the orphaned PowerDNS rows (records, DNSSEC keys, metadata) and purges the pdns caches for the affected names. Scan first and review the list."
+  },
+  "domainrepaircard": {
+    "cancel": "إلغاء",
+    "select_a_user": "اختر مستخدمًا"
+  },
+  "repaircard": {
+    "cancel": "إلغاء",
+    "run": "تشغيل"
+  },
+  "userreset2faaction": {
+    "reset": "إعادة تعيين"
+  },
+  "userresetpasswordaction": {
+    "done": "تم",
+    "reset": "إعادة تعيين"
+  },
+  "myprofile": {
+    "email": "البريد الإلكتروني",
+    "full_name": "الاسم الكامل",
+    "member_since": "عضو منذ",
+    "role": "الدور",
+    "security": "الأمان",
+    "user_id": "معرّف المستخدم",
+    "username": "اسم المستخدم"
+  },
+  "myprofilebackupcard": {
+    "destination": "الوجهة"
+  },
+  "myprofileschedulecard": {
+    "destination": "الوجهة"
+  },
+  "userdashboard": {
+    "databases": "قواعد البيانات",
+    "domains": "نطاقات الويب",
+    "mailboxes": "صناديق البريد"
+  },
+  "accountactivity": {
+    "result": "النتيجة",
+    "target": "الهدف"
+  },
+  "userapitokenspage": {
+    "create": "إنشاء",
+    "name": "الاسم"
+  },
+  "cloneapplicationmodal": {
+    "select_a_domain": "اختر نطاقًا"
+  },
+  "installapplicationmodal": {
+    "copy": "نسخ",
+    "domain": "النطاق",
+    "no_domains_yet": "لا توجد نطاقات بعد",
+    "select_a_domain": "اختر نطاقًا"
+  },
+  "userapplicationlist": {
+    "actions": "الإجراءات",
+    "created": "تم الإنشاء",
+    "domain": "النطاق",
+    "failed": "فشل",
+    "in_progress": "قيد التنفيذ",
+    "ready": "جاهز"
+  },
+  "createcronmodal": {
+    "name": "الاسم",
+    "schedule": "الجدول"
+  },
+  "quicksetupmodal": {
+    "copy": "نسخ"
+  },
+  "userdatabasedrawer": {
+    "create_database": "إنشاء قاعدة بيانات",
+    "name": "الاسم"
+  },
+  "userdatabaselist": {
+    "actions": "الإجراءات",
+    "created": "تم الإنشاء",
+    "database": "قاعدة بيانات",
+    "size": "الحجم"
+  },
+  "userdnszonesoverviewpage": {
+    "actions": "الإجراءات",
+    "domain_name": "اسم النطاق",
+    "expiration": "انتهاء الصلاحية"
+  },
+  "userdockerappspage": {
+    "running": "قيد التشغيل",
+    "stopped": "متوقف"
+  },
+  "userdomaindrawer": {
+    "add_domain": "إضافة نطاق",
+    "domain_name": "اسم النطاق",
+    "document_root": "جذر المستند",
+    "document_root_hint": "المكان الذي تُقدَّم منه ملفات هذا النطاق. اتركه فارغًا لاستخدام المسار الافتراضي. يجب أن يبقى داخل مجلد هذا النطاق نفسه."
+  },
+  "userdomainlist": {
+    "actions": "الإجراءات",
+    "domain": "النطاق",
+    "status": "الحالة"
+  },
+  "filemanagerpage": {
+    "apply": "تطبيق",
+    "create": "إنشاء",
+    "move": "نقل",
+    "rename": "إعادة تسمية",
+    "save": "حفظ"
+  },
+  "autoreplymodal": {
+    "save": "حفظ"
+  },
+  "createmailboxwizardmodal": {
+    "create_mailbox": "إنشاء صندوق بريد",
+    "display_name": "اسم العرض",
+    "domain": "النطاق",
+    "email_address": "عنوان البريد الإلكتروني",
+    "password": "كلمة المرور",
+    "select_a_domain": "اختر نطاقًا"
+  },
+  "catchalltab": {
+    "domain": "النطاق",
+    "save": "حفظ"
+  },
+  "disclaimertab": {
+    "edit": "تعديل",
+    "save": "حفظ"
+  },
+  "forwarderstab": {
+    "add_forwarder": "إضافة إعادة توجيه",
+    "create": "إنشاء",
+    "remove": "إزالة",
+    "type": "النوع"
+  },
+  "mailboxestab": {
+    "new_password": "كلمة مرور جديدة",
+    "no_mailboxes_yet": "لا توجد صناديق بريد بعد",
+    "set_password": "تعيين كلمة المرور"
+  },
+  "sharedfolderstab": {
+    "remove": "إزالة",
+    "share": "مشاركة"
+  },
+  "userphpsettingspage": {
+    "domain": "النطاق",
+    "select_a_domain": "اختر نطاقًا"
+  },
+  "pythonappspage": {
+    "create": "إنشاء",
+    "domain": "النطاق",
+    "name": "الاسم",
+    "select_a_domain": "اختر نطاقًا",
+    "status": "الحالة",
+    "type": "النوع"
+  },
+  "usersshkeyspage": {
+    "add_ssh_key": "إضافة مفتاح SSH",
+    "name": "الاسم",
+    "public_key": "المفتاح العام",
+    "yes": "نعم"
+  },
+  "domainnginxoptionsmodal": {
+    "save": "حفظ"
+  },
+  "notificationbell": {
+    "clear": "مسح",
+    "notifications": "الإشعارات"
+  },
+  "sslmanagertable": {
+    "status": "الحالة",
+    "yes": "نعم"
+  },
+  "settings": {
+    "hostname": "اسم المضيف",
+    "select_timezone": "اختر المنطقة الزمنية",
+    "timezone": "المنطقة الزمنية"
+  }
+}

@@ -1,0 +1,68 @@
+services:
+  web:
+    image: {{ .ImageChannel }}
+    container_name: dotnext-app-{{ .Slug }}
+    restart: unless-stopped
+    depends_on:
+      - meilisearch
+      - chrome
+    environment:
+      NEXTAUTH_URL: "https://{{ .Domain }}"
+      NEXTAUTH_SECRET: {{ q (index .Env "NEXTAUTH_SECRET") }}
+      DATA_DIR: "/data"
+      MEILI_ADDR: "http://meilisearch:7700"
+      MEILI_MASTER_KEY: {{ q (index .Env "MEILI_MASTER_KEY") }}
+      BROWSER_WEB_URL: "http://chrome:9222"
+    volumes:
+      - {{ .DataRoot }}/data:/data
+    ports:
+{{- with index .Ports "http" }}
+      - "{{ .BindInterface }}:{{ .HostPort }}:{{ .ContainerPort }}/{{ .Protocol }}"
+{{- end }}
+    deploy:
+      resources:
+        limits:
+          cpus: "{{ .CPULimit }}"
+          memory: {{ .MemoryLimit }}
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 45s
+
+  # gcr.io/zenika-hub/alpine-chrome no longer serves pulls (the registry
+  # answers "billing must be enabled"). Karakeep's own image, as upstream's
+  # compose uses: its entrypoint runs Chrome headless with --no-sandbox and
+  # forwards :9222 to the DevTools port, so the command adds only flags.
+  chrome:
+    image: ghcr.io/karakeep-app/karakeep-chrome:154.0.8037.57-r1@sha256:c51a8c8e6c3c1040a50fa0ecfd0b2fc298401b4229262636552458151f6f18fa
+    container_name: dotnext-app-{{ .Slug }}-chrome
+    restart: unless-stopped
+    init: true
+    command:
+      - --disable-gpu
+      - --disable-dev-shm-usage
+      - --hide-scrollbars
+      - --disable-blink-features=AutomationControlled
+      - --window-size=1440,900
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512m
+
+  meilisearch:
+    image: getmeili/meilisearch:v1.41.0@sha256:860fa4baed04ae1c235de870edab0c8006227546dea1bbb6411fbfc5e27cf1db
+    container_name: dotnext-app-{{ .Slug }}-meili
+    restart: unless-stopped
+    environment:
+      MEILI_NO_ANALYTICS: "true"
+      MEILI_MASTER_KEY: {{ q (index .Env "MEILI_MASTER_KEY") }}
+    volumes:
+      - {{ .DataRoot }}/meili:/meili_data
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 512m

@@ -1,0 +1,349 @@
+#!/usr/bin/env bash
+# deps-check.sh — one monthly pass over EVERY dependency surface (GH #613/#614).
+#
+# dotnext pins dependencies in three places that upgrade differently:
+#   1. install.sh  — upstream binaries/tools as a bash VAR="x.y" plus a
+#      companion install/<tool>.sha256 checksum file. Off-the-shelf bots
+#      (Dependabot/Renovate) cannot see these, so they're the ones that end up
+#      as one-off "bump X" issues.
+#   2. go.mod      — Go modules.
+#   3. panel-ui/package.json — npm deps.
+#
+# This script reports current-vs-latest across all three so the monthly review
+# is a single table, and can re-capture an install.sh pin's .sha256 in lockstep
+# (`--refresh-sha <VAR>`) so a bump is: edit the version var -> refresh -> done.
+#
+# Usage:
+#   scripts/deps-check.sh                 # human table on stdout
+#   scripts/deps-check.sh --markdown      # GitHub-flavored markdown (for the issue)
+#   scripts/deps-check.sh --refresh-sha STALWART_VERSION [--version 0.16.15]
+#
+# Needs: gh (authenticated), go, npm. A missing tool degrades to a skipped
+# section with a note, never a hard failure.
+set -uo pipefail
+
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INSTALL_SH="$REPO_DIR/install.sh"
+
+# ---- manifest -------------------------------------------------------------
+# One row per install.sh pin: VAR|repo|tag_prefix|sha_file|url_template
+#  - VAR         : the bash variable in install.sh (upper- or lower-case).
+#  - repo        : GitHub owner/name whose releases/latest is the source of truth.
+#  - tag_prefix  : stripped from the release tag to get the bare version
+#                  ("v", "", or "RELEASE_" for phpMyAdmin's RELEASE_5_2_3).
+#  - sha_file    : install/*.sha256 to refresh in lockstep, or "-" if none.
+#  - url_template: release asset URL for --refresh-sha ({V}=version), or "-"
+#                  when the asset name varies by arch (report-only; the table
+#                  prints the manual capture command instead).
+MANIFEST=(
+  "STALWART_VERSION|stalwartlabs/stalwart|v|install/stalwart.sha256|https://github.com/stalwartlabs/stalwart/releases/download/v{V}/stalwart-x86_64-unknown-linux-gnu.tar.gz"
+  "STALWART_MIGRATE_VERSION|stalwartlabs/stalwart-migrate|v|install/stalwart-migrate.sha256|https://github.com/stalwartlabs/stalwart-migrate/releases/download/v{V}/stalwart-migrate-x86_64-unknown-linux-gnu.tar.xz"
+  "cli_version|stalwartlabs/cli|v|install/stalwart-cli.sha256|-"
+  "bulwark_version|bulwarkmail/webmail||install/bulwark.sha256|-"
+  "kratos_version|ory/kratos|v|install/kratos.sha256|https://github.com/ory/kratos/releases/download/v{V}/kratos_{V}-linux_64bit.tar.gz"
+  "wp_version|wp-cli/wp-cli|v|install/wp-cli.sha256|https://github.com/wp-cli/wp-cli/releases/download/v{V}/wp-cli-{V}.phar"
+  "pma_version|phpmyadmin/phpmyadmin|RELEASE_|install/phpmyadmin.sha256|-"
+  "adminer_version|vrana/adminer|v|install/adminer.sha256|https://github.com/vrana/adminer/releases/download/v{V}/adminer-{V}.php"
+  "snuf_version|jvoisin/snuffleupagus|v|-|-"
+  "LMD_VERSION|rfxn/linux-malware-detect|v|-|-"
+  "YARAX_VERSION|VirusTotal/yara-x|v|-|-"
+)
+
+MODE="table"
+REFRESH_VAR=""
+REFRESH_VERSION=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --markdown) MODE="markdown"; shift ;;
+    --refresh-sha) MODE="refresh"; REFRESH_VAR="${2:-}"; shift 2 ;;
+    --version) REFRESH_VERSION="${2:-}"; shift 2 ;;
+    -h|--help) grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "unknown arg: $1" >&2; exit 2 ;;
+  esac
+done
+
+# current_pin VAR -> the value assigned in install.sh (first match wins).
+current_pin() {
+  grep -oE "${1}=\"[^\"]+\"" "$INSTALL_SH" 2>/dev/null | head -1 | sed -E "s/.*=\"([^\"]+)\"/\1/"
+}
+
+# latest_release repo tag_prefix -> bare latest version, or "" on failure.
+# Prefers gh (authenticated locally); falls back to curl + the REST API so it
+# also works when gh is missing (curl + a token are enough).
+latest_release() {
+  local repo="$1" prefix="$2" tag=""
+  if command -v gh >/dev/null 2>&1; then
+    tag="$(gh api "repos/${repo}/releases/latest" --jq '.tag_name' 2>/dev/null)"
+  fi
+  if [[ -z "$tag" ]]; then
+    local -a auth=()
+    local tok="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+    [[ -n "$tok" ]] && auth=(-H "Authorization: Bearer ${tok}")
+    tag="$(curl -fsSL "${auth[@]}" -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
+      | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"[^"]+"' | head -1 \
+      | sed -E 's/.*"([^"]+)"$/\1/')"
+  fi
+  [[ -z "$tag" ]] && return 0
+  # phpMyAdmin tags are RELEASE_5_2_3 -> 5.2.3; underscores to dots after strip.
+  tag="${tag#"$prefix"}"
+  [[ "$prefix" == "RELEASE_" ]] && tag="${tag//_/.}"
+  printf '%s' "$tag"
+}
+
+# release_body repo -> the /releases/latest notes (markdown), truncated so the
+# monthly issue stays readable. Surfaces WHAT a bump brings — new features to
+# consider adopting into dotnext, not just a version number (GH #1456). gh
+# locally; curl + REST when gh is missing. Empty on failure.
+RELEASE_NOTES_MAX_LINES="${RELEASE_NOTES_MAX_LINES:-40}"
+release_body() {
+  local repo="$1" body=""
+  if command -v gh >/dev/null 2>&1; then
+    body="$(gh api "repos/${repo}/releases/latest" --jq '.body' 2>/dev/null)"
+  fi
+  if [[ -z "$body" ]]; then
+    local tok="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+    local -a auth=(); [[ -n "$tok" ]] && auth=(-H "Authorization: Bearer ${tok}")
+    # When gh is missing, decode the JSON-escaped .body with python3 (the same
+    # tool the workflow uses to build the issue payload); jq only if python3 is absent.
+    local json
+    json="$(curl -fsSL "${auth[@]}" -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null)"
+    if [[ -n "$json" ]]; then
+      if command -v python3 >/dev/null 2>&1; then
+        body="$(printf '%s' "$json" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("body") or "")' 2>/dev/null)"
+      elif command -v jq >/dev/null 2>&1; then
+        body="$(printf '%s' "$json" | jq -r '.body // ""')"
+      fi
+    fi
+  fi
+  [[ -z "$body" ]] && return 0
+  # Normalise CRLF, drop the boilerplate contributor/checksum tail, truncate.
+  printf '%s' "$body" | tr -d '\r' | sed -E 's/[[:space:]]+$//' | head -n "$RELEASE_NOTES_MAX_LINES"
+}
+
+# ---- --refresh-sha --------------------------------------------------------
+if [[ "$MODE" == "refresh" ]]; then
+  [[ -z "$REFRESH_VAR" ]] && { echo "--refresh-sha needs a VAR name" >&2; exit 2; }
+  for row in "${MANIFEST[@]}"; do
+    IFS='|' read -r var repo prefix shafile urltpl <<<"$row"
+    [[ "$var" != "$REFRESH_VAR" ]] && continue
+    [[ "$shafile" == "-" || "$urltpl" == "-" ]] && { echo "$var has no auto-refreshable sha (arch-varying asset) — capture by hand" >&2; exit 1; }
+    local_ver="${REFRESH_VERSION:-$(current_pin "$var")}"
+    [[ -z "$local_ver" ]] && { echo "could not resolve a version for $var" >&2; exit 1; }
+    url="${urltpl//\{V\}/$local_ver}"
+    echo "downloading $url" >&2
+    sum="$(curl -fsSL "$url" | sha256sum | awk '{print $1}')" || { echo "download/hash failed for $url" >&2; exit 1; }
+    [[ -z "$sum" ]] && { echo "empty checksum" >&2; exit 1; }
+    tgt="$REPO_DIR/$shafile"
+    { echo "# ${var} ${local_ver} — SHA-256 of $(basename "$url") (refreshed by deps-check.sh)"; echo "$sum  $(basename "$url")"; } >"$tgt"
+    echo "wrote $shafile: $sum" >&2
+    exit 0
+  done
+  echo "unknown VAR: $REFRESH_VAR" >&2; exit 2
+fi
+
+# ---- collect install.sh pin rows -----------------------------------------
+declare -a ROWS_OUT   # "name|current|latest|status"
+outdated=0
+for row in "${MANIFEST[@]}"; do
+  IFS='|' read -r var repo prefix shafile urltpl <<<"$row"
+  cur="$(current_pin "$var")"; [[ -z "$cur" ]] && cur="(unset)"
+  lat="$(latest_release "$repo" "$prefix")"; [[ -z "$lat" ]] && lat="(fetch failed)"
+  if [[ "$lat" == "(fetch failed)" || "$cur" == "$lat" ]]; then
+    status="ok"
+  else
+    status="UPGRADE"; outdated=$((outdated+1))
+  fi
+  disp="${var%_VERSION}"; disp="${disp%_version}"; disp="${disp,,}"
+  ROWS_OUT+=("$disp|$cur|$lat|$status|$repo")
+done
+
+# signature-base (JAB-248) — rolling-master repo pinned by COMMIT SHA, not
+# a release tag, so it can't ride the MANIFEST loop. Compare the pinned
+# SHA against upstream master HEAD; drift means a reviewed pin bump is
+# due. Report-only, same as every other row.
+sigbase_cur="$(current_pin 'SIGBASE_COMMIT')"
+if [[ -n "$sigbase_cur" ]]; then
+  sigbase_lat=""
+  if command -v gh >/dev/null 2>&1; then
+    sigbase_lat="$(gh api "repos/Neo23x0/signature-base/commits/master" --jq '.sha' 2>/dev/null)"
+  fi
+  if [[ -z "$sigbase_lat" ]]; then
+    _tok="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+    _auth=(); [[ -n "$_tok" ]] && _auth=(-H "Authorization: Bearer ${_tok}")
+    sigbase_lat="$(curl -fsSL "${_auth[@]}" -H "Accept: application/vnd.github+json" \
+      "https://api.github.com/repos/Neo23x0/signature-base/commits/master" 2>/dev/null \
+      | grep -oE '"sha"[[:space:]]*:[[:space:]]*"[0-9a-f]{40}"' | head -1 \
+      | grep -oE '[0-9a-f]{40}')"
+  fi
+  if [[ -z "$sigbase_lat" ]]; then
+    ROWS_OUT+=("signature-base|${sigbase_cur:0:12}|(fetch failed)|ok|Neo23x0/signature-base")
+  elif [[ "$sigbase_cur" == "$sigbase_lat" ]]; then
+    ROWS_OUT+=("signature-base|${sigbase_cur:0:12}|${sigbase_lat:0:12}|ok|Neo23x0/signature-base")
+  else
+    ROWS_OUT+=("signature-base|${sigbase_cur:0:12}|${sigbase_lat:0:12}|UPGRADE|Neo23x0/signature-base")
+    outdated=$((outdated+1))
+  fi
+fi
+
+# Go toolchain — pinned in install.sh as GO_VERSION="${DOTNEXT_GO_VERSION:-x.y.z}"
+# and kept equal to go.mod's toolchain line and the workflows' GO_VERSION
+# (TestGoToolchainPinsAgree). Go publishes on go.dev, not as GitHub releases,
+# so it can't ride the MANIFEST loop. go.dev's JSON lists stable releases
+# newest first.
+go_cur="$(grep -oE '^GO_VERSION="\$\{DOTNEXT_GO_VERSION:-[0-9.]+\}"' "$INSTALL_SH" 2>/dev/null \
+  | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1)"
+if [[ -n "$go_cur" ]]; then
+  go_lat="$(curl -fsSL "https://go.dev/dl/?mode=json" 2>/dev/null \
+    | grep -oE '"version"[[:space:]]*:[[:space:]]*"go[0-9.]+"' | head -1 \
+    | grep -oE '[0-9]+\.[0-9]+(\.[0-9]+)?')"
+  if [[ -z "$go_lat" ]]; then
+    ROWS_OUT+=("go|$go_cur|(fetch failed)|ok|golang/go")
+  elif [[ "$go_cur" == "$go_lat" ]]; then
+    ROWS_OUT+=("go|$go_cur|$go_lat|ok|golang/go")
+  else
+    ROWS_OUT+=("go|$go_cur|$go_lat|UPGRADE|golang/go")
+    outdated=$((outdated+1))
+  fi
+fi
+
+# ---- apt / packagecloud deps ---------------------------------------------
+# CrowdSec (engine) and the crowdsec-nginx-bouncer are installed from the
+# upstream packagecloud apt repo (add_crowdsec_apt_source in install.sh),
+# NOT pinned as an install.sh VAR — apt tracks the packagecloud `any main`
+# candidate, so both the off-the-shelf bots and the VAR-based MANIFEST loop
+# above miss them. Report the upstream GitHub release so a new minor/major
+# (e.g. CrowdSec 1.8's AppSec bot-detection) surfaces in the monthly issue
+# instead of being discovered by accident from a blog post.
+#
+# Report-only, no current-vs-latest diff: "current" is whatever each box's
+# apt resolved at install/update time (`cscli version` on the box), not a
+# value in the repo — so there's nothing here to compare against. A human
+# reviews the changelog and bumps on a box.
+declare -a APT_ROWS_OUT   # "name|latest|repo"
+for aptrow in \
+  "crowdsec|crowdsecurity/crowdsec|v" \
+  "crowdsec-nginx-bouncer|crowdsecurity/cs-nginx-bouncer|v"; do
+  IFS='|' read -r aname arepo aprefix <<<"$aptrow"
+  alat="$(latest_release "$arepo" "$aprefix")"; [[ -z "$alat" ]] && alat="(fetch failed)"
+  APT_ROWS_OUT+=("$aname|$alat|$arepo")
+done
+
+# ---- go.mod --------------------------------------------------------------
+go_report() {
+  command -v go >/dev/null 2>&1 || { echo "_(go not installed — skipped)_"; return; }
+  local out
+  out="$(cd "$REPO_DIR" && GOFLAGS=-mod=mod go list -u -m -f '{{if and .Update (not .Indirect)}}{{.Path}} {{.Version}} -> {{.Update.Version}}{{end}}' all 2>/dev/null | grep -v '^$')"
+  if [[ -z "$out" ]]; then echo "All direct Go modules up to date."; else echo "$out"; fi
+}
+
+# ---- npm -----------------------------------------------------------------
+npm_report() {
+  command -v npm >/dev/null 2>&1 || { echo "_(npm not installed — skipped)_"; return; }
+  [[ -f "$REPO_DIR/panel-ui/package.json" ]] || { echo "_(panel-ui/package.json missing)_"; return; }
+  local json
+  json="$(cd "$REPO_DIR/panel-ui" && npm outdated --json 2>/dev/null)"
+  [[ -z "$json" || "$json" == "{}" ]] && { echo "All npm deps up to date."; return; }
+  if command -v jq >/dev/null 2>&1; then
+    # Without node_modules (a fresh checkout, the monthly workflow) npm reports
+    # no "current" and lists every dependency; the version the lockfile pins is
+    # what installs, so report that and drop the ones already at latest.
+    local lock="$REPO_DIR/panel-ui/package-lock.json"
+    [[ -f "$lock" ]] || lock=/dev/null
+    echo "$json" | jq -r --slurpfile lock "$lock" '
+      to_entries[]
+      | (.value.current // ($lock[0].packages["node_modules/" + .key].version? // "?")) as $cur
+      | select($cur != .value.latest)
+      | "\(.key) \($cur) -> \(.value.latest)"'
+  else
+    echo "$json"
+  fi
+}
+
+# release_link name repo -> where a pin row's release notes live.
+release_link() {
+  if [[ "$1" == "go" ]]; then
+    printf '%s' "https://go.dev/doc/devel/release"
+  else
+    printf '%s' "https://github.com/$2/releases/latest"
+  fi
+}
+
+# ---- render ---------------------------------------------------------------
+if [[ "$MODE" == "markdown" ]]; then
+  echo "## install.sh pins (${outdated} to upgrade)"
+  echo
+  echo "| dependency | current | latest | status | repo |"
+  echo "|---|---|---|---|---|"
+  for r in "${ROWS_OUT[@]}"; do
+    IFS='|' read -r n c l s repo <<<"$r"
+    mark="✅"; [[ "$s" == "UPGRADE" ]] && mark="⬆️ **upgrade**"
+    echo "| \`$n\` | $c | $l | $mark | [$repo]($(release_link "$n" "$repo")) |"
+  done
+  echo
+  echo "## Go modules (\`go.mod\`)"
+  echo '```'; go_report; echo '```'
+  echo
+  echo "## npm (\`panel-ui\`)"
+  echo '```'; npm_report; echo '```'
+  echo
+  echo "## apt / packagecloud (unpinned — review upstream)"
+  echo
+  echo "| dependency | current | upstream latest | repo |"
+  echo "|---|---|---|---|"
+  for r in "${APT_ROWS_OUT[@]}"; do
+    IFS='|' read -r n l repo <<<"$r"
+    echo "| \`$n\` | apt (packagecloud) — \`cscli version\` on a box | $l | [$repo](https://github.com/$repo/releases/latest) |"
+  done
+  echo
+  echo "> CrowdSec and its nginx bouncer come from the upstream packagecloud repo (unpinned), so they aren't in the pin table above. Compare the upstream release against \`cscli version\` on a box; a bump can carry AppSec/config changes (e.g. 1.8's bot-detection needs a newer \`crowdsec-nginx-bouncer\` **and** appsec config), so read the changelog and E2E on a box before rolling to the fleet."
+  echo
+  # ---- what's new: the upstream release notes for each upgrade, inline, so a
+  # maintainer can spot features worth adopting into dotnext without opening ten
+  # tabs (GH #1456). install.sh pin upgrades + the always-report crowdsec rows.
+  echo "## What's new upstream (features to consider adopting)"
+  echo
+  any_notes=0
+  for r in "${ROWS_OUT[@]}"; do
+    IFS='|' read -r n c l s repo <<<"$r"
+    [[ "$s" != "UPGRADE" ]] && continue
+    [[ "$n" == "signature-base" ]] && continue # rolling rule commits, not feature releases
+    notes=""
+    [[ "$n" != "go" ]] && notes="$(release_body "$repo")" # Go has no GitHub releases
+    echo "<details><summary><code>$n</code> $c → $l — <a href=\"$(release_link "$n" "$repo")\">full notes</a></summary>"
+    echo
+    if [[ -n "$notes" ]]; then echo "$notes"; else echo "_(release notes not fetched — open the link)_"; fi
+    echo
+    echo "</details>"
+    echo
+    any_notes=1
+  done
+  for r in "${APT_ROWS_OUT[@]}"; do
+    IFS='|' read -r n l repo <<<"$r"
+    notes="$(release_body "$repo")"
+    echo "<details><summary><code>$n</code> — upstream latest $l — <a href=\"https://github.com/$repo/releases/latest\">full notes</a></summary>"
+    echo
+    if [[ -n "$notes" ]]; then echo "$notes"; else echo "_(release notes not fetched — open the link)_"; fi
+    echo
+    echo "</details>"
+    echo
+    any_notes=1
+  done
+  [[ "$any_notes" == 0 ]] && { echo "_No upstream upgrades to review this month._"; echo; }
+  echo "> Bump an install.sh pin, then \`scripts/deps-check.sh --refresh-sha <VAR>\` to re-capture its \`.sha256\`. Framework bumps (Stalwart, Bulwark, Kratos) need an E2E on a box before merge."
+else
+  printf '%-14s %-14s %-14s %s\n' "DEP" "CURRENT" "LATEST" "STATUS"
+  for r in "${ROWS_OUT[@]}"; do
+    IFS='|' read -r n c l s repo <<<"$r"
+    printf '%-14s %-14s %-14s %s\n' "$n" "$c" "$l" "$s"
+  done
+  echo; echo "== Go (direct, outdated) =="; go_report
+  echo; echo "== npm (panel-ui, outdated) =="; npm_report
+  echo; echo "== apt/packagecloud (unpinned, upstream latest — check 'cscli version' on a box) =="
+  for r in "${APT_ROWS_OUT[@]}"; do
+    IFS='|' read -r n l repo <<<"$r"
+    printf '%-26s %s\n' "$n" "$l"
+  done
+  echo; echo "install.sh pins needing upgrade: $outdated"
+fi

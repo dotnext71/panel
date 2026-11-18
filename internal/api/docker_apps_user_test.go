@@ -1,0 +1,711 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	"gorm.io/gorm"
+
+	"github.com/dotnext-panel/dotnext/internal/agent"
+	"github.com/dotnext-panel/dotnext/internal/auth"
+	"github.com/dotnext-panel/dotnext/internal/dockerapp"
+	"github.com/dotnext-panel/dotnext/internal/ginctx"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+)
+
+// --- pure helpers ---
+
+func TestTenantInstanceSlug_NamespacedByOwner(t *testing.T) {
+	a := tenantInstanceSlug("memos", "01HXYZABCDEFGHIJKLMNOPQRST", "notes")
+	b := tenantInstanceSlug("memos", "01HXYZ99999999999999999999", "notes")
+	if a == b {
+		t.Fatal("same slug+name for different owners must differ")
+	}
+	if !strings.HasPrefix(a, "memos-") || strings.ToLower(a) != a {
+		t.Errorf("instance slug %q not lowercased/prefixed", a)
+	}
+	// Regression: ULID user IDs share a millisecond-timestamp PREFIX, so two
+	// users created in the same window must NOT collide (the userID[:8] bug).
+	// These two differ only in their random tail.
+	p1 := tenantInstanceSlug("memos", "01HXYZ0000AAAAAAAAAAAAAAAA", "notes")
+	p2 := tenantInstanceSlug("memos", "01HXYZ0000BBBBBBBBBBBBBBBB", "notes")
+	if p1 == p2 {
+		t.Fatalf("same-timestamp-prefix users collided: %q == %q (entropy must come from the whole ID)", p1, p2)
+	}
+}
+
+func TestTenantInstallable_Filter(t *testing.T) {
+	if tenantInstallable(dockerapp.Entry{TenantInstallable: false}) {
+		t.Error("false flag must not be installable")
+	}
+	pub := dockerapp.Entry{TenantInstallable: true, Ports: []dockerapp.PortSpec{{DefaultBind: "public"}}}
+	if tenantInstallable(pub) {
+		t.Error("a default-public port must disqualify a tenant app")
+	}
+	ok := dockerapp.Entry{TenantInstallable: true, Ports: []dockerapp.PortSpec{{DefaultBind: "loopback"}}}
+	if !tenantInstallable(ok) {
+		t.Error("loopback-only tenant_installable app must be installable")
+	}
+}
+
+// --- fakes (embed the interface; override only what the guard paths hit) ---
+
+type fakeDockerRepo struct {
+	repository.DockerAppRepository
+	count           int64
+	sumBytes        int64
+	owned           map[string]*models.DockerApp
+	updated         map[string]string
+	byOwnerSlugName map[string]*models.DockerApp // key: userID|slug|name
+	deleted         map[string]bool
+	createErr       error
+}
+
+func (f *fakeDockerRepo) FindByOwnerSlugName(_ context.Context, userID, slug, name string) (*models.DockerApp, error) {
+	if a, ok := f.byOwnerSlugName[userID+"|"+slug+"|"+name]; ok {
+		return a, nil
+	}
+	return nil, gorm.ErrRecordNotFound
+}
+
+func (f *fakeDockerRepo) Create(_ context.Context, _ *models.DockerApp) error { return f.createErr }
+
+func (f *fakeDockerRepo) Delete(_ context.Context, id string) error {
+	if f.deleted == nil {
+		f.deleted = map[string]bool{}
+	}
+	f.deleted[id] = true
+	return nil
+}
+
+func (f *fakeDockerRepo) CreatePort(context.Context, *models.DockerAppPublishedPort) error { return nil }
+
+func (f *fakeDockerRepo) FindFreeHostPort(_ context.Context, _ string, skip func(int) bool) (int, error) {
+	for p := 10000; p <= 19999; p++ {
+		if skip == nil || !skip(p) {
+			return p, nil
+		}
+	}
+	return 0, repository.ErrNotFound
+}
+
+func (f *fakeDockerRepo) HostPortInUse(context.Context, string, int, string) (bool, error) {
+	return false, nil
+}
+
+func (f *fakeDockerRepo) ListPortsForApp(context.Context, string) ([]*models.DockerAppPublishedPort, error) {
+	return nil, nil
+}
+
+func (f *fakeDockerRepo) UpdateStatus(_ context.Context, id, status string, _ *string) error {
+	if f.updated == nil {
+		f.updated = map[string]string{}
+	}
+	f.updated[id] = status
+	return nil
+}
+
+func (f *fakeDockerRepo) UpdateCatalogVersion(context.Context, string, string) error { return nil }
+
+func (f *fakeDockerRepo) SumDataBytesByUserID(context.Context, string) (int64, error) {
+	return f.sumBytes, nil
+}
+
+func (f *fakeDockerRepo) CountByUserID(context.Context, string) (int64, error) { return f.count, nil }
+func (f *fakeDockerRepo) ListByUserID(context.Context, string) ([]*models.DockerApp, error) {
+	return nil, nil
+}
+func (f *fakeDockerRepo) FindByIDForUser(_ context.Context, id, _ string) (*models.DockerApp, error) {
+	if a, ok := f.owned[id]; ok {
+		return a, nil
+	}
+	return nil, gorm.ErrRecordNotFound
+}
+
+type fakeUserRepo struct {
+	repository.UserRepository
+	user *models.User
+}
+
+func (f *fakeUserRepo) FindByID(context.Context, string) (*models.User, error) { return f.user, nil }
+
+type fakePkgRepo struct {
+	repository.PackageRepository
+	pkg *models.HostingPackage
+}
+
+func (f *fakePkgRepo) FindByID(context.Context, string) (*models.HostingPackage, error) {
+	return f.pkg, nil
+}
+
+type fakeDomainRepo struct {
+	repository.DomainRepository
+	byName   map[string]*models.Domain
+	owned    []models.Domain
+	detached map[string]bool
+	deleted  map[string]bool
+}
+
+func (f *fakeDomainRepo) ListByUserID(_ context.Context, _ string, _ repository.ListOptions) ([]models.Domain, int64, error) {
+	return f.owned, int64(len(f.owned)), nil
+}
+
+func (f *fakeDomainRepo) DetachDockerApp(_ context.Context, id string, _ bool) error {
+	if f.detached == nil {
+		f.detached = map[string]bool{}
+	}
+	f.detached[id] = true
+	return nil
+}
+
+func (f *fakeDomainRepo) Delete(_ context.Context, id string) error {
+	if f.deleted == nil {
+		f.deleted = map[string]bool{}
+	}
+	f.deleted[id] = true
+	return nil
+}
+
+func (f *fakeDomainRepo) FindByName(_ context.Context, n string) (*models.Domain, error) {
+	if d, ok := f.byName[n]; ok {
+		return d, nil
+	}
+	// repository.ErrNotFound (not gorm.ErrRecordNotFound) so a not-found advances
+	// CrossTenantSuffixCollision's errors.Is(err, repository.ErrNotFound) parent
+	// walk instead of tripping its fail-closed default — matches the real
+	// domainRepo.FindByName and every other fake in this package.
+	return nil, repository.ErrNotFound
+}
+
+// tenantCatalog writes a minimal tenant_installable app into a temp dir.
+func tenantCatalog(t *testing.T) *dockerapp.Catalog {
+	t.Helper()
+	root := t.TempDir()
+	dir := filepath.Join(root, "tdemo")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	app := `slug: tdemo
+name: TDemo
+version: "1.0.0"
+description: tenant demo app
+image_channel: docker.io/library/busybox:1@sha256:0000000000000000000000000000000000000000000000000000000000000000
+tenant_installable: true
+tenant_caps: ["CHOWN"]
+volumes:
+  - name: data
+    container_path: /data
+ports:
+  - name: http
+    container_port: 8080
+    protocol: tcp
+    default_enabled: true
+    default_bind: loopback
+    default_reverse_proxy: true
+`
+	compose := "services:\n  tdemo:\n    image: {{ .ImageChannel }}\n"
+	os.WriteFile(filepath.Join(dir, "app.yaml"), []byte(app), 0o644)
+	os.WriteFile(filepath.Join(dir, "compose.yml.tmpl"), []byte(compose), 0o644)
+	os.WriteFile(filepath.Join(dir, "icon.svg"), []byte(`<svg/>`), 0o644)
+	cat, errs := dockerapp.LoadDir(root)
+	if len(errs) > 0 {
+		t.Fatalf("temp catalog load errors: %v", errs)
+	}
+	return cat
+}
+
+func tenantRouter(t *testing.T, cfg UserDockerAppHandlerConfig, flagExists bool) *gin.Engine {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	if flagExists {
+		f := filepath.Join(t.TempDir(), "flag")
+		os.WriteFile(f, []byte("on"), 0o644)
+		cfg.TenantFlagPath = f
+	} else {
+		cfg.TenantFlagPath = filepath.Join(t.TempDir(), "absent")
+	}
+	r := gin.New()
+	v1 := r.Group("/api/v1")
+	v1.Use(func(c *gin.Context) {
+		ginctx.SetClaims(c, &auth.AccessClaims{UserID: "u1", IsAdmin: false})
+		c.Next()
+	})
+	RegisterUserDockerAppRoutes(v1, cfg)
+	return r
+}
+
+func post(r *gin.Engine, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/docker-apps", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	return rec
+}
+
+func uname(s string) *string { return &s }
+
+func TestTenantDocker_FlagAbsent403(t *testing.T) {
+	r := tenantRouter(t, UserDockerAppHandlerConfig{Repo: &fakeDockerRepo{}, Catalog: tenantCatalog(t)}, false)
+	rec := post(r, `{"slug":"tdemo","name":"x","domain":"x.example.com"}`)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "docker_tenant_not_enabled") {
+		t.Fatalf("want 403 docker_tenant_not_enabled, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestTenantDocker_PackageNotIncluded403(t *testing.T) {
+	cfg := UserDockerAppHandlerConfig{
+		Repo:     &fakeDockerRepo{},
+		Catalog:  tenantCatalog(t),
+		Users:    &fakeUserRepo{user: &models.User{ID: "u1", Username: uname("alice"), PackageID: uname("p1")}},
+		Packages: &fakePkgRepo{pkg: &models.HostingPackage{ID: "p1", MaxDockerApps: 0}},
+		Domains:  &fakeDomainRepo{},
+	}
+	r := tenantRouter(t, cfg, true)
+	rec := post(r, `{"slug":"tdemo","name":"x","domain":"x.example.com"}`)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "docker_apps_not_in_package") {
+		t.Fatalf("want 403 not_in_package, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestTenantDocker_QuotaExceeded409(t *testing.T) {
+	cfg := UserDockerAppHandlerConfig{
+		Repo:     &fakeDockerRepo{count: 1},
+		Catalog:  tenantCatalog(t),
+		Users:    &fakeUserRepo{user: &models.User{ID: "u1", Username: uname("alice"), PackageID: uname("p1")}},
+		Packages: &fakePkgRepo{pkg: &models.HostingPackage{ID: "p1", MaxDockerApps: 1}},
+		Domains:  &fakeDomainRepo{},
+	}
+	r := tenantRouter(t, cfg, true)
+	rec := post(r, `{"slug":"tdemo","name":"x","domain":"x.example.com"}`)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "docker_app_quota_exceeded") {
+		t.Fatalf("want 409 quota_exceeded, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestTenantDocker_ForeignDomain409(t *testing.T) {
+	cfg := UserDockerAppHandlerConfig{
+		Repo:     &fakeDockerRepo{count: 0},
+		Catalog:  tenantCatalog(t),
+		Users:    &fakeUserRepo{user: &models.User{ID: "u1", Username: uname("alice"), PackageID: uname("p1")}},
+		Packages: &fakePkgRepo{pkg: &models.HostingPackage{ID: "p1", MaxDockerApps: 5}},
+		Domains:  &fakeDomainRepo{byName: map[string]*models.Domain{"x.example.com": {ID: "d1", UserID: "someone-else"}}},
+	}
+	r := tenantRouter(t, cfg, true)
+	rec := post(r, `{"slug":"tdemo","name":"x","domain":"x.example.com"}`)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "domain_in_use") {
+		t.Fatalf("want 409 domain_in_use, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// GH #1776: a tenant who deleted their own app must be able to reinstall it
+// under the same name. The `deleted` tombstone (kept for admin visibility)
+// holds the (user_id, slug, name) unique key, so the install path must clear
+// the corpse before Create. A fake repo can't reproduce the DB unique-key
+// rejection, so the decisive assertion is that the tombstone row was deleted;
+// Create is forced to error to short-circuit before the port/agent stages.
+func TestTenantDocker_DeletedTombstoneReinstall_ClearsCorpse(t *testing.T) {
+	tomb := &models.DockerApp{ID: "old-tomb", UserID: uname("u1"), Slug: "tdemo", Name: "x", Status: models.DockerAppStatusDeleted}
+	repo := &fakeDockerRepo{
+		byOwnerSlugName: map[string]*models.DockerApp{"u1|tdemo|x": tomb},
+		createErr:       errors.New("stop-after-corpse"),
+	}
+	cfg := UserDockerAppHandlerConfig{
+		Repo:     repo,
+		Catalog:  tenantCatalog(t),
+		Users:    &fakeUserRepo{user: &models.User{ID: "u1", Username: uname("alice"), PackageID: uname("p1")}},
+		Packages: &fakePkgRepo{pkg: &models.HostingPackage{ID: "p1", MaxDockerApps: 5}},
+		Domains:  &fakeDomainRepo{},
+	}
+	r := tenantRouter(t, cfg, true)
+	rec := post(r, `{"slug":"tdemo","name":"x","domain":"x.example.com"}`)
+	if !repo.deleted["old-tomb"] {
+		t.Fatalf("deleted tombstone was not cleared before reinstall; body=%s", rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "already_installed") {
+		t.Fatalf("reinstall of a deleted app must not 409 already_installed: %s", rec.Body.String())
+	}
+}
+
+// A still-live install of the same name is a genuine conflict — the corpse
+// path must NOT clear it, and the tenant gets a clean 409.
+func TestTenantDocker_LiveDuplicateReinstall_409(t *testing.T) {
+	live := &models.DockerApp{ID: "live1", UserID: uname("u1"), Slug: "tdemo", Name: "x", Status: models.DockerAppStatusRunning}
+	repo := &fakeDockerRepo{byOwnerSlugName: map[string]*models.DockerApp{"u1|tdemo|x": live}}
+	cfg := UserDockerAppHandlerConfig{
+		Repo:     repo,
+		Catalog:  tenantCatalog(t),
+		Users:    &fakeUserRepo{user: &models.User{ID: "u1", Username: uname("alice"), PackageID: uname("p1")}},
+		Packages: &fakePkgRepo{pkg: &models.HostingPackage{ID: "p1", MaxDockerApps: 5}},
+		Domains:  &fakeDomainRepo{},
+	}
+	r := tenantRouter(t, cfg, true)
+	rec := post(r, `{"slug":"tdemo","name":"x","domain":"x.example.com"}`)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "already_installed") {
+		t.Fatalf("live duplicate must 409 already_installed, got %d %s", rec.Code, rec.Body.String())
+	}
+	if repo.deleted["live1"] {
+		t.Fatal("a live install must never be cleared as a corpse")
+	}
+}
+
+// A tenant docker-app install whose auto-created domain name collides with
+// another domain's web-domain alias (server_name) must be refused — the GH #1789
+// follow-up wiring the GH #1625 AliasCollision guard into this door, which it
+// previously skipped. The install reaches the free-name create branch (empty
+// Domains), the alias table reports "x.example.com" taken, and the handler fails
+// the install 409 domain_conflicts_alias instead of persisting the hijacking row
+// (fakeDomainRepo does not implement Create, so reaching it would panic — the
+// clean 409 proves the guard fired first).
+func TestTenantDocker_Install_AliasCollision409(t *testing.T) {
+	cfg := UserDockerAppHandlerConfig{
+		Repo:             &fakeDockerRepo{},
+		Catalog:          tenantCatalog(t),
+		Users:            &fakeUserRepo{user: &models.User{ID: "u1", Username: uname("alice"), PackageID: uname("p1")}},
+		Packages:         &fakePkgRepo{pkg: &models.HostingPackage{ID: "p1", MaxDockerApps: 5}},
+		Domains:          &fakeDomainRepo{},
+		WebDomainAliases: aliasTestAliases{taken: map[string]bool{"x.example.com": true}},
+	}
+	r := tenantRouter(t, cfg, true)
+	rec := post(r, `{"slug":"tdemo","name":"x","domain":"x.example.com"}`)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "domain_conflicts_alias") {
+		t.Fatalf("alias collision must 409 domain_conflicts_alias, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// JAB-390: a tenant docker-app install must not auto-create a domain that is,
+// or is a parent zone of, the panel's custom mail hostname. Like the alias
+// case above, reaching fakeDomainRepo.Create would panic, so a clean 409
+// proves the guard fired first.
+func TestTenantDocker_Install_MailHostnameCollision409(t *testing.T) {
+	for _, domain := range []string{"mx.example.com", "example.com"} {
+		cfg := UserDockerAppHandlerConfig{
+			Repo:             &fakeDockerRepo{},
+			Catalog:          tenantCatalog(t),
+			Users:            &fakeUserRepo{user: &models.User{ID: "u1", Username: uname("alice"), PackageID: uname("p1")}},
+			Packages:         &fakePkgRepo{pkg: &models.HostingPackage{ID: "p1", MaxDockerApps: 5}},
+			Domains:          &fakeDomainRepo{},
+			WebDomainAliases: aliasTestAliases{},
+			ServerSettings:   aliasTestSettings{hostname: "panel.host.com", mailHostname: "mx.example.com"},
+		}
+		r := tenantRouter(t, cfg, true)
+		rec := post(r, `{"slug":"tdemo","name":"x","domain":"`+domain+`"}`)
+		if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "domain_conflicts_mail_hostname") {
+			t.Fatalf("%s: want 409 domain_conflicts_mail_hostname, got %d %s", domain, rec.Code, rec.Body.String())
+		}
+	}
+}
+
+// A tenant docker-app install whose Domain carries a YAML-significant byte must
+// be rejected 400 invalid_domain before it can reach the compose renderer
+// (GH #1790). The payload uses a bare quote with no whitespace/HTML/path chars,
+// so it exercises validateDomainName's FQDN-regex branch — the one that actually
+// stops the injection — rather than an incidental whitespace rejection.
+func TestTenantDocker_Install_RejectsInjectionDomain400(t *testing.T) {
+	cfg := UserDockerAppHandlerConfig{Repo: &fakeDockerRepo{}, Catalog: tenantCatalog(t)}
+	r := tenantRouter(t, cfg, true)
+	rec := post(r, "{\"slug\":\"tdemo\",\"name\":\"x\",\"domain\":\"evil\\\"x.example.com\"}")
+	if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid_domain") {
+		t.Fatalf("injection domain must 400 invalid_domain, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestTenantDocker_UnknownSlug400(t *testing.T) {
+	cfg := UserDockerAppHandlerConfig{Repo: &fakeDockerRepo{}, Catalog: tenantCatalog(t)}
+	r := tenantRouter(t, cfg, true)
+	rec := post(r, `{"slug":"nope","name":"x","domain":"x.example.com"}`)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("want 400 for unknown slug, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestTenantDocker_GetNotOwned404(t *testing.T) {
+	cfg := UserDockerAppHandlerConfig{Repo: &fakeDockerRepo{owned: map[string]*models.DockerApp{}}, Catalog: tenantCatalog(t)}
+	r := tenantRouter(t, cfg, true)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/docker-apps/someone-elses-id", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("want 404 for non-owned app, got %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestTenantDocker_CatalogFilteredToInstallable(t *testing.T) {
+	cfg := UserDockerAppHandlerConfig{Repo: &fakeDockerRepo{}, Catalog: tenantCatalog(t)}
+	r := tenantRouter(t, cfg, true)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/docker-apps/catalog", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "tdemo") {
+		t.Fatalf("tenant catalog should list tdemo: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestTenantDocker_LogsEnvNotOwned404(t *testing.T) {
+	cfg := UserDockerAppHandlerConfig{Repo: &fakeDockerRepo{owned: map[string]*models.DockerApp{}}, Catalog: tenantCatalog(t)}
+	r := tenantRouter(t, cfg, true)
+	for _, path := range []string{"/api/v1/docker-apps/x/logs", "/api/v1/docker-apps/x/env"} {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("%s: want 404 for non-owned, got %d", path, rec.Code)
+		}
+	}
+}
+
+func TestTenantDocker_UsageOverQuota(t *testing.T) {
+	cfg := UserDockerAppHandlerConfig{
+		Repo:     &fakeDockerRepo{sumBytes: 600 * 1024 * 1024}, // 600 MiB used
+		Catalog:  tenantCatalog(t),
+		Users:    &fakeUserRepo{user: &models.User{ID: "u1", Username: uname("alice"), PackageID: uname("p1")}},
+		Packages: &fakePkgRepo{pkg: &models.HostingPackage{ID: "p1", DiskQuotaMB: 500}}, // 500 MiB quota
+	}
+	r := tenantRouter(t, cfg, true)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/docker-apps/usage", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"over_quota":true`) {
+		t.Fatalf("want over_quota true (600>500 MiB): %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestTenantDocker_UsageUnderQuota(t *testing.T) {
+	cfg := UserDockerAppHandlerConfig{
+		Repo:     &fakeDockerRepo{sumBytes: 100 * 1024 * 1024},
+		Catalog:  tenantCatalog(t),
+		Users:    &fakeUserRepo{user: &models.User{ID: "u1", Username: uname("alice"), PackageID: uname("p1")}},
+		Packages: &fakePkgRepo{pkg: &models.HostingPackage{ID: "p1", DiskQuotaMB: 500}},
+	}
+	r := tenantRouter(t, cfg, true)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/docker-apps/usage", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), `"over_quota":false`) {
+		t.Fatalf("want over_quota false: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// GH #284: tenant delete must detach the app's own domain link + clear the
+// injected proxy_pass (else the hostname keeps 502-ing at the dead container)
+// and remove any hostname auto-created for the app — mirroring the admin path.
+func TestTenantDocker_DeleteCleansDomainLinks(t *testing.T) {
+	appID := "a1"
+	dom := &fakeDomainRepo{
+		owned: []models.Domain{
+			{ID: "d1", UserID: "u1", DockerAppID: &appID, ManagedBy: ""},
+			{ID: "d2", UserID: "u1", DockerAppID: &appID, ManagedBy: models.DomainManagedByDockerApp, Name: "auto.example.com"},
+		},
+	}
+	repo := &fakeDockerRepo{owned: map[string]*models.DockerApp{
+		appID: {ID: appID, UserID: uname("u1"), Slug: "tdemo", Status: models.DockerAppStatusFailed},
+	}}
+	cfg := UserDockerAppHandlerConfig{Repo: repo, Catalog: tenantCatalog(t), Domains: dom}
+	r := tenantRouter(t, cfg, true)
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/docker-apps/a1", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("want 200, got %d %s", rec.Code, rec.Body.String())
+	}
+	if !dom.detached["d1"] {
+		t.Errorf("tenant-owned domain d1 should be detached (proxy_pass cleared)")
+	}
+	if !dom.deleted["d2"] {
+		t.Errorf("auto-managed domain d2 should be deleted")
+	}
+	if repo.updated["a1"] != models.DockerAppStatusDeleted {
+		t.Errorf("app should be soft-deleted, got %q", repo.updated["a1"])
+	}
+}
+
+// JAB-245: start/restart of an over-quota app is refused — the
+// reconciler-stop → tenant-restart loop was a reliable disk-quota
+// bypass. Stop is never gated.
+func TestTenantDocker_StartOverQuota409(t *testing.T) {
+	cfg := UserDockerAppHandlerConfig{
+		Repo: &fakeDockerRepo{
+			sumBytes: 2 << 30, // 2 GiB used
+			owned:    map[string]*models.DockerApp{"a1": {ID: "a1", Slug: "tdemo", UserID: uname("u1"), Status: models.DockerAppStatusStopped}},
+		},
+		Catalog:  tenantCatalog(t),
+		Users:    &fakeUserRepo{user: &models.User{ID: "u1", Username: uname("alice"), PackageID: uname("p1")}},
+		Packages: &fakePkgRepo{pkg: &models.HostingPackage{ID: "p1", MaxDockerApps: 5, DiskQuotaMB: 1024}}, // 1 GiB quota
+		Domains:  &fakeDomainRepo{},
+	}
+	r := tenantRouter(t, cfg, true)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/docker-apps/a1/start", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "disk_quota_exceeded") {
+		t.Fatalf("want 409 disk_quota_exceeded, got %d %s", rec.Code, rec.Body.String())
+	}
+	repo := cfg.Repo.(*fakeDockerRepo)
+	if repo.updated["a1"] != "" {
+		t.Fatalf("status updated despite refused start: %q", repo.updated["a1"])
+	}
+}
+
+func TestTenantDocker_StartUnderQuotaOK(t *testing.T) {
+	cfg := UserDockerAppHandlerConfig{
+		Repo: &fakeDockerRepo{
+			sumBytes: 100 << 20, // 100 MiB used
+			owned:    map[string]*models.DockerApp{"a1": {ID: "a1", Slug: "tdemo", UserID: uname("u1"), Status: models.DockerAppStatusStopped}},
+		},
+		Catalog:  tenantCatalog(t),
+		Users:    &fakeUserRepo{user: &models.User{ID: "u1", Username: uname("alice"), PackageID: uname("p1")}},
+		Packages: &fakePkgRepo{pkg: &models.HostingPackage{ID: "p1", MaxDockerApps: 5, DiskQuotaMB: 1024}},
+		Domains:  &fakeDomainRepo{},
+	}
+	r := tenantRouter(t, cfg, true)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/docker-apps/a1/start", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("under-quota start = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+// dockerCgroupCfg is the shared happy-path cfg for the tenant lifecycle
+// revalidation tests: owner "alice", package under quota, a recording agent.
+func dockerCgroupCfg(t *testing.T, mock *agent.MockClient, status string) UserDockerAppHandlerConfig {
+	t.Helper()
+	return UserDockerAppHandlerConfig{
+		Repo: &fakeDockerRepo{
+			sumBytes: 100 << 20, // under quota
+			owned:    map[string]*models.DockerApp{"a1": {ID: "a1", Slug: "tdemo", UserID: uname("u1"), Status: status}},
+		},
+		Catalog:  tenantCatalog(t),
+		Users:    &fakeUserRepo{user: &models.User{ID: "u1", Username: uname("alice"), PackageID: uname("p1")}},
+		Packages: &fakePkgRepo{pkg: &models.HostingPackage{ID: "p1", MaxDockerApps: 5, DiskQuotaMB: 1024}},
+		Domains:  &fakeDomainRepo{},
+		Agent:    mock,
+	}
+}
+
+func lastAgentParams(t *testing.T, mock *agent.MockClient, command string) map[string]any {
+	t.Helper()
+	var found *agent.MockCall
+	for i := range mock.Calls() {
+		if c := mock.Calls()[i]; c.Command == command {
+			cc := c
+			found = &cc
+		}
+	}
+	if found == nil {
+		t.Fatalf("no agent call recorded for %q; calls=%v", command, mock.Calls())
+	}
+	var p map[string]any
+	if err := json.Unmarshal(found.Params, &p); err != nil {
+		t.Fatalf("unmarshal %q params: %v", command, err)
+	}
+	return p
+}
+
+// JAB-364: tenant start/restart must re-validate the tenant safety profile with
+// the EXACT owner slice (tenant_cgroup), not just tenant_validate/tenant_caps.
+// Omitting tenant_cgroup dropped the agent's Gitea #525 cross-tenant-slice check
+// to the weak generic-pattern match on the bring-up path.
+func TestTenantDocker_BringUpPassesOwnerCgroup(t *testing.T) {
+	for _, verb := range []string{"start", "restart"} {
+		t.Run(verb, func(t *testing.T) {
+			mock := agent.NewMockClient()
+			mock.On("docker_app."+verb, map[string]any{"status": "ok"})
+			r := tenantRouter(t, dockerCgroupCfg(t, mock, models.DockerAppStatusStopped), true)
+
+			req := httptest.NewRequest(http.MethodPost, "/api/v1/docker-apps/a1/"+verb, nil)
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("%s: want 200, got %d (%s)", verb, rec.Code, rec.Body.String())
+			}
+			p := lastAgentParams(t, mock, "docker_app."+verb)
+			if p["tenant_validate"] != true {
+				t.Errorf("%s: tenant_validate = %v, want true", verb, p["tenant_validate"])
+			}
+			if got := p["tenant_cgroup"]; got != "dotnext-user-alice.slice" {
+				t.Errorf("%s: tenant_cgroup = %v, want dotnext-user-alice.slice", verb, got)
+			}
+			if _, ok := p["tenant_caps"]; !ok {
+				t.Errorf("%s: tenant_caps missing", verb)
+			}
+		})
+	}
+}
+
+// JAB-364 / Gitea #529: if the owner slice can't be resolved (no username), the
+// bring-up must fail closed — never dispatch `compose up` unvalidated.
+func TestTenantDocker_BringUpFailsClosedWhenOwnerUnresolved(t *testing.T) {
+	mock := agent.NewMockClient()
+	mock.On("docker_app.start", map[string]any{"status": "ok"})
+	cfg := dockerCgroupCfg(t, mock, models.DockerAppStatusStopped)
+	cfg.Users = &fakeUserRepo{user: &models.User{ID: "u1", Username: nil, PackageID: uname("p1")}}
+	r := tenantRouter(t, cfg, true)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/docker-apps/a1/start", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "tenant_validation_unavailable") {
+		t.Fatalf("want 500 tenant_validation_unavailable, got %d %s", rec.Code, rec.Body.String())
+	}
+	for _, c := range mock.Calls() {
+		if c.Command == "docker_app.start" {
+			t.Fatal("agent bring-up dispatched despite an unresolved owner slice — must fail closed")
+		}
+	}
+}
+
+// Stop is never a bring-up, so it neither validates nor needs the owner slice.
+func TestTenantDocker_StopDoesNotValidate(t *testing.T) {
+	mock := agent.NewMockClient()
+	mock.On("docker_app.stop", map[string]any{"status": "ok"})
+	r := tenantRouter(t, dockerCgroupCfg(t, mock, models.DockerAppStatusRunning), true)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/docker-apps/a1/stop", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stop: want 200, got %d (%s)", rec.Code, rec.Body.String())
+	}
+	p := lastAgentParams(t, mock, "docker_app.stop")
+	if _, ok := p["tenant_validate"]; ok {
+		t.Errorf("stop must not set tenant_validate: %v", p)
+	}
+}
+
+func TestTenantDocker_StopOverQuotaNeverGated(t *testing.T) {
+	cfg := UserDockerAppHandlerConfig{
+		Repo: &fakeDockerRepo{
+			sumBytes: 2 << 30,
+			owned:    map[string]*models.DockerApp{"a1": {ID: "a1", Slug: "tdemo", UserID: uname("u1"), Status: models.DockerAppStatusRunning}},
+		},
+		Catalog:  tenantCatalog(t),
+		Users:    &fakeUserRepo{user: &models.User{ID: "u1", Username: uname("alice"), PackageID: uname("p1")}},
+		Packages: &fakePkgRepo{pkg: &models.HostingPackage{ID: "p1", MaxDockerApps: 5, DiskQuotaMB: 1024}},
+		Domains:  &fakeDomainRepo{},
+	}
+	r := tenantRouter(t, cfg, true)
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/docker-apps/a1/stop", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("stop of over-quota app = %d, want 200 — blocking stop would be perverse (%s)", rec.Code, rec.Body.String())
+	}
+}
+
+func (r *fakeDomainRepo) RewriteDocRootPrefix(context.Context, string, string, string) (int64, error) {
+	return 0, nil
+}
+
+func (r *fakeUserRepo) UpdateUsername(context.Context, string, string) error          { return nil }
+func (r *fakeDomainRepo) TransferOwner(context.Context, string, string, string) error { return nil }

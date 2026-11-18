@@ -1,0 +1,84 @@
+import { useTranslation } from "react-i18next";
+import { useEffect, useState } from "react";
+import { Card, Switch, Typography } from "antd";
+import { feedback } from "../../../lib/feedback"; // GH #970: themed toasts
+
+import { apiClient } from "../../../apiClient";
+
+// TenantDomainOptionsCard — Server Settings → General: opt non-admin domain
+// owners into the curated safe nginx options plus the tenant-safe rewrite /
+// custom_header rule builder (GH #307, GH #1624). Off by default; raw nginx
+// directives (proxy_pass, IP access, PHP settings) stay admin-only regardless.
+export const TenantDomainOptionsCard = () => {
+  const { t } = useTranslation();
+  const [enabled, setEnabled] = useState(false);
+  const [docroot, setDocroot] = useState(true);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [savingDocroot, setSavingDocroot] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await apiClient.get<{ tenant_domain_options_enabled?: boolean; tenant_docroot_editable?: boolean }>("/admin/settings");
+        if (!cancelled) {
+          setEnabled(resp.data.tenant_domain_options_enabled === true);
+          setDocroot(resp.data.tenant_docroot_editable !== false);
+        }
+      } catch {
+        if (!cancelled) feedback.message.error("Failed to load tenant domain options setting");
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const onToggle = async (next: boolean) => {
+    setSaving(true);
+    try {
+      await apiClient.patch("/admin/settings", { tenant_domain_options_enabled: next });
+      setEnabled(next);
+      feedback.message.success(next ? "Tenant domain options enabled" : "Tenant domain options disabled");
+    } catch {
+      feedback.message.error("Failed to update setting");
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const onToggleDocroot = async (next: boolean) => {
+    setSavingDocroot(true);
+    try {
+      await apiClient.patch("/admin/settings", { tenant_docroot_editable: next });
+      setDocroot(next);
+      feedback.message.success(next ? "Tenant document-root editing enabled" : "Tenant document-root editing disabled");
+    } catch {
+      feedback.message.error("Failed to update setting");
+    } finally {
+      setSavingDocroot(false);
+    }
+  };
+
+  return (
+    <Card title={t("tenantdomainoptionscard.tenant_domain_options")} style={{ marginBottom: 16 }} loading={loading}>
+      <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+        Let non-admin users set a curated, safe set of nginx options on their own
+        domains — max upload size, HSTS, security headers, and gzip — plus a
+        limited rewrite / custom-response-header rule builder. The panel validates
+        every rule and renders fixed directives; raw nginx directives, proxy_pass,
+        IP access, and PHP settings stay admin-only either way.
+      </Typography.Paragraph>
+      <Switch checked={enabled} loading={saving} onChange={onToggle} checkedChildren="On" unCheckedChildren="Off" />
+      <Typography.Paragraph type="secondary" style={{ marginTop: 20, marginBottom: 8 }}>
+        Let non-admin users repoint their own domain&apos;s <strong>document root</strong> to a folder inside that
+        domain (e.g. a framework&apos;s <code>public/</code> subdir). Confined server-side to the domain&apos;s own
+        tree — it can&apos;t escape into another domain or elsewhere. On by default.
+      </Typography.Paragraph>
+      <Switch checked={docroot} loading={savingDocroot} onChange={onToggleDocroot} checkedChildren="On" unCheckedChildren="Off" />
+    </Card>
+  );
+};

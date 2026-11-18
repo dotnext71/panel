@@ -1,0 +1,240 @@
+package panelcmd
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"io"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/spf13/cobra"
+
+	"github.com/dotnext-panel/dotnext/internal/models"
+)
+
+func hasArg(args []string, want string) bool {
+	for _, a := range args {
+		if a == want {
+			return true
+		}
+	}
+	return false
+}
+
+func newRetentionTestCmd() *cobra.Command {
+	c := &cobra.Command{}
+	c.SetOut(&bytes.Buffer{})
+	c.SetErr(&bytes.Buffer{})
+	return c
+}
+
+func testDest() resticRepo {
+	return resticRepo{
+		BackupDestination: &models.BackupDestination{ID: "d1", Name: "nightly", URL: "/var/lib/dotnext-backups/repo"},
+		PasswordFile:      "/etc/dotnext/restic-repo.password",
+	}
+}
+
+func TestRetention_UnlocksAndRetriesOnStaleLock(t *testing.T) {
+	orig := retentionExec
+	t.Cleanup(func() { retentionExec = orig })
+
+	var seq []string
+	forgetN := 0
+	retentionExec = func(_ context.Context, _ []string, _ io.Writer, stderr io.Writer, _ string, args ...string) error {
+		seq = append(seq, strings.Join(args, " "))
+		if hasArg(args, "unlock") {
+			return nil // unlock succeeds
+		}
+		forgetN++
+		if forgetN == 1 {
+			// First forget: the stale-lock error, written to stderr like restic.
+			io.WriteString(stderr, "unable to create lock in backend: repository is already locked by PID 2540018 on host by root\n")
+			return errors.New("exit status 11")
+		}
+		return nil // retry succeeds
+	}
+
+	err := runResticWithLockRecovery(context.Background(), newRetentionTestCmd(), testDest(),
+		[]string{"--repo", "/var/lib/dotnext-backups/repo", "forget", "--tag", "schedule-id=s1"})
+	if err != nil {
+		t.Fatalf("expected recovery to succeed, got %v", err)
+	}
+	if len(seq) != 3 {
+		t.Fatalf("expected forget→unlock→forget (3 calls), got %d: %v", len(seq), seq)
+	}
+	if !hasArg(strings.Fields(seq[1]), "unlock") {
+		t.Fatalf("2nd call must be `restic unlock`, got %q", seq[1])
+	}
+	// Never --remove-all: that would drop a live backup's lock.
+	if hasArg(strings.Fields(seq[1]), "--remove-all") {
+		t.Fatalf("unlock must NOT use --remove-all: %q", seq[1])
+	}
+}
+
+func TestRetention_NoLockRunsOnceNoUnlock(t *testing.T) {
+	orig := retentionExec
+	t.Cleanup(func() { retentionExec = orig })
+
+	var seq []string
+	retentionExec = func(_ context.Context, _ []string, _, _ io.Writer, _ string, args ...string) error {
+		seq = append(seq, strings.Join(args, " "))
+		return nil
+	}
+	if err := runResticWithLockRecovery(context.Background(), newRetentionTestCmd(), testDest(),
+		[]string{"--repo", "/repo", "prune"}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(seq) != 1 {
+		t.Fatalf("clean run must be a single call, got %d: %v", len(seq), seq)
+	}
+	if hasArg(strings.Fields(seq[0]), "unlock") {
+		t.Fatalf("must not unlock when there is no lock error")
+	}
+}
+
+func TestRetention_NonLockErrorDoesNotRetry(t *testing.T) {
+	orig := retentionExec
+	t.Cleanup(func() { retentionExec = orig })
+
+	calls := 0
+	retentionExec = func(_ context.Context, _ []string, _, stderr io.Writer, _ string, args ...string) error {
+		calls++
+		io.WriteString(stderr, "Fatal: wrong password or no key found\n")
+		return errors.New("exit status 1")
+	}
+	err := runResticWithLockRecovery(context.Background(), newRetentionTestCmd(), testDest(),
+		[]string{"--repo", "/repo", "forget"})
+	if err == nil {
+		t.Fatalf("expected the original error to surface")
+	}
+	if calls != 1 {
+		t.Fatalf("a non-lock error must NOT trigger unlock+retry, got %d calls", calls)
+	}
+}
+
+func TestRetention_UnlockFailureSurfaces(t *testing.T) {
+	orig := retentionExec
+	t.Cleanup(func() { retentionExec = orig })
+
+	retentionExec = func(_ context.Context, _ []string, _, stderr io.Writer, _ string, args ...string) error {
+		if hasArg(args, "unlock") {
+			return errors.New("unlock exit status 1")
+		}
+		io.WriteString(stderr, "repository is already locked\n")
+		return errors.New("exit status 11")
+	}
+	err := runResticWithLockRecovery(context.Background(), newRetentionTestCmd(), testDest(),
+		[]string{"--repo", "/repo", "forget"})
+	if err == nil || !strings.Contains(err.Error(), "unlock") {
+		t.Fatalf("unlock failure should surface, got %v", err)
+	}
+}
+
+func TestRetention_CatalogHasRetentionFailEvent(t *testing.T) {
+	var meta *models.NotificationEventKindMeta
+	for i := range models.AllNotificationEventKinds {
+		if models.AllNotificationEventKinds[i].Kind == "backup.retention.fail" {
+			meta = &models.AllNotificationEventKinds[i]
+			break
+		}
+	}
+	if meta == nil {
+		t.Fatalf("backup.retention.fail missing from the notification event catalog")
+	}
+	if meta.Severity != "error" || !meta.DefaultOn {
+		t.Fatalf("backup.retention.fail should be severity=error DefaultOn=true, got %q on=%v", meta.Severity, meta.DefaultOn)
+	}
+}
+
+func recordRetentionAlerts(t *testing.T) *[][]string {
+	t.Helper()
+	orig := publishRetentionFailure
+	t.Cleanup(func() { publishRetentionFailure = orig })
+	var alerts [][]string
+	publishRetentionFailure = func(_ context.Context, _ *cobra.Command, failures []string) {
+		alerts = append(alerts, failures)
+	}
+	return &alerts
+}
+
+// A sweep where every (schedule, destination) pair failed has nothing to
+// prune. It must still alert and exit non-zero, or a one-destination box's
+// failing sweep is silent (the JAB-392 failure mode).
+func TestFinishRetention_EveryPairFailedStillAlertsAndExitsNonZero(t *testing.T) {
+	alerts := recordRetentionAlerts(t)
+	calls := fakeRestic(t, nil)
+	failures := []string{"schedule s1 dest d1 (nightly) forget: wrong password or no key found"}
+	err := finishRetention(context.Background(), newRetentionTestCmd(), map[string]resticRepo{}, &fakeJobStore{}, failures, false)
+	if err == nil || !strings.Contains(err.Error(), "wrong password") {
+		t.Fatalf("err = %v, want the sweep to fail with its forget failure", err)
+	}
+	if len(*alerts) != 1 {
+		t.Errorf("alerts = %v, want one backup.retention.fail", *alerts)
+	}
+	if len(*calls) != 0 {
+		t.Errorf("nothing was forgotten, so nothing should be pruned: %v", *calls)
+	}
+}
+
+func TestFinishRetention_NothingToDoIsQuiet(t *testing.T) {
+	alerts := recordRetentionAlerts(t)
+	if err := finishRetention(context.Background(), newRetentionTestCmd(), map[string]resticRepo{}, &fakeJobStore{}, nil, false); err != nil {
+		t.Errorf("no policy and no failures must exit zero: %v", err)
+	}
+	if len(*alerts) != 0 {
+		t.Errorf("no failures, no alert: %v", *alerts)
+	}
+}
+
+type fakeScheduleStore struct {
+	dests map[string][]models.BackupDestination
+	errs  map[string]error
+}
+
+func (f fakeScheduleStore) GetDestinations(_ context.Context, id string) ([]models.BackupDestination, error) {
+	if err := f.errs[id]; err != nil {
+		return nil, err
+	}
+	return f.dests[id], nil
+}
+
+// A schedule whose destinations cannot be loaded (a database error, or a
+// binary newer than the schema) was skipped with a line on stderr, and the
+// sweep exited zero without an alert. It is a failure like any other.
+func TestForgetEverySchedule_DestinationLoadFailureAlertsAndExitsNonZero(t *testing.T) {
+	alerts := recordRetentionAlerts(t)
+	fakeRestic(t, jobSet("J1", "u1", "2026-01-01T01:00:00Z", "2026-01-01T01:01:00Z", "2026-01-01T01:02:00Z"))
+	shared := filepath.Join(t.TempDir(), "restic-repo.password")
+	if err := os.WriteFile(shared, []byte("shared"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	withSharedPasswordFile(t, shared)
+	scheds := []models.BackupSchedule{
+		{ID: "s1", Enabled: true, KeepDaily: keep(7)},
+		{ID: "s2", Enabled: true, KeepDaily: keep(7)},
+	}
+	store := fakeScheduleStore{
+		dests: map[string][]models.BackupDestination{"s2": {{ID: "d1", Name: "nightly", URL: "/srv/d1", Enabled: true}}},
+		errs:  map[string]error{"s1": errors.New("Error 1054 (42S22): Unknown column 'd.consecutive_failures' in 'SELECT'")},
+	}
+	pw := newDestPasswords()
+	defer pw.close()
+	cmd := newRetentionTestCmd()
+	pruneDests, failures := forgetEverySchedule(context.Background(), cmd, scheds, store, pw, &fakeJobStore{rows: map[string]*models.BackupJob{}}, false)
+	if len(failures) != 1 || !strings.Contains(failures[0], "s1") || !strings.Contains(failures[0], "load destinations") {
+		t.Fatalf("failures = %v, want one for schedule s1's destinations", failures)
+	}
+	if _, ok := pruneDests["d1"]; !ok {
+		t.Errorf("the other schedule's destination must still be swept: %v", pruneDests)
+	}
+	if err := finishRetention(context.Background(), cmd, pruneDests, &fakeJobStore{}, failures, false); err == nil {
+		t.Error("the sweep must exit non-zero")
+	}
+	if len(*alerts) != 1 {
+		t.Errorf("alerts = %v, want one backup.retention.fail", *alerts)
+	}
+}

@@ -1,0 +1,593 @@
+// PackageEditor — the shared Hosting Package entitlement form (JAB-331).
+//
+// One deep Module that both PackageCreate and PackageEdit render through. It owns
+// the whole Form (fields, layout, validation), the two catalog fetches (nspawn
+// images + tenant-installable Docker apps), the disk-quota toggle, and the CSV
+// codecs. The shells stay thin adapters: they own the mutation, navigation, and
+// the success/error toast, handed in via `onSubmit`.
+//
+// Create vs edit is a data distinction, not a code fork:
+//   - create: no `initialValue` → the Form seeds from PACKAGE_DEFAULTS.
+//   - edit:   `initialValue` arrives from the query → seeded once (a later
+//             background refetch must not clobber the operator's unsaved edits).
+import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { Alert, Button, Card, Checkbox, Col, Divider, Form, Input, InputNumber, Row, Select, Spin, Switch, Typography } from "antd";
+import { CheckOutlined, CloseOutlined } from "@icons";
+
+import { apiClient } from "../../apiClient";
+import { useDiskQuotaEnabled } from "../../hooks/useDiskQuotaEnabled";
+import { useFpmExecConfinement } from "../../hooks/useSecurityAppArmor";
+import {
+  BACKUP_DESTINATION_KINDS,
+  PACKAGE_DEFAULTS,
+  PACKAGE_LIMIT_FIELDS,
+  decodePackageForm,
+  encodePackagePayload,
+  looksLikeCIDR,
+  type LimitFieldDef,
+  type PackageFormValues,
+  type PackageRecord,
+  type PackageWirePayload,
+} from "./packageFields";
+import {
+  PHP_SENSITIVE_DOMAIN_DIRECTIVES,
+  PHP_SETTING_DIRECTIVES,
+  type PHPSettingsPolicyForm,
+} from "./phpSettingsPolicy";
+import {
+  PHP_DEFENSE_EXEC_FUNCTIONS,
+  PHP_FUNCTION_NAME,
+  PHP_LOCKDOWN_FUNCTIONS,
+  defaultDisabledFunctionsForm,
+} from "./phpDisabledFunctions";
+
+// GH #1701: the two levels a catalog directive takes.
+const PHP_POLICY_OPTIONS = [
+  { value: "tenant_allowed", label: "Tenant can change" },
+  { value: "admin_only", label: "Admin only" },
+];
+
+// GH #1701 slice 3: the security-sensitive directives never take
+// tenant_allowed; the opt-in is tenant_privileged, and the server still checks
+// every value the tenant sends.
+const PHP_SENSITIVE_POLICY_OPTIONS = [
+  { value: "admin_only", label: "Admin only" },
+  { value: "tenant_privileged", label: "Tenant can change (checked)" },
+];
+
+type NspawnImage = { name: string };
+
+type TFunc = ReturnType<typeof useTranslation>["t"];
+
+export type PackageEditorProps = {
+  title: string;
+  // Edit: the loaded record. Create: undefined/null.
+  initialValue?: PackageRecord | null;
+  // Edit: the record query is still loading.
+  isLoading?: boolean;
+  // The adapter's mutation is in flight.
+  submitting: boolean;
+  // The adapter owns mutate + toast + navigate + error handling; it must not
+  // throw (the Module does not re-toast).
+  onSubmit: (payload: PackageWirePayload) => Promise<void>;
+};
+
+// One numeric entitlement field, driven by its LimitFieldDef.
+function LimitField({ field, t }: { field: LimitFieldDef; t: TFunc }) {
+  const tooltip = field.tooltipKey ? t(`packageedit.${field.tooltipKey}`) : field.tooltipText;
+  return (
+    <Form.Item
+      label={t(`packageedit.${field.labelKey}`)}
+      name={field.name}
+      rules={field.required ? [{ required: true, message: field.requiredMsg }] : undefined}
+      tooltip={tooltip}
+    >
+      <InputNumber min={field.min} max={field.max} style={{ width: field.width }} />
+    </Form.Item>
+  );
+}
+
+// Only a name that is actually in PACKAGE_LIMIT_FIELDS is accepted, so a typo or
+// an unlisted key (e.g. a switch field) is a compile error, not a runtime crash.
+type LimitFieldName = (typeof PACKAGE_LIMIT_FIELDS)[number]["name"];
+
+const byGroup = (group: LimitFieldDef["group"]): readonly LimitFieldDef[] =>
+  PACKAGE_LIMIT_FIELDS.filter((f) => f.group === group);
+const byName = (name: LimitFieldName): LimitFieldDef =>
+  PACKAGE_LIMIT_FIELDS.find((f) => f.name === name) as LimitFieldDef;
+
+export const PackageEditor = ({ title, initialValue, isLoading, submitting, onSubmit }: PackageEditorProps) => {
+  const { t } = useTranslation();
+  const [form] = Form.useForm<PackageFormValues>();
+  const { enabled: diskQuotaEnabled } = useDiskQuotaEnabled();
+  const egressSSHOut = Form.useWatch("egress_ssh_out", form);
+  // GH #2001: whether the form allows a function that starts programs, and
+  // what such a function can start on this server.
+  const lockdownDisabled = Form.useWatch(["php_disabled_functions", "lockdown"], form) as string[] | undefined;
+  const allowsProgramExec =
+    lockdownDisabled !== undefined && PHP_DEFENSE_EXEC_FUNCTIONS.some((f) => !lockdownDisabled.includes(f));
+  const execConfinement = useFpmExecConfinement();
+
+  const [nspawnImages, setNspawnImages] = useState<NspawnImage[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await apiClient.get<{ images: NspawnImage[] }>("/system/nspawn-images");
+        if (!cancelled) setNspawnImages(resp.data.images || []);
+      } catch {
+        // empty list — Select stays empty, server default is used
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const [dockerApps, setDockerApps] = useState<{ slug: string; name: string }[]>([]);
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await apiClient.get<{ items: { slug: string; name: string; tenant_installable: boolean }[] }>(
+          "/admin/docker-apps/catalog",
+        );
+        if (!cancelled)
+          setDockerApps((r.data.items || []).filter((e) => e.tenant_installable).map((e) => ({ slug: e.slug, name: e.name })));
+      } catch {
+        /* catalog unavailable */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Seed the edit form once per record. Keying on `[data, form]` (the old
+  // behaviour) re-seeded on every background refetch and discarded the operator's
+  // unsaved edits. Tracking the seeded id (not a boolean) also reseeds correctly
+  // if the same element is ever reused for a different package.
+  const seededIdRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (initialValue && seededIdRef.current !== initialValue.id) {
+      seededIdRef.current = initialValue.id;
+      form.setFieldsValue(decodePackageForm(initialValue));
+    }
+  }, [initialValue, form]);
+
+  // GH #1701: encode the PHP settings policy from the form STORE, not the
+  // submitted values. The submitted values hold only the directives the form
+  // renders; the store also keeps any other stored key (a security-sensitive
+  // directive an admin opted in through the CLI), which a save must not drop.
+  const handleFinish = (values: PackageFormValues) =>
+    onSubmit(
+      encodePackagePayload({
+        ...values,
+        php_settings_policy:
+          (form.getFieldValue("php_settings_policy") as PHPSettingsPolicyForm | undefined) ??
+          values.php_settings_policy,
+      }),
+    );
+
+  if (isLoading && !initialValue) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center", minHeight: 240 }}>
+        <Spin />
+      </div>
+    );
+  }
+
+  return (
+    <Card>
+      <Typography.Title level={3} style={{ marginTop: 0 }}>
+        {title}
+      </Typography.Title>
+      <Form<PackageFormValues>
+        form={form}
+        layout="vertical"
+        initialValues={initialValue ? undefined : PACKAGE_DEFAULTS}
+        onFinish={handleFinish}
+      >
+        <Form.Item
+          label={t("packageedit.name")}
+          name="name"
+          rules={[{ required: true, message: "Package name is required" }]}
+        >
+          <Input placeholder="e.g., Basic, Professional, Enterprise" />
+        </Form.Item>
+
+        <Divider titlePlacement="left">Resource limits</Divider>
+        <Typography.Paragraph type="secondary" style={{ marginTop: -8 }}>
+          Enforced per-user via POSIX quota (disk) and cgroups v2 (cpu/memory/io/tasks). Zero on any field means unlimited.
+        </Typography.Paragraph>
+
+        <Row gutter={16}>
+          <Col xs={24} sm={12} md={8}>
+            <Form.Item
+              label={t("packageedit.disk_quota_mb")}
+              name="disk_quota_mb"
+              rules={[{ required: true, message: "Disk quota is required" }]}
+              tooltip={
+                diskQuotaEnabled
+                  ? "Hard limit enforced via setquota(8). 0 = unlimited."
+                  : "Disabled — enable POSIX disk quotas in Server Settings → Disk Quotas first."
+              }
+              extra={diskQuotaEnabled ? undefined : "Disabled until disk quotas are enabled in Server Settings."}
+            >
+              <InputNumber min={0} style={{ width: "100%" }} disabled={!diskQuotaEnabled} />
+            </Form.Item>
+          </Col>
+          {byGroup("resource").map((f) => (
+            <Col key={f.name} xs={24} sm={12} md={8}>
+              <LimitField field={f} t={t} />
+            </Col>
+          ))}
+        </Row>
+
+        <Divider titlePlacement="left">Feature quotas</Divider>
+
+        <Row gutter={16}>
+          {byGroup("quota").map((f) => (
+            <Col key={f.name} xs={24} sm={12} md={8}>
+              <LimitField field={f} t={t} />
+            </Col>
+          ))}
+        </Row>
+
+        <Divider titlePlacement="left">Backups</Divider>
+        <Typography.Paragraph type="secondary" style={{ marginTop: -8 }}>
+          Tenant self-service backups (GH #454). The admin owns the schedule time; tenants choose what to back up and which
+          allowed destination, within these limits. Max backups = 0 disables tenant backups entirely.
+        </Typography.Paragraph>
+        <Row gutter={16}>
+          <Col xs={24} sm={12} md={8}>
+            <LimitField field={byName("max_backups")} t={t} />
+          </Col>
+          <Col xs={24} sm={12} md={8}>
+            <Form.Item
+              label={t("packageedit.scheduled_backups")}
+              name="scheduled_backups_enabled"
+              valuePropName="checked"
+              tooltip={t("packageedit.allow_tenants_on_this_plan_to_enable_a_sched")}
+            >
+              <Switch />
+            </Form.Item>
+          </Col>
+          <Col xs={24} sm={12} md={8}>
+            <LimitField field={byName("max_backup_schedules")} t={t} />
+          </Col>
+          <Col xs={24} sm={12} md={8}>
+            <Form.Item
+              label={t("packageedit.allowed_backup_destinations")}
+              name="allowed_backup_destination_kinds"
+              tooltip={t("packageedit.destination_kinds_a_tenant_may_back_up_to_em")}
+            >
+              <Select
+                mode="multiple"
+                allowClear
+                placeholder="e.g. local, s3"
+                options={BACKUP_DESTINATION_KINDS.map((k) => ({ value: k, label: k }))}
+                style={{ width: "100%" }}
+              />
+            </Form.Item>
+          </Col>
+          <Col xs={24} sm={12} md={8}>
+            <Form.Item
+              label={t("packageedit.backup_retention_policy")}
+              name="backup_retention_policy"
+              tooltip={t("packageedit.what_happens_when_a_tenant_reaches_max_backu")}
+            >
+              <Select
+                options={[
+                  { value: "reject", label: "Reject at cap (safe)" },
+                  { value: "prune", label: "Auto-prune oldest" },
+                ]}
+                style={{ width: "100%" }}
+              />
+            </Form.Item>
+          </Col>
+        </Row>
+
+        <Divider titlePlacement="left">Features</Divider>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+          <Form.Item name="ssh_enabled" valuePropName="checked" tooltip={t("packageedit.allow_ssh_access")} noStyle>
+            <Switch checkedChildren={<CheckOutlined />} unCheckedChildren={<CloseOutlined />} />
+          </Form.Item>
+          <Typography.Text>SSH Enabled</Typography.Text>
+        </div>
+
+        {/* GH #2276 (ADR-0176): Composer runs from the domain page. A run
+            executes the project's composer.json scripts in the user's SSH
+            sandbox, so it is granted like SSH. */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+          <Form.Item
+            name="composer_enabled"
+            valuePropName="checked"
+            tooltip="Lets users on this package run Composer (install, update, require, …) for their domains from the panel. Composer runs the project's composer.json scripts, which can run any command in the user's SSH sandbox: grant it as you would SSH."
+            noStyle
+          >
+            <Switch aria-label="Composer" checkedChildren={<CheckOutlined />} unCheckedChildren={<CloseOutlined />} />
+          </Form.Item>
+          <Typography.Text>Composer</Typography.Text>
+        </div>
+
+        {/* GH #2277 (ADR-0178): Git deployment from the domain page. A
+            deployment runs the user's deploy commands (php, wp) in their SSH
+            sandbox, so it is granted like SSH. */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+          <Form.Item
+            name="git_deploy_enabled"
+            valuePropName="checked"
+            tooltip="Lets users on this package connect a domain to a Git repository and deploy it from the panel, by hand or on every push. A deployment runs the user's deploy commands (php, wp) in their SSH sandbox: grant it as you would SSH. A project with composer.lock and no vendor/ also needs Composer."
+            noStyle
+          >
+            <Switch aria-label="Git deploy" checkedChildren={<CheckOutlined />} unCheckedChildren={<CloseOutlined />} />
+          </Form.Item>
+          <Typography.Text>Git deploy</Typography.Text>
+        </div>
+
+        {/* GH #1798: per-package openings in the M34 per-user outbound firewall.
+            Both default OFF and only change anything for users whose outbound
+            firewall is enforced or learning. */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+          <Form.Item
+            name="egress_ssh_out"
+            valuePropName="checked"
+            tooltip="Lets users on this package open SSH connections (TCP port 22) from their shell, e.g. git over SSH. Only affects users whose outbound firewall is enforced or learning."
+            noStyle
+          >
+            <Switch checkedChildren={<CheckOutlined />} unCheckedChildren={<CloseOutlined />} />
+          </Form.Item>
+          <Typography.Text>Allow outbound SSH (port 22)</Typography.Text>
+        </div>
+        {egressSSHOut ? (
+          <Form.Item
+            label="Outbound SSH destinations"
+            name="egress_ssh_out_cidrs"
+            extra="CIDR ranges users may SSH to, e.g. 203.0.113.0/24 or 2001:db8::/32. Leave empty to allow any destination."
+            rules={[
+              {
+                validator: (_rule, value: string[] | undefined) => {
+                  const bad = (value ?? []).map((v) => v.trim()).filter((v) => v && !looksLikeCIDR(v));
+                  return bad.length
+                    ? Promise.reject(new Error(`Not a CIDR range: ${bad.join(", ")} (use address/prefix, e.g. 203.0.113.7/32)`))
+                    : Promise.resolve();
+                },
+              },
+            ]}
+            style={{ marginLeft: 52 }}
+          >
+            <Select
+              mode="tags"
+              tokenSeparators={[",", " "]}
+              open={false}
+              suffixIcon={null}
+              placeholder="Any destination"
+              style={{ width: "100%", maxWidth: 480 }}
+            />
+          </Form.Item>
+        ) : null}
+
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+          <Form.Item
+            name="egress_icmp"
+            valuePropName="checked"
+            tooltip="Lets users on this package send ping (ICMP echo requests) from their shell. Only affects users whose outbound firewall is enforced or learning."
+            noStyle
+          >
+            <Switch checkedChildren={<CheckOutlined />} unCheckedChildren={<CloseOutlined />} />
+          </Form.Item>
+          <Typography.Text>Allow ping (ICMP echo)</Typography.Text>
+        </div>
+
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 24 }}>
+          <Form.Item name="cgi_enabled" valuePropName="checked" tooltip={t("packageedit.allow_cgi_scripts")} noStyle>
+            <Switch checkedChildren={<CheckOutlined />} unCheckedChildren={<CloseOutlined />} />
+          </Form.Item>
+          <Typography.Text>CGI Enabled</Typography.Text>
+        </div>
+
+        {/* GH #1628: webmail (Bulwark UI) as a package entitlement, defaulting
+            ON. Slice 1 stores the flag; the webmail reconciler starts reading
+            it in slice 2. */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 24 }}>
+          <Form.Item name="webmail_enabled" valuePropName="checked" tooltip={t("packageedit.allow_webmail")} noStyle>
+            <Switch checkedChildren={<CheckOutlined />} unCheckedChildren={<CloseOutlined />} />
+          </Form.Item>
+          <Typography.Text>Webmail Enabled</Typography.Text>
+        </div>
+
+        {/* GH #2502: the owner of a domain on this package may give the
+            webmail on mail.<domain> its own name, logos, favicon and links. */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 24 }}>
+          <Form.Item
+            name="webmail_branding_enabled"
+            valuePropName="checked"
+            tooltip="Lets users on this package brand the webmail of their domains (mail.<domain>): its name, logos, favicon and links. Empty fields keep the server-wide branding."
+            noStyle
+          >
+            <Switch aria-label="Webmail branding" checkedChildren={<CheckOutlined />} unCheckedChildren={<CloseOutlined />} />
+          </Form.Item>
+          <Typography.Text>Webmail branding</Typography.Text>
+        </div>
+
+        {/* GH #2056: whether this package's sites may send email with PHP
+            mail() (contact forms, WordPress), through the local mail server or
+            the smarthost picked under Server Settings > Email. */}
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 24 }}>
+          <Form.Item
+            name="website_sends_email"
+            valuePropName="checked"
+            tooltip="Lets the sites on this package send email with PHP mail(), which contact forms and WordPress use. Users with no package can still send through the local mail server, but not through a smarthost."
+            noStyle
+          >
+            <Switch aria-label="Websites can send email" checkedChildren={<CheckOutlined />} unCheckedChildren={<CloseOutlined />} />
+          </Form.Item>
+          <Typography.Text>Websites can send email</Typography.Text>
+        </div>
+
+        {/* GH #1701: the package's disabled PHP functions. Replaces the old
+            all-or-nothing "Allow PHP exec functions" switch; the backend still
+            reports php_exec_enabled, derived from this list. */}
+        <Typography.Title level={5} style={{ marginTop: 8 }}>
+          Disabled PHP functions
+        </Typography.Title>
+        <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+          Functions this package&apos;s sites cannot call. By default every
+          command-execution function is disabled. Uncheck one only for plans whose
+          apps genuinely need to run commands:{" "}
+          <Typography.Text type="warning">allowing any of them is a security risk.</Typography.Text>{" "}
+          Allowing {PHP_DEFENSE_EXEC_FUNCTIONS.map((f, i) => (
+            <span key={f}>
+              {i > 0 ? ", " : ""}
+              <code>{f}</code>
+            </span>
+          ))}{" "}
+          also lifts PHP Defense&apos;s ban on it for these sites.
+        </Typography.Paragraph>
+        <Form.Item label="Command execution (checked = disabled)" name={["php_disabled_functions", "lockdown"]}>
+          <Checkbox.Group
+            aria-label="Disabled command-execution functions"
+            options={PHP_LOCKDOWN_FUNCTIONS.map((f) => ({ value: f, label: <code>{f}</code> }))}
+          />
+        </Form.Item>
+        {allowsProgramExec && execConfinement === "enforce" && (
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message="On this server, PHP's AppArmor profile (dotnext-fpm-app) is enforced, so an allowed command-execution function can start only the shell (sh) and cat. Other commands, such as df, ls or grep, fail with Permission denied."
+          />
+        )}
+        {allowsProgramExec && (execConfinement === "complain" || execConfinement === "none") && (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 16 }}
+            message={`On this server, PHP's AppArmor profile (dotnext-fpm-app) ${
+              execConfinement === "complain" ? "is in complain mode, so it only logs" : "is not active"
+            }. An allowed command-execution function can run any program the site's user can run: for anyone who takes over such a site, that is the same as shell access. Switch the profile to enforce under Security → AppArmor to limit these functions to the shell and cat.`}
+          />
+        )}
+        <Form.Item
+          label="Also disable"
+          name={["php_disabled_functions", "extra"]}
+          extra="Any other PHP functions to disable for these sites, e.g. mail or curl_exec."
+          rules={[
+            {
+              validator: (_r, value: string[] | undefined) => {
+                const bad = (value ?? []).find((f) => !PHP_FUNCTION_NAME.test(f.trim().toLowerCase()));
+                return bad ? Promise.reject(new Error(`"${bad}" is not a PHP function name`)) : Promise.resolve();
+              },
+            },
+          ]}
+        >
+          <Select mode="tags" aria-label="Also disable" tokenSeparators={[",", " "]} placeholder="Function names" open={false} />
+        </Form.Item>
+        <Button
+          type="link"
+          style={{ paddingLeft: 0, marginBottom: 16 }}
+          onClick={() => form.setFieldValue("php_disabled_functions", defaultDisabledFunctionsForm())}
+        >
+          Reset disabled functions to the default
+        </Button>
+
+        <Typography.Title level={5} style={{ marginTop: 8 }}>
+          PHP-FPM Performance Policy
+        </Typography.Title>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+          <Form.Item
+            name="fpm_user_can_edit"
+            valuePropName="checked"
+            tooltip={t("packageedit.let_tenants_pick_a_safe_php_performance_mode")}
+            noStyle
+          >
+            <Switch checkedChildren={<CheckOutlined />} unCheckedChildren={<CloseOutlined />} />
+          </Form.Item>
+          <Typography.Text>Users can pick a PHP Performance Mode</Typography.Text>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+          <Form.Item
+            name="fpm_advanced_mode"
+            valuePropName="checked"
+            tooltip={t("packageedit.also_expose_the_individual_pm_knobs_clamped")}
+            noStyle
+          >
+            <Switch checkedChildren={<CheckOutlined />} unCheckedChildren={<CloseOutlined />} />
+          </Form.Item>
+          <Typography.Text>Users can use Advanced mode (raw pm.*, clamped to the cap)</Typography.Text>
+        </div>
+        <LimitField field={byName("fpm_max_children_cap")} t={t} />
+        <LimitField field={byName("fpm_worker_mem_mb")} t={t} />
+
+        {/* GH #1701: per-directive policy for the per-domain PHP Settings page. */}
+        <Typography.Title level={5} style={{ marginTop: 8 }}>
+          PHP settings tenants may change
+        </Typography.Title>
+        <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+          Who may set each directive on a domain&apos;s PHP Settings page. An
+          admin can always set every one. &quot;Admin only&quot; locks it for the
+          tenant, who sees the value but cannot change it.
+        </Typography.Paragraph>
+        <Row gutter={[16, 0]}>
+          {PHP_SETTING_DIRECTIVES.map((d) => (
+            <Col xs={24} sm={12} lg={8} key={d}>
+              <Form.Item label={<code>{d}</code>} name={["php_settings_policy", d]}>
+                <Select aria-label={`${d} policy`} options={PHP_POLICY_OPTIONS} />
+              </Form.Item>
+            </Col>
+          ))}
+        </Row>
+        <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+          Security-sensitive: admin only unless you opt in. A tenant who may
+          change one can only narrow <code>open_basedir</code> to folders inside
+          their own home.
+        </Typography.Paragraph>
+        <Row gutter={[16, 0]}>
+          {PHP_SENSITIVE_DOMAIN_DIRECTIVES.map((d) => (
+            <Col xs={24} sm={12} lg={8} key={d}>
+              <Form.Item label={<code>{d}</code>} name={["php_settings_policy", d]}>
+                <Select aria-label={`${d} policy`} options={PHP_SENSITIVE_POLICY_OPTIONS} />
+              </Form.Item>
+            </Col>
+          ))}
+        </Row>
+
+        <Form.Item
+          label={t("packageedit.docker_apps_per_package_allowlist")}
+          name="docker_app_slugs"
+          extra="Tenants on this package may install only these apps. Empty = use the server-wide Docker Apps curation. Requires Max Docker Apps > 0."
+        >
+          <Select
+            mode="multiple"
+            allowClear
+            placeholder={t("packageedit.empty_server_wide_default")}
+            options={dockerApps.map((a) => ({ value: a.slug, label: a.name }))}
+          />
+        </Form.Item>
+
+        <Form.Item
+          label="nspawn sandbox image"
+          name="nspawn_image_version"
+          extra="Only used when sandbox mode = nspawn AND SSH is enabled. Empty = use server default."
+        >
+          <Select
+            showSearch
+            allowClear
+            placeholder="(use server default)"
+            options={nspawnImages.map((img) => ({ value: img.name, label: img.name }))}
+            style={{ width: "100%" }}
+          />
+        </Form.Item>
+
+        <Form.Item>
+          <Button type="primary" htmlType="submit" loading={submitting}>
+            Save
+          </Button>
+        </Form.Item>
+      </Form>
+    </Card>
+  );
+};

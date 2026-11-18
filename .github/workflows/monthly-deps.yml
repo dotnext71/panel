@@ -1,0 +1,76 @@
+# Monthly dependency review (GH #613/#614). Instead of reactive per-library
+# "bump X" issues, this opens ONE consolidated review issue on the 1st of each
+# month covering all three pinning surfaces (install.sh pins + go.mod + npm).
+# It only REPORTS — a human still bumps + E2Es + merges. See scripts/deps-check.sh.
+#
+# The steps use REST over curl + python3 (like release.yml), so they do not
+# depend on the runner image having gh or jq.
+name: Monthly dependency review
+
+on:
+  schedule:
+    - cron: "0 6 1 * *" # 06:00 UTC on the 1st of every month
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  GO_VERSION: "1.27.3"
+  NODE_VERSION: "20"
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          # cache: false — the job runs once a month, so a cold module download costs little.
+          cache: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Generate dependency report
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # lets deps-check.sh's curl fallback authenticate
+        run: bash scripts/deps-check.sh --markdown > "$RUNNER_TEMP/deps-report.md"
+
+      - name: Open or update the monthly review issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          API="https://api.github.com"
+          REPO="$GITHUB_REPOSITORY"
+          hdr=(-H "Authorization: Bearer ${GH_TOKEN}" -H "Accept: application/vnd.github+json" -H "X-GitHub-Api-Version: 2022-11-28")
+          MONTH="$(date -u +'%Y-%m')"
+          TITLE="Monthly dependency review — ${MONTH}"
+
+          {
+            echo "_Auto-generated on $(date -u +'%Y-%m-%d') by \`.github/workflows/monthly-deps.yml\`. Bump each upgrade, E2E on a box (framework bumps especially), then merge. Roll open \`deps\`-labelled bump requests into this._"
+            echo
+            cat "$RUNNER_TEMP/deps-report.md"
+          } > "$RUNNER_TEMP/body.md"
+
+          # Ensure the 'deps' label exists (422 already-exists is fine).
+          curl -sS "${hdr[@]}" -X POST "${API}/repos/${REPO}/labels" \
+            -d '{"name":"deps","color":"0e8a16","description":"Dependency upgrades"}' >/dev/null || true
+
+          # Find this month's open issue by exact title (list is immediate; search lags indexing).
+          NUM="$(curl -sS "${hdr[@]}" "${API}/repos/${REPO}/issues?state=open&labels=deps&per_page=100" \
+                 | python3 -c 'import json,sys; items=json.load(sys.stdin); t=sys.argv[1]; print(next((i["number"] for i in items if i.get("title")==t and "pull_request" not in i), ""))' "$TITLE")"
+
+          # JSON-encode the payload (python3 handles body escaping, so the step does not need jq).
+          PAYLOAD="$(python3 -c 'import json,sys; print(json.dumps({"title":sys.argv[1],"body":open(sys.argv[2]).read(),"labels":["deps"]}))' "$TITLE" "$RUNNER_TEMP/body.md")"
+
+          if [[ -n "$NUM" ]]; then
+            curl -sS "${hdr[@]}" -X PATCH "${API}/repos/${REPO}/issues/${NUM}" -d "$PAYLOAD" >/dev/null
+            echo "Updated existing review issue #${NUM}"
+          else
+            curl -sS "${hdr[@]}" -X POST "${API}/repos/${REPO}/issues" -d "$PAYLOAD" \
+              | python3 -c 'import json,sys; print("Created issue #%s" % json.load(sys.stdin)["number"])'
+          fi

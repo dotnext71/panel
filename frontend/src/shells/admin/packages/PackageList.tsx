@@ -1,0 +1,222 @@
+// PackageList — hosting packages admin list. Sortable + searchable.
+// Post-M21: useTable → useTableURL, <CreateButton>/<EditButton>/
+// <DeleteButton> replaced with plain react-router <Button>s + a
+// RowDeleteButton wired to useDeleteMutation.
+import { useTranslation } from "react-i18next";
+import { Button, Card, Input, Space, Table, Tag, Typography } from "antd";
+import { EditOutlined, PackageOpenOutlined, SearchOutlined, DeleteOutlined } from "@icons";
+
+import { RowActions } from "../../../components/RowActions";
+import { useNavigate } from "react-router";
+import { sorterToParams } from "../../../utils/tableSorter";
+
+import { SearchableTableStringQ } from "../../../components/SearchableTable";
+import { EmptyWithCTA } from "../../../components/EmptyWithCTA";
+import { useDeleteMutation } from "../../../hooks/useQueries";
+import { useTableURL } from "../../../hooks/useTableURL";
+import { disabledFunctionsSummary } from "../../../components/packages/phpDisabledFunctions";
+import { Timestamp } from "../../../components/Timestamp";
+
+type Package = {
+  id: string;
+  name: string;
+  disk_quota_mb: number;
+  bandwidth_quota_mb: number;
+  max_domains: number;
+  max_email_accounts: number;
+  max_databases: number;
+  ssh_enabled: boolean;
+  cgi_enabled: boolean;
+  php_exec_enabled: boolean;
+  php_disabled_functions: string | null; // GH #1701
+  created_at: string;
+  updated_at: string;
+};
+
+// "∞" for 0 quotas keeps the cell readable instead of printing 0.
+const formatQuota = (value: number) => (value === 0 ? "∞" : value);
+
+export const PackageList = () => {
+  const { t } = useTranslation();
+  const navigate = useNavigate();
+  const query = useTableURL<Package>({
+    resource: "packages",
+    defaultSort: "name",
+    defaultOrder: "asc",
+  });
+  const deleteMutation = useDeleteMutation({ resource: "packages" });
+
+  const handleTableChange: React.ComponentProps<typeof Table<Package>>["onChange"] = (
+    pagination,
+    _filters,
+    sorter,
+  ) => {
+    const { sort, order } = sorterToParams<Package>(sorter);
+    query.setParams({
+      page: pagination.current ?? 1,
+      pageSize: pagination.pageSize ?? 20,
+      sort,
+      order,
+    });
+  };
+
+  return (
+    <div>
+      <Space
+        wrap
+        align="center"
+        style={{
+          marginBottom: 16,
+          width: "100%",
+          justifyContent: "space-between",
+        }}
+      >
+        <Typography.Title level={3} style={{ margin: 0 }}>
+          <PackageOpenOutlined /> Hosting Packages
+        </Typography.Title>
+        <Button
+          type="primary"
+          onClick={() => navigate("/admin/packages/create")}
+        >
+          Create
+        </Button>
+      </Space>
+
+      <Card>
+        <SearchableTableStringQ<Package>
+          rowKey="id"
+          loading={query.isLoading}
+          dataSource={query.items}
+          initialSearch={query.params.q}
+          searchPlaceholder="Search by package name"
+          onSearchChange={(q) => query.setParams({ q, page: 1 })}
+          pagination={{
+            current: query.params.page,
+            pageSize: query.params.pageSize,
+            total: query.total,
+          }}
+          onChange={handleTableChange}
+          locale={{
+            emptyText: (
+              <EmptyWithCTA
+                description={t("packagelist.no_hosting_packages_yet")}
+                ctaLabel="Create package"
+                onCta={() => navigate("/admin/packages/create")}
+              />
+            ),
+          }}
+        >
+          <Table.Column
+            dataIndex="name"
+            title={t("packagelist.name")}
+            key="name"
+            sorter
+            defaultSortOrder="ascend"
+            filterIcon={() => (
+              <SearchOutlined
+                style={{ color: query.params.q ? "#ef4444" : undefined }}
+              />
+            )}
+            filterDropdown={({ confirm, close }) => (
+              <div style={{ padding: 8, minWidth: 240 }}>
+                <Input.Search
+                  placeholder={t("packagelist.search_by_package_name")}
+                  allowClear
+                  defaultValue={query.params.q}
+                  onSearch={(value) => {
+                    query.setParams({ q: value.trim(), page: 1 });
+                    confirm({ closeDropdown: false });
+                    close();
+                  }}
+                />
+              </div>
+            )}
+          />
+          <Table.Column
+            dataIndex="disk_quota_mb"
+            title={t("packagelist.disk_mb")}
+            key="disk_quota_mb"
+            sorter
+            render={(value: number) => formatQuota(value)}
+          />
+          <Table.Column
+            dataIndex="bandwidth_quota_mb"
+            title={t("packagelist.bandwidth_mb")}
+            key="bandwidth_quota_mb"
+            sorter
+            render={(value: number) => formatQuota(value)}
+          />
+          <Table.Column
+            dataIndex="max_domains"
+            title={t("packagelist.domains")}
+            key="max_domains"
+            sorter
+            render={(value: number) => formatQuota(value)}
+          />
+          <Table.Column
+            dataIndex="max_email_accounts"
+            title={t("packagelist.email")}
+            key="max_email_accounts"
+            sorter
+            render={(value: number) => formatQuota(value)}
+          />
+          <Table.Column
+            dataIndex="max_databases"
+            title="DB"
+            key="max_databases"
+            sorter
+            render={(value: number) => formatQuota(value)}
+          />
+          <Table.Column
+            dataIndex="ssh_enabled"
+            title={t("packagelist.ssh")}
+            key="ssh_enabled"
+            sorter
+            render={(enabled: boolean) =>
+              enabled ? <Tag color="green">yes</Tag> : <Tag>no</Tag>
+            }
+          />
+          <Table.Column
+            dataIndex="php_exec_enabled"
+            title={t("packagelist.php_exec")}
+            key="php_exec_enabled"
+            sorter
+            // GH #1701: the package's disabled functions, not just the
+            // all-or-nothing flag, so a package that re-allows one function
+            // does not read as fully locked.
+            render={(enabled: boolean, record: Package) => {
+              const summary = disabledFunctionsSummary(record.php_disabled_functions, enabled);
+              return <Tag color={summary === "locked" ? undefined : "red"}>{summary}</Tag>;
+            }}
+          />
+          <Table.Column
+            dataIndex="created_at"
+            title={t("packagelist.created")}
+            key="created_at"
+            sorter
+            render={(ts: string) => <Timestamp value={ts} />}
+          />
+          <Table.Column
+            title={t("packagelist.actions")}
+            dataIndex="actions"
+            render={(_: unknown, r: Package) => (
+              <RowActions
+                actions={[
+                  { key: "edit", label: "Edit", icon: <EditOutlined />, onClick: () => navigate(`/admin/packages/edit/${r.id}`) },
+                  {
+                    key: "delete",
+                    label: "Delete",
+                    icon: <DeleteOutlined />,
+                    danger: true,
+                    onClick: () => { void deleteMutation.mutateAsync({ id: r.id }); },
+                    confirm: { title: `Delete package "${r.name}"?`, okText: "Delete" },
+                  },
+                ]}
+              />
+            )}
+          />
+        </SearchableTableStringQ>
+      </Card>
+    </div>
+  );
+};

@@ -1,0 +1,275 @@
+package panelcmd
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"testing"
+
+	"github.com/dotnext-panel/dotnext/internal/dbops"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+)
+
+// --- fakes (JAB-282 CLI db-identity creation) ---
+
+type recCreateAgent struct {
+	calls  []string
+	params []map[string]any
+	failOn map[string]bool // command name -> return an error
+}
+
+func (a *recCreateAgent) Call(_ context.Context, cmd string, params any) (json.RawMessage, error) {
+	a.calls = append(a.calls, cmd)
+	m, _ := params.(map[string]any)
+	a.params = append(a.params, m)
+	if a.failOn[cmd] {
+		return nil, errors.New(cmd + " boom")
+	}
+	return json.RawMessage(`{}`), nil
+}
+
+type fakeCreateDBUsers struct {
+	repository.DatabaseUserRepository
+	count      int64
+	exists     bool
+	failCreate bool
+	// atInsert, when set, is the count the locked insert sees: another
+	// create landed between the early count and the insert.
+	atInsert *int64
+	created  *models.DatabaseUser
+	taken    map[string]bool // "<engine>|<username>" another tenant's row has
+}
+
+func (f *fakeCreateDBUsers) CountByEngineAndUsername(_ context.Context, engine, username string) (int64, error) {
+	if f.taken[engine+"|"+username] {
+		return 1, nil
+	}
+	return 0, nil
+}
+
+func (f *fakeCreateDBUsers) ExistsByUserAndUsername(_ context.Context, _, _ string) (bool, error) {
+	return f.exists, nil
+}
+func (f *fakeCreateDBUsers) CountByUserID(_ context.Context, _ string) (int64, error) {
+	return f.count, nil
+}
+func (f *fakeCreateDBUsers) Create(_ context.Context, du *models.DatabaseUser) error {
+	if f.failCreate {
+		return errors.New("row insert boom")
+	}
+	f.created = du
+	return nil
+}
+
+func (f *fakeCreateDBUsers) CreateWithinCap(ctx context.Context, du *models.DatabaseUser, maxUsers uint32) error {
+	n := f.count
+	if f.atInsert != nil {
+		n = *f.atInsert
+	}
+	if n >= int64(maxUsers) {
+		return repository.ErrDatabaseUserCapExceeded
+	}
+	return f.Create(ctx, du)
+}
+
+type fakeCreatePackages struct {
+	repository.PackageRepository
+	pkg *models.HostingPackage
+}
+
+func (f fakeCreatePackages) FindByID(_ context.Context, _ string) (*models.HostingPackage, error) {
+	if f.pkg != nil {
+		return f.pkg, nil
+	}
+	return nil, repository.ErrNotFound
+}
+
+func packagedUser() *models.User {
+	return &models.User{ID: "u1", Username: strp("alice"), PackageID: strp("pkgA")}
+}
+
+func createDeps(a *recCreateAgent, dbu *fakeCreateDBUsers, pkgs repository.PackageRepository) dbUserCreateDeps {
+	return dbUserCreateDeps{agent: a, dbUsers: dbu, packages: pkgs}
+}
+
+// Happy path: engine credential created, row persisted, password revealed.
+func TestDBUserCreate_HappyPath(t *testing.T) {
+	ag := &recCreateAgent{}
+	dbu := &fakeCreateDBUsers{}
+	du, pw, err := dbUserCreate(context.Background(), createDeps(ag, dbu, fakeCreatePackages{}),
+		dbUserCreateInput{panelUser: packagedUser(), name: "app"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if len(ag.calls) != 1 || ag.calls[0] != "db_user.create" {
+		t.Fatalf("expected one db_user.create call, got %v", ag.calls)
+	}
+	if du.Username != "alice_app" || pw == "" || dbu.created == nil {
+		t.Fatalf("unexpected result: du=%+v pw=%q created=%v", du, pw, dbu.created)
+	}
+}
+
+// JAB-282 bug #1: package max_database_users quota must be enforced (CLI parity
+// with REST). At-limit → error BEFORE any engine credential is created.
+func TestDBUserCreate_QuotaExceeded_NoEngineCall(t *testing.T) {
+	ag := &recCreateAgent{}
+	dbu := &fakeCreateDBUsers{count: 3}
+	pkgs := fakeCreatePackages{pkg: &models.HostingPackage{MaxDatabaseUsers: 3}}
+	_, _, err := dbUserCreate(context.Background(), createDeps(ag, dbu, pkgs),
+		dbUserCreateInput{panelUser: packagedUser(), name: "app"})
+	if err == nil {
+		t.Fatal("expected quota_exceeded error at the limit")
+	}
+	if len(ag.calls) != 0 {
+		t.Fatalf("quota must be enforced BEFORE creating the engine credential, got %v", ag.calls)
+	}
+}
+
+// Under the limit still creates.
+func TestDBUserCreate_UnderQuota_Creates(t *testing.T) {
+	ag := &recCreateAgent{}
+	dbu := &fakeCreateDBUsers{count: 2}
+	pkgs := fakeCreatePackages{pkg: &models.HostingPackage{MaxDatabaseUsers: 3}}
+	if _, _, err := dbUserCreate(context.Background(), createDeps(ag, dbu, pkgs),
+		dbUserCreateInput{panelUser: packagedUser(), name: "app"}); err != nil {
+		t.Fatalf("under quota should succeed: %v", err)
+	}
+	if len(ag.calls) != 1 || ag.calls[0] != "db_user.create" {
+		t.Fatalf("expected create call, got %v", ag.calls)
+	}
+}
+
+// JAB-282 bug #2: a row-insert failure must compensate by dropping the live
+// engine credential — never leave an orphaned MariaDB user / PostgreSQL role.
+func TestDBUserCreate_RowInsertFails_CompensatesDrop(t *testing.T) {
+	ag := &recCreateAgent{}
+	dbu := &fakeCreateDBUsers{failCreate: true}
+	_, _, err := dbUserCreate(context.Background(), createDeps(ag, dbu, fakeCreatePackages{}),
+		dbUserCreateInput{panelUser: packagedUser(), name: "app"})
+	if err == nil {
+		t.Fatal("expected row-insert error")
+	}
+	if len(ag.calls) != 2 || ag.calls[0] != "db_user.create" || ag.calls[1] != "db_user.drop" {
+		t.Fatalf("row-insert failure must compensate with a drop, got %v", ag.calls)
+	}
+	if ag.params[1]["db_user_name"] != "alice_app" {
+		t.Errorf("drop must target the created credential, got %v", ag.params[1])
+	}
+}
+
+// Postgres row-insert failure compensates with the role-drop verb + role param.
+func TestDBUserCreate_Postgres_RowInsertFails_CompensatesRoleDrop(t *testing.T) {
+	ag := &recCreateAgent{}
+	dbu := &fakeCreateDBUsers{failCreate: true}
+	ss := okServerSettings{enabled: true}
+	deps := createDeps(ag, dbu, fakeCreatePackages{})
+	deps.serverSettings = ss
+	_, _, err := dbUserCreate(context.Background(), deps,
+		dbUserCreateInput{panelUser: packagedUser(), name: "app", engine: "postgres"})
+	if err == nil {
+		t.Fatal("expected row-insert error")
+	}
+	if len(ag.calls) != 2 || ag.calls[0] != "db.postgres.create_role" || ag.calls[1] != "db.postgres.drop_role" {
+		t.Fatalf("postgres compensation must drop the role, got %v", ag.calls)
+	}
+	if ag.params[1]["role"] != "alice_app" {
+		t.Errorf("role-drop must target the created role, got %v", ag.params[1])
+	}
+}
+
+type okServerSettings struct {
+	repository.ServerSettingsRepository
+	enabled bool
+}
+
+func (s okServerSettings) Get(_ context.Context) (*models.ServerSettings, error) {
+	return &models.ServerSettings{PostgresEnabled: s.enabled}, nil
+}
+
+func (f *fakeCreateDBUsers) UpdateUsername(context.Context, string, string) error { return nil }
+
+// A database account is server-wide: alice asking for "x_app" names tenant
+// alice_x's alice_x_app. The CLI refuses it before any engine call, and asks
+// the agent not to take over an existing account.
+func TestDBUserCreate_RefusesAnotherTenantsAccount(t *testing.T) {
+	ag := &recCreateAgent{}
+	dbu := &fakeCreateDBUsers{taken: map[string]bool{"mariadb|alice_x_app": true}}
+	if _, _, err := dbUserCreate(context.Background(), createDeps(ag, dbu, fakeCreatePackages{}),
+		dbUserCreateInput{panelUser: packagedUser(), name: "x_app"}); err == nil {
+		t.Fatal("expected a refusal for a name another tenant's row has")
+	}
+	if _, _, err := dbUserCreate(context.Background(), createDeps(ag, dbu, fakeCreatePackages{}),
+		dbUserCreateInput{panelUser: packagedUser(), name: "x_mysqladmin"}); err == nil {
+		t.Fatal("expected a refusal for a sign-in account name")
+	}
+	if len(ag.calls) != 0 {
+		t.Fatalf("no engine call may be made, got %v", ag.calls)
+	}
+	if _, _, err := dbUserCreate(context.Background(), createDeps(ag, dbu, fakeCreatePackages{}),
+		dbUserCreateInput{panelUser: packagedUser(), name: "app"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if len(ag.params) != 1 || ag.params[0]["create_only"] != true {
+		t.Fatalf("want create_only on db_user.create, got %v", ag.params)
+	}
+}
+
+// Another create took the last slot between the early count and the insert:
+// the locked insert refuses, and the engine credential this call made is
+// dropped again.
+func TestDBUserCreate_CapReachedAtInsert_RollsBack(t *testing.T) {
+	ag := &recCreateAgent{}
+	full := int64(3)
+	dbu := &fakeCreateDBUsers{count: 2, atInsert: &full}
+	pkgs := fakeCreatePackages{pkg: &models.HostingPackage{MaxDatabaseUsers: 3}}
+	_, _, err := dbUserCreate(context.Background(), createDeps(ag, dbu, pkgs),
+		dbUserCreateInput{panelUser: packagedUser(), name: "app"})
+	if !errors.Is(err, repository.ErrDatabaseUserCapExceeded) {
+		t.Fatalf("err = %v, want the cap error", err)
+	}
+	if dbu.created != nil {
+		t.Fatal("row inserted over the cap")
+	}
+	if len(ag.calls) != 2 || ag.calls[0] != "db_user.create" || ag.calls[1] != "db_user.drop" {
+		t.Fatalf("want create then drop, got %v", ag.calls)
+	}
+}
+
+type errCreatePackages struct{ repository.PackageRepository }
+
+func (errCreatePackages) FindByID(context.Context, string) (*models.HostingPackage, error) {
+	return nil, errors.New("db down")
+}
+
+// A package that is set but can't be loaded refuses the create; it doesn't
+// lift the cap.
+func TestDBUserCreate_PackageLookupError_Refuses(t *testing.T) {
+	for name, pkgs := range map[string]repository.PackageRepository{
+		"lookup error":  errCreatePackages{},
+		"no repository": nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			ag := &recCreateAgent{}
+			dbu := &fakeCreateDBUsers{}
+			_, _, err := dbUserCreate(context.Background(), createDeps(ag, dbu, pkgs),
+				dbUserCreateInput{panelUser: packagedUser(), name: "app"})
+			if !errors.Is(err, dbops.ErrQuotaUnavailable) {
+				t.Fatalf("err = %v, want ErrQuotaUnavailable", err)
+			}
+			if len(ag.calls) != 0 || dbu.created != nil {
+				t.Fatalf("created anyway: calls %v row %v", ag.calls, dbu.created)
+			}
+		})
+	}
+}
+
+// A package that no longer exists is no cap, the same as no package.
+func TestDBUserCreate_DeletedPackage_NoCap(t *testing.T) {
+	ag := &recCreateAgent{}
+	dbu := &fakeCreateDBUsers{count: 50}
+	if _, _, err := dbUserCreate(context.Background(), createDeps(ag, dbu, fakeCreatePackages{}),
+		dbUserCreateInput{panelUser: packagedUser(), name: "app"}); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+}

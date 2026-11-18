@@ -1,0 +1,198 @@
+package backup
+
+import (
+	"reflect"
+	"testing"
+)
+
+// TestBuildSSHConnArgs_Pin freezes the connection prefix buildSSHConnArgs
+// produces for every auth mode; the ls and rename builders append their
+// command to it. (It pinned the remote mkdir's argv until GH #2077 removed
+// that shell command: restic init creates the folder over SFTP.)
+func TestBuildSSHConnArgs_Pin(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		in   SFTPInputs
+		want []string
+	}{
+		{
+			name: "password auth",
+			in:   SFTPInputs{User: "u", Host: "h", Path: "/p", Auth: "password"},
+			want: []string{
+				"sshpass", "-e", "ssh",
+				"-o", "StrictHostKeyChecking=accept-new",
+				"-o", "PreferredAuthentications=password",
+				"-o", "PubkeyAuthentication=no",
+				"-l", "u", "--", "h",
+			},
+		},
+		{
+			name: "key auth with key path",
+			in:   SFTPInputs{User: "u", Host: "h", Path: "/p", Auth: "key", KeyPath: "/k"},
+			want: []string{
+				"ssh", "-i", "/k", "-o", "IdentitiesOnly=yes",
+				"-o", "StrictHostKeyChecking=accept-new",
+				"-o", "BatchMode=yes",
+				"-l", "u", "--", "h",
+			},
+		},
+		{
+			name: "default auth (no key, no password)",
+			in:   SFTPInputs{User: "u", Host: "h", Path: "/p"},
+			want: []string{
+				"ssh",
+				"-o", "StrictHostKeyChecking=accept-new",
+				"-o", "BatchMode=yes",
+				"-l", "u", "--", "h",
+			},
+		},
+		{
+			name: "non-22 port on key auth",
+			in:   SFTPInputs{User: "u", Host: "h", Path: "/p", Auth: "key", KeyPath: "/k", Port: 2222},
+			want: []string{
+				"ssh", "-i", "/k", "-o", "IdentitiesOnly=yes",
+				"-o", "StrictHostKeyChecking=accept-new",
+				"-o", "BatchMode=yes",
+				"-p", "2222",
+				"-l", "u", "--", "h",
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildSSHConnArgs(tc.in)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("argv mismatch\n got: %#v\nwant: %#v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuildSSHListArgs pins the ls argv: the shared connection prefix, then a
+// `--` separator (so ssh stops parsing its own options), then `ls -1` and the
+// remote path as ONE argv element, quoted for the remote shell when it holds a
+// character a shell treats specially. Falsify by dropping the `--`, or by
+// joining the remote command into a single string.
+func TestBuildSSHListArgs(t *testing.T) {
+	t.Parallel()
+
+	got := buildSSHListArgs(
+		SFTPInputs{User: "u", Host: "h", Auth: "key", KeyPath: "/k", Port: 2222},
+		"/home/puzzle/dotnext/keys",
+	)
+	want := []string{
+		"ssh", "-i", "/k", "-o", "IdentitiesOnly=yes",
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "BatchMode=yes",
+		"-p", "2222",
+		"-l", "u", "--", "h", "ls", "-1", "/home/puzzle/dotnext/keys",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("ls argv mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+
+	// The remote shell parses the command, so a path with a space is quoted
+	// to stay one argument there (TestListRemoteSFTP_PathStaysOneArgumentOnTheRemoteShell).
+	spaced := buildSSHListArgs(SFTPInputs{User: "u", Host: "h"}, "/a b/keys")
+	if last := spaced[len(spaced)-1]; last != "'/a b/keys'" {
+		t.Errorf("remote path not quoted for the remote shell: last argv element = %q", last)
+	}
+}
+
+// TestBuildSSHRenameArgs pins the move-aside argv (JAB-405 Part 2b): the shared
+// connection prefix, then `--` (so ssh stops parsing its own options), then
+// `mv -n` and src+dst as TWO separate argv elements. Falsify by dropping the
+// `--`, dropping `-n`, or joining the remote command into one string. src and dst
+// as distinct argv elements is what keeps a repository path with spaces from
+// splitting into extra `mv` operands.
+func TestBuildSSHRenameArgs(t *testing.T) {
+	t.Parallel()
+
+	const (
+		src = "/home/puzzle/dotnext/keys/3c0bdcd0"
+		dst = "/home/puzzle/dotnext/3c0bdcd0.dotnext-race-1"
+	)
+	cases := []struct {
+		name string
+		in   SFTPInputs
+		want []string
+	}{
+		{
+			name: "password auth",
+			in:   SFTPInputs{User: "u", Host: "h", Auth: "password"},
+			want: []string{
+				"sshpass", "-e", "ssh",
+				"-o", "StrictHostKeyChecking=accept-new",
+				"-o", "PreferredAuthentications=password",
+				"-o", "PubkeyAuthentication=no",
+				"-l", "u", "--", "h", "mv", "-n", src, dst,
+			},
+		},
+		{
+			name: "key auth with key path",
+			in:   SFTPInputs{User: "u", Host: "h", Auth: "key", KeyPath: "/k"},
+			want: []string{
+				"ssh", "-i", "/k", "-o", "IdentitiesOnly=yes",
+				"-o", "StrictHostKeyChecking=accept-new",
+				"-o", "BatchMode=yes",
+				"-l", "u", "--", "h", "mv", "-n", src, dst,
+			},
+		},
+		{
+			name: "default auth (no key, no password)",
+			in:   SFTPInputs{User: "u", Host: "h"},
+			want: []string{
+				"ssh",
+				"-o", "StrictHostKeyChecking=accept-new",
+				"-o", "BatchMode=yes",
+				"-l", "u", "--", "h", "mv", "-n", src, dst,
+			},
+		},
+		{
+			name: "non-22 port on key auth",
+			in:   SFTPInputs{User: "u", Host: "h", Auth: "key", KeyPath: "/k", Port: 2222},
+			want: []string{
+				"ssh", "-i", "/k", "-o", "IdentitiesOnly=yes",
+				"-o", "StrictHostKeyChecking=accept-new",
+				"-o", "BatchMode=yes",
+				"-p", "2222",
+				"-l", "u", "--", "h", "mv", "-n", src, dst,
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := buildSSHRenameArgs(tc.in, src, dst)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("rename argv mismatch\n got: %#v\nwant: %#v", got, tc.want)
+			}
+		})
+	}
+
+	// src and dst with spaces are each quoted to stay one argument on the
+	// remote shell (TestRenameRemoteSFTP_PathsStayOneArgumentEachOnTheRemoteShell).
+	spaced := buildSSHRenameArgs(SFTPInputs{User: "u", Host: "h"}, "/a b/keys/K", "/a b/K aside")
+	if spaced[len(spaced)-2] != "'/a b/keys/K'" || spaced[len(spaced)-1] != "'/a b/K aside'" {
+		t.Errorf("src/dst not quoted for the remote shell: tail = %#v", spaced[len(spaced)-2:])
+	}
+}
+
+// A user or host that starts with `-` must never reach ssh where it would be
+// read as an ssh option: the user is -l's argument and the host comes right
+// after `--`, so the remote command's first word can't become the host either.
+func TestBuildSSHConnArgs_DashLedUserAndHostAreNotOptions(t *testing.T) {
+	t.Parallel()
+
+	got := buildSSHListArgs(SFTPInputs{User: "-oProxyCommand=user-cmd", Host: "-oProxyCommand=host-cmd"}, "/r/keys")
+	want := []string{
+		"ssh",
+		"-o", "StrictHostKeyChecking=accept-new",
+		"-o", "BatchMode=yes",
+		"-l", "-oProxyCommand=user-cmd", "--", "-oProxyCommand=host-cmd", "ls", "-1", "/r/keys",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("argv mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}

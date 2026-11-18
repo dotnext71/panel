@@ -1,0 +1,149 @@
+package pyframeworks
+
+import (
+	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
+)
+
+// CreateSpec is the resolved runtime config for provisioning a Python app from a
+// framework entry: the fields the create flow stamps on the app row + the plan
+// the agent executes (scaffold, requirements, post-install). Pure derivation
+// from an Entry — no I/O — so it's fully unit-testable ahead of the agent wiring.
+type CreateSpec struct {
+	AppType      string   // wsgi | asgi
+	Server       string   // gunicorn | uvicorn | hypercorn | daphne
+	Entrypoint   string   // rendered module:callable (e.g. site.wsgi:application)
+	Requirements []string // pinned pip deps written to requirements.txt
+	Project      string   // scaffold project name (cmd scaffolds)
+
+	ScaffoldKind    string            // cmd | template | source
+	ScaffoldCommand []string          // argv for a cmd scaffold (rendered); nil otherwise
+	TemplateFiles   map[string]string // relpath->content for a template scaffold; nil otherwise
+	// SourceURL + SourceSHA256 are a source scaffold's pinned upstream tarball.
+	SourceURL    string
+	SourceSHA256 string
+	// SystemLibs are the shared libraries (KnownSystemLibs names) the agent
+	// installs on demand before the app is scaffolded or applied.
+	SystemLibs []string
+
+	// HardenSettings requests the Django-style settings.py rewrite (SECRET_KEY +
+	// ALLOWED_HOSTS from env, STATIC_ROOT). Derived from a secret_key generator.
+	HardenSettings bool
+	// PatchScript, when set, is the framework's own python settings surgery run
+	// in place of the generic hardener (Wagtail/Channels). Takes precedence.
+	PatchScript string
+
+	NeedsDB     string
+	StaticURL   string
+	StaticRoot  string
+	MediaURL    string
+	MediaRoot   string
+	PostInstall []string
+	// GenerateEnv are the env vars the scaffolder must mint a value for (secret
+	// generators) — kept separate so the caller writes them to the app's env,
+	// never to source.
+	GenerateEnv []EnvVar
+	// Env is the full declared default env (generated + static). The create flow
+	// merges these into the app's env after scaffolding, filling generated keys
+	// from the scaffolder's output.
+	Env []EnvVar
+}
+
+var (
+	// projectRe guards a cmd-scaffold project name — it becomes a Python package
+	// (django-admin startproject <name>), so it must be an importable identifier.
+	projectRe = regexp.MustCompile(`^[a-z][a-z0-9_]{0,31}$`)
+	// entrypointRe mirrors the runtime's module:callable contract after rendering.
+	entrypointRe = regexp.MustCompile(`^[A-Za-z0-9_.]+:[A-Za-z0-9_]+$`)
+)
+
+// renderProject substitutes {{.Project}} in a template with the project name.
+// Only that one variable is supported, so a literal replace is enough (and
+// avoids pulling text/template + its error surface into the hot path).
+func renderProject(tmpl, project string) string {
+	return strings.ReplaceAll(tmpl, "{{.Project}}", project)
+}
+
+// ResolveCreate turns a validated Entry into the runtime CreateSpec. It renders
+// the entrypoint + scaffold command against the project name and re-checks the
+// derived entrypoint against the runtime's module:callable contract, so a bad
+// template can't produce an unlaunchable app.
+func (e Entry) ResolveCreate() (CreateSpec, error) {
+	project := e.Scaffold.Project
+	if project == "" {
+		project = "app"
+	}
+	if (e.Scaffold.Kind == "cmd" || e.Scaffold.Kind == "source") && !projectRe.MatchString(project) {
+		return CreateSpec{}, fmt.Errorf("scaffold.project %q: must be an importable identifier ^[a-z][a-z0-9_]{0,31}$", project)
+	}
+
+	entrypoint := renderProject(e.EntrypointTemplate, project)
+	if !entrypointRe.MatchString(entrypoint) {
+		return CreateSpec{}, fmt.Errorf("rendered entrypoint %q is not module:callable", entrypoint)
+	}
+
+	spec := CreateSpec{
+		AppType:      e.AppType,
+		Server:       e.Server,
+		Entrypoint:   entrypoint,
+		Requirements: append([]string(nil), e.PipRequirements...),
+		Project:      project,
+		ScaffoldKind: e.Scaffold.Kind,
+		NeedsDB:      e.NeedsDB,
+		StaticURL:    e.StaticURL,
+		StaticRoot:   e.StaticRoot,
+		MediaURL:     e.MediaURL,
+		MediaRoot:    e.MediaRoot,
+		PostInstall:  append([]string(nil), e.PostInstall...),
+	}
+	switch e.Scaffold.Kind {
+	case "cmd":
+		spec.ScaffoldCommand = strings.Fields(renderProject(e.Scaffold.Command, project))
+		if len(spec.ScaffoldCommand) == 0 {
+			return CreateSpec{}, fmt.Errorf("scaffold.command rendered empty")
+		}
+	case "source":
+		spec.SourceURL = e.Scaffold.URL
+		spec.SourceSHA256 = e.Scaffold.SHA256
+	default:
+		spec.TemplateFiles = e.TemplateFiles
+	}
+	if len(e.SystemLibs) > 0 {
+		spec.SystemLibs = append([]string(nil), e.SystemLibs...)
+	}
+	spec.PatchScript = e.PatchScript
+	spec.Env = append([]EnvVar(nil), e.DefaultEnv...)
+	for _, v := range e.DefaultEnv {
+		if v.Generate != "" {
+			spec.GenerateEnv = append(spec.GenerateEnv, v)
+		}
+		if v.Generate == "secret_key" {
+			spec.HardenSettings = true
+		}
+	}
+	return spec, nil
+}
+
+// RunsOn reports whether the entry supports a Python runtime version such as
+// "3.12": true when the entry names no python_min, or the version is at least
+// python_min. A malformed version never passes. The create paths check it so
+// an app isn't made on a runtime its pinned deps refuse (GH #2156: sic's
+// Django 6 needs 3.12).
+func (e Entry) RunsOn(version string) bool {
+	if !pyVerRe.MatchString(version) {
+		return false
+	}
+	if e.PythonMin == "" {
+		return true
+	}
+	return pyMinor(version) >= pyMinor(e.PythonMin)
+}
+
+// pyMinor returns the minor number of a "3.N" version already matched by
+// pyVerRe.
+func pyMinor(v string) int {
+	n, _ := strconv.Atoi(strings.TrimPrefix(v, "3."))
+	return n
+}

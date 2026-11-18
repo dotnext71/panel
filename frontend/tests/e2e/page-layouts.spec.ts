@@ -1,0 +1,161 @@
+// GH #2251: pages laid out like Security and Backups. Each page opens with a
+// level-3 heading that carries the sidebar's icon; a page with tabs puts them
+// in the tab bar of one card below that heading, not bare on the page, and a
+// tab does not repeat the page's heading inside the card. Real-browser pass
+// against the built SPA, since happy-dom has no layout to compare.
+import { admin, user, mockApi, signIn, test, expect } from "./fixtures";
+import type { Locator, Page } from "@playwright/test";
+
+async function expectPageHeading(page: Page, name: RegExp): Promise<Locator> {
+  const heading = page.getByRole("heading", { level: 3, name });
+  await expect(heading).toBeVisible();
+  await expect(heading.locator("svg")).toHaveCount(1);
+  return heading;
+}
+
+// The tabs sit in the head of one card, and that card starts below the heading.
+async function expectTabsInCardBelow(page: Page, heading: Locator, tabs: string[]): Promise<void> {
+  const head = page.locator(".ant-card-head").filter({ has: page.getByRole("tab", { name: tabs[0] }) });
+  await expect(head).toHaveCount(1);
+  for (const name of tabs) {
+    await expect(head.getByRole("tab", { name })).toBeVisible();
+  }
+  await expect(page.locator(".ant-tabs").filter({ has: page.getByRole("tab", { name: tabs[0] }) })).toHaveCount(1);
+  const h = await heading.boundingBox();
+  const card = await head.boundingBox();
+  expect(h && card && h.y + h.height <= card.y).toBe(true);
+}
+
+async function mockCron(page: Page): Promise<void> {
+  await page.route("**/api/v1/admin/cron", (route) =>
+    route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ items: [] }) }),
+  );
+  await page.route("**/api/v1/admin/system-jobs", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ data: [], total: 0, page: 1, page_size: 0 }),
+    }),
+  );
+}
+
+test.describe("GH #2251 — admin page layouts", () => {
+  test.beforeEach(async ({ page }) => {
+    await mockApi(page, { me: admin });
+    await mockCron(page);
+    await signIn(page, admin);
+    await page.waitForURL(/\/dotnext-admin/);
+  });
+
+  test("Logs & Statistics: heading with its icon, tabs in the card below it", async ({ page }) => {
+    await page.goto("/dotnext-admin/logs");
+    const heading = await expectPageHeading(page, /Logs & Statistics/);
+    await expectTabsInCardBelow(page, heading, ["Domains", "Audit Log", "Backups", "Updates", "Mail"]);
+
+    await page.getByRole("tab", { name: "Updates" }).click();
+    await expect(page).toHaveURL(/[?&]tab=updates/);
+    await expect(page.getByRole("tab", { name: "Updates", selected: true })).toBeVisible();
+  });
+
+  test("Cron Jobs: the heading sits above the tabs, and neither tab repeats it", async ({ page }) => {
+    await page.goto("/dotnext-admin/cron");
+    const heading = await expectPageHeading(page, /^Cron Jobs$/);
+    await expectTabsInCardBelow(page, heading, ["Tenant jobs", "System jobs"]);
+    await expect(page.getByRole("heading", { name: /Cron Jobs/ })).toHaveCount(1);
+    await expect(page.getByRole("button", { name: /New Cron Job/ })).toBeVisible();
+
+    await page.goto("/dotnext-admin/cron?tab=system");
+    await expect(page.getByRole("tab", { name: "System jobs", selected: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: /System jobs/ })).toHaveCount(0);
+  });
+
+  test("Databases and Migrations have a heading with their icon", async ({ page }) => {
+    await page.goto("/dotnext-admin/databases");
+    await expectPageHeading(page, /^Databases$/);
+
+    await page.goto("/dotnext-admin/migrations");
+    await expectPageHeading(page, /^Migrations$/);
+  });
+
+  test("Cache and Server API Access have a level-3 heading with their icon", async ({ page }) => {
+    await page.goto("/dotnext-admin/cache");
+    await expectPageHeading(page, /^Cache$/);
+
+    await page.goto("/dotnext-admin/automation");
+    await expectPageHeading(page, /^Server API Access$/);
+  });
+});
+
+// The tenant pages below sit behind capability gates, and Disk Usage and Mail
+// read data mockApi does not serve.
+async function mockTenantPages(page: Page): Promise<void> {
+  const json = (body: unknown) => ({ status: 200, contentType: "application/json", body: JSON.stringify(body) });
+  await page.route("**/api/v1/me/server-capabilities", (route) =>
+    route.fulfill(json({ python_apps_enabled: true, mail_enabled: true, dns_enabled: true })),
+  );
+  const none = { bytes: 0, items: [] };
+  await page.route("**/api/v1/me/disk-usage", (route) =>
+    route.fulfill(
+      json({ computed_at: "2026-10-24T08:00:00Z", total_bytes: 0, quota_bytes: 0, files: none, email: none, databases: none }),
+    ),
+  );
+  await page.route("**/api/v1/me/disk-usage/files*", (route) => route.fulfill(json({ path: "", total: 0, entries: [] })));
+  await page.route("**/api/v1/me/mail-domains*", (route) =>
+    route.fulfill(json({ data: [], total: 0, page: 1, page_size: 25 })),
+  );
+}
+
+test.describe("GH #2251 — tenant page layouts", () => {
+  test.beforeEach(async ({ page }) => {
+    await mockApi(page, { me: user });
+    await mockTenantPages(page);
+    await signIn(page, user);
+    await page.waitForURL(/\/dotnext-panel/);
+  });
+
+  test("Logs & Statistics: heading with its icon, tabs in the card below it", async ({ page }) => {
+    await page.goto("/dotnext-panel/logs");
+    const heading = await expectPageHeading(page, /Logs & Statistics/);
+    await expectTabsInCardBelow(page, heading, ["Domain logs", "Account activity"]);
+
+    // The old /activity link still lands on the Account activity tab, which
+    // the tab names: no second heading inside the card.
+    await page.goto("/dotnext-panel/activity");
+    await expect(page).toHaveURL(/\/dotnext-panel\/logs\?tab=activity/);
+    await expect(page.getByRole("tab", { name: "Account activity", selected: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: /Account Activity/i })).toHaveCount(0);
+  });
+
+  test("PHP Settings: tabs in the card below the heading, no card inside a tab", async ({ page }) => {
+    await page.goto("/dotnext-panel/php-settings");
+    const heading = await expectPageHeading(page, /^PHP Settings$/);
+    await expectTabsInCardBelow(page, heading, [
+      "Version & Domains",
+      "Performance",
+      "OPcache & JIT",
+      "Environment",
+      "Extensions",
+      "Xdebug",
+    ]);
+
+    await page.getByRole("tab", { name: "Environment" }).click();
+    await expect(page).toHaveURL(/[?&]tab=env/);
+    await expect(page.getByText("Per-domain environment variables for PHP apps.")).toBeVisible();
+    await expect(page.locator(".ant-card .ant-card")).toHaveCount(0);
+  });
+
+  test("Disk Usage, Python Apps, Mail Domains and Notifications have a heading with their icon", async ({ page }) => {
+    await page.goto("/dotnext-panel/disk-usage");
+    await expectPageHeading(page, /^Disk Usage$/);
+
+    await page.goto("/dotnext-panel/python-apps");
+    await expectPageHeading(page, /^Python Apps$/);
+
+    await page.goto("/dotnext-panel/mail-domains");
+    await expectPageHeading(page, /^Mail Domains$/);
+    await expect(page.getByRole("button", { name: /Create Mail Domain/ }).first()).toBeVisible();
+
+    await page.goto("/dotnext-panel/notifications");
+    await expectPageHeading(page, /^Notifications$/);
+  });
+});

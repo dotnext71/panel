@@ -1,0 +1,1364 @@
+package repository
+
+import (
+	"context"
+	"errors"
+	"strings"
+	"time"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
+
+	"github.com/dotnext-panel/dotnext/internal/models"
+)
+
+// DomainRepository defines data access for hosted domains.
+type DomainRepository interface {
+	Create(ctx context.Context, d *models.Domain) error
+	FindByID(ctx context.Context, id string) (*models.Domain, error)
+	// FindByIDs batch-loads domains by id (deduped, one query) — the
+	// N+1-free path for list handlers resolving many rows (JAB-147).
+	FindByIDs(ctx context.Context, ids []string) ([]models.Domain, error)
+	FindByName(ctx context.Context, name string) (*models.Domain, error)
+	// FindStrictSubdomains returns every domain whose name is a strict
+	// subdomain of `name` — i.e. ends in "."+name (label-boundary aware, so
+	// "evil.example.com" matches "example.com" but "notexample.com" does not).
+	// The child-direction lookup for the cross-tenant subdomain-hijack guard
+	// (GH #1789); the caller compares each row's owner against the claimant.
+	// `name` is a validated FQDN (no LIKE metacharacters), so it is safe to
+	// interpolate into the "%."+name LIKE pattern.
+	FindStrictSubdomains(ctx context.Context, name string) ([]models.Domain, error)
+	List(ctx context.Context, opts ListOptions) ([]models.Domain, int64, error)
+	ListByUserID(ctx context.Context, userID string, opts ListOptions) ([]models.Domain, int64, error)
+	// ComputeSSLState resolves a domain's flat ssl_state from its cert row (the
+	// same value the list endpoints populate). Lets the single-domain detail
+	// handler fill ssl_state, which FindByID leaves empty (GH #1543).
+	ComputeSSLState(domain *models.Domain, cert *models.SSLCertificate) string
+	Update(ctx context.Context, d *models.Domain) error
+	// Transaction runs fn inside a single database transaction, passing a
+	// DomainRepository bound to that transaction. Every write fn issues through
+	// the passed repo commits together, or — on any error fn returns — rolls
+	// back as a unit. This is the persistence contract a multi-write domain
+	// apply relies on (JAB-318 AC4): the general Update plus the dedicated
+	// ssl_mode / cache_enabled / mail_provider / listen_ips writers can then
+	// never leave the row half-patched when a later write fails.
+	Transaction(ctx context.Context, fn func(DomainRepository) error) error
+	// RewriteDocRootPrefix rewrites the leading /home/<old> of every doc_root
+	// owned by userID to /home/<new> when a user is renamed (GH #1238).
+	// Prefix-anchored + user-scoped, so it can never touch another tenant's
+	// paths. Returns the number of rows changed.
+	RewriteDocRootPrefix(ctx context.Context, userID, oldPrefix, newPrefix string) (int64, error)
+	// TransferOwner reassigns a domain to a new owner and repoints its docroot
+	// (GH #1238 owner-change). Dedicated method: the Update allowlist excludes
+	// user_id, so a full-model Update would silently drop the transfer. It
+	// deletes the domain's Git repository settings in the same transaction:
+	// they hold the old owner's token (GH #2277).
+	TransferOwner(ctx context.Context, domainID, newUserID, newDocRoot string) error
+	// Rename changes a domain's name and doc_root together (GH #1579 domain
+	// rename). Dedicated setter: the generic Update allowlist includes name, but
+	// a rename must move name + doc_root as a unit and is only ever driven by
+	// userops.RenameDomain (which tears down the old name's artifacts + moves the
+	// files). Keeping it a distinct method means no other edit path can rename a
+	// row without that orchestration.
+	Rename(ctx context.Context, id, newName, newDocRoot string) error
+	// BulkSetEnabledByUserID flips domains.is_enabled for every row
+	// owned by the user. Returns the count of changed rows. Used by
+	// the admin user-suspend handler so a single API call takes every
+	// site offline. Reconciler picks up the flip on the next tick and
+	// removes (or restores) the nginx sites-enabled symlinks.
+	BulkSetEnabledByUserID(ctx context.Context, userID string, enabled bool) (int64, error)
+	Delete(ctx context.Context, id string) error
+	CountByUserID(ctx context.Context, userID string) (int64, error)
+	// CreateWithinCap inserts d only while its owner has fewer than maxDomains
+	// domains, else ErrDomainCapExceeded. The count and the insert run in one
+	// transaction holding the owner's users row FOR UPDATE. ErrNotFound when
+	// the owner row is missing.
+	CreateWithinCap(ctx context.Context, d *models.Domain, maxDomains uint32) error
+	// ListPreviewEnabled returns every domain whose preview URL is on, with
+	// only id, name, and temp_url_enabled loaded (JAB-279). It backs the
+	// preview-slug collision check, which must see all of them — not a page —
+	// and needs none of the other columns.
+	ListPreviewEnabled(ctx context.Context) ([]models.Domain, error)
+	// ListForRegistrarRefresh returns domains whose registrar expiry has never
+	// been checked or was last checked before staleBefore (GH #259), oldest
+	// first, capped at limit — the WHOIS-fetch ticker's work queue.
+	ListForRegistrarRefresh(ctx context.Context, staleBefore time.Time, limit int) ([]models.Domain, error)
+	// SetRegistrarExpiry caches a domain's registration expiry + stamps the
+	// check time. expiresAt may be nil (whois unavailable / unparseable) — the
+	// check time is still set so the ticker doesn't re-query every pass.
+	SetRegistrarExpiry(ctx context.Context, id string, expiresAt *time.Time, checkedAt time.Time) error
+	// CountByPHPPoolID returns the number of domains currently bound to
+	// the given PHP pool. Used by the pool-delete handler to refuse with
+	// 409 when any domain still references the pool (ADR-0023 decision 10).
+	CountByPHPPoolID(ctx context.Context, poolID string) (int64, error)
+	// SetPHPPoolID binds (or, when poolID is nil, unbinds) a domain's
+	// php_pool_id column in isolation. Update()'s column allowlist does
+	// NOT include php_pool_id on purpose — it's the one column whose
+	// mutations must only come from the dedicated bind/unbind handlers,
+	// not from generic domain PATCH.
+	SetPHPPoolID(ctx context.Context, id string, poolID *string) error
+	// UpdatePHPSettings atomically updates the per-domain PHP INI override
+	// columns (the six resource/execution limits plus the GH #1332 runtime
+	// directives display_errors/error_reporting/timezone). NULL values
+	// explicitly clear the override. This is a dedicated method because the
+	// columns are not in Update()'s allowlist.
+	UpdatePHPSettings(ctx context.Context, id string, settings DomainPHPSettings) error
+	// UpdateEnvVars replaces a domain's per-domain environment variables (GH
+	// #1332 item 14). Dedicated method (not in Update()'s allowlist); an empty
+	// slice clears them (JSON column round-trips to NULL).
+	UpdateEnvVars(ctx context.Context, id string, envVars models.DomainEnvVars) error
+	// UpdateEmailState writes the four M6 email columns (email_enabled,
+	// dkim_selector, dkim_public_key, email_enabled_at) in one go. Dedicated
+	// method because none of these are in Update()'s allowlist and because
+	// all four flip together when email is enabled/disabled (ADR-0042).
+	// Passing enabled=false clears the timestamp but keeps dkim_selector +
+	// dkim_public_key so DNS re-publication after a later re-enable doesn't
+	// re-roll the key per ADR-0043.
+	UpdateEmailState(ctx context.Context, id string, state DomainEmailState) error
+	// UpdateDKIMPublicKeys writes the published DKIM public keys of a domain
+	// whose mail is already set up (GH #2475): the reconciler records the
+	// RSA key it gave the domain, and an Ed25519 key it had to recreate.
+	// A nil key leaves its column alone; email_enabled and the selector are
+	// never touched, so a concurrent disable can't be undone by it.
+	UpdateDKIMPublicKeys(ctx context.Context, id string, ed25519, rsa *string) error
+	// UpdateMailProvider writes the GH#181 mail-provider columns
+	// (mail_provider + the optional DKIM tokens) together with the
+	// derived email_enabled + skip_auto_san. Dedicated method (not the
+	// Select-allowlist Update) so the columns can't be silently dropped.
+	UpdateMailProvider(ctx context.Context, id string, mp DomainMailProvider) error
+
+	// UpdateSSLMode writes ssl_mode + the derived ssl_enabled shadow together
+	// (GH #246). Dedicated method, not the Select-allowlist Update, to avoid
+	// silent column drops.
+	UpdateSSLMode(ctx context.Context, id string, mode string) error
+	// SetSharedCertificate attaches (sharedCertID non-nil, mode 'shared') or
+	// detaches (nil, mode 'le') a domain from a JAB-170 shared certificate.
+	SetSharedCertificate(ctx context.Context, id string, sharedCertID *string, mode string) error
+	// FindPanelPrimary returns the single is_panel_primary=1 row, or
+	// ErrPanelPrimaryNotFound if no such row exists. ADR-0048.
+	FindPanelPrimary(ctx context.Context) (*models.Domain, error)
+	// MarkPanelPrimary sets is_panel_primary=1 on the target row and
+	// clears it on any other row in a single transaction, so the "at
+	// most one" invariant holds without a SQL UNIQUE constraint.
+	// Idempotent — re-running on an already-marked row is a no-op.
+	// ADR-0048.
+	MarkPanelPrimary(ctx context.Context, id string) error
+	// SetListenIPs writes the M24 per-domain IP binding columns
+	// (listen_ipv4_id, listen_ipv6_id). Only families flagged ChangeIPv4
+	// / ChangeIPv6 are written — others are left untouched, so a PATCH
+	// that only mentions one family doesn't accidentally clear the
+	// other. Nil pointers map to SQL NULL ("use server default per
+	// family"). Dedicated method because the columns are not in
+	// Update()'s allowlist on purpose.
+	SetListenIPs(ctx context.Context, id string, upd DomainListenIPs) error
+	// UpdateCatchallTarget writes the catchall_target column for a domain.
+	// Nil target clears the catch-all (sets to NULL). Dedicated method
+	// because the column is not in Update()'s allowlist.
+	UpdateCatchallTarget(ctx context.Context, id string, target *string) error
+	// UpdateDisclaimer writes disclaimer_enabled + disclaimer_text.
+	// M6.5 Step 6 ADR-0052; reconciler pushes to Stalwart sieve.
+	UpdateDisclaimer(ctx context.Context, id string, enabled bool, text *string) error
+	// SetRateLimits writes rate_limit_rps + connection_limit (0 = none).
+	// Dedicated method because the columns are not in Update()'s allowlist;
+	// a restore with Overwrite is its only writer (GH #1993).
+	SetRateLimits(ctx context.Context, id string, rps, conn uint32) error
+	// UpdateDNSSECEnabled writes dnssec_enabled + dnssec_enabled_at.
+	// ADR-0076. Dedicated method because neither column is in Update()'s
+	// allowlist; enabling without a timestamp or disabling without clearing
+	// the timestamp is a bug waiting to happen.
+	UpdateDNSSECEnabled(ctx context.Context, id string, enabled bool) error
+	// UpdateWebDisabled / UpdateDNSDisabled flip the facet flags for a
+	// facet-preserving delete (GH #1603): "delete the Web Domain, keep the
+	// Mail Domain / DNS Zone" removes the web (or DNS) facet while keeping the
+	// row. Dedicated setters because neither web_disabled nor dns_disabled is in
+	// Update()'s allowlist, and the flip must land BEFORE the host teardown so
+	// the reconciler does not re-render what the teardown just removed.
+	UpdateWebDisabled(ctx context.Context, id string, disabled bool) error
+	UpdateDNSDisabled(ctx context.Context, id string, disabled bool) error
+	// AttachDockerApp wires an existing (tenant-managed) domain to a
+	// docker app: rewrites nginx_rules + sets docker_app_id in one
+	// shot. Dedicated method because docker_app_id is not in
+	// Update()'s allowlist.
+	AttachDockerApp(ctx context.Context, id string, dockerAppID string, rules models.NginxRules) error
+	// DetachDockerApp is the inverse: clears docker_app_id and (when
+	// resetRules is true) clears nginx_rules back to an empty set.
+	// Called from docker_app delete to drop the proxy_pass rule the
+	// install/attach handler injected.
+	DetachDockerApp(ctx context.Context, id string, resetRules bool) error
+	// UpdateCacheEnabled writes domains.cache_enabled (ADR-0108).
+	// Dedicated method: cache_enabled is not in Update()'s allowlist.
+	UpdateCacheEnabled(ctx context.Context, id string, enabled bool) error
+	// UpdateCachePath writes domains.cache_path (Gitea #420).
+	UpdateCachePath(ctx context.Context, id, path string) error
+	UpdateCacheTTL(ctx context.Context, id string, seconds int) error
+	// UpdateCacheQueryAllowlist writes domains.cache_query_allowlist (migration
+	// 000230). csv is the normalized comma-joined param names ("" = off).
+	UpdateCacheQueryAllowlist(ctx context.Context, id, csv string) error
+	// UpdateSkipAutoSAN writes domains.skip_auto_san (M50 SAN opt-out).
+	// Dedicated method per [[feedback_domain_update_allowlist_silent_drop]].
+	UpdateSkipAutoSAN(ctx context.Context, id string, enabled bool) error
+	// UpdateMTASTSEnabled writes domains.mta_sts_enabled (ADR-0109). On
+	// enable, also bumps mta_sts_id to the current unix timestamp so the
+	// TXT record id rotates (forces caches to refetch). On disable, the
+	// id is left intact — re-enabling later picks up a fresh id anyway,
+	// and keeping it lets ops correlate older TXT snapshots.
+	UpdateMTASTSEnabled(ctx context.Context, id string, enabled bool) (newID uint64, err error)
+	// UpdateMTASTSAppliedID records the id the agent successfully
+	// applied via mail.mtasts.apply (ADR-0109 / Wave 7c). Idempotent
+	// no-op when applied == 0 — the reconciler uses 0 only after a
+	// disable, but that path uses UpdateMTASTSEnabled(false) which
+	// doesn't touch this column on its own.
+	UpdateMTASTSAppliedID(ctx context.Context, id string, appliedID uint64) error
+	// UpdatePHPPoolID writes domains.php_pool_id. Dedicated method
+	// because the column isn't in Update()'s allowlist (the comment
+	// there explicitly notes PHP-pool binding has its own writer).
+	// Pass nil to unbind. Bug: ensureDomainPHPBinding previously called
+	// the generic Update which silently dropped the column, so the row
+	// stayed NULL and the reconciler re-bound on every tick.
+	UpdatePHPPoolID(ctx context.Context, id string, poolID *string) error
+	// UpdateGhostState writes the M38 ghost-detector columns
+	// (ghost_state + ghost_checked_at + ghost_detail) atomically.
+	// Dedicated method because none of the three are in Update()'s
+	// allowlist; the detector is the only writer and runs every few
+	// hours from the eventsources package.
+	UpdateGhostState(ctx context.Context, id, state string, checkedAt time.Time, detail *string) error
+	// ListForGhostCheck returns up to `limit` domains whose
+	// ghost_checked_at is older than `staleBefore` (NULL counts as
+	// stale), ordered by checked_at NULLS first then asc. Used by
+	// the ghost detector to walk the table in batches.
+	ListForGhostCheck(ctx context.Context, staleBefore time.Time, limit int) ([]models.Domain, error)
+}
+
+// DomainListenIPs is the bundle of optional column writes for
+// SetListenIPs. ChangeIPv4 / ChangeIPv6 disambiguate "absent in PATCH"
+// from "explicitly set to null" — only the flagged family is touched.
+type DomainListenIPs struct {
+	ChangeIPv4 bool
+	IPv4ID     *uint64
+	ChangeIPv6 bool
+	IPv6ID     *uint64
+}
+
+// DomainEmailState is the bundle of columns written together by
+// UpdateEmailState. Nil DkimSelector / DkimPublicKey leave those
+// columns alone (used by disable, which keeps the key material).
+type DomainEmailState struct {
+	Enabled       bool
+	DkimSelector  *string
+	DkimPublicKey *string
+	// DkimRSAPublicKey is the RSA key's TXT value (GH #2475); nil leaves it.
+	DkimRSAPublicKey *string
+	EmailEnabledAt   *time.Time
+}
+
+// DomainPHPSettings holds per-domain PHP INI overrides.
+// NULL means "use pool default — do not emit a fastcgi_param".
+type DomainPHPSettings struct {
+	MemoryLimit       *string `json:"php_memory_limit,omitempty"`
+	UploadMaxFilesize *string `json:"php_upload_max_filesize,omitempty"`
+	PostMaxSize       *string `json:"php_post_max_size,omitempty"`
+	MaxInputVars      *int    `json:"php_max_input_vars,omitempty"`
+	MaxExecutionTime  *int    `json:"php_max_execution_time,omitempty"`
+	MaxInputTime      *int    `json:"php_max_input_time,omitempty"`
+	// GH #1332 per-domain runtime directives (same NULL = pool-default rule).
+	DisplayErrors  *bool   `json:"php_display_errors,omitempty"`
+	ErrorReporting *int    `json:"php_error_reporting,omitempty"`
+	Timezone       *string `json:"php_timezone,omitempty"`
+	// GH #1701 Slice 2 flags (same NULL = inherit rule).
+	LogErrors    *bool `json:"php_log_errors,omitempty"`
+	FileUploads  *bool `json:"php_file_uploads,omitempty"`
+	ShortOpenTag *bool `json:"php_short_open_tag,omitempty"`
+	// GH #1701 Slice 3 admin values (same NULL = inherit rule). OpenBasedir
+	// must already be normalized by internal/phpbasedir.
+	OpenBasedir   *string `json:"php_open_basedir,omitempty"`
+	AllowURLFopen *bool   `json:"php_allow_url_fopen,omitempty"`
+}
+
+// DomainPHPSettingsOf returns a domain's stored PHP settings. UpdatePHPSettings
+// writes every field (nil clears it), so a caller changing only some of them
+// starts from this, or it clears the rest.
+func DomainPHPSettingsOf(d *models.Domain) DomainPHPSettings {
+	return DomainPHPSettings{
+		MemoryLimit:       d.PHPMemoryLimit,
+		UploadMaxFilesize: d.PHPUploadMaxFilesize,
+		PostMaxSize:       d.PHPPostMaxSize,
+		MaxInputVars:      d.PHPMaxInputVars,
+		MaxExecutionTime:  d.PHPMaxExecutionTime,
+		MaxInputTime:      d.PHPMaxInputTime,
+		DisplayErrors:     d.PHPDisplayErrors,
+		ErrorReporting:    d.PHPErrorReporting,
+		Timezone:          d.PHPTimezone,
+		LogErrors:         d.PHPLogErrors,
+		FileUploads:       d.PHPFileUploads,
+		ShortOpenTag:      d.PHPShortOpenTag,
+		OpenBasedir:       d.PHPOpenBasedir,
+		AllowURLFopen:     d.PHPAllowURLFopen,
+	}
+}
+
+type domainRepo struct{ db *gorm.DB }
+
+func NewDomainRepository(db *gorm.DB) DomainRepository {
+	return &domainRepo{db: db}
+}
+
+func (r *domainRepo) Create(ctx context.Context, d *models.Domain) error {
+	if err := r.db.WithContext(ctx).Create(d).Error; err != nil {
+		return translate(err)
+	}
+	return nil
+}
+
+func (r *domainRepo) FindByID(ctx context.Context, id string) (*models.Domain, error) {
+	var d models.Domain
+	if err := r.db.WithContext(ctx).Where("id = ?", id).First(&d).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &d, nil
+}
+
+// FindByIDs batch-loads domains by id (deduped, one query) — the N+1-free
+// path for list handlers resolving many rows (JAB-147).
+func (r *domainRepo) FindByIDs(ctx context.Context, ids []string) ([]models.Domain, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var rows []models.Domain
+	if err := r.db.WithContext(ctx).Where("id IN ?", ids).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+func (r *domainRepo) FindByName(ctx context.Context, name string) (*models.Domain, error) {
+	var d models.Domain
+	if err := r.db.WithContext(ctx).Where("name = ?", name).First(&d).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, err
+	}
+	return &d, nil
+}
+
+// FindStrictSubdomains returns every domain that is a strict subdomain of name
+// (GH #1789 child-direction check). The "%."+name pattern matches only rows a
+// full label deeper ("evil.example.com" for "example.com") — never the name
+// itself and never a same-suffix sibling like "notexample.com". name is a
+// validated FQDN so it carries no LIKE wildcards; empty in → empty out.
+func (r *domainRepo) FindStrictSubdomains(ctx context.Context, name string) ([]models.Domain, error) {
+	if name == "" {
+		return nil, nil
+	}
+	var rows []models.Domain
+	if err := r.db.WithContext(ctx).Where("name LIKE ?", "%."+name).Find(&rows).Error; err != nil {
+		return nil, err
+	}
+	return rows, nil
+}
+
+// domainListCols — only the domain name is free-text searchable.
+// user_id is deliberately absent from Search because it's an opaque ULID
+// and admins have a dedicated "this user's domains" path via ListByUserID.
+//
+// Sort accepts the qualified `users.username` form so the LEFT JOIN we
+// apply at the SQL layer can resolve it; List() rewrites the bare
+// `username` requested by the UI into the qualified form before
+// passing opts down to applyListOptions.
+// domainHeavyListColumns are the wide TEXT/LONGTEXT columns the domains
+// list never renders. Every UI consumer of these (nginx safe-options
+// modal, DKIM/email panels, disclaimer tab) fetches the single domain or
+// a dedicated endpoint rather than reading the list row, so the list
+// SELECT can skip them when ListOptions.OmitHeavyColumns is set.
+var domainHeavyListColumns = []string{
+	"google_dkim",
+	"dkim_public_key",
+	"dkim_rsa_public_key",
+	"disclaimer_text",
+	"nginx_safe_options",
+}
+
+var domainListCols = ListCols{
+	Search:      []string{"domains.name"},
+	Sort:        []string{"domains.name", "domains.created_at", "users.username", "domains.is_enabled"},
+	DefaultSort: "domains.name",
+}
+
+// rewriteDomainSort maps the bare sort key the UI sends onto the
+// qualified column the JOIN-ed query needs. Unknown keys are passed
+// through verbatim and will fall back to DefaultSort via pickSort.
+func rewriteDomainSort(sort string) string {
+	switch sort {
+	case "name":
+		return "domains.name"
+	case "created_at":
+		return "domains.created_at"
+	case "username":
+		return "users.username"
+	case "is_enabled":
+		return "domains.is_enabled"
+	}
+	return sort
+}
+
+func (r *domainRepo) List(ctx context.Context, opts ListOptions) ([]models.Domain, int64, error) {
+	var (
+		domains []models.Domain
+		total   int64
+	)
+	base := r.db.WithContext(ctx).
+		Model(&models.Domain{}).
+		Joins("LEFT JOIN users ON users.id = domains.user_id")
+
+	countQ := applyListOptions(base.Session(&gorm.Session{}), ListOptions{Search: opts.Search}, domainListCols)
+	if err := countQ.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	if opts.Sort == "" && opts.Order == "" {
+		opts.Order = "asc"
+	}
+	opts.Sort = rewriteDomainSort(opts.Sort)
+	q := applyListOptions(base.Session(&gorm.Session{}), opts, domainListCols)
+	if opts.OmitHeavyColumns {
+		q = q.Omit(domainHeavyListColumns...)
+	}
+	if err := q.Find(&domains).Error; err != nil {
+		return nil, 0, err
+	}
+	if err := r.populateSSLStates(ctx, &domains); err != nil {
+		return nil, 0, err
+	}
+	return domains, total, nil
+}
+
+func (r *domainRepo) ListByUserID(ctx context.Context, userID string, opts ListOptions) ([]models.Domain, int64, error) {
+	var (
+		domains []models.Domain
+		total   int64
+	)
+	base := r.db.WithContext(ctx).
+		Model(&models.Domain{}).
+		Joins("LEFT JOIN users ON users.id = domains.user_id").
+		Where("domains.user_id = ?", userID)
+
+	countQ := applyListOptions(base.Session(&gorm.Session{}), ListOptions{Search: opts.Search}, domainListCols)
+	if err := countQ.Count(&total).Error; err != nil {
+		return nil, 0, err
+	}
+	if opts.Sort == "" && opts.Order == "" {
+		opts.Order = "asc"
+	}
+	opts.Sort = rewriteDomainSort(opts.Sort)
+	q := applyListOptions(base.Session(&gorm.Session{}), opts, domainListCols)
+	if opts.OmitHeavyColumns {
+		q = q.Omit(domainHeavyListColumns...)
+	}
+	if err := q.Find(&domains).Error; err != nil {
+		return nil, 0, err
+	}
+	if err := r.populateSSLStates(ctx, &domains); err != nil {
+		return nil, 0, err
+	}
+	return domains, total, nil
+}
+
+func (r *domainRepo) RewriteDocRootPrefix(ctx context.Context, userID, oldPrefix, newPrefix string) (int64, error) {
+	// Prefix-anchored (LIKE oldPrefix%) AND user-scoped, so it only ever rewrites
+	// this tenant's own docroots — CONCAT the new prefix onto the tail after the
+	// old prefix. MariaDB SUBSTRING is 1-indexed, so start at len(oldPrefix)+1.
+	res := r.db.WithContext(ctx).
+		Model(&models.Domain{}).
+		Where("user_id = ? AND doc_root LIKE ?", userID, oldPrefix+"%").
+		Update("doc_root", gorm.Expr("CONCAT(?, SUBSTRING(doc_root, ?))", newPrefix, len(oldPrefix)+1))
+	return res.RowsAffected, res.Error
+}
+
+func (r *domainRepo) TransferOwner(ctx context.Context, domainID, newUserID, newDocRoot string) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var d models.Domain
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Select("nginx_rules", "docker_app_id").Where("id = ?", domainID).First(&d).Error; err != nil {
+			return translate(err)
+		}
+		// GH #2289: the domain's Python apps run as the old owner, from the
+		// old owner's home, so they don't pass to the new owner either. They
+		// go with the nginx rules that send the domain to them. The locking
+		// read keeps an app from being added to the domain until this
+		// commits.
+		var apps []models.PythonApp
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("domain_id = ?", domainID).Find(&apps).Error; err != nil {
+			return err
+		}
+		updates := map[string]any{"user_id": newUserID, "doc_root": newDocRoot}
+		rules, rulesChanged := d.NginxRules, len(apps) > 0
+		for i := range apps {
+			rules = rules.WithoutPythonApp(&apps[i])
+		}
+		ports, unlink, err := dockerAppPortsToUnlink(tx, d.DockerAppID, newUserID)
+		if err != nil {
+			return err
+		}
+		if unlink {
+			updates["docker_app_id"] = nil
+			for i := range ports {
+				rules = rules.WithoutProxyPassTo(ports[i].ProxyTarget())
+			}
+			rulesChanged = true
+		}
+		if rulesChanged {
+			updates["nginx_rules"] = rules
+		}
+		if err := tx.Model(&models.Domain{}).
+			Where("id = ?", domainID).
+			Updates(updates).Error; err != nil {
+			return err
+		}
+		if err := deleteDomainPythonApps(tx, domainID); err != nil {
+			return err
+		}
+		// GH #2277: the domain's Git repository settings hold the old owner's
+		// access token; they don't pass to the new owner.
+		if err := tx.Where("domain_id = ?", domainID).Delete(&models.DomainGitRepo{}).Error; err != nil {
+			return err
+		}
+		// GH #2276: the Composer project folder is a path in the old owner's
+		// home; the new owner's domain finds composer.json on its own.
+		return tx.Where("domain_id = ?", domainID).Delete(&models.DomainComposerSettings{}).Error
+	})
+}
+
+// dockerAppPortsToUnlink decides, inside tx, whether the Docker app linked
+// onto a domain that is changing owner stays linked. A server-level app (no
+// owner) and the new owner's own app stay. Any other account's app is
+// unlinked, or it would go on serving the new owner's domain (GH #2289); it
+// keeps running and keeps its data. It returns the app's ports, whose
+// proxy_pass rules go with the link, and whether the link goes.
+func dockerAppPortsToUnlink(tx *gorm.DB, dockerAppID *string, newUserID string) ([]models.DockerAppPublishedPort, bool, error) {
+	if dockerAppID == nil {
+		return nil, false, nil
+	}
+	var app models.DockerApp
+	err := tx.Select("id", "user_id").Where("id = ?", *dockerAppID).Take(&app).Error
+	switch {
+	case errors.Is(err, gorm.ErrRecordNotFound):
+		// A link to an app that is gone: it goes too.
+	case err != nil:
+		return nil, false, err
+	case app.UserID == nil || *app.UserID == newUserID:
+		return nil, false, nil
+	}
+	var ports []models.DockerAppPublishedPort
+	if err := tx.Where("app_id = ?", *dockerAppID).Find(&ports).Error; err != nil {
+		return nil, false, err
+	}
+	return ports, true, nil
+}
+
+func (r *domainRepo) Update(ctx context.Context, d *models.Domain) error {
+	// Whitelist the columns the API's update handler is allowed to write.
+	// Anything not listed here is silently ignored by GORM's Select+Updates,
+	// which previously dropped index_priority, redirect_all_to,
+	// redirect_all_type, and page_redirects on the floor — the handler set
+	// them on the in-memory struct, the row was saved without them, and the
+	// reconciler never saw the new values. SSL flags, PHP pool binding, and
+	// PHP per-domain settings have their own dedicated repo methods.
+	if err := r.db.WithContext(ctx).Model(d).Where("id = ?", d.ID).Select(
+		"name", "doc_root", "is_enabled", "nginx_custom_directives",
+		"nginx_tenant_directives", "nginx_rules", "nginx_safe_options",
+		"redirect_all_to", "redirect_all_type", "page_redirects",
+		"index_priority", "ssl_enabled", "is_quota_suspended", "webmail_enabled",
+		"dmarc_np", "dmarc_testing", "temp_url_enabled",
+		"bot_challenge_exempt", "bot_challenge_include", "block_ai_crawlers",
+		"caldav_host", "carddav_host", "allow_subdomain_delegation", "updated_at",
+	).Updates(d).Error; err != nil {
+		return translate(err)
+	}
+	return nil
+}
+
+// Transaction — see interface doc. Binds a domainRepo to the gorm transaction
+// handle so every dedicated writer fn calls (Update, UpdateSSLMode,
+// UpdateCacheEnabled, UpdateMailProvider, SetListenIPs, …) executes on the same
+// *sql.Tx and commits or rolls back atomically (JAB-318 AC4). Mirrors the
+// gorm-transaction pattern already used by MarkPanelPrimary and Rename.
+func (r *domainRepo) Transaction(ctx context.Context, fn func(DomainRepository) error) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		return fn(&domainRepo{db: tx})
+	})
+}
+
+func (r *domainRepo) BulkSetEnabledByUserID(ctx context.Context, userID string, enabled bool) (int64, error) {
+	res := r.db.WithContext(ctx).
+		Model(&models.Domain{}).
+		Where("user_id = ?", userID).
+		Updates(map[string]any{
+			"is_enabled": enabled,
+			"updated_at": time.Now().UTC(),
+		})
+	if res.Error != nil {
+		return 0, translate(res.Error)
+	}
+	return res.RowsAffected, nil
+}
+
+func (r *domainRepo) Delete(ctx context.Context, id string) error {
+	// Guard: refuse to delete the panel-primary row. Load first so we
+	// can distinguish "missing" from "protected"; this is cheap (index
+	// lookup on PK) and avoids silently eating a protected row when
+	// RowsAffected == 0.
+	var existing models.Domain
+	if err := r.db.WithContext(ctx).Select("id", "is_panel_primary").Where("id = ?", id).First(&existing).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if existing.IsPanelPrimary {
+		return ErrCannotDeletePanelPrimary
+	}
+
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		res := tx.Delete(&models.Domain{}, "id = ?", id)
+		if res.Error != nil {
+			return res.Error
+		}
+		if res.RowsAffected == 0 {
+			return ErrNotFound
+		}
+		return deleteDomainPythonApps(tx, id)
+	})
+}
+
+// deleteDomainPythonApps deletes, inside tx, the Python apps of a domain
+// whose row tx is deleting, and their env rows. python_apps has no foreign key
+// to domains (000168), so before this an app outlived its domain: it kept
+// running with no vhost and kept its loopback port. The reconciler's sweep
+// removes the units of apps with no row (GH #2289).
+func deleteDomainPythonApps(tx *gorm.DB, domainID string) error {
+	apps := tx.Model(&models.PythonApp{}).Select("id").Where("domain_id = ?", domainID)
+	if err := tx.Where("app_id IN (?)", apps).Delete(&models.PythonAppEnv{}).Error; err != nil {
+		return err
+	}
+	return tx.Where("domain_id = ?", domainID).Delete(&models.PythonApp{}).Error
+}
+
+// FindPanelPrimary — see interface doc.
+func (r *domainRepo) FindPanelPrimary(ctx context.Context) (*models.Domain, error) {
+	var d models.Domain
+	if err := r.db.WithContext(ctx).Where("is_panel_primary = ?", true).First(&d).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, ErrPanelPrimaryNotFound
+		}
+		return nil, err
+	}
+	return &d, nil
+}
+
+// MarkPanelPrimary — see interface doc.
+func (r *domainRepo) MarkPanelPrimary(ctx context.Context, id string) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Verify target exists — fail with ErrNotFound rather than silently
+		// leaving the invariant partially applied.
+		var exists int64
+		if err := tx.Model(&models.Domain{}).Where("id = ?", id).Count(&exists).Error; err != nil {
+			return err
+		}
+		if exists == 0 {
+			return ErrNotFound
+		}
+		// Clear any other panel-primary marker. Scoped to id != target so
+		// an idempotent re-run on the already-marked row is a no-op.
+		if err := tx.Model(&models.Domain{}).
+			Where("is_panel_primary = ? AND id != ?", true, id).
+			Update("is_panel_primary", false).Error; err != nil {
+			return err
+		}
+		// Set target.
+		if err := tx.Model(&models.Domain{}).
+			Where("id = ?", id).
+			Update("is_panel_primary", true).Error; err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
+// CreateWithinCap — see the interface doc. The users row is the per-owner
+// serialization point: it exists even at zero domains, where a COUNT ... FOR
+// UPDATE would lock nothing (the FTP cap's reasoning, JAB-262). Keep the lock
+// before the count: under REPEATABLE READ the read view is taken at the first
+// plain SELECT, so a count made after the lock sees the other create's commit.
+func (r *domainRepo) CreateWithinCap(ctx context.Context, d *models.Domain, maxDomains uint32) error {
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		var lockedID string
+		if err := tx.Raw("SELECT id FROM users WHERE id = ? FOR UPDATE", d.UserID).Scan(&lockedID).Error; err != nil {
+			return err
+		}
+		if lockedID == "" {
+			return ErrNotFound
+		}
+		var count int64
+		if err := tx.Model(&models.Domain{}).Where("user_id = ?", d.UserID).Count(&count).Error; err != nil {
+			return err
+		}
+		if count >= int64(maxDomains) {
+			return ErrDomainCapExceeded
+		}
+		if err := tx.Create(d).Error; err != nil {
+			return translate(err)
+		}
+		return nil
+	})
+}
+
+func (r *domainRepo) CountByUserID(ctx context.Context, userID string) (int64, error) {
+	var count int64
+	if err := r.db.WithContext(ctx).Model(&models.Domain{}).Where("user_id = ?", userID).Count(&count).Error; err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (r *domainRepo) ListPreviewEnabled(ctx context.Context) ([]models.Domain, error) {
+	var out []models.Domain
+	if err := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Select("id", "name", "temp_url_enabled").
+		Where("temp_url_enabled = ?", true).
+		Order("id").
+		Find(&out).Error; err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (r *domainRepo) SetPHPPoolID(ctx context.Context, id string, poolID *string) error {
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Update("php_pool_id", poolID)
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *domainRepo) CountByPHPPoolID(ctx context.Context, poolID string) (int64, error) {
+	var count int64
+	if err := r.db.WithContext(ctx).Model(&models.Domain{}).Where("php_pool_id = ?", poolID).Count(&count).Error; err != nil {
+		return 0, err
+	}
+	return count, nil
+}
+
+func (r *domainRepo) UpdatePHPSettings(ctx context.Context, id string, settings DomainPHPSettings) error {
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Updates(map[string]interface{}{
+			"php_memory_limit":        settings.MemoryLimit,
+			"php_upload_max_filesize": settings.UploadMaxFilesize,
+			"php_post_max_size":       settings.PostMaxSize,
+			"php_max_input_vars":      settings.MaxInputVars,
+			"php_max_execution_time":  settings.MaxExecutionTime,
+			"php_max_input_time":      settings.MaxInputTime,
+			// GH #1332 — a nil pointer writes NULL (clears the override).
+			"php_display_errors":  settings.DisplayErrors,
+			"php_error_reporting": settings.ErrorReporting,
+			"php_timezone":        settings.Timezone,
+			// GH #1701 Slice 2.
+			"php_log_errors":     settings.LogErrors,
+			"php_file_uploads":   settings.FileUploads,
+			"php_short_open_tag": settings.ShortOpenTag,
+			// GH #1701 Slice 3.
+			"php_open_basedir":    settings.OpenBasedir,
+			"php_allow_url_fopen": settings.AllowURLFopen,
+		})
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *domainRepo) UpdateEnvVars(ctx context.Context, id string, envVars models.DomainEnvVars) error {
+	// Use Updates(map) so a nil/empty slice writes NULL (clears). The column is
+	// not in Update()'s Select allowlist on purpose.
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Updates(map[string]interface{}{"env_vars": envVars})
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *domainRepo) UpdateEmailState(ctx context.Context, id string, state DomainEmailState) error {
+	updates := map[string]interface{}{
+		"email_enabled":    state.Enabled,
+		"email_enabled_at": state.EmailEnabledAt,
+	}
+	// Only write DKIM material when the caller supplies it — disable
+	// intentionally keeps the existing key (ADR-0043).
+	if state.DkimSelector != nil {
+		updates["dkim_selector"] = state.DkimSelector
+	}
+	if state.DkimPublicKey != nil {
+		updates["dkim_public_key"] = state.DkimPublicKey
+	}
+	if state.DkimRSAPublicKey != nil {
+		updates["dkim_rsa_public_key"] = state.DkimRSAPublicKey
+	}
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Updates(updates)
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *domainRepo) UpdateDKIMPublicKeys(ctx context.Context, id string, ed25519, rsa *string) error {
+	updates := map[string]interface{}{}
+	if ed25519 != nil {
+		updates["dkim_public_key"] = ed25519
+	}
+	if rsa != nil {
+		updates["dkim_rsa_public_key"] = rsa
+	}
+	if len(updates) == 0 {
+		return nil
+	}
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Updates(updates)
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// DomainMailProvider is the input to UpdateMailProvider. EmailEnabled +
+// SkipAutoSAN are the values DERIVED from Provider by models.DeriveMailFlags
+// (the caller computes them so the reconciler/cert columns stay consistent
+// with the enum). M365Onmicrosoft / GoogleDKIM are written as-is (nil ->
+// SQL NULL); validate/normalise before calling.
+type DomainMailProvider struct {
+	Provider        string
+	EmailEnabled    bool
+	SkipAutoSAN     bool
+	M365Onmicrosoft *string
+	GoogleDKIM      *string
+}
+
+func (r *domainRepo) SetSharedCertificate(ctx context.Context, id string, sharedCertID *string, mode string) error {
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Updates(map[string]interface{}{
+			"ssl_mode":              mode,
+			"ssl_enabled":           models.SSLEnabledForMode(mode),
+			"shared_certificate_id": sharedCertID,
+			"updated_at":            time.Now().UTC(),
+		})
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *domainRepo) Rename(ctx context.Context, id, newName, newDocRoot string) error {
+	now := time.Now().UTC()
+	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		res := tx.Model(&models.Domain{}).
+			Where("id = ?", id).
+			Updates(map[string]interface{}{
+				"name":       newName,
+				"doc_root":   newDocRoot,
+				"updated_at": now,
+			})
+		if res.Error != nil {
+			// The unique index on name surfaces a concurrent claim as a conflict.
+			return translate(res.Error)
+		}
+		if res.RowsAffected == 0 {
+			return ErrNotFound
+		}
+		// Resync the denormalized email_cached on shared MAILBOX resources (M52).
+		// Unlike mailboxes / mail_groups — whose email_cached is kept current by
+		// the AFTER UPDATE domains triggers (migrations 000054 / 000170) — a shared
+		// resource's email_cached is maintained in Go (see models.SharedResource),
+		// so the domains rename does not cascade to it. Only kind='mailbox' rows
+		// carry an address. GH #1579 mail-carrying rename.
+		if err := tx.Exec(
+			"UPDATE shared_resources SET email_cached = CONCAT(local_part, '@', ?), updated_at = ? "+
+				"WHERE domain_id = ? AND kind = 'mailbox' AND local_part IS NOT NULL",
+			newName, now, id).Error; err != nil {
+			return translate(err)
+		}
+		return nil
+	})
+}
+
+func (r *domainRepo) UpdateSSLMode(ctx context.Context, id string, mode string) error {
+	updates := map[string]interface{}{
+		"ssl_mode":    mode,
+		"ssl_enabled": models.SSLEnabledForMode(mode),
+		"updated_at":  time.Now().UTC(),
+	}
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Updates(updates)
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *domainRepo) UpdateMailProvider(ctx context.Context, id string, mp DomainMailProvider) error {
+	updates := map[string]interface{}{
+		"mail_provider":    mp.Provider,
+		"email_enabled":    mp.EmailEnabled,
+		"skip_auto_san":    mp.SkipAutoSAN,
+		"m365_onmicrosoft": mp.M365Onmicrosoft,
+		"google_dkim":      mp.GoogleDKIM,
+		"updated_at":       time.Now().UTC(),
+	}
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Updates(updates)
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *domainRepo) SetListenIPs(ctx context.Context, id string, upd DomainListenIPs) error {
+	cols := make(map[string]interface{}, 2)
+	if upd.ChangeIPv4 {
+		cols["listen_ipv4_id"] = upd.IPv4ID
+	}
+	if upd.ChangeIPv6 {
+		cols["listen_ipv6_id"] = upd.IPv6ID
+	}
+	if len(cols) == 0 {
+		return nil
+	}
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Updates(cols)
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateCatchallTarget — see interface doc.
+func (r *domainRepo) UpdateCatchallTarget(ctx context.Context, id string, target *string) error {
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Update("catchall_target", target)
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// SetRateLimits — see interface doc.
+func (r *domainRepo) SetRateLimits(ctx context.Context, id string, rps, conn uint32) error {
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Updates(map[string]any{
+			"rate_limit_rps":   rps,
+			"connection_limit": conn,
+			"updated_at":       time.Now().UTC(),
+		})
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *domainRepo) UpdateDisclaimer(ctx context.Context, id string, enabled bool, text *string) error {
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Updates(map[string]any{
+			"disclaimer_enabled": enabled,
+			"disclaimer_text":    text,
+		})
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateDNSSECEnabled writes dnssec_enabled + dnssec_enabled_at in lockstep.
+// Enabling stamps now(); disabling clears the timestamp.
+func (r *domainRepo) UpdateDNSSECEnabled(ctx context.Context, id string, enabled bool) error {
+	updates := map[string]any{"dnssec_enabled": enabled}
+	if enabled {
+		updates["dnssec_enabled_at"] = time.Now().UTC()
+	} else {
+		updates["dnssec_enabled_at"] = nil
+	}
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Updates(updates)
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateWebDisabled flips web_disabled (GH #1603 facet-preserving delete).
+// Dedicated setter: web_disabled is not in Update()'s allowlist, and the flip
+// must precede the host web teardown so the reconciler stops rendering the vhost.
+func (r *domainRepo) UpdateWebDisabled(ctx context.Context, id string, disabled bool) error {
+	return r.updateBoolColumn(ctx, id, "web_disabled", disabled)
+}
+
+// UpdateDNSDisabled flips dns_disabled (GH #1603 facet-preserving delete).
+func (r *domainRepo) UpdateDNSDisabled(ctx context.Context, id string, disabled bool) error {
+	return r.updateBoolColumn(ctx, id, "dns_disabled", disabled)
+}
+
+func (r *domainRepo) updateBoolColumn(ctx context.Context, id, column string, val bool) error {
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Updates(map[string]any{column: val, "updated_at": time.Now().UTC()})
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// AttachDockerApp updates nginx_rules + docker_app_id in one shot
+// so M48 install can attach to a tenant-owned domain without hitting
+// the domains.name UNIQUE constraint via a Create.
+func (r *domainRepo) DetachDockerApp(ctx context.Context, id string, resetRules bool) error {
+	upd := map[string]any{
+		"docker_app_id": nil,
+		"updated_at":    time.Now().UTC(),
+	}
+	if resetRules {
+		upd["nginx_rules"] = models.NginxRules{}
+	}
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Updates(upd)
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *domainRepo) AttachDockerApp(ctx context.Context, id string, dockerAppID string, rules models.NginxRules) error {
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Updates(map[string]any{
+			"nginx_rules":   rules,
+			"docker_app_id": dockerAppID,
+			"updated_at":    time.Now().UTC(),
+		})
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateCacheEnabled writes domains.cache_enabled (ADR-0108).
+func (r *domainRepo) UpdateCacheEnabled(ctx context.Context, id string, enabled bool) error {
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Update("cache_enabled", enabled)
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *domainRepo) UpdateCachePath(ctx context.Context, id, path string) error {
+	return r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).Update("cache_path", path).Error
+}
+
+// UpdateCacheTTL writes domains.cache_ttl_seconds (Gitea #596). Dedicated
+// method (no Select allowlist) per the domain.Update-allowlist lesson.
+func (r *domainRepo) UpdateCacheTTL(ctx context.Context, id string, seconds int) error {
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Update("cache_ttl_seconds", seconds)
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateCacheQueryAllowlist writes domains.cache_query_allowlist (migration
+// 000230). Dedicated method (no Select allowlist) per the same lesson.
+func (r *domainRepo) UpdateCacheQueryAllowlist(ctx context.Context, id, csv string) error {
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Update("cache_query_allowlist", csv)
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateSkipAutoSAN writes domains.skip_auto_san — tenant opt-out of
+// the ADR-0070 auto-added mail/autoconfig SAN entries.
+func (r *domainRepo) UpdateSkipAutoSAN(ctx context.Context, id string, enabled bool) error {
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Update("skip_auto_san", enabled)
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdateMTASTSEnabled writes domains.mta_sts_enabled + mta_sts_id
+// in lockstep (ADR-0109). Enabling stamps id = now-unix so the TXT
+// record rotates; disabling flips the flag but leaves id untouched
+// (re-enabling later rebumps it anyway).
+func (r *domainRepo) UpdateMTASTSEnabled(ctx context.Context, id string, enabled bool) (uint64, error) {
+	updates := map[string]any{"mta_sts_enabled": enabled}
+	var newID uint64
+	if enabled {
+		newID = uint64(time.Now().UTC().Unix())
+		updates["mta_sts_id"] = newID
+	}
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Updates(updates)
+	if res.Error != nil {
+		return 0, translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return 0, ErrNotFound
+	}
+	return newID, nil
+}
+
+// UpdateMTASTSAppliedID stamps the applied policy id. Called by the
+// reconciler after a successful mail.mtasts.apply (ADR-0109).
+func (r *domainRepo) UpdateMTASTSAppliedID(ctx context.Context, id string, appliedID uint64) error {
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Update("mta_sts_applied_id", appliedID)
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+// UpdatePHPPoolID writes domains.php_pool_id (nil = unbind).
+func (r *domainRepo) UpdatePHPPoolID(ctx context.Context, id string, poolID *string) error {
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Update("php_pool_id", poolID)
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *domainRepo) UpdateGhostState(ctx context.Context, id, state string, checkedAt time.Time, detail *string) error {
+	updates := map[string]any{
+		"ghost_state":      state,
+		"ghost_checked_at": checkedAt.UTC(),
+		"ghost_detail":     detail, // GORM nil-pointer => SQL NULL
+	}
+	res := r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Updates(updates)
+	if res.Error != nil {
+		return translate(res.Error)
+	}
+	if res.RowsAffected == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
+func (r *domainRepo) ListForGhostCheck(ctx context.Context, staleBefore time.Time, limit int) ([]models.Domain, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	var out []models.Domain
+	q := r.db.WithContext(ctx).
+		Where("ghost_checked_at IS NULL OR ghost_checked_at < ?", staleBefore.UTC()).
+		Order("ghost_checked_at IS NOT NULL, ghost_checked_at ASC").
+		Limit(limit)
+	if err := q.Find(&out).Error; err != nil {
+		return nil, translate(err)
+	}
+	return out, nil
+}
+
+// populateSSLStates enriches domains with their SSL certificate states
+func (r *domainRepo) populateSSLStates(ctx context.Context, domains *[]models.Domain) error {
+	if len(*domains) == 0 {
+		return nil
+	}
+
+	// Collect domain IDs
+	domainIDs := make([]string, len(*domains))
+	for i, d := range *domains {
+		domainIDs[i] = d.ID
+	}
+
+	// Query SSL certificates for these domains
+	sslRepo := NewSSLCertificateRepository(r.db)
+	certs, err := sslRepo.FindByDomainIDs(ctx, domainIDs)
+	if err != nil {
+		return err
+	}
+
+	// Map certs by domain_id
+	certsByDomain := make(map[string]*models.SSLCertificate)
+	for i := range certs {
+		certsByDomain[certs[i].DomainID] = &certs[i]
+	}
+
+	// Compute SSL state for each domain
+	for i := range *domains {
+		(*domains)[i].SSLState = ComputeSSLState(&(*domains)[i], certsByDomain[(*domains)[i].ID])
+	}
+
+	return nil
+}
+
+// ComputeSSLState is the interface-level wrapper so a single-domain handler
+// (the Web Domain detail / Overview, GH #1543) can set the flat ssl_state from
+// a cert it already has — matching what the list endpoints render.
+func (r *domainRepo) ComputeSSLState(domain *models.Domain, cert *models.SSLCertificate) string {
+	return ComputeSSLState(domain, cert)
+}
+
+// ComputeSSLState determines the SSL certificate state for a domain. Package
+// func (no receiver) so callers outside the repo — including test mocks — can
+// reuse the exact same canonical computation instead of duplicating it.
+func ComputeSSLState(domain *models.Domain, cert *models.SSLCertificate) string {
+	// None mode never serves TLS regardless of any lingering cert row (GH #246).
+	if domain.SSLMode == models.SSLModeNone || !domain.SSLEnabled {
+		return "off"
+	}
+
+	if cert == nil {
+		return "pending"
+	}
+
+	// A revoked cert (e.g. left over after a mode switch) is NOT "pending".
+	if cert.Status == models.SSLStatusRevoked {
+		return "off"
+	}
+
+	if cert.Status == models.SSLStatusIssued {
+		// Check if it's a Let's Encrypt certificate
+		if cert.CertPath != nil && strings.HasPrefix(*cert.CertPath, "/etc/letsencrypt/") {
+			return "active_le"
+		}
+		// Self-signed or other issued certs
+		return "self_signed"
+	}
+
+	if cert.Status == models.SSLStatusFailed {
+		return "failed"
+	}
+
+	// A DELIBERATE self-signed cert (Self mode, GH #246) is terminal — it is
+	// NOT "pending/issuing". (The LE stop-gap fallback uses status
+	// pending_acme_retry, handled below, so this never masks an in-flight LE.)
+	if cert.Status == models.SSLStatusSelfSigned {
+		return "self_signed"
+	}
+
+	// Pending, Issuing, PendingACMERetry
+	return "pending"
+}
+
+func (r *domainRepo) ListForRegistrarRefresh(ctx context.Context, staleBefore time.Time, limit int) ([]models.Domain, error) {
+	var rows []models.Domain
+	err := r.db.WithContext(ctx).
+		Where("registrar_checked_at IS NULL OR registrar_checked_at < ?", staleBefore).
+		Order("registrar_checked_at IS NOT NULL, registrar_checked_at ASC").
+		Limit(limit).
+		Find(&rows).Error
+	return rows, err
+}
+
+func (r *domainRepo) SetRegistrarExpiry(ctx context.Context, id string, expiresAt *time.Time, checkedAt time.Time) error {
+	return r.db.WithContext(ctx).Model(&models.Domain{}).
+		Where("id = ?", id).
+		Updates(map[string]any{
+			"registrar_expires_at": expiresAt,
+			"registrar_checked_at": checkedAt,
+		}).Error
+}

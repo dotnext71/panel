@@ -1,0 +1,256 @@
+package repository
+
+import (
+	"context"
+	"regexp"
+	"testing"
+	"time"
+
+	"database/sql"
+
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/DATA-DOG/go-sqlmock"
+	"github.com/stretchr/testify/require"
+	"gorm.io/driver/mysql"
+	"gorm.io/gorm"
+	"gorm.io/gorm/logger"
+)
+
+func newMockPackageDB(t *testing.T) (*gorm.DB, sqlmock.Sqlmock, *sql.DB) {
+	t.Helper()
+	raw, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
+	require.NoError(t, err)
+	mock.ExpectQuery(regexp.QuoteMeta("SELECT VERSION()")).
+		WillReturnRows(sqlmock.NewRows([]string{"VERSION()"}).AddRow("10.11.6-MariaDB"))
+	gdb, err := gorm.Open(mysql.New(mysql.Config{Conn: raw, SkipInitializeWithVersion: false}),
+		&gorm.Config{Logger: logger.Default.LogMode(logger.Silent)})
+	require.NoError(t, err)
+	return gdb, mock, raw
+}
+
+func TestPackage_EnsureDefaults_NoOpWhenPopulated(t *testing.T) {
+	db, mock, raw := newMockPackageDB(t)
+	defer raw.Close()
+	repo := NewPackageRepository(db)
+
+	// One existing package -> EnsureDefaults must not INSERT anything.
+	mock.ExpectQuery("SELECT count.* FROM .hosting_packages.").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(2))
+
+	require.NoError(t, repo.EnsureDefaults(context.Background()))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPackage_EnsureDefaults_SeedsThreeWhenEmpty(t *testing.T) {
+	db, mock, raw := newMockPackageDB(t)
+	defer raw.Close()
+	repo := NewPackageRepository(db)
+
+	mock.ExpectQuery("SELECT count.* FROM .hosting_packages.").
+		WillReturnRows(sqlmock.NewRows([]string{"count"}).AddRow(0))
+	mock.ExpectBegin()
+	for i := 0; i < 3; i++ {
+		mock.ExpectExec("INSERT INTO .hosting_packages.").
+			WillReturnResult(sqlmock.NewResult(int64(i+1), 1))
+	}
+	mock.ExpectCommit()
+
+	require.NoError(t, repo.EnsureDefaults(context.Background()))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPackage_defaultPackages_ShapeAndTiers(t *testing.T) {
+	defs := defaultPackages(time.Now().UTC())
+	require.Len(t, defs, 3)
+	require.Equal(t, "Tier 1", defs[0].Name)
+	require.Equal(t, "Tier 2", defs[1].Name)
+	require.Equal(t, "Tier 3", defs[2].Name)
+	// Tiers must be strictly increasing on disk so the UI sorts sensibly.
+	require.Less(t, defs[0].DiskQuotaMB, defs[1].DiskQuotaMB)
+	require.Less(t, defs[1].DiskQuotaMB, defs[2].DiskQuotaMB)
+	// Every default sets a real (non-zero) cap — zero means unlimited.
+	for _, d := range defs {
+		require.NotZero(t, d.DiskQuotaMB)
+		require.NotZero(t, d.MaxDomains)
+		require.NotEmpty(t, d.ID)
+		require.False(t, d.CreatedAt.IsZero())
+	}
+}
+
+// Regression (GH #170 / #402): the Update Select allowlist must carry every
+// column the API handler can set. docker_app_slugs and php_exec_enabled were
+// both silently dropped — selecting apps / toggling PHP-exec on edit never
+// persisted. Guard each critical column appears in the emitted UPDATE.
+func updatePersistsColumn(t *testing.T, colRegex string) {
+	t.Helper()
+	db, mock, raw := newMockPackageDB(t)
+	defer raw.Close()
+	repo := NewPackageRepository(db)
+
+	mock.ExpectBegin()
+	mock.ExpectExec("UPDATE .hosting_packages. SET .*" + colRegex).
+		WillReturnResult(sqlmock.NewResult(0, 1))
+	mock.ExpectCommit()
+
+	pkg := &models.HostingPackage{
+		ID:             "01HXPKG0000000000000000000",
+		Name:           "p",
+		DockerAppSlugs: "wordpress,ghost",
+		PHPExecEnabled: true,
+		MaxDockerApps:  5,
+		UpdatedAt:      time.Now().UTC(),
+	}
+	require.NoError(t, repo.Update(context.Background(), pkg))
+	require.NoError(t, mock.ExpectationsWereMet())
+}
+
+func TestPackage_Update_PersistsDockerAppSlugs(t *testing.T) {
+	updatePersistsColumn(t, "docker_app_slugs")
+}
+
+func TestPackage_Update_PersistsPHPExecEnabled(t *testing.T) {
+	updatePersistsColumn(t, "php_exec_enabled")
+}
+
+// GH #1628: webmail_enabled is added to the model + package editor + API
+// update handler; without it in the Update Select allowlist the admin's
+// webmail toggle would report success and revert on reload — the exact
+// silent-drop class as #170/#402/#454/#1053/JAB-329 above.
+func TestPackage_Update_PersistsWebmailEnabled(t *testing.T) {
+	updatePersistsColumn(t, "webmail_enabled")
+}
+
+// GH #2056: "Website sends email" goes through the same Select-allowlist
+// Update; missing from it, the admin's toggle would save and revert on reload.
+func TestPackage_Update_PersistsWebsiteSendsEmail(t *testing.T) {
+	updatePersistsColumn(t, "website_sends_email")
+}
+
+// GH #2056: the starter plans keep PHP mail() working on a fresh install, as
+// every package that existed before migration 000317 does.
+func TestDefaultPackages_SitesCanSendMail(t *testing.T) {
+	for _, p := range defaultPackages(time.Now()) {
+		require.True(t, p.WebsiteSendsEmail, "seeded package %s must let its sites send mail", p.Name)
+	}
+}
+
+// GH #2276: the Composer entitlement goes through the same Select-allowlist
+// Update; missing from it, the admin's toggle would save and revert on reload.
+func TestPackage_Update_PersistsComposerEnabled(t *testing.T) {
+	updatePersistsColumn(t, "composer_enabled")
+}
+
+// GH #2276: no starter plan runs Composer until the admin turns it on.
+func TestDefaultPackages_NoComposer(t *testing.T) {
+	for _, p := range defaultPackages(time.Now()) {
+		require.False(t, p.ComposerEnabled, "seeded package %s must not run Composer", p.Name)
+	}
+}
+
+// GH #2165: Redis keys per call goes through the same Select-allowlist Update;
+// missing from it, the admin's value would save and revert on reload.
+func TestPackage_Update_PersistsRedisKeysPerCall(t *testing.T) {
+	updatePersistsColumn(t, "redis_keys_per_call")
+}
+
+// GH #2165: the starter plans get the default Redis keys per call.
+func TestDefaultPackages_RedisKeysPerCall(t *testing.T) {
+	for _, p := range defaultPackages(time.Now()) {
+		require.Equal(t, models.RedisKeysPerCallDefault, p.RedisKeysPerCall, "seeded package %s", p.Name)
+	}
+}
+
+// GH #1798: the per-package egress allowances go through the same Select-
+// allowlist Update. Missing from the allowlist, the admin's SSH-out / ICMP
+// toggles would save-with-success and revert on reload — the silent-drop class
+// again. Falsify by removing the column from the Update Select list in
+// package_repository.go: it vanishes from the SQL and these go RED.
+func TestPackage_Update_PersistsEgressSSHOut(t *testing.T) {
+	updatePersistsColumn(t, "egress_ssh_out")
+}
+
+func TestPackage_Update_PersistsEgressSSHOutCIDRs(t *testing.T) {
+	updatePersistsColumn(t, "egress_ssh_out_cidrs")
+}
+
+func TestPackage_Update_PersistsEgressICMP(t *testing.T) {
+	updatePersistsColumn(t, "egress_icmp")
+}
+
+// GH #1701: the PHP settings policy goes through the same Select-allowlist
+// Update; missing from it, the admin's policy would save and revert on reload.
+func TestPackage_Update_PersistsPHPSettingsPolicy(t *testing.T) {
+	updatePersistsColumn(t, "php_settings_policy")
+}
+
+// GH #1701: the disabled-functions list goes through the same Select-allowlist
+// Update; missing from it, the admin's list would save and revert on reload
+// while php_exec_enabled (derived from it) persisted.
+func TestPackage_Update_PersistsPHPDisabledFunctions(t *testing.T) {
+	updatePersistsColumn(t, "php_disabled_functions")
+}
+
+// GH #1628: webmail defaults ON, so the column carries DEFAULT 1. If the model
+// field also kept a `default:1` GORM tag, GORM's create callback would
+// substitute that default for an explicit false (zero value) AND write it back
+// onto the struct — an admin unchecking Webmail on Create would silently get it
+// back ON, and the 201 body would echo the wrong value (feedback_gorm_default_
+// tag_zero_value). This pins that an explicit false survives the emitted INSERT.
+func TestPackage_Create_PersistsExplicitWebmailFalse(t *testing.T) {
+	db, _, raw := newMockPackageDB(t)
+	defer raw.Close()
+	p := &models.HostingPackage{ID: "01HXPKG0000000000000000000", Name: "p", WebmailEnabled: false}
+	// DryRun builds the INSERT without executing; SkipDefaultTransaction stops the
+	// create callback from opening a transaction the sqlmock has no expectation for
+	// (which would abort before the SQL is built).
+	stmt := db.Session(&gorm.Session{DryRun: true, SkipDefaultTransaction: true}).Create(p).Statement
+	require.Contains(t, stmt.SQL.String(), "webmail_enabled",
+		"webmail_enabled must appear in the INSERT (not omitted for the DB default)")
+	require.False(t, p.WebmailEnabled,
+		"GORM must not substitute a default:1 tag for an explicit false on create")
+}
+
+// GH #454: the tenant-backup entitlement columns were added to the model + API
+// update handler but missed from the Update Select allowlist, so admins saw a
+// success toast yet the backup limits never persisted (reverted on reload) —
+// tenants never received the backup permissions. Guard every backup column
+// appears in the emitted UPDATE (each would be absent with the old allowlist).
+func TestPackage_Update_PersistsBackupLimits(t *testing.T) {
+	updatePersistsColumn(t, "max_backups")
+	// GH #454 7B: this one was the actual reported bug — editing Max Backup
+	// Schedules on a package saved-with-success but reverted on reload.
+	updatePersistsColumn(t, "max_backup_schedules")
+	updatePersistsColumn(t, "scheduled_backups_enabled")
+	updatePersistsColumn(t, "allowed_backup_destination_kinds")
+	updatePersistsColumn(t, "backup_retention_policy")
+}
+
+// GH #1053 (johnnyq's live report): max_ftp_accounts was added to the model,
+// the package editor, AND the API update handler — but missed from this
+// Update Select allowlist, so setting the FTP account cap showed success and
+// reverted to 0 on reload. Third occurrence of this exact class (#170/#402,
+// #454); the guard keeps it from being a fourth.
+func TestPackage_Update_PersistsMaxFTPAccounts(t *testing.T) {
+	updatePersistsColumn(t, "max_ftp_accounts")
+}
+
+// JAB-329: max_database_users was enforced (database_users.go) + seeded, but
+// omitted from the Update Select allowlist (and the create/update request
+// models), so an operator could never configure the DB-user cap through a
+// package — the same silent-drop class as #170/#402/#454/#1053 above.
+func TestPackage_Update_PersistsMaxDatabaseUsers(t *testing.T) {
+	updatePersistsColumn(t, "max_database_users")
+}
+
+// GH #2277: the Git deploy entitlement goes through the same Select-allowlist
+// Update; missing from it, the admin's toggle would save and revert on reload.
+func TestPackage_Update_PersistsGitDeployEnabled(t *testing.T) {
+	updatePersistsColumn(t, "git_deploy_enabled")
+}
+
+// GH #2277: no starter plan deploys from Git until the admin turns it on.
+func TestDefaultPackages_NoGitDeploy(t *testing.T) {
+	for _, p := range defaultPackages(time.Now()) {
+		require.False(t, p.GitDeployEnabled, "seeded package %s must not deploy from Git", p.Name)
+	}
+}

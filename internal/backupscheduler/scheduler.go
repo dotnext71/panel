@@ -1,0 +1,1180 @@
+// Package backupscheduler — M30.1 in-process scheduler. Ticks every
+// 60s, scans backup_schedules.next_run_at <= now, dispatches each
+// overdue row to panel-agent via the same backup.create call the REST
+// handler uses.
+//
+// Why in-process instead of a systemd timer + CLI tick (like the M30
+// retention sweep)? At 60s cadence the cobra cold-start cost dominates,
+// and we already have several goroutine-based tickers (reconciler, M14
+// notification dispatcher, eventsources). Missed ticks during panel
+// restart are tolerated — the schedules stay overdue and the next tick
+// picks them up.
+//
+// One backup at a time per (kind, user-id) is enforced by the agent;
+// the scheduler just dispatches and lets the agent return 409 Conflict
+// when the prior job is still running. We log + skip on conflict.
+package backupscheduler
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"strings"
+	"time"
+
+	"github.com/dotnext-panel/dotnext/internal/agent"
+	internalbackup "github.com/dotnext-panel/dotnext/internal/backup"
+	"github.com/dotnext-panel/dotnext/internal/backupmetadata"
+	"github.com/dotnext-panel/dotnext/internal/backupwrapperhelpers"
+	"github.com/dotnext-panel/dotnext/internal/ids"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/notifications"
+	"github.com/dotnext-panel/dotnext/internal/paneltime"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+	"github.com/dotnext-panel/dotnext/internal/ssokey"
+)
+
+// EnqueueInterval is the cadence at which due schedules are scanned and
+// enqueued as backup_jobs. Bigger than 60s loses scheduling precision;
+// smaller burns DB queries with no operator value.
+const EnqueueInterval = 60 * time.Second
+
+// DispatchInterval is the cadence at which queued backup_jobs are
+// drained under the concurrency limit. Smaller = quicker reaction when
+// a slot frees, but every tick is one settings-fetch + count query.
+const DispatchInterval = 10 * time.Second
+
+// MaxDuePerTick caps how many overdue schedules one tick will enqueue.
+// Bigger = potential DB pressure on the join queries; smaller = recovery
+// from a long pause takes more ticks. 50 fits a 5-minute outage on a
+// 1k-user host.
+const MaxDuePerTick = 50
+
+// DefaultMaxConcurrent is the fallback when server_settings is missing
+// or zero. 2 keeps a fast disk busy without melting restic on a wide
+// fan-out.
+const DefaultMaxConcurrent = 2
+
+// Deps is the dependency bundle passed by serve.go.
+type Deps struct {
+	Schedules      repository.BackupScheduleRepository
+	Jobs           repository.BackupJobRepository
+	Destinations   repository.BackupDestinationRepository
+	Users          repository.UserRepository
+	Databases      repository.DatabaseRepository
+	DatabaseUsers  repository.DatabaseUserRepository
+	DatabaseGrants repository.DatabaseUserGrantRepository
+	Domains        repository.DomainRepository
+	Mailboxes      repository.MailboxRepository
+	AppInstalls    repository.ApplicationInstallRepository
+	// DockerApps resolves the account's docker app slugs so SCHEDULED
+	// backups cover their data trees too (GH #954) — the nightly job is
+	// the one most accounts actually rely on. Optional; nil means the
+	// docker stage records "no docker apps".
+	DockerApps repository.DockerAppRepository
+	Settings   repository.ServerSettingsRepository
+	// Packages + Notify (GH #454) enforce the per-package retention cap on
+	// SCHEDULED backups too — the on-demand path already does. Both OPTIONAL:
+	// nil Packages skips the cap check entirely (pre-#454 behaviour); nil Notify
+	// just omits the tenant/admin notice.
+	Packages repository.PackageRepository
+	Notify   *notifications.Queue
+
+	// Schema-v2 metadata producer fan-out — every nullable repo here is
+	// queried by buildScheduleMetadata so scheduled backups carry the
+	// same per-user state as manual admin / self-shell jobs.
+	SSLCerts       repository.SSLCertificateRepository
+	PHPPools       repository.PHPPoolRepository
+	PHPPoolIni     repository.PHPPoolIniOverrideRepository
+	Forwarders     repository.EmailForwarderRepository
+	Autoresponders repository.EmailAutoresponderRepository
+	MailboxShares  repository.MailboxShareRepository
+	TrustedSenders repository.MailboxTrustedSenderRepository
+	DNSSECKeys     repository.DNSSECKeyRepository
+	DNSZones       repository.DNSZoneRepository
+	DNSRecords     repository.DNSRecordRepository
+	SSHKeys        repository.SSHKeyRepository
+	CronJobs       repository.CronJobRepository
+	FtpAccounts    repository.FtpAccountRepository
+	// WebDomainAliases lets a scheduled backup carry each domain's web
+	// domain aliases (GH #1993).
+	WebDomainAliases repository.WebDomainAliasRepository
+	LimitOverrides   repository.UserLimitOverrideRepository
+	EgressPolicies   repository.UserEgressPolicyRepository
+	EgressRequests   repository.UserEgressRequestRepository
+
+	// WebmailBranding lets a scheduled backup carry each domain's webmail
+	// branding (GH #2502).
+	WebmailBranding repository.DomainWebmailBrandingRepository
+
+	Agent agent.AgentInterface
+
+	// M30.2.x — sso key for unsealing per-destination restic
+	// passwords. Optional; nil falls back to the legacy shared file.
+	SSOKey *ssokey.Key
+	Log    *slog.Logger
+}
+
+// Scheduler is the goroutine wrapper. Construct via New, start with
+// Start(ctx). Returns immediately; the loop runs until ctx is done.
+type Scheduler struct {
+	deps Deps
+	// dispatch admits one queued job. Overridable in tests to capture the
+	// dispatcher's admission decisions (per-destination cap + breaker) without
+	// running the full per-job machinery. nil → dispatchOne.
+	dispatch func(context.Context, models.BackupJob)
+	// timedFor is the panel zone the stored cron next-runs were last timed
+	// for (GH #2164). "" until the first tick, so a fresh process re-times
+	// once; that pass is a no-op unless the zone moved.
+	timedFor string
+}
+
+// New returns a configured scheduler. Returns nil if any required dep
+// is missing — callers log + skip start in that case so an incomplete
+// deployment doesn't crash on boot.
+func New(deps Deps) *Scheduler {
+	if deps.Schedules == nil || deps.Jobs == nil || deps.Destinations == nil ||
+		deps.Users == nil || deps.Agent == nil || deps.Log == nil {
+		return nil
+	}
+	return &Scheduler{deps: deps}
+}
+
+// Start runs the enqueue + dispatch loops until ctx is done. Two
+// tickers because a 60s enqueue cadence is too slow to react when a
+// dispatch slot frees up — drains run every 10s.
+func (s *Scheduler) Start(ctx context.Context) {
+	enqueueT := time.NewTicker(EnqueueInterval)
+	dispatchT := time.NewTicker(DispatchInterval)
+	defer enqueueT.Stop()
+	defer dispatchT.Stop()
+	s.deps.Log.Info("backup scheduler started",
+		"enqueue_interval", EnqueueInterval,
+		"dispatch_interval", DispatchInterval)
+	// Run one of each immediately so a panel restart doesn't leave
+	// overdue schedules waiting up to 60s for the next firing.
+	s.tickEnqueue(ctx)
+	s.tickDispatch(ctx)
+	for {
+		select {
+		case <-ctx.Done():
+			s.deps.Log.Info("backup scheduler stopped")
+			return
+		case <-enqueueT.C:
+			s.tickEnqueue(ctx)
+		case <-dispatchT.C:
+			s.tickDispatch(ctx)
+		}
+	}
+}
+
+// TickOnce runs one enqueue + dispatch pass synchronously. Exposed
+// for the `dotnext backup scheduler tick` CLI subcommand so an
+// operator can manually poke the scheduler without waiting for the
+// next 60s + 10s ticks. Production path stays the long-running
+// Start goroutine — TickOnce is for ops debugging + bootstrap-
+// script tests.
+func (s *Scheduler) TickOnce(ctx context.Context) {
+	s.tickEnqueue(ctx)
+	s.tickDispatch(ctx)
+}
+
+// standbyInert reports whether this box is a DR standby (GH #331 two-node
+// drill finding): each applied drsync restore loads the PRIMARY's panel DB,
+// which carries the primary's ENABLED backup schedules and queued job rows.
+// An ungated scheduler on a standby therefore runs the primary's schedules —
+// including the DR feed itself, which shipped the STANDBY's state into the
+// shared DR repo, where a later promote could restore it as if it were the
+// primary's. A standby enqueues nothing and dispatches nothing; promotion
+// flips the role and the next tick resumes naturally (same re-read pattern
+// as drsync).
+func (s *Scheduler) standbyInert(ctx context.Context) bool {
+	if s.deps.Settings == nil {
+		return false
+	}
+	set, err := s.deps.Settings.Get(ctx)
+	return err == nil && set != nil && set.IsStandby()
+}
+
+// syncClock keeps the panel clock on the Server Settings timezone (GH #2164)
+// and, when the zone is not the one the stored cron next-runs were timed for,
+// times them again: after the upgrade from the UTC-only scheduler, after an
+// admin changes the timezone, and after a DR restore brings another box's
+// settings. A standby only follows the clock; it writes no schedule rows.
+func (s *Scheduler) syncClock(ctx context.Context) {
+	if s.deps.Settings != nil {
+		set, err := s.deps.Settings.Get(ctx)
+		if err != nil || set == nil {
+			return
+		}
+		paneltime.Set(set.Timezone)
+		if set.IsStandby() {
+			return
+		}
+	}
+	zone := paneltime.Name()
+	if zone == s.timedFor {
+		return
+	}
+	n, err := s.retimeCronSchedules(ctx, time.Now().UTC())
+	if err != nil {
+		s.deps.Log.Warn("backup scheduler: re-time to the panel timezone failed; retrying next tick", "zone", zone, "err", err)
+		return
+	}
+	if n > 0 {
+		s.deps.Log.Info("backup schedules re-timed to the panel timezone", "zone", zone, "count", n)
+	}
+	s.timedFor = zone
+}
+
+// retimeCronSchedules recomputes the next run of every cron-governed schedule
+// whose next run is still ahead, on the current panel clock. In steady state
+// that is a no-op: the next run after the last firing is the next run after
+// now. It only moves rows timed on another zone. Overdue rows are left for the
+// enqueue pass, and window-governed tenant schedules (Cadence != "") re-check
+// the window when they come due. Returns how many rows moved.
+func (s *Scheduler) retimeCronSchedules(ctx context.Context, now time.Time) (int, error) {
+	all, err := s.deps.Schedules.List(ctx)
+	if err != nil {
+		return 0, err
+	}
+	moved := 0
+	for _, sc := range all {
+		if sc.Cadence != "" || sc.NextRunAt == nil || !sc.NextRunAt.After(now) {
+			continue
+		}
+		next, ferr := internalbackup.NextFire(sc.CronExpr, now)
+		if ferr != nil || next.Equal(*sc.NextRunAt) {
+			continue
+		}
+		if err := s.deps.Schedules.UpdateNextRun(ctx, sc.ID, next); err != nil {
+			return moved, err
+		}
+		moved++
+	}
+	return moved, nil
+}
+
+func (s *Scheduler) tickEnqueue(ctx context.Context) {
+	s.syncClock(ctx)
+	if s.standbyInert(ctx) {
+		return
+	}
+	// GH #1240: converge the managed default-local-backup schedule from the flag
+	// before scanning due schedules, so a just-enabled default is picked up the
+	// same tick. Idempotent + cheap; skipped on standbys by the gate above.
+	s.ensureDefaultLocalBackup(ctx)
+	now := time.Now().UTC()
+	due, err := s.deps.Schedules.ListDue(ctx, now, MaxDuePerTick)
+	if err != nil {
+		s.deps.Log.Error("scheduler list-due failed", "err", err)
+		return
+	}
+	for _, sched := range due {
+		s.enqueue(ctx, sched)
+	}
+}
+
+// tickDispatch reads the current concurrency limit, counts running
+// jobs, and dispatches queued rows to fill the gap.
+func (s *Scheduler) tickDispatch(ctx context.Context) {
+	if s.standbyInert(ctx) {
+		return
+	}
+	max := uint32(DefaultMaxConcurrent)
+	if s.deps.Settings != nil {
+		set, err := s.deps.Settings.Get(ctx)
+		if err == nil && set != nil && set.BackupMaxConcurrentJobs > 0 {
+			max = set.BackupMaxConcurrentJobs
+		}
+	}
+	running, err := s.deps.Jobs.CountByStatus(ctx, models.BackupJobStatusRunning)
+	if err != nil {
+		s.deps.Log.Error("dispatcher count-running failed", "err", err)
+		return
+	}
+	slots := int(max) - int(running)
+	if slots <= 0 {
+		return
+	}
+
+	// JAB-362 per-destination fairness + circuit-breaker.
+	//   - runningByDest caps the slots any one destination may hold, so a
+	//     stall-failing destination (each attempt burns a 4h slot) cannot
+	//     monopolise the pool and starve backups to healthy destinations.
+	//   - backedOff destinations (tripped breaker, backoff not yet expired) are
+	//     skipped entirely so a dead destination is not retried every tick.
+	// Admission is WORK-CONSERVING: pass 1 honours the per-destination cap; pass
+	// 2 fills any slots the cap left idle (e.g. a single-destination server) so
+	// the cap only ever redistributes under contention, never throttles.
+	runningByDest, err := s.deps.Jobs.CountRunningByDestination(ctx)
+	if err != nil {
+		s.deps.Log.Error("dispatcher count-by-destination failed", "err", err)
+		return
+	}
+	var backedOff map[string]bool
+	if s.deps.Destinations != nil {
+		if bo, boErr := s.deps.Destinations.ListBackedOffIDs(ctx, time.Now().UTC()); boErr != nil {
+			s.deps.Log.Error("dispatcher list-backed-off failed", "err", boErr)
+			return
+		} else {
+			backedOff = bo
+		}
+	}
+
+	// Fetch a generous window so pass 1 can skip past saturated/backed-off
+	// destinations and still fill slots from others.
+	window := int(max) * 8
+	if window < 50 {
+		window = 50
+	}
+	queued, err := s.deps.Jobs.ListQueuedOldest(ctx, window)
+	if err != nil {
+		s.deps.Log.Error("dispatcher list-queued failed", "err", err)
+		return
+	}
+
+	perDestCap := (int(max) + 1) / 2
+	if perDestCap < 1 {
+		perDestCap = 1
+	}
+
+	admittedByDest := make(map[string]int)
+	admitted := 0
+	var deferred []models.BackupJob // hit the per-dest cap in pass 1
+
+	dispatch := s.dispatchOne
+	if s.dispatch != nil {
+		dispatch = s.dispatch
+	}
+	admit := func(j models.BackupJob) {
+		dispatch(ctx, j)
+		admittedByDest[destKey(j)]++
+		admitted++
+	}
+
+	// Pass 1 — oldest-first, respecting the per-destination cap + breaker.
+	for _, j := range queued {
+		if admitted >= slots {
+			break
+		}
+		dk := destKey(j)
+		if backedOff[dk] {
+			continue
+		}
+		if runningByDest[dk]+admittedByDest[dk] >= perDestCap {
+			deferred = append(deferred, j)
+			continue
+		}
+		admit(j)
+	}
+	// Pass 2 — work-conserving: fill leftover slots beyond the cap (still never a
+	// backed-off destination).
+	for _, j := range deferred {
+		if admitted >= slots {
+			break
+		}
+		if backedOff[destKey(j)] {
+			continue
+		}
+		admit(j)
+	}
+
+	if admitted < slots && len(queued) == window {
+		s.deps.Log.Info("dispatcher window exhausted with slots free; more queued jobs deferred to next tick",
+			"window", window, "admitted", admitted, "slots", slots)
+	}
+}
+
+// destKey buckets a job by its destination for per-destination slot accounting.
+// Legacy jobs with no destination share the "" bucket.
+func destKey(j models.BackupJob) string {
+	if j.DestinationID != nil {
+		return *j.DestinationID
+	}
+	return ""
+}
+
+// enqueue handles one overdue schedule end-to-end: compute next
+// firing, create queued backup_jobs rows for each fan-out target, mark
+// the schedule ran. The dispatcher tick then drains the queue.
+func (s *Scheduler) enqueue(ctx context.Context, sched models.BackupSchedule) {
+	// GH #454 7B: a non-empty cadence marks a window-governed tenant schedule —
+	// its timing comes from the admin maintenance window + interval, NOT cron.
+	if sched.Cadence != "" {
+		s.enqueueTenantWindow(ctx, sched)
+		return
+	}
+
+	logger := s.deps.Log.With(
+		"schedule_id", sched.ID,
+		"kind", sched.Kind,
+		"user_id", strDeref(sched.UserID),
+	)
+
+	next, err := internalbackup.NextFire(sched.CronExpr, time.Now().UTC())
+	if err != nil {
+		logger.Error("invalid cron in DB; disabling for one tick", "cron_expr", sched.CronExpr, "err", err)
+		// Push next_run_at far enough out that we don't re-process this
+		// row every tick. Operator must fix the cron via UI.
+		bump := time.Now().UTC().Add(24 * time.Hour)
+		_ = s.deps.Schedules.UpdateNextRun(ctx, sched.ID, bump)
+		return
+	}
+
+	enqueued, qErr := s.enqueueBackup(ctx, sched)
+	if qErr != nil {
+		logger.Error("scheduler enqueue failed", "err", qErr)
+		// Still advance next_run_at so we don't tight-loop on a
+		// permanent failure (e.g. user deleted but FK didn't cascade).
+		_ = s.deps.Schedules.UpdateNextRun(ctx, sched.ID, next)
+		return
+	}
+	if !enqueued {
+		// No fan-out targets — advance next_run_at without marking ran.
+		_ = s.deps.Schedules.UpdateNextRun(ctx, sched.ID, next)
+		return
+	}
+
+	if err := s.deps.Schedules.MarkRan(ctx, sched.ID, time.Now().UTC(), next); err != nil {
+		logger.Error("schedule mark-ran failed", "err", err)
+	}
+}
+
+// enqueueTenantWindow handles a window-governed tenant schedule (GH #454 7B):
+// it only enqueues while the clock is inside the admin maintenance window, and
+// advances next_run_at to the next in-window opening (smeared per schedule) so
+// N tenants that come due together don't all fire at window open. The retention
+// cap + fan-out reuse the same enqueueBackup path as the cron schedules.
+func (s *Scheduler) enqueueTenantWindow(ctx context.Context, sched models.BackupSchedule) {
+	logger := s.deps.Log.With("schedule_id", sched.ID, "cadence", sched.Cadence, "user_id", strDeref(sched.UserID))
+	now := time.Now().UTC()
+	// GH #1097: the maintenance window is opt-in (OFF by default). Enforcement
+	// off = a whole-day window (StartMin==EndMin), which window.go treats as
+	// ungated, so NextTenantRun fires on the pure cadence interval (Hourly =
+	// every hour). Only when the admin turns enforcement on do we narrow to the
+	// configured window. A missing/unreadable settings row also stays ungated —
+	// the safe default is "run the schedule the tenant chose", not "silently
+	// throttle to a few hours".
+	w := internalbackup.TenantWindow{} // whole-day / ungated
+	if s.deps.Settings != nil {
+		if set, err := s.deps.Settings.Get(ctx); err == nil && set != nil {
+			w = internalbackup.EffectiveTenantWindow(set.TenantBackupWindowEnforce, set.TenantBackupWindowStart, set.TenantBackupWindowEnd)
+		}
+	}
+	// GH #2300: the next run keeps this run's planned clock times, so a tick
+	// that sees it late (a panel restart) or a DST change doesn't move them.
+	var planned time.Time
+	if sched.NextRunAt != nil {
+		planned = *sched.NextRunAt
+	}
+	next := internalbackup.NextTenantRunAfter(planned, now, sched.Cadence, w, sched.ID)
+	if !w.Contains(now) {
+		// Due but outside the window — defer to the next (smeared) opening
+		// without enqueuing anything.
+		_ = s.deps.Schedules.UpdateNextRun(ctx, sched.ID, next)
+		return
+	}
+	enqueued, qErr := s.enqueueBackup(ctx, sched)
+	if qErr != nil {
+		logger.Error("tenant window enqueue failed", "err", qErr)
+		_ = s.deps.Schedules.UpdateNextRun(ctx, sched.ID, next)
+		return
+	}
+	if !enqueued {
+		_ = s.deps.Schedules.UpdateNextRun(ctx, sched.ID, next)
+		return
+	}
+	if err := s.deps.Schedules.MarkRan(ctx, sched.ID, now, next); err != nil {
+		logger.Error("tenant window mark-ran failed", "err", err)
+	}
+}
+
+// enqueueBackup creates queued backup_jobs rows for the given
+// schedule. Per ADR-0080 each linked destination gets its own row
+// (no source-then-mirror); the dispatcher tick later picks them up
+// and calls the agent under the concurrency cap. All rows from one
+// tick share a run_id so the admin UI can roll them up under a
+// single header.
+func (s *Scheduler) enqueueBackup(ctx context.Context, sched models.BackupSchedule) (bool, error) {
+	runID := ids.NewULID()
+	dests, err := s.deps.Schedules.GetDestinations(ctx, sched.ID)
+	if err != nil {
+		return false, fmt.Errorf("load schedule destinations: %w", err)
+	}
+	if len(dests) == 0 {
+		s.deps.Log.Warn("schedule has no destinations linked; skipping",
+			"schedule_id", sched.ID)
+		return false, nil
+	}
+	// Filter out disabled destinations — leaving them in would create
+	// jobs the dispatcher would then mark failed. Cleaner to drop here.
+	enabledDests := dests[:0]
+	for _, d := range dests {
+		if d.Enabled {
+			enabledDests = append(enabledDests, d)
+		}
+	}
+	if len(enabledDests) == 0 {
+		s.deps.Log.Warn("schedule destinations are all disabled; skipping",
+			"schedule_id", sched.ID)
+		return false, nil
+	}
+	switch sched.Kind {
+	case models.BackupScheduleKindAccount:
+		anyUser := false
+		explicitIDs, err := s.deps.Schedules.GetUserIDs(ctx, sched.ID)
+		if err != nil {
+			return false, fmt.Errorf("load schedule users: %w", err)
+		}
+		targets, err := resolveAccountTargets(ctx, s.deps.Users, sched.ID, explicitIDs, s.deps.Log)
+		if err != nil {
+			return false, err
+		}
+		for i := range targets {
+			u := &targets[i]
+			// Resolve the hosting package ONCE per user, not once per
+			// (user, destination): it is the same static row for every
+			// destination, and on a large host this loop ran
+			// users × destinations lookups inside the 60s enqueue tick.
+			// The cap check itself stays per-pair — each enqueue adds a job,
+			// so the count it reads genuinely changes.
+			pkg := s.userPackage(ctx, u)
+			for j := range enabledDests {
+				if ok := s.enqueueAccountBackup(ctx, sched, u, pkg, &enabledDests[j], runID); ok {
+					anyUser = true
+				}
+			}
+		}
+		anySystem := false
+		if sched.IncludeSystemBackup {
+			for j := range enabledDests {
+				if ok := s.enqueueSystemBackup(ctx, sched, &enabledDests[j], runID); ok {
+					anySystem = true
+				}
+			}
+		}
+		return anyUser || anySystem, nil
+
+	case models.BackupScheduleKindSystem:
+		any := false
+		for j := range enabledDests {
+			if ok := s.enqueueSystemBackup(ctx, sched, &enabledDests[j], runID); ok {
+				any = true
+			}
+		}
+		return any, nil
+
+	default:
+		return false, fmt.Errorf("unknown schedule kind %q", sched.Kind)
+	}
+}
+
+// enqueueAccountBackup creates one backup_jobs row in status=queued
+// for the given (user, destination) pair. Per ADR-0080 the destination
+// is a first-class field on backup_jobs.
+// pkg is the user's hosting package, resolved once by the caller for all of
+// that user's destinations (nil when unresolvable or not wired).
+func (s *Scheduler) enqueueAccountBackup(ctx context.Context, sched models.BackupSchedule, user *models.User, pkg *models.HostingPackage, dest *models.BackupDestination, runID string) bool {
+	logger := s.deps.Log.With("schedule_id", sched.ID, "user_id", user.ID, "destination_id", dest.ID, "run_id", runID)
+	// Retention cap (GH #454): honour the tenant's package policy on scheduled
+	// backups, matching the on-demand path. Only enforced when the package repo
+	// is wired AND the plan actually caps backups; otherwise the scheduled
+	// backup proceeds unchanged (no regression for uncapped/unresolvable plans).
+	if s.deps.Packages != nil {
+		if pkg != nil && pkg.BackupsEnabled() && s.atOrOverCap(ctx, user.ID, int(pkg.MaxBackups)) {
+			if pkg.BackupRetentionPrunes() && s.pruneOldestForUser(ctx, user, int(pkg.MaxBackups)) {
+				s.notifyBackupLimit(ctx, user, "prune", pkg.MaxBackups)
+			} else if keepsOwnBackups(sched) && s.dropScheduleOldest(ctx, sched, user, int(pkg.MaxBackups)) {
+				// No notice: this is the schedule's own retention, run before
+				// the nightly sweep. An hourly schedule at the limit would
+				// otherwise notify 24 times a day.
+				logger.Info("scheduled backup at the plan's limit: removed this schedule's oldest backup to make room", "max_backups", pkg.MaxBackups)
+			} else {
+				s.notifyBackupLimit(ctx, user, "reject", pkg.MaxBackups)
+				logger.Warn("scheduled backup skipped: retention cap reached", "policy", pkg.BackupRetentionPolicy, "max_backups", pkg.MaxBackups)
+				return false
+			}
+		}
+	}
+	// JAB-361: skip if a job for this exact (schedule, destination, user) target
+	// is already queued or running. A slow/dead destination holds each slot for
+	// the finalizer's 4h stall window, so without this the cadence piles up
+	// duplicate jobs faster than they drain — the queue grows unbounded and real
+	// tenant backups starve for days behind the grind.
+	if pending, perr := s.deps.Jobs.HasPendingForTarget(ctx, sched.ID, dest.ID, user.ID); perr != nil {
+		logger.Error("check pending backup_job failed", "err", perr)
+		return false
+	} else if pending {
+		logger.Info("scheduled backup skipped: a job for this target is already queued/running")
+		return false
+	}
+	schedID := sched.ID
+	rid := runID
+	dID := dest.ID
+	job := &models.BackupJob{
+		ID:            ids.NewULID(),
+		UserID:        user.ID,
+		DestinationID: &dID,
+		ScheduleID:    &schedID,
+		RunID:         &rid,
+		Kind:          models.BackupJobKindAccountBackup,
+		Status:        models.BackupJobStatusQueued,
+		// Denormalise the schedule's content onto the job so the dispatcher
+		// trims the db/mailbox lists to match without re-loading the schedule
+		// (GH #454). "" normalises to "full" = the pre-feature behaviour.
+		Content:   models.NormalizeBackupContent(sched.Content),
+		CreatedAt: time.Now().UTC(),
+	}
+	if err := s.deps.Jobs.Create(ctx, job); err != nil {
+		logger.Error("create backup_job failed", "err", err)
+		return false
+	}
+	return true
+}
+
+// enqueueSystemBackup creates one backup_jobs row in status=queued
+// for a system backup against the given destination.
+// userPackage resolves the tenant's hosting package for the retention cap
+// check, or nil (no package / lookup error -> the caller treats it as uncapped,
+// so a transient error never blocks a scheduled run) (GH #454).
+func (s *Scheduler) userPackage(ctx context.Context, user *models.User) *models.HostingPackage {
+	if user.PackageID == nil || s.deps.Packages == nil {
+		return nil
+	}
+	pkg, err := s.deps.Packages.FindByID(ctx, *user.PackageID)
+	if err != nil {
+		return nil
+	}
+	return pkg
+}
+
+// atOrOverCap reports whether the user already holds >= maxBackups jobs.
+func (s *Scheduler) atOrOverCap(ctx context.Context, userID string, maxBackups int) bool {
+	// COUNT only. This used to call ListForUser(userID, 1, 0), which runs a
+	// COUNT(*) *and* a LIMIT 1 SELECT just to read the total — paid once per
+	// (user, destination) pair inside the 60s enqueue tick.
+	total, err := s.deps.Jobs.CountRetainedForUser(ctx, userID)
+	if err != nil {
+		return false
+	}
+	return total >= int64(maxBackups)
+}
+
+// pruneOldestForUser forgets the user's OLDEST OWNED account_backup(s) until
+// under maxBackups. Owner-scoped: OldestAccountBackupForUser filters by
+// user_id, so a scheduled prune only ever touches the target tenant's own
+// backups. Returns true once under the cap (GH #454).
+// maxPrunesPerTick bounds how many snapshots one enqueue tick will forget.
+// Each backup.forget is a synchronous `restic forget` (30s timeout) that
+// takes the repo lock, so an unbounded loop — e.g. after an operator lowers
+// a plan's cap from 10 to 2 — blocked the 60s tick for minutes and contended
+// with any running backup. Whatever is left over is pruned on the next tick.
+const maxPrunesPerTick = 5
+
+func (s *Scheduler) pruneOldestForUser(ctx context.Context, user *models.User, maxBackups int) bool {
+	for i := 0; i < maxPrunesPerTick; i++ {
+		if !s.atOrOverCap(ctx, user.ID, maxBackups) {
+			return true
+		}
+		oldest, err := s.deps.Jobs.OldestAccountBackupForUser(ctx, user.ID)
+		if err != nil || oldest == nil {
+			return false
+		}
+		if s.deps.Agent != nil {
+			fctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			ferr := s.forgetJob(fctx, oldest)
+			cancel()
+			if ferr != nil {
+				// Do NOT delete the row when the snapshot is still in the
+				// repo. Dropping it would orphan the data: the repo keeps
+				// growing while the panel's retention accounting believes
+				// the tenant is under cap, and nothing ever revisits it.
+				// Leave the row so a later tick retries the forget.
+				s.deps.Log.Error("retention prune: backup.forget failed; keeping job row for retry",
+					"user_id", user.ID, "job_id", oldest.ID, "snapshot_id", oldest.SnapshotID, "err", ferr)
+				return false
+			}
+		}
+		if derr := s.deps.Jobs.Delete(ctx, oldest.ID); derr != nil {
+			return false
+		}
+	}
+	// Still over cap after this tick's budget — report that so the caller
+	// rejects rather than silently proceeding, and the next tick continues.
+	if s.atOrOverCap(ctx, user.ID, maxBackups) {
+		s.deps.Log.Info("retention prune hit the per-tick budget; continuing next tick",
+			"user_id", user.ID, "pruned", maxPrunesPerTick)
+		return false
+	}
+	return true
+}
+
+// keepsOwnBackups reports whether the schedule has a keep rule, so the nightly
+// retention sweep removes its old backups.
+func keepsOwnBackups(s models.BackupSchedule) bool {
+	set := func(v *int) bool { return v != nil && *v > 0 }
+	return set(s.KeepDaily) || set(s.KeepWeekly) || set(s.KeepMonthly) || set(s.KeepWithinDays)
+}
+
+// dropScheduleOldest makes room under the plan's backup limit for a run of a
+// schedule that has a keep rule, by removing that schedule's oldest backups of
+// the account: as many as the limit needs, at most maxPrunesPerTick a run, and
+// never the schedule's last one. Its keep rule would remove those anyway. Under
+// "reject" the run used to be skipped, and since the nightly sweep keeps what
+// the rule asks for, a schedule whose rule reached the limit never ran again
+// (GH #2300). Backups of other schedules, and manual ones, are left alone.
+// Returns true once under the limit.
+func (s *Scheduler) dropScheduleOldest(ctx context.Context, sched models.BackupSchedule, user *models.User, maxBackups int) bool {
+	total, err := s.deps.Jobs.CountRetainedForUser(ctx, user.ID)
+	if err != nil {
+		return false
+	}
+	need := int(total) - maxBackups + 1
+	if need <= 0 {
+		return true
+	}
+	own, err := s.deps.Jobs.CountRetainedForSchedule(ctx, user.ID, sched.ID)
+	if err != nil || int(own)-need < 1 {
+		return false
+	}
+	for i := 0; i < need && i < maxPrunesPerTick; i++ {
+		oldest, err := s.deps.Jobs.OldestRetainedForSchedule(ctx, user.ID, sched.ID)
+		if err != nil || oldest == nil {
+			return false
+		}
+		if s.deps.Agent != nil {
+			fctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			ferr := s.forgetJob(fctx, oldest)
+			cancel()
+			if ferr != nil {
+				// Keep the row: the backup is still in its repository.
+				s.deps.Log.Error("backup limit: forgetting the schedule's oldest backup failed; keeping it",
+					"user_id", user.ID, "schedule_id", sched.ID, "job_id", oldest.ID, "err", ferr)
+				return false
+			}
+		}
+		if err := s.deps.Jobs.Delete(ctx, oldest.ID); err != nil {
+			return false
+		}
+	}
+	return !s.atOrOverCap(ctx, user.ID, maxBackups)
+}
+
+// forgetJob asks the agent to forget a backup job's snapshots from the
+// repository the job wrote to: its destination's repo, credentials and restic
+// password. Named by job alone, the agent looks in its default local repo, so
+// a backup on any other destination was not found there, the caller deleted
+// its row, and its data stayed behind uncounted. A job without a destination
+// (pre-ADR-0080), or whose destination was deleted, uses the default repo, as
+// the admin Delete does. A destination that cannot be read is an error, so
+// the caller keeps the row.
+func (s *Scheduler) forgetJob(ctx context.Context, job *models.BackupJob) error {
+	params := map[string]any{"job_id": job.ID, "user_id": job.UserID, "kind": job.Kind}
+	var dest *models.BackupDestination
+	if job.DestinationID != nil && *job.DestinationID != "" && s.deps.Destinations != nil {
+		d, err := s.deps.Destinations.Get(ctx, *job.DestinationID)
+		switch {
+		case errors.Is(err, repository.ErrNotFound):
+		case err != nil:
+			return fmt.Errorf("load destination %s: %w", *job.DestinationID, err)
+		case d != nil:
+			dest = d
+			for k, v := range destWireParams(d) {
+				params[k] = v
+			}
+		}
+	}
+	call := func(passwordFile string) error {
+		if passwordFile != "" {
+			params["password_file"] = passwordFile
+		}
+		_, err := s.deps.Agent.Call(ctx, "backup.forget", params)
+		return err
+	}
+	if dest != nil {
+		return backupwrapperhelpers.WithDestPasswordFile(ctx, dest, s.deps.Agent, s.deps.SSOKey, call)
+	}
+	return call("")
+}
+
+// notifyBackupLimit fires backup.limit.reached to the tenant's inbox
+// (Envelope.UserID) and broadcasts to admins (UserID empty), tailored to the
+// outcome. Best-effort (GH #454).
+func (s *Scheduler) notifyBackupLimit(ctx context.Context, user *models.User, outcome string, limit uint32) {
+	if s.deps.Notify == nil {
+		return
+	}
+	who := user.ID
+	if user.Username != nil && *user.Username != "" {
+		who = *user.Username
+	}
+	var tenantBody, adminBody string
+	if outcome == "prune" {
+		tenantBody = fmt.Sprintf("Your scheduled backup reached your plan's limit (%d); the oldest backup was automatically removed to make room.", limit)
+		adminBody = fmt.Sprintf("Scheduled backup for tenant %s hit the backup limit (%d); the oldest was auto-pruned per the package retention policy.", who, limit)
+	} else {
+		tenantBody = fmt.Sprintf("Your scheduled backup was skipped: you reached your plan's backup limit (%d). Delete an old backup or ask your host to raise the limit.", limit)
+		adminBody = fmt.Sprintf("Scheduled backup for tenant %s was skipped — backup limit (%d) reached (reject policy).", who, limit)
+	}
+	nctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_, _ = s.deps.Notify.Publish(nctx, notifications.Envelope{
+		EventKind: "backup.limit.reached", Severity: "warning",
+		Title: "Scheduled backup limit reached", Body: tenantBody, UserID: user.ID,
+	})
+	_, _ = s.deps.Notify.Publish(nctx, notifications.Envelope{
+		EventKind: "backup.limit.reached", Severity: "warning",
+		Title: "Tenant scheduled backup limit reached", Body: adminBody,
+	})
+}
+
+func (s *Scheduler) enqueueSystemBackup(ctx context.Context, sched models.BackupSchedule, dest *models.BackupDestination, runID string) bool {
+	logger := s.deps.Log.With("schedule_id", sched.ID, "kind", "system_backup", "destination_id", dest.ID, "run_id", runID)
+	// JAB-361: skip if a system_backup for this (schedule, destination) is already
+	// queued or running. This is the exact case that piled 133 jobs on .86 — a
+	// dead SFTP destination on a */30 schedule, each job holding a slot for 4h.
+	if pending, perr := s.deps.Jobs.HasPendingForTarget(ctx, sched.ID, dest.ID, "system"); perr != nil {
+		logger.Error("check pending system backup_job failed", "err", perr)
+		return false
+	} else if pending {
+		logger.Info("system backup skipped: a job for this target is already queued/running")
+		return false
+	}
+	schedID := sched.ID
+	rid := runID
+	dID := dest.ID
+	job := &models.BackupJob{
+		ID:            ids.NewULID(),
+		UserID:        "system",
+		DestinationID: &dID,
+		ScheduleID:    &schedID,
+		RunID:         &rid,
+		Kind:          models.BackupJobKindSystemBackup,
+		Status:        models.BackupJobStatusQueued,
+		CreatedAt:     time.Now().UTC(),
+	}
+	if err := s.deps.Jobs.Create(ctx, job); err != nil {
+		logger.Error("create system backup_job failed", "err", err)
+		return false
+	}
+	return true
+}
+
+// dispatchOne sends one queued job to the agent and flips it to
+// running. Errors are logged + the row is marked failed so the
+// finalizer doesn't leave it stuck in queued forever.
+func (s *Scheduler) dispatchOne(ctx context.Context, j models.BackupJob) {
+	switch j.Kind {
+	case models.BackupJobKindAccountBackup:
+		s.dispatchAccount(ctx, j)
+	case models.BackupJobKindSystemBackup:
+		s.dispatchSystem(ctx, j)
+	default:
+		s.deps.Log.Warn("dispatcher: unknown job kind, skipping",
+			"job_id", j.ID, "kind", j.Kind)
+	}
+}
+
+func (s *Scheduler) dispatchAccount(ctx context.Context, j models.BackupJob) {
+	logger := s.deps.Log.With("job_id", j.ID, "user_id", j.UserID)
+	user, err := s.deps.Users.FindByID(ctx, j.UserID)
+	if err != nil || user == nil {
+		_ = s.deps.Jobs.MarkFinished(ctx, j.ID, models.BackupJobStatusFailed,
+			"", "", 0, 0, nil, nil, "user not found at dispatch time")
+		logger.Warn("dispatcher: user lookup failed; marking failed", "err", err)
+		return
+	}
+	dest, derr := s.loadDestination(ctx, j)
+	if derr != nil {
+		_ = s.deps.Jobs.MarkFinished(ctx, j.ID, models.BackupJobStatusFailed,
+			"", "", 0, 0, nil, nil, "destination lookup: "+derr.Error())
+		logger.Error("dispatcher: destination lookup failed", "err", derr)
+		return
+	}
+	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	// Resolve the account's full content selection through the shared producer
+	// (JAB-324): the same code the admin and tenant handlers use, with one
+	// lookup-failure classification — a partial result that is logged, never a
+	// silent empty a transient DB hiccup would turn into "the account owns none".
+	sel, warns := backupmetadata.SelectAll(callCtx, scheduleMetaDeps(s.deps, logger), user.ID, user.IsAdmin)
+	backupmetadata.LogWarnings(logger, warns)
+	dbs, pgDbs, mbs := sel.MariaDB, sel.Postgres, sel.Mailboxes
+	// Honour the schedule's content selection (GH #454): the agent skips the
+	// home stage only for content=database but backs up whatever db/mailbox
+	// lists it is handed, so trim the lists the content excludes here and pass
+	// the selector through. Empty content -> "full" -> everything (unchanged).
+	content := models.NormalizeBackupContent(j.Content)
+	dbs, mbs, pgDbs = models.ApplyBackupContent(content, dbs, mbs, pgDbs)
+	meta := buildScheduleMetadata(callCtx, s.deps, user, logger)
+	scheduleID := ""
+	if j.ScheduleID != nil {
+		scheduleID = *j.ScheduleID
+	}
+	params := map[string]any{
+		"job_id":             j.ID,
+		"user_id":            user.ID,
+		"username":           user.Username,
+		"email":              user.Email,
+		"is_admin":           user.IsAdmin,
+		"databases":          dbs,
+		"databases_postgres": pgDbs,
+		"mailboxes":          mbs,
+		"docker_apps":        sel.DockerApps,
+		"content":            content,
+		"compression":        j.Compression,
+		"metadata":           meta,
+		"schedule_id":        scheduleID,
+	}
+	for k, v := range destWireParams(dest) {
+		params[k] = v
+	}
+	// Async variant: backup.create returns as soon as the agent spawns its
+	// orchestrator, so the password tempfile must outlive this call — the
+	// agent unlinks it when the job ends. The synchronous helper unlinked it
+	// here, seconds into a job that needs it for up to 90 minutes.
+	err = backupwrapperhelpers.WithDestPasswordFileAsync(callCtx, dest, s.deps.Agent, s.deps.SSOKey,
+		func(passwordFile string) error {
+			if passwordFile != "" {
+				params["password_file"] = passwordFile
+			}
+			_, callErr := s.deps.Agent.Call(callCtx, "backup.create", params)
+			return callErr
+		})
+	if err != nil {
+		if isAgentConflict(err) {
+			_ = s.deps.Jobs.MarkFinished(ctx, j.ID, models.BackupJobStatusCancelled,
+				"", "", 0, 0, nil, nil, "skipped: prior backup still running")
+			return
+		}
+		_ = s.deps.Jobs.MarkFinished(ctx, j.ID, models.BackupJobStatusFailed,
+			"", "", 0, 0, nil, nil, err.Error())
+		logger.Error("agent backup.create failed", "err", err)
+		return
+	}
+	s.markStartedOrStop(ctx, j.ID, "backup.cancel", logger)
+}
+
+func (s *Scheduler) dispatchSystem(ctx context.Context, j models.BackupJob) {
+	logger := s.deps.Log.With("job_id", j.ID, "kind", "system_backup")
+	dest, derr := s.loadDestination(ctx, j)
+	if derr != nil {
+		_ = s.deps.Jobs.MarkFinished(ctx, j.ID, models.BackupJobStatusFailed,
+			"", "", 0, 0, nil, nil, "destination lookup: "+derr.Error())
+		logger.Error("dispatcher: destination lookup failed", "err", derr)
+		return
+	}
+	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	scheduleID := ""
+	if j.ScheduleID != nil {
+		scheduleID = *j.ScheduleID
+	}
+	params := map[string]any{
+		"job_id":           j.ID,
+		"include_accounts": false,
+		"compression":      j.Compression,
+		"schedule_id":      scheduleID,
+	}
+	for k, v := range destWireParams(dest) {
+		params[k] = v
+	}
+	// A system backup writes to the same destinations as account backups, so
+	// it needs the same per-destination password bridging — without it a
+	// rotated destination fails outright. Async, like backup.create: the
+	// agent owns the tempfile for the life of the job.
+	if err := backupwrapperhelpers.WithDestPasswordFileAsync(callCtx, dest, s.deps.Agent, s.deps.SSOKey,
+		func(passwordFile string) error {
+			if passwordFile != "" {
+				params["password_file"] = passwordFile
+			}
+			_, callErr := s.deps.Agent.Call(callCtx, "system.backup", params)
+			return callErr
+		}); err != nil {
+		if isAgentConflict(err) {
+			_ = s.deps.Jobs.MarkFinished(ctx, j.ID, models.BackupJobStatusCancelled,
+				"", "", 0, 0, nil, nil, "skipped: prior system backup still running")
+			return
+		}
+		_ = s.deps.Jobs.MarkFinished(ctx, j.ID, models.BackupJobStatusFailed,
+			"", "", 0, 0, nil, nil, err.Error())
+		logger.Error("agent system.backup failed", "err", err)
+		return
+	}
+	s.markStartedOrStop(ctx, j.ID, "system.backup_cancel", logger)
+}
+
+// markStartedOrStop moves a dispatched job to running. MarkStarted only
+// moves a job that is still queued, so ErrNotFound here means an admin
+// cancelled it (or deleted it) while backup.create was in flight: the agent
+// is now running a backup its row says is cancelled, holding that user's job
+// slot. Stop it (GH #2245).
+func (s *Scheduler) markStartedOrStop(ctx context.Context, jobID, cancelRPC string, logger *slog.Logger) {
+	err := s.deps.Jobs.MarkStarted(ctx, jobID)
+	if !errors.Is(err, repository.ErrNotFound) {
+		return
+	}
+	callCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if _, cerr := s.deps.Agent.Call(callCtx, cancelRPC, map[string]any{"job_id": jobID}); cerr != nil {
+		logger.Error("job was cancelled during dispatch; stopping it on the agent failed", "err", cerr)
+		return
+	}
+	logger.Warn("job was cancelled during dispatch; stopped it on the agent")
+}
+
+// isAgentConflict matches the agent's 409-equivalent NDJSON error string
+// for "another job already running". Cheap heuristic — cleaner than a
+// typed sentinel that would require coordinating both packages. False
+// positives only delay one tick, no data loss.
+func isAgentConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "already running") ||
+		strings.Contains(msg, "conflict") ||
+		strings.Contains(msg, "job_already_active")
+}
+
+// scheduleMetaDeps maps the scheduler's Deps onto the backupmetadata Deps both
+// shared producers read — Build (schema-v2 metadata) and SelectAll (backup
+// content selection, JAB-324) — so a scheduled backup selects content through
+// the exact same code, and the same lookup-failure classification, as the admin
+// and tenant handlers.
+func scheduleMetaDeps(deps Deps, logger *slog.Logger) backupmetadata.Deps {
+	return backupmetadata.Deps{
+		Databases:      deps.Databases,
+		DatabaseUsers:  deps.DatabaseUsers,
+		DatabaseGrants: deps.DatabaseGrants,
+		Domains:        deps.Domains,
+		Mailboxes:      deps.Mailboxes,
+		AppInstalls:    deps.AppInstalls,
+		DockerApps:     deps.DockerApps,
+		SSLCerts:       deps.SSLCerts,
+		PHPPools:       deps.PHPPools,
+		PHPPoolIni:     deps.PHPPoolIni,
+		Forwarders:     deps.Forwarders,
+		Autoresponders: deps.Autoresponders,
+		MailboxShares:  deps.MailboxShares,
+		TrustedSenders: deps.TrustedSenders,
+		DNSSECKeys:     deps.DNSSECKeys,
+		DNSZones:       deps.DNSZones,
+		DNSRecords:     deps.DNSRecords,
+		SSHKeys:        deps.SSHKeys,
+		CronJobs:       deps.CronJobs,
+		FtpAccounts:    deps.FtpAccounts,
+		// GH #1993: each domain's web domain aliases.
+		WebDomainAliases: deps.WebDomainAliases,
+		LimitOverrides:   deps.LimitOverrides,
+		EgressPolicies:   deps.EgressPolicies,
+		EgressRequests:   deps.EgressRequests,
+		Log:              logger,
+
+		// GH #2502: each domain's webmail branding.
+		WebmailBranding: deps.WebmailBranding,
+	}
+}
+
+// buildScheduleMetadata is the scheduler's wrapper around the shared schema-v2
+// producer in panel-api/internal/backupmetadata. Keeps the scheduler in
+// lockstep with the admin / user-shell handlers so every backup carries the
+// same per-user state regardless of trigger path.
+func buildScheduleMetadata(ctx context.Context, deps Deps, user *models.User, logger *slog.Logger) *internalbackup.AccountMetadata {
+	return backupmetadata.Build(ctx, user, scheduleMetaDeps(deps, logger))
+}
+
+// resolveAccountTargets resolves the users an account-backup schedule fans out
+// to. An empty explicit set = the default sweep of every TENANT (admins are
+// not hosting accounts, so a blanket schedule never touches them). An
+// explicitly named user is honored even when admin (GH #1360): server-level
+// docker apps (UserID NULL) have no tenant account, so an admin's own account
+// backup is the per-account path that covers them on a schedule. Missing users
+// are warn-skipped, not fatal.
+func resolveAccountTargets(ctx context.Context, users repository.UserRepository, scheduleID string, explicitIDs []string, log *slog.Logger) ([]models.User, error) {
+	if len(explicitIDs) == 0 {
+		notAdmin := false
+		list, _, err := users.List(ctx, repository.ListOptions{Limit: 10000, IsAdmin: &notAdmin})
+		if err != nil {
+			return nil, fmt.Errorf("list users: %w", err)
+		}
+		return list, nil
+	}
+	var targets []models.User
+	for _, uid := range explicitIDs {
+		u, err := users.FindByID(ctx, uid)
+		if err != nil || u == nil {
+			if log != nil {
+				log.Warn("schedule references missing user; skipping",
+					"schedule_id", scheduleID, "user_id", uid)
+			}
+			continue
+		}
+		targets = append(targets, *u)
+	}
+	return targets, nil
+}
+
+func strDerefOr(p *string, def string) string {
+	if p == nil {
+		return def
+	}
+	return *p
+}
+
+func strDeref(p *string) string {
+	if p == nil {
+		return ""
+	}
+	return *p
+}
+
+// loadDestination resolves the destination row a queued job points at.
+// Legacy rows (pre-ADR-0080) carry a NULL destination_id and are
+// rejected — the operator must re-create the schedule with explicit
+// destinations linked.
+func (s *Scheduler) loadDestination(ctx context.Context, j models.BackupJob) (*models.BackupDestination, error) {
+	if j.DestinationID == nil || *j.DestinationID == "" {
+		return nil, fmt.Errorf("legacy job without destination_id (pre-ADR-0080); re-create the schedule")
+	}
+	d, err := s.deps.Destinations.Get(ctx, *j.DestinationID)
+	if err != nil {
+		return nil, err
+	}
+	if d == nil {
+		return nil, fmt.Errorf("destination %s not found", *j.DestinationID)
+	}
+	if !d.Enabled {
+		return nil, fmt.Errorf("destination %s disabled", d.ID)
+	}
+	return d, nil
+}
+
+// destWireParams projects a destination into the JSON keys the agent
+// backup commands accept. Centralised so account+system dispatch stay
+// in lockstep.
+func destWireParams(d *models.BackupDestination) map[string]any {
+	out := map[string]any{
+		"repo_url":         d.URL,
+		"destination_kind": d.Kind,
+		"sftp":             backupwrapperhelpers.SFTPWireParams(d),
+	}
+	if d.CredentialsRef != nil {
+		out["credentials_ref"] = *d.CredentialsRef
+	}
+	if d.Kind == models.BackupDestinationKindSFTP {
+		if s := d.ExtraOptionsTyped().SFTP; s != nil {
+			out["sftp"] = map[string]any{
+				"host":     s.Host,
+				"user":     s.User,
+				"port":     s.Port,
+				"path":     s.Path,
+				"auth":     s.Auth,
+				"key_path": s.KeyPath,
+			}
+		}
+	}
+	return out
+}

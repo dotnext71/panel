@@ -1,0 +1,122 @@
+# Platform — Components
+
+The full third-party inventory shipped or installed by DotNext on a Debian 13 host. Every component listed here is fetched, configured, and started by `install.sh`; nothing requires manual operator install.
+
+Version pins shown are the values in `install.sh` at the time of writing. Run `dotnext-cli --version` plus `dpkg-query -l` for the live values on a deployed host.
+
+## Runtime services
+
+| Component | Version | Role | Upstream license |
+|---|---|---|---|
+| **dotnext-api / dotnext-cli** | this repo | Go + Gin HTTP panel API & CLI; serves the React SPA; the only writer to the panel DB | GPL-3.0-only |
+| **dotnext-agent** | this repo | Root-privileged process; performs every privileged host operation over `/run/dotnext/agent.sock` | GPL-3.0-only |
+| **Stalwart Mail** | 1.0.2 | SMTP + IMAP + JMAP + mailbox store (single binary) | AGPL-3.0 |
+| **Bulwark** | 1.19.1 (GitHub release tarball) | Node + Next.js standalone JMAP webmail on `mail.<domain>`, plus autoconfig / autodiscover and the magic-link bridge | own |
+| **Ory Kratos** | 26.2.0 | Identity (login, 2FA, recovery); Unix sockets only | Apache-2.0 |
+| **nginx** | Debian native | Reverse-proxy + per-vhost server. Sury-nginx purged defensively | BSD-2 |
+| **PHP-FPM** (Sury) | 8.1–8.5 | One master per panel user (`dotnext-fpm@<user>`), on that user's version; the distro units are masked | PHP License |
+| **MariaDB** | Debian | Panel DB + tenant DBs; socket plus loopback `127.0.0.1:3306` only (loopback TCP because Stalwart's SQL directory needs it) | GPL-2 |
+| **PostgreSQL** | Debian 17 | Tenant DBs only; opt-in | PostgreSQL |
+| **Redis** | Debian | Notification dispatcher stream + panel cache | BSD-3 |
+| **PowerDNS Authoritative** | Debian | Authoritative `:53` for hosted zones, MariaDB backend | GPL-2 |
+| **pdns-recursor** | Debian | Loopback recursor `127.0.0.1:53` (split-port) | GPL-2 |
+| **CrowdSec** | packagecloud | IP-trust source + AppSec WAF + bouncers | MIT |
+| **certbot** | Debian | Let's Encrypt issuance and renewal | Apache-2.0 |
+
+`dotnext-cli update` moves Stalwart up to the version in this table, never down. A server that already runs a newer Stalwart, installed by hand, keeps it, and the update prints a warning. DotNext is tested with the version in the table. A server on Stalwart 0.16 moves to 1.0 by copying its mail data into a new store: see [Mail → Moving to Stalwart 1.0](../mail.md#moving-to-stalwart-10).
+
+## Security stack
+
+| Component | Source | Role |
+|---|---|---|
+| `crowdsec` + `crowdsec-nginx-bouncer` + `cs-firewall-bouncer` + AppSec | packagecloud + hub | IP bans, scenarios, WAF |
+| CrowdSec community blocklist | CAPI | Free community IP blocklist, pulled by the engine; no console enrolment |
+| **Snuffleupagus** | repo | PHP runtime hardening (Zend extension) |
+| **AppArmor** + `apparmor-profiles-extra` + `apparmor-utils` | Debian | Per-process MAC; profiles shipped for every DotNext service |
+| **AIDE** + `aide-common` | Debian | Daily host-integrity scan |
+| **auditd** + `audispd-plugins` | Debian | Linux audit subsystem |
+| **bubblewrap** | Debian | Per-user PHP sandbox + SSH chroot for migrations |
+| **UFW** | Debian | Port baseline only (IP decisions live in CrowdSec) |
+| **nftables** | Debian | Per-user egress (cgroup v2 vmap) |
+| **Linux Malware Detect (LMD)** | 2.0.1 (GitHub) | On-demand malware scanner — native HEX + YARA |
+| **YARA-X** (`yr` binary) | 1.22.1 (GitHub) | Pattern matching for LMD + the async mail scanner |
+
+## Apps / tooling
+
+| Component | Version | Role |
+|---|---|---|
+| **phpMyAdmin** | 5.2.3 | MariaDB web UI with single-use SSO (`sso.php`) |
+| **Adminer** | 6.2.0 | Lighter DB web UI + `dotnext-sso-plugin.php` |
+| **WP-CLI** | 2.12.0 | WordPress automation |
+| **GoAccess** | Debian | nginx log analyzer |
+| **restic** | Debian | Backup engine (deduplicated, encrypted, multi-destination) |
+| **Go toolchain** | 1.27.3 | Build agent + panel-api |
+| **Node.js** | NodeSource current LTS | Bulwark runtime + UI build |
+
+## OS plumbing
+
+systemd, `systemd-container`, `systemd-resolved` (gated under `DOTNEXT_DNS_FORWARDER`), `auditd`, OpenSSH (`Match Group dotnext-sftp`), `tar`, `curl`, `wget`, `gnupg`, `ca-certificates`, `git`, `build-essential`, `libpcre2-dev`, `acl`, `jq`, `socat`.
+
+## Frontend (`frontend`)
+
+| Library | Version | Purpose |
+|---|---|---|
+| **React** + `react-dom` | 19.3 | SPA |
+| **Ant Design** | 6.6.8 | Component library |
+| `@ant-design/icons` | 6.3 | Icons |
+| **TanStack Query** (`@tanstack/react-query`) | 5.105 | API state |
+| **react-router** | 7.18 | Routing |
+| **axios** | 1.21 | HTTP client |
+| **CodeMirror** (`codemirror` + `@codemirror/*`) | 6 | In-browser code editor (File Manager) |
+| **i18next** + `react-i18next` | 26.6 / 17.1 | UI strings |
+| **xterm.js** + addon-fit | 6.0 / 0.11 | Web terminal |
+| `@dnd-kit/core` + `sortable` + `utilities` | 6.3 / 10 / 3.2 | Drag-and-drop |
+| `lucide-react` | 1.66 | Extra icons |
+| `micro-key-producer` | 0.8.6 | Browser-side key generation |
+| `@fontsource/inter` | 5.3 | Self-hosted font |
+| Vite 6 / TypeScript 5.7 / Vitest 3.2 / Playwright 1.63 / Testing Library | — | Build + test toolchain |
+
+## Go libraries (direct dependencies in `go.mod`)
+
+`gin-gonic/gin` (HTTP), `gorm.io/gorm` + `gorm.io/driver/mysql` (ORM), `golang-migrate/migrate/v4` (migrations), `redis/go-redis/v9` (Redis), `gorilla/websocket` (WebSocket), `spf13/cobra` (CLI), `robfig/cron/v3` (schedules), `oklog/ulid/v2` (IDs), `fxamacker/cbor/v2` (encoding), `SherClockHolmes/webpush-go` (VAPID Web Push), `BurntSushi/toml`, `google/shlex`, `golang.org/x/crypto|net|sync|sys|term|time`.
+
+Test-only: `DATA-DOG/go-sqlmock`, `alicebob/miniredis/v2`, `stretchr/testify`.
+
+## In-house patterns shipped under `infrastructure/`
+
+- **`dotnext-sso-<43-char-nonce>.php`** — self-deleting magic SSO file (Installatron / Softaculous style). Used by Bulwark webmail and every application install for one-click admin sign-in. 60 s TTL; 256-bit nonce filename; `flock` + `unlink` on first hit.
+- **phpMyAdmin `sso.php`** and **Adminer `dotnext-sso-plugin.php`** — adapt the magic-file pattern to the two DB web UIs.
+- **`infrastructure/snuffleupagus/rules/`** — server-wide Snuffleupagus baseline rules.
+- **`infrastructure/wp-cli.sha256`** / **`infrastructure/phpmyadmin.sha256`** — checksum-pinned upstream tarballs.
+
+## Removed
+
+Components that previously shipped but are not present in the current build. See [Removed Features](../removed-features.md) for the rationale per item.
+
+| Component | Status | Replacement |
+|---|---|---|
+| **Hydra** (OIDC provider) | Rolled back | Magic-file SSO for app sign-in |
+| **ModSecurity** + libmodsecurity + nginx-modsecurity-connector + OWASP CRS | Removed | CrowdSec AppSec WAF |
+| **filebrowser** | Replaced | In-panel AntD File Manager |
+| **Tetragon** + `dotnext-tetragon-relay` | Removed 2026-04-30 | (none — eBPF tripwires retired) |
+| **ClamAV daemon + freshclam timer** | Removed | On-demand `clamscan`, now itself superseded by LMD-native + YARA-X |
+| **`@refinedev/*`** | Removed | TanStack Query + AntD + react-router |
+
+The installer's `cleanup_*` functions actively purge leftover packages and config from these components on every install, so a host that previously ran an older DotNext generation does not carry a footprint forward.
+
+## Source-of-truth pointers
+
+If you need the live, currently-installed version of any component on a deployed host:
+
+```bash
+dpkg-query -W -f='${Package} ${Version}\n' | grep -E 'mariadb|postgresql|redis|nginx|pdns|certbot|crowdsec|stalwart|kratos|auditd|aide|apparmor|nftables|ufw|restic|bubblewrap'
+stalwart --version
+kratos version
+dotnext-cli --version
+```
+
+To see exactly which versions are pinned for the next install:
+
+```bash
+grep -E 'VERSION="|version="|local .+_version=' install.sh | grep -v '^[[:space:]]*#'
+```

@@ -1,0 +1,883 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+
+	"github.com/dotnext-panel/dotnext/internal/auth"
+	"github.com/dotnext-panel/dotnext/internal/ginctx"
+	"github.com/dotnext-panel/dotnext/internal/models"
+)
+
+// domainEmailTestRouter returns a gin engine with the domain-email
+// routes wired to the supplied mock agent, plus a pre-seeded
+// mockDomainRepo containing one domain owned by user1. DNS repos are
+// nil — exercise the pre-Step-6 no-DNS path.
+func domainEmailTestRouter(t *testing.T, ma *mockAgent, isAdmin bool, userID string) (*gin.Engine, *mockDomainRepo) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	v1 := r.Group("/api/v1")
+	v1.Use(func(c *gin.Context) {
+		ginctx.SetClaims(c, &auth.AccessClaims{
+			UserID:  userID,
+			IsAdmin: isAdmin,
+		})
+		c.Next()
+	})
+
+	domains := newMockDomainRepo()
+	domains.domains["dom1"] = &models.Domain{
+		ID:             "dom1",
+		UserID:         "user1",
+		Name:           "example.com",
+		OwnershipState: models.OwnershipState{OwnershipStatus: models.OwnershipVerified},
+	}
+	RegisterDomainEmailRoutes(v1, DomainEmailHandlerConfig{
+		Domains: domains,
+		Agent:   ma,
+	})
+	return r, domains
+}
+
+// domainEmailRouterWithDNS wires domain + zone + record mocks together
+// and seeds the zone row the handler will look up on enable/disable.
+func domainEmailRouterWithDNS(t *testing.T, ma *mockAgent) (*gin.Engine, *mockDomainRepo, *mockDNSZoneRepo, *mockDNSRecordRepo) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	v1 := r.Group("/api/v1")
+	v1.Use(func(c *gin.Context) {
+		ginctx.SetClaims(c, &auth.AccessClaims{UserID: "user1", IsAdmin: false})
+		c.Next()
+	})
+
+	domains := newMockDomainRepo()
+	domains.domains["dom1"] = &models.Domain{
+		ID:             "dom1",
+		UserID:         "user1",
+		Name:           "example.com",
+		OwnershipState: models.OwnershipState{OwnershipStatus: models.OwnershipVerified},
+	}
+	zones := newMockDNSZoneRepo()
+	zones.zones["zone1"] = &models.DNSZone{ID: "zone1", DomainID: "dom1", Name: "example.com"}
+	records := newMockDNSRecordRepo()
+
+	RegisterDomainEmailRoutes(v1, DomainEmailHandlerConfig{
+		Domains:    domains,
+		Agent:      ma,
+		DNSZones:   zones,
+		DNSRecords: records,
+	})
+	return r, domains, zones, records
+}
+
+// TestDomainEmail_Enable_Success is the happy-path. Agent returns a
+// valid DKIM response; handler must persist it and return 200 with
+// the DNS hint list populated.
+func TestDomainEmail_Enable_Success(t *testing.T) {
+	ma := &mockAgent{
+		callFn: func(ctx context.Context, cmd string, params any) (json.RawMessage, error) {
+			require.Equal(t, "domain.email_enable", cmd)
+			return json.RawMessage(`{"ok":true,"dkim_selector":"dotnext","dkim_public_key":"v=DKIM1;k=ed25519;p=AAAA"}`), nil
+		},
+	}
+	r, domains := domainEmailTestRouter(t, ma, false, "user1")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/domains/dom1/email", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	var resp domainEmailResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.True(t, resp.EmailEnabled)
+	require.Equal(t, "dotnext", resp.DkimSelector)
+	require.Equal(t, "v=DKIM1;k=ed25519;p=AAAA", resp.DkimPublicKey)
+	require.NotNil(t, resp.EmailEnabledAt)
+
+	// Row state mirrors the response.
+	require.True(t, domains.domains["dom1"].EmailEnabled)
+	require.NotNil(t, domains.domains["dom1"].DkimSelector)
+	require.Equal(t, "dotnext", *domains.domains["dom1"].DkimSelector)
+
+	// Same 16-record hint list as TestDomainEmail_Get_ShowsHints, with the
+	// real DKIM key in place of the placeholder.
+	require.Len(t, resp.Records, 16)
+}
+
+// TestDomainEmail_Enable_AgentFails verifies the panel does NOT flip
+// email_enabled when the agent errors out. The row must stay untouched
+// so the operator can retry cleanly.
+func TestDomainEmail_Enable_AgentFails(t *testing.T) {
+	ma := &mockAgent{callErr: errors.New("boom")}
+	r, domains := domainEmailTestRouter(t, ma, false, "user1")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/domains/dom1/email", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	require.False(t, domains.domains["dom1"].EmailEnabled)
+	require.Nil(t, domains.domains["dom1"].DkimSelector)
+}
+
+// GH #1816 / ADR-0170: enabling mail on a domain whose owner has not proven
+// the name is refused with 409 before the agent is called.
+func TestDomainEmail_Enable_PendingOwnership409(t *testing.T) {
+	ma := &mockAgent{}
+	r, domains := domainEmailTestRouter(t, ma, false, "user1")
+	domains.domains["dom1"].OwnershipState = models.OwnershipState{OwnershipStatus: models.OwnershipPending}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/domains/dom1/email", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusConflict, rec.Code)
+	require.Contains(t, rec.Body.String(), "domain_ownership_pending")
+	require.Zero(t, ma.callCount, "no agent call for a pending domain")
+	require.False(t, domains.domains["dom1"].EmailEnabled)
+}
+
+// TestDomainEmail_Enable_AgentBadResponse guards against the agent
+// returning ok:false or missing DKIM material — without this check we
+// would persist an empty selector and render broken DNS hints.
+func TestDomainEmail_Enable_AgentBadResponse(t *testing.T) {
+	ma := &mockAgent{
+		callFn: func(ctx context.Context, cmd string, params any) (json.RawMessage, error) {
+			return json.RawMessage(`{"ok":false}`), nil
+		},
+	}
+	r, domains := domainEmailTestRouter(t, ma, false, "user1")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/domains/dom1/email", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	require.False(t, domains.domains["dom1"].EmailEnabled)
+}
+
+// TestDomainEmail_Enable_ForbiddenOtherOwner — non-admin trying to
+// flip another user's domain must hit 403, and the agent must not be
+// called. The row stays untouched.
+func TestDomainEmail_Enable_ForbiddenOtherOwner(t *testing.T) {
+	ma := &mockAgent{}
+	r, domains := domainEmailTestRouter(t, ma, false, "user2")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/domains/dom1/email", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusForbidden, rec.Code)
+	require.Equal(t, 0, ma.callCount, "agent must not be contacted on auth failure")
+	require.False(t, domains.domains["dom1"].EmailEnabled)
+}
+
+// TestDomainEmail_Enable_CustomTemplatePostureLocked — GH #1627: a domain
+// created from a custom DNS template carries the external 'custom' mail
+// posture. Enabling DotNext mail on it must be refused (409) and must never
+// reach the agent, so the template's external MX/SPF is not shadowed by a
+// DotNext mailbox + DKIM.
+func TestDomainEmail_Enable_CustomTemplatePostureLocked(t *testing.T) {
+	ma := &mockAgent{}
+	r, domains := domainEmailTestRouter(t, ma, false, "user1")
+	domains.domains["dom1"].MailProvider = models.MailProviderCustom
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/domains/dom1/email", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusConflict, rec.Code, rec.Body.String())
+	require.Contains(t, rec.Body.String(), "template_posture_locked")
+	require.Equal(t, 0, ma.callCount, "agent must not be contacted for a custom-posture domain")
+	require.False(t, domains.domains["dom1"].EmailEnabled)
+}
+
+// TestDomainEmail_Disable_KeepsDKIM — disable clears email_enabled and
+// email_enabled_at but MUST preserve dkim_selector + dkim_public_key
+// so a later re-enable doesn't roll the key (ADR-0043).
+func TestDomainEmail_Disable_KeepsDKIM(t *testing.T) {
+	sel := "dotnext"
+	pub := "v=DKIM1;k=ed25519;p=AAAA"
+	ma := &mockAgent{}
+	r, domains := domainEmailTestRouter(t, ma, false, "user1")
+	// Preload: already enabled with DKIM material set.
+	domains.domains["dom1"].EmailEnabled = true
+	domains.domains["dom1"].DkimSelector = &sel
+	domains.domains["dom1"].DkimPublicKey = &pub
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/domains/dom1/email", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
+	require.False(t, domains.domains["dom1"].EmailEnabled)
+	require.Nil(t, domains.domains["dom1"].EmailEnabledAt)
+	// Key material survived the disable — this is the ADR-0043
+	// contract; losing it would re-issue a fresh key on next enable
+	// and break every cached DKIM receiver until DNS propagates.
+	require.NotNil(t, domains.domains["dom1"].DkimSelector)
+	require.Equal(t, "dotnext", *domains.domains["dom1"].DkimSelector)
+	require.NotNil(t, domains.domains["dom1"].DkimPublicKey)
+}
+
+// TestDomainEmail_Disable_AgentFails — leave row untouched on agent
+// failure so the operator can retry. Matches the mailbox.delete
+// ordering pattern.
+func TestDomainEmail_Disable_AgentFails(t *testing.T) {
+	ma := &mockAgent{callErr: errors.New("boom")}
+	r, domains := domainEmailTestRouter(t, ma, false, "user1")
+	domains.domains["dom1"].EmailEnabled = true
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/domains/dom1/email", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	require.True(t, domains.domains["dom1"].EmailEnabled, "row must stay enabled when agent fails")
+}
+
+// TestDomainEmail_Get_ShowsHints — GET on a disabled domain still
+// returns the MX/SPF/DMARC hints so the operator can see what they
+// will need; the DKIM entry shows the placeholder text.
+func TestDomainEmail_Get_ShowsHints(t *testing.T) {
+	r, _ := domainEmailTestRouter(t, &mockAgent{}, false, "user1")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/domains/dom1/email", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp domainEmailResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.False(t, resp.EmailEnabled)
+	// 16 records in the hint list: MX, SPF, DMARC, autoconfig CNAME,
+	// autodiscover CNAME, _autodiscover._tcp SRV, _imap/_imaps/
+	// _submission/_submissions SRV, _caldavs/_carddavs SRV (GH #1917),
+	// TLS-RPT TXT, 2 CAA, DKIM (GH #134).
+	require.Len(t, resp.Records, 16)
+	// Last record is the DKIM placeholder before enable — empty Value
+	// is the contract for "generated later".
+	last := len(resp.Records) - 1
+	require.Equal(t, "TXT", resp.Records[last].Type)
+	require.Contains(t, resp.Records[last].Purpose, "DKIM")
+	require.Equal(t, "", resp.Records[last].Value, "DKIM placeholder has empty value pre-enable")
+}
+
+// TestDomainEmail_Get_NotFound — requesting email for a non-existent
+// domain returns 404, not 500.
+func TestDomainEmail_Get_NotFound(t *testing.T) {
+	r, _ := domainEmailTestRouter(t, &mockAgent{}, false, "user1")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/domains/unknown/email", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+// TestDomainEmail_Get_IncludesMailHostAWhenServerIPKnown — GH #1612: when the
+// server's public IP is known, the mail host's A/AAAA records lead the hint
+// list. On external DNS these are the records every MX/SRV/autodiscover entry
+// points at, so without them nothing resolves. Also asserts the DKIM Value is
+// the full TXT content (v=DKIM1; …), copy-pasteable as-is.
+func TestDomainEmail_Get_IncludesMailHostAWhenServerIPKnown(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	v1 := r.Group("/api/v1")
+	v1.Use(func(c *gin.Context) {
+		ginctx.SetClaims(c, &auth.AccessClaims{UserID: "user1", IsAdmin: false})
+		c.Next()
+	})
+	domains := newMockDomainRepo()
+	// Production stores the agent's DKIM value verbatim and UNQUOTED (the zone
+	// publisher adds the quotes at wire time — email_records.go). The hint's Value
+	// is that raw string, copy-pasteable into a provider's TXT field as-is.
+	sel, key := "dotnext", "v=DKIM1;k=ed25519;p=AAAA"
+	domains.domains["dom1"] = &models.Domain{
+		ID: "dom1", UserID: "user1", Name: "example.com",
+		EmailEnabled: true, DkimSelector: &sel, DkimPublicKey: &key,
+	}
+	settings := &mockServerSettingsRepo{getResult: &models.ServerSettings{
+		ID: 1, PublicIPv4: "203.0.113.9", PublicIPv6: "2001:db8::9",
+	}}
+	RegisterDomainEmailRoutes(v1, DomainEmailHandlerConfig{
+		Domains: domains, Agent: &mockAgent{}, ServerSettings: settings,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/domains/dom1/email", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	var resp domainEmailResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+
+	require.GreaterOrEqual(t, len(resp.Records), 2)
+	require.Equal(t, "A", resp.Records[0].Type, "mail-host A leads the list")
+	require.Equal(t, "mail.example.com.", resp.Records[0].Name)
+	require.Equal(t, "203.0.113.9", resp.Records[0].Value)
+	require.Equal(t, "AAAA", resp.Records[1].Type)
+	require.Equal(t, "mail.example.com.", resp.Records[1].Name)
+	require.Equal(t, "2001:db8::9", resp.Records[1].Value)
+
+	byKey := map[string]domainEmailDNSHint{}
+	for _, h := range resp.Records {
+		byKey[h.Type+":"+h.Name] = h
+	}
+	dkim, ok := byKey["TXT:dotnext._domainkey.example.com."]
+	require.True(t, ok, "DKIM hint present when enabled")
+	require.Equal(t, "v=DKIM1;k=ed25519;p=AAAA", dkim.Value,
+		"DKIM Value is the raw TXT content (unquoted), copy-pasteable as-is")
+}
+
+// TestDomainEmail_Get_ListsDAVDiscoverySRV — GH #1917: the panel no longer
+// shows per-mailbox CalDAV/CardDAV URLs, so mail apps find calendars and
+// contacts only through the secure DAV SRV rows. An external-DNS domain must
+// be told to publish them, with the same target a panel-hosted zone gets:
+// mail.<domain>:443 by default, or the GH #1462 override host (and port).
+func TestDomainEmail_Get_ListsDAVDiscoverySRV(t *testing.T) {
+	cases := []struct {
+		name              string
+		calDAV, cardDAV   string
+		wantCal, wantCard string
+	}{
+		{"built-in DAV", "", "", "0 1 443 mail.example.com.", "0 1 443 mail.example.com."},
+		{"calendar override with port", "dav.example.net:8443", "", "0 1 8443 dav.example.net.", "0 1 443 mail.example.com."},
+		{"contacts override", "", "cloud.example.org", "0 1 443 mail.example.com.", "0 1 443 cloud.example.org."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gin.SetMode(gin.TestMode)
+			r := gin.New()
+			v1 := r.Group("/api/v1")
+			v1.Use(func(c *gin.Context) {
+				ginctx.SetClaims(c, &auth.AccessClaims{UserID: "user1", IsAdmin: false})
+				c.Next()
+			})
+			domains := newMockDomainRepo()
+			domains.domains["dom1"] = &models.Domain{
+				ID: "dom1", UserID: "user1", Name: "example.com", EmailEnabled: true,
+				CalDAVHost: tc.calDAV, CardDAVHost: tc.cardDAV,
+			}
+			RegisterDomainEmailRoutes(v1, DomainEmailHandlerConfig{Domains: domains, Agent: &mockAgent{}})
+
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/domains/dom1/email", nil)
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+			var resp domainEmailResponse
+			require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+			byKey := map[string]domainEmailDNSHint{}
+			for _, h := range resp.Records {
+				byKey[h.Type+":"+h.Name] = h
+			}
+			cal, ok := byKey["SRV:_caldavs._tcp.example.com."]
+			require.True(t, ok, "calendar discovery SRV listed")
+			require.Equal(t, tc.wantCal, cal.Value)
+			card, ok := byKey["SRV:_carddavs._tcp.example.com."]
+			require.True(t, ok, "contacts discovery SRV listed")
+			require.Equal(t, tc.wantCard, card.Value)
+			_, plain := byKey["SRV:_caldav._tcp.example.com."]
+			require.False(t, plain, "plaintext :80 DAV SRV is never advertised")
+		})
+	}
+}
+
+// ---- M6 Step 6: DNS autoconfig sync ---------------------------------
+
+// Enable with DNS repos wired must insert the three M6 records
+// (DKIM + autoconfig CNAME + _autodiscover._tcp SRV) into the zone,
+// each stamped with ManagedBy="m6" so disable can scope its cleanup.
+func TestDomainEmail_Enable_InsertsM6DNSRecords(t *testing.T) {
+	ma := &mockAgent{
+		callFn: func(ctx context.Context, cmd string, params any) (json.RawMessage, error) {
+			return json.RawMessage(`{"ok":true,"dkim_selector":"dotnext","dkim_public_key":"v=DKIM1;k=ed25519;p=AAAA"}`), nil
+		},
+	}
+	r, _, _, records := domainEmailRouterWithDNS(t, ma)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/domains/dom1/email", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	// Collect just the M6-managed rows — the inserted delta. Every row
+	// with ManagedBy=="m6" must be one of the three expected names.
+	got := map[string]string{}
+	for _, rec := range records.records {
+		if rec.ManagedBy == nil || *rec.ManagedBy != "m6" {
+			continue
+		}
+		got[rec.Type+":"+rec.Name] = rec.Content
+	}
+	// 14 distinct (type:name) M6 keys. BuildEmailRecords emits 15 rows
+	// — DKIM + autoconfig + autodiscover + 5 cal/carddav + 4 client SRVs
+	// + TLS-RPT + 2 apex CAA (GH #134) — but the two CAA share the
+	// type:name key "CAA:@" so the map collapses them to 13... +1 = 14.
+	require.Len(t, got, 14, "expected 14 M6 record keys, got %v", got)
+	require.Equal(t, `"v=DKIM1;k=ed25519;p=AAAA"`, got["TXT:dotnext._domainkey"])
+	require.Equal(t, "mail.example.com", got["CNAME:autoconfig"])
+	require.Equal(t, "0 443 mail.example.com", got["SRV:_autodiscover._tcp"])
+	require.Equal(t, "1 443 mail.example.com", got["SRV:_caldavs._tcp"])
+	require.Equal(t, "1 443 mail.example.com", got["SRV:_carddavs._tcp"])
+}
+
+// GH #2475: enable stores the RSA key the agent returns, answers with it,
+// and publishes it at dotnextrsa._domainkey split into 255-character strings.
+func TestDomainEmail_Enable_StoresAndPublishesRSAKey(t *testing.T) {
+	rsaKey := "v=DKIM1; k=rsa; p=" + strings.Repeat("R", 392)
+	ma := &mockAgent{
+		callFn: func(ctx context.Context, cmd string, params any) (json.RawMessage, error) {
+			b, _ := json.Marshal(map[string]any{
+				"ok": true, "dkim_selector": "dotnext", "dkim_public_key": "v=DKIM1;k=ed25519;p=AAAA",
+				"dkim_rsa_selector": "dotnextrsa", "dkim_rsa_public_key": rsaKey,
+			})
+			return b, nil
+		},
+	}
+	r, domains, _, records := domainEmailRouterWithDNS(t, ma)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/domains/dom1/email", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	var resp domainEmailResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+	require.Equal(t, "dotnextrsa", resp.DkimRSASelector)
+	require.Equal(t, rsaKey, resp.DkimRSAPublicKey)
+	require.NotNil(t, domains.domains["dom1"].DkimRSAPublicKey)
+	require.Equal(t, rsaKey, *domains.domains["dom1"].DkimRSAPublicKey)
+
+	var published []string
+	for _, rr := range records.records {
+		if rr.Name == "dotnextrsa._domainkey" && rr.Type == "TXT" {
+			published = append(published, rr.Content)
+		}
+	}
+	require.Equal(t, []string{`"` + rsaKey[:255] + `" "` + rsaKey[255:] + `"`}, published)
+
+	var hint *domainEmailDNSHint
+	for i := range resp.Records {
+		if resp.Records[i].Name == "dotnextrsa._domainkey.example.com." {
+			hint = &resp.Records[i]
+		}
+	}
+	require.NotNil(t, hint, "the RSA DKIM record is listed for external DNS")
+	require.Equal(t, rsaKey, hint.Value, "hint value is the raw, unsplit TXT content")
+}
+
+// An agent from before #2475 returns no RSA key: enable still succeeds and
+// lists no RSA record (the reconciler adds it once the agent has one).
+func TestDomainEmail_Enable_WithoutRSAKey(t *testing.T) {
+	ma := &mockAgent{
+		callFn: func(ctx context.Context, cmd string, params any) (json.RawMessage, error) {
+			return json.RawMessage(`{"ok":true,"dkim_selector":"dotnext","dkim_public_key":"v=DKIM1;k=ed25519;p=AAAA"}`), nil
+		},
+	}
+	r, domains, _, records := domainEmailRouterWithDNS(t, ma)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/domains/dom1/email", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Nil(t, domains.domains["dom1"].DkimRSAPublicKey)
+	for _, rr := range records.records {
+		require.NotEqual(t, "dotnextrsa._domainkey", rr.Name)
+	}
+	require.NotContains(t, rec.Body.String(), "dotnextrsa")
+}
+
+// Disable must remove every ManagedBy="m6" row — and nothing else. We
+// seed the zone with one M4 bootstrap row (ManagedBy=nil) + one
+// user-edited row (ManagedBy=nil, Managed=false) to prove the scoped
+// delete leaves them both intact. Keeping user edits is the whole
+// point of the managed_by column (ADR-0042 style: explicit ownership).
+func TestDomainEmail_Disable_DeletesOnlyM6Records(t *testing.T) {
+	ma := &mockAgent{}
+	r, domains, _, records := domainEmailRouterWithDNS(t, ma)
+
+	// Mark the domain as enabled with DKIM set so disable has work.
+	sel := "dotnext"
+	pub := "v=DKIM1;k=ed25519;p=AAAA"
+	domains.domains["dom1"].EmailEnabled = true
+	domains.domains["dom1"].DkimSelector = &sel
+	domains.domains["dom1"].DkimPublicKey = &pub
+
+	// Seed: 1 M6 row (will be deleted), 1 M4 row (must survive),
+	// 1 user-edited row (must survive).
+	m6 := "m6"
+	records.records["r-m6-dkim"] = &models.DNSRecord{
+		ID: "r-m6-dkim", ZoneID: "zone1",
+		Name: "dotnext._domainkey", Type: "TXT", Content: `"v=DKIM1..."`,
+		Managed: true, ManagedBy: &m6,
+	}
+	records.records["r-m4-mx"] = &models.DNSRecord{
+		ID: "r-m4-mx", ZoneID: "zone1",
+		Name: "@", Type: "MX", Content: "mail", Priority: 10,
+		Managed: true, ManagedBy: nil,
+	}
+	records.records["r-user-txt"] = &models.DNSRecord{
+		ID: "r-user-txt", ZoneID: "zone1",
+		Name: "@", Type: "TXT", Content: `"custom spf rule"`,
+		Managed: false, ManagedBy: nil,
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/v1/domains/dom1/email", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusNoContent, rec.Code, rec.Body.String())
+
+	// The M6 row is gone; both non-M6 rows survive — this is the
+	// contract that keeps user overrides alive across an
+	// enable/disable cycle.
+	_, m6Present := records.records["r-m6-dkim"]
+	require.False(t, m6Present, "M6 row should be deleted")
+	require.Contains(t, records.records, "r-m4-mx", "M4 bootstrap row must survive")
+	require.Contains(t, records.records, "r-user-txt", "user-edited row must survive")
+}
+
+// Enable against a zone that already has a user-edited row at (autoconfig,
+// CNAME) must skip that specific insert and surface a warning in the
+// response — never overwrite the user's choice.
+func TestDomainEmail_Enable_UserOverride_Warns(t *testing.T) {
+	ma := &mockAgent{
+		callFn: func(ctx context.Context, cmd string, params any) (json.RawMessage, error) {
+			return json.RawMessage(`{"ok":true,"dkim_selector":"dotnext","dkim_public_key":"v=DKIM1;k=ed25519;p=AAAA"}`), nil
+		},
+	}
+	r, _, _, records := domainEmailRouterWithDNS(t, ma)
+	// Pre-existing user-edited CNAME at the autoconfig slot.
+	records.records["r-user-autoconfig"] = &models.DNSRecord{
+		ID: "r-user-autoconfig", ZoneID: "zone1",
+		Name: "autoconfig", Type: "CNAME", Content: "something-else",
+		Managed: false, ManagedBy: nil,
+	}
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/domains/dom1/email", nil)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusOK, rec.Code)
+	var resp domainEmailResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &resp))
+
+	// DKIM + autodiscover got added; autoconfig was blocked by the
+	// user-edited row, so only 2 M6-managed rows in the store.
+	m6Count := 0
+	for _, r := range records.records {
+		if r.ManagedBy != nil && *r.ManagedBy == "m6" {
+			m6Count++
+		}
+	}
+	// 15 M6 records normally (GH #134 set); user-edited autoconfig blocks
+	// 1 insert → 14.
+	require.Equal(t, 14, m6Count, "user-edited autoconfig row blocks exactly one insert")
+
+	// Warning must mention autoconfig so the operator knows what to
+	// fix; the exact wording isn't locked down to avoid brittleness.
+	hasAutoconfigWarn := false
+	for _, w := range resp.Warnings {
+		if contains(w, "autoconfig") {
+			hasAutoconfigWarn = true
+			break
+		}
+	}
+	require.True(t, hasAutoconfigWarn, "warnings should mention the autoconfig conflict; got %v", resp.Warnings)
+}
+
+// Enable twice is idempotent — the second POST must not create
+// duplicate M6 rows. Same row count before and after the second call.
+func TestDomainEmail_Enable_Idempotent(t *testing.T) {
+	ma := &mockAgent{
+		callFn: func(ctx context.Context, cmd string, params any) (json.RawMessage, error) {
+			return json.RawMessage(`{"ok":true,"dkim_selector":"dotnext","dkim_public_key":"v=DKIM1;k=ed25519;p=AAAA"}`), nil
+		},
+	}
+	r, _, _, records := domainEmailRouterWithDNS(t, ma)
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/domains/dom1/email", nil)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		require.Equal(t, http.StatusOK, rec.Code, "enable call %d", i+1)
+	}
+
+	m6Count := 0
+	for _, r := range records.records {
+		if r.ManagedBy != nil && *r.ManagedBy == "m6" {
+			m6Count++
+		}
+	}
+	require.Equal(t, 15, m6Count, "re-enable must not duplicate rows")
+}
+
+// The shared enable/disable lifecycle (EnableDomainEmailInline and its
+// sentinel-error taxonomy) moved to internal/domainmailops in JAB-288; its
+// behavioral matrix — happy path, agent-error taxonomy, DNS-warning
+// flow-through — now lives in domainmailops_test.go. The handler-level tests
+// above still exercise it end-to-end through the HTTP routes.
+
+// TestDomains_Create_AutoEnablesEmail verifies the wired-up create
+// endpoint auto-enables email on a freshly-created domain. Exercises
+// the path in domainHandler.create via its public HTTP surface.
+func TestDomains_Create_AutoEnablesEmail(t *testing.T) {
+	ma := &mockAgent{callFn: func(ctx context.Context, cmd string, params any) (json.RawMessage, error) {
+		require.Equal(t, "domain.email_enable", cmd, "create should call domain.email_enable inline")
+		return json.RawMessage(`{"ok":true,"dkim_selector":"dotnext","dkim_public_key":"v=DKIM1; k=ed25519; p=AAA"}`), nil
+	}}
+	domains := newMockDomainRepo()
+	zones := newMockDNSZoneRepo()
+	zones.zones["zone1"] = &models.DNSZone{ID: "zone1", DomainID: "any", Name: "autoenable.test"}
+	records := newMockDNSRecordRepo()
+	users := &mockUserRepo{
+		users: map[string]*models.User{
+			"user1": {
+				ID:       "user1",
+				Email:    "user1@example.com",
+				Username: strPtr("user1"),
+				IsAdmin:  false,
+			},
+		},
+	}
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	v1 := r.Group("/api/v1")
+	v1.Use(func(c *gin.Context) {
+		ginctx.SetClaims(c, &auth.AccessClaims{UserID: "user1", IsAdmin: true})
+		c.Next()
+	})
+	RegisterDomainRoutes(v1, DomainHandlerConfig{
+		Domains:    domains,
+		Users:      users,
+		Agent:      ma,
+		DNSZones:   zones,
+		DNSRecords: records,
+	})
+
+	body := `{"name":"autoenable.test","user_id":"user1"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/domains", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code, "body: %s", w.Body.String())
+
+	var resp models.Domain
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	require.True(t, resp.EmailEnabled, "response must reflect email_enabled=1 from auto-enable")
+	require.NotNil(t, resp.DkimSelector)
+	require.Equal(t, "dotnext", *resp.DkimSelector)
+	require.Equal(t, 1, ma.callCount, "exactly one agent call (domain.email_enable) expected")
+}
+
+// TestDomains_Create_AutoEnableFailureStillReturns201 verifies the
+// best-effort semantic: agent down at create time must NOT fail the
+// domain.create call. The row is inserted with email_enabled=1 (the
+// ADR-0080 default — intent stays "on" so the reconciler retries
+// provisioning on the next tick rather than leaving the tenant
+// stranded behind the mailbox-create gate).
+func TestDomains_Create_AutoEnableFailureStillReturns201(t *testing.T) {
+	ma := &mockAgent{callErr: errors.New("agent: dial: connection refused")}
+	domains := newMockDomainRepo()
+	zones := newMockDNSZoneRepo()
+	records := newMockDNSRecordRepo()
+	users := &mockUserRepo{
+		users: map[string]*models.User{
+			"user1": {
+				ID: "user1", Email: "user1@example.com",
+				Username: strPtr("user1"), IsAdmin: false,
+			},
+		},
+	}
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	v1 := r.Group("/api/v1")
+	v1.Use(func(c *gin.Context) {
+		ginctx.SetClaims(c, &auth.AccessClaims{UserID: "user1", IsAdmin: true})
+		c.Next()
+	})
+	RegisterDomainRoutes(v1, DomainHandlerConfig{
+		Domains: domains, Users: users, Agent: ma,
+		DNSZones: zones, DNSRecords: records,
+	})
+
+	body := `{"name":"agentdown.test","user_id":"user1"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/domains", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	require.Equal(t, http.StatusCreated, w.Code, "agent failure must not block create; body: %s", w.Body.String())
+
+	var resp models.Domain
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &resp))
+	// ADR-0080: email_enabled is the INTENT flag. Even when inline
+	// auto-enable fails (agent unreachable here), the row's intent
+	// stays "on" so the reconciler can converge provisioning later.
+	// What stays empty is the dependent provisioning state: no DKIM
+	// material, no email_enabled_at timestamp.
+	require.True(t, resp.EmailEnabled, "email_enabled intent stays 1 even when provisioning failed")
+	require.Nil(t, resp.DkimSelector, "no DKIM material when agent never ran")
+	require.Nil(t, resp.EmailEnabledAt, "email_enabled_at unset when agent never ran")
+}
+
+// --- DKIM rotation (JAB-286) — the rotate handler had no tests before the
+// lifecycle moved into internal/domainmailops; these pin the six-code error
+// contract + the 200 shape the module's typed results map onto. ---
+
+// dkimRotateRouter wires the domain-email routes with one pre-seeded domain
+// owned by user1. withAgent controls whether an agent is present (so the
+// nil-agent 503 path is reachable); emailEnabled seeds the rotate guard.
+func dkimRotateRouter(t *testing.T, ma *mockAgent, withAgent, emailEnabled bool) (*gin.Engine, *mockDomainRepo) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+	v1 := r.Group("/api/v1")
+	v1.Use(func(c *gin.Context) {
+		ginctx.SetClaims(c, &auth.AccessClaims{UserID: "user1", IsAdmin: false})
+		c.Next()
+	})
+	domains := newMockDomainRepo()
+	domains.domains["dom1"] = &models.Domain{ID: "dom1", UserID: "user1", Name: "example.com", EmailEnabled: emailEnabled}
+	cfg := DomainEmailHandlerConfig{Domains: domains}
+	if withAgent {
+		cfg.Agent = ma
+	}
+	RegisterDomainEmailRoutes(v1, cfg)
+	return r, domains
+}
+
+func doRotate(t *testing.T, r *gin.Engine) *httptest.ResponseRecorder {
+	t.Helper()
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/v1/domains/dom1/email/dkim-rotate", nil))
+	return w
+}
+
+func TestDomainEmail_RotateDKIM_Success(t *testing.T) {
+	ma := &mockAgent{callFn: func(_ context.Context, cmd string, _ any) (json.RawMessage, error) {
+		require.Equal(t, "domain.email_dkim_rotate", cmd)
+		return json.RawMessage(`{"old_dkim_public_key":"p=OLD","new_dkim_public_key":"p=NEW","old_key_backup_path":"/etc/x.old",` +
+			`"old_dkim_rsa_public_key":"p=OLDRSA","new_dkim_rsa_public_key":"p=NEWRSA"}`), nil
+	}}
+	r, _ := dkimRotateRouter(t, ma, true, true)
+	w := doRotate(t, r)
+	require.Equal(t, http.StatusOK, w.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.Equal(t, "dotnext", body["dkim_selector"])
+	require.Equal(t, "p=NEW", body["new_dkim_public_key"])
+	require.Equal(t, "p=OLD", body["old_dkim_public_key"])
+	require.Equal(t, "/etc/x.old", body["old_key_backup_path"])
+	require.Equal(t, "dotnextrsa", body["dkim_rsa_selector"])
+	require.Equal(t, "p=NEWRSA", body["new_dkim_rsa_public_key"])
+	require.Equal(t, "p=OLDRSA", body["old_dkim_rsa_public_key"])
+	require.Equal(t, 1, ma.callCount)
+}
+
+// TestDomainEmail_RotateDKIM_SurfacesTypedWarningOnWire is the api-side routing
+// proof for JAB-286 AC3: the rotate handler projects domainmailops' typed
+// Warnings through WarningMessages() into the response `warnings` field, with no
+// other warning source mixed in (unlike enable, which also folds in
+// buildHintsWithStatus and so cannot isolate this route). A user-edited row at a
+// managed slot survives the m6-scoped wipe and blocks the republish, so the
+// module returns exactly one WarnConflict; its Message() must appear on the wire
+// verbatim. Dropping the projection at the handler, or breaking WarningMessages,
+// reddens this.
+func TestDomainEmail_RotateDKIM_SurfacesTypedWarningOnWire(t *testing.T) {
+	ma := &mockAgent{callFn: func(_ context.Context, cmd string, _ any) (json.RawMessage, error) {
+		require.Equal(t, "domain.email_dkim_rotate", cmd)
+		return json.RawMessage(`{"old_dkim_public_key":"p=OLD","new_dkim_public_key":"p=NEW","old_key_backup_path":"/etc/x.old"}`), nil
+	}}
+	r, domains, _, records := domainEmailRouterWithDNS(t, ma)
+	// The rotate guard requires email already enabled with DKIM material.
+	sel, key := "dotnext", "v=DKIM1;k=ed25519;p=OLD"
+	domains.domains["dom1"].EmailEnabled = true
+	domains.domains["dom1"].DkimSelector = &sel
+	domains.domains["dom1"].DkimPublicKey = &key
+	// A user-edited CNAME at the autoconfig slot: it survives the m6-scoped wipe
+	// and blocks the republish, so the module returns exactly one WarnConflict.
+	records.records["r-user-autoconfig"] = &models.DNSRecord{
+		ID: "r-user-autoconfig", ZoneID: "zone1",
+		Name: "autoconfig", Type: "CNAME", Content: "something-else",
+		Managed: false, ManagedBy: nil,
+	}
+
+	w := doRotate(t, r)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+	var body struct {
+		Warnings []string `json:"warnings"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.Contains(t, body.Warnings,
+		"A user-edited CNAME record at autoconfig is blocking the autoconfig entry. Remove it in the DNS editor or accept M6 may overwrite.",
+		"the module's typed WarnConflict must reach the rotate response verbatim; got %v", body.Warnings)
+}
+
+func TestDomainEmail_RotateDKIM_NotEnabled_409(t *testing.T) {
+	ma := &mockAgent{callFn: func(context.Context, string, any) (json.RawMessage, error) {
+		t.Fatal("agent must not be called when email is disabled")
+		return nil, nil
+	}}
+	r, _ := dkimRotateRouter(t, ma, true, false)
+	w := doRotate(t, r)
+	require.Equal(t, http.StatusConflict, w.Code)
+	require.Contains(t, w.Body.String(), "email_not_enabled")
+	require.Equal(t, 0, ma.callCount)
+}
+
+func TestDomainEmail_RotateDKIM_AgentUnconfigured_503(t *testing.T) {
+	r, _ := dkimRotateRouter(t, nil, false, true)
+	w := doRotate(t, r)
+	require.Equal(t, http.StatusServiceUnavailable, w.Code)
+	require.Contains(t, w.Body.String(), "agent_unconfigured")
+}
+
+func TestDomainEmail_RotateDKIM_AgentFailed_500(t *testing.T) {
+	ma := &mockAgent{callErr: errors.New("dial: connection refused")}
+	r, _ := dkimRotateRouter(t, ma, true, true)
+	w := doRotate(t, r)
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+	require.Contains(t, w.Body.String(), "agent_rotate_failed")
+}
+
+func TestDomainEmail_RotateDKIM_BadResponse_500(t *testing.T) {
+	ma := &mockAgent{callFn: func(context.Context, string, any) (json.RawMessage, error) {
+		return json.RawMessage(`{"old_dkim_public_key":"p=OLD","new_dkim_public_key":""}`), nil
+	}}
+	r, _ := dkimRotateRouter(t, ma, true, true)
+	w := doRotate(t, r)
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+	require.Contains(t, w.Body.String(), "agent_bad_response")
+}
+
+func TestDomainEmail_RotateDKIM_PersistFailed_500(t *testing.T) {
+	ma := &mockAgent{callFn: func(context.Context, string, any) (json.RawMessage, error) {
+		return json.RawMessage(`{"new_dkim_public_key":"p=NEW","new_dkim_rsa_public_key":"p=NEWRSA"}`), nil
+	}}
+	r, domains := dkimRotateRouter(t, ma, true, true)
+	domains.emailStateErr = errors.New("db down")
+	w := doRotate(t, r)
+	require.Equal(t, http.StatusInternalServerError, w.Code)
+	require.Contains(t, w.Body.String(), "persist_failed")
+	// The mail server already signs with the new keys: the operator gets
+	// them to publish by hand.
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.Equal(t, "p=NEW", body["new_dkim_public_key"])
+	require.Equal(t, "p=NEWRSA", body["new_dkim_rsa_public_key"])
+}

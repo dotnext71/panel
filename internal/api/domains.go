@@ -1,0 +1,2923 @@
+package api
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net"
+	"net/http"
+	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/gin-gonic/gin"
+
+	"github.com/dotnext-panel/dotnext/internal/agent"
+	"github.com/dotnext-panel/dotnext/internal/dnscompile"
+	"github.com/dotnext-panel/dotnext/internal/domainops"
+	"github.com/dotnext-panel/dotnext/internal/frontcontroller"
+	"github.com/dotnext-panel/dotnext/internal/ginctx"
+	"github.com/dotnext-panel/dotnext/internal/ids"
+	"github.com/dotnext-panel/dotnext/internal/kratosclient"
+	"github.com/dotnext-panel/dotnext/internal/middleware"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/nginxrules"
+	"github.com/dotnext-panel/dotnext/internal/reconciler"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+)
+
+type DomainHandlerConfig struct {
+	Domains repository.DomainRepository
+	// DomainTeardowns persists the JAB-236 tombstones: delete writes one
+	// BEFORE the row goes, so the host-side teardown survives a panel
+	// restart and gets retried by the reconciler until it succeeds.
+	DomainTeardowns repository.DomainTeardownRepository
+	// DomainOwnership (GH #1816 / ADR-0170) reads the proof-required switch
+	// at create and backs the ownership endpoints. Nil means proof is
+	// required: a tenant create is stored pending.
+	DomainOwnership repository.DomainOwnershipRepository
+	Users           repository.UserRepository
+	SSLCerts        repository.SSLCertificateRepository
+	SharedCerts     repository.SharedCertificateRepository
+	// MailCerts lets the GH #1579 rename re-queue the per-domain mail TLS cert
+	// for reissuance under the NEW name (its row is domain_id-keyed and survives
+	// the rename, but its lineage still covers mail.<old>). Optional — a panel
+	// without per-domain mail TLS simply skips that heal.
+	MailCerts repository.MailCertificateRepository
+	// Mailboxes lets the GH #1603 facet-preserving delete purge a domain's
+	// mailbox rows when the caller opts to also delete the Mail Domain. Optional —
+	// nil skips the row cleanup (Stalwart accounts are purged regardless).
+	Mailboxes repository.MailboxRepository
+	// FtpAccounts lets the GH #1579 rename refuse when an FTP/SFTP subaccount is
+	// homed at or under the docroot being moved — its jail/chroot is not moved
+	// automatically. Optional — nil skips the check (the rename proceeds).
+	FtpAccounts repository.FtpAccountRepository
+	// DMARCAggregate / TLSRPTAggregate let the GH #1579 rename move the domain's
+	// DMARC + TLS-RPT report history onto the new name so those dashboards are not
+	// orphaned. Optional — nil skips the re-key (the rename still succeeds).
+	DMARCAggregate  repository.DMARCAggregateRepository
+	TLSRPTAggregate repository.TLSRPTAggregateRepository
+	// Forwarders lets the GH #1579 rename rewrite the domain's alias forwarder
+	// targets to the new name. Optional — nil skips (the rename still succeeds).
+	Forwarders repository.EmailForwarderRepository
+	Packages   repository.PackageRepository
+	Agent      agent.AgentInterface
+	Reconciler *reconciler.Reconciler
+	// PortAllocations (GH #1175): shared loopback-port pool for reverse-proxy domains.
+	PortAllocations repository.PortAllocationRepository
+	// DNSZones + DNSRecords feed the auto-enable-email path on create.
+	// Both optional — when unset, create proceeds without flipping email
+	// on (matches the pre-auto-enable behaviour). The explicit
+	// /domains/:id/email endpoint is wired via DomainEmailHandlerConfig
+	// separately and is the retry path for domains that skip auto-enable
+	// or hit an error during create.
+	DNSZones   repository.DNSZoneRepository
+	DNSRecords repository.DNSRecordRepository
+	// BWDaily backs the GET /domains/:id/bandwidth endpoint (M13.1).
+	// Optional — nil makes the endpoint return 503 instead of 404 so
+	// the panel UI knows the feature isn't wired vs. the domain
+	// genuinely having no traffic.
+	BWDaily repository.BWDailyRepository
+	// ManagedIPs is the M24 IP-pool repo. Optional: when nil, the
+	// listen_ipv*_id PATCH path is rejected with 503 (the pool is the
+	// source of truth) and GET responses skip the denormalized
+	// listen_ipv4 / listen_ipv6 nested objects.
+	ManagedIPs repository.ManagedIPRepository
+	// ServerSettings gates the tenant-safe nginx options opt-in (GH #307).
+	ServerSettings repository.ServerSettingsRepository
+	// WebDomainAliases (GH #1625) backs the reverse cross-tenant hijack guard:
+	// domain-create must reject a name whose apex/www/mail-helper server_name is
+	// already claimed by another domain's alias (aliasCollision). Optional — a
+	// nil repo skips the check (fail-open only when the alias feature is unwired).
+	WebDomainAliases repository.WebDomainAliasRepository
+	// DNSTemplates (GH #1627) resolves a tenant-selected custom DNS template at
+	// create: it validates the template exists and flips the domain to the
+	// external 'custom' mail posture + records mail_template_id, which the
+	// reconciler reads once to seed the template's records. Optional — nil makes
+	// a create that names a dns_template_id return 503 (fail-closed), never a
+	// silent skip.
+	DNSTemplates repository.DNSTemplateRepository
+	// WebTemplates (GH #1624 / ADR-0169 Phase 3) resolves an admin-selected web
+	// (nginx) template at create: it validates the template exists + its
+	// directives pass the admin denylist, then snapshot-copies them onto the new
+	// domain's nginx_custom_directives. Optional — nil makes a create that names a
+	// web_template_id return 503 (fail-closed), never a silent skip.
+	WebTemplates repository.WebTemplateRepository
+	// AppInstalls (GH #1238 chown) backs the change-owner refusal: a domain
+	// with an app install carries the current owner's DB creds in its config,
+	// so re-owning it would leak a live cross-tenant credential. REQUIRED for
+	// the chown route — a nil repo makes the handler 503 rather than silently
+	// skip the security check (fail-closed).
+	AppInstalls repository.ApplicationInstallRepository
+	// PythonApps lets the change-owner stop the units of the domain's Python
+	// apps, which the change deletes (GH #2289). Optional — nil leaves them to
+	// the reconciler's sweep.
+	PythonApps repository.PythonAppRepository
+	// AuditEvents records the admin change-owner (GH #1238). Optional — nil
+	// in dev binaries makes the audit a no-op.
+	AuditEvents repository.AuditEventRepository
+	// KratosClient gates the change-owner route behind the JAB-380 recent-auth
+	// step-up (same as rename / the root File Manager).
+	KratosClient *kratosclient.Client
+}
+
+const (
+	defaultDomainsPageSize = 20
+	maxDomainsPageSize     = 200
+)
+
+// Security validation patterns. The domain-name FQDN regex moved into the shared
+// domainops leaf (domainops.ValidateDomainName, JAB-279) so every door validates
+// the identical shape; htmlTagRe stays here because it is also used to STRIP tags
+// from raw input before validation (automation_billing.go, the create handler).
+var (
+	// HTML tag detection for XSS prevention
+	htmlTagRe = regexp.MustCompile(`<[^>]*>`)
+)
+
+func RegisterDomainRoutes(g *gin.RouterGroup, cfg DomainHandlerConfig) {
+	h := &domainHandler{cfg: cfg}
+	domains := g.Group("/domains")
+	domains.GET("", h.list)
+	domains.POST("", h.create)
+	domains.GET("/:id", h.get)
+	domains.PATCH("/:id", h.update)
+	domains.DELETE("/:id", h.delete)
+	domains.GET("/:id/bandwidth", h.bandwidth)
+	// GH #1579: rename a domain in place (owner-scoped; admin or the domain's
+	// own tenant). Experimental phase 1 — web-only, mail must be off.
+	domains.POST("/:id/rename", h.rename)
+
+	// GH #1238: reassign a domain to a new tenant (move + re-own the docroot,
+	// repoint the DB row). Admin-only AND behind the JAB-380 recent-auth
+	// step-up — it moves files and hands them to another tenant, mirroring the
+	// user-rename surface. Registered on the base group, not /domains.
+	g.POST("/admin/domains/:id/chown", middleware.RequireAdmin(), h.chown)
+}
+
+type domainHandler struct{ cfg DomainHandlerConfig }
+
+type createDomainRequest struct {
+	Name    string `json:"name" binding:"required"`
+	UserID  string `json:"user_id"`
+	DocRoot string `json:"doc_root"`
+	// GH#181: mail provider chosen at domain-add. Empty -> "dotnext".
+	// Drives EmailEnabled + SkipAutoSAN via models.DeriveMailFlags.
+	MailProvider    string `json:"mail_provider"`
+	M365Onmicrosoft string `json:"m365_onmicrosoft"`
+	GoogleDKIM      string `json:"google_dkim"`
+	// CreateWWW (GH #225) opts the domain into the bootstrap www CNAME.
+	// Omitted/false => no www record (the new default).
+	CreateWWW bool `json:"create_www"`
+	// TempURLEnabled (migration 000243) opts the domain into a preview
+	// URL (<slug>.preview.<hostname>). Off by default.
+	TempURLEnabled bool `json:"temp_url_enabled"`
+	// ReverseProxy (GH #1175): create a reverse-proxy domain (panel allocates a
+	// loopback port; the vhost proxies / to it). No docroot/PHP.
+	ReverseProxy bool `json:"reverse_proxy"`
+	// ReverseProxyPort (GH #1401): the specific loopback port the tenant wants
+	// the domain proxied to (e.g. their app already listens on 6875). 0/absent
+	// = the panel auto-assigns from its reverse-proxy pool (the #1175 default).
+	// Validated (range + dotnext-infra denylist + not-already-allocated) before
+	// it is reserved — a tenant must not be able to point their public domain at
+	// the panel, a system service, or another tenant's allocated port.
+	ReverseProxyPort uint32 `json:"reverse_proxy_port,omitempty"`
+	// SSLMode (GH #246) — le|self|none at create. 'custom' is rejected here:
+	// it needs a cert upload, set via PUT /domains/:id/ssl/custom after create.
+	// Empty defaults to 'le'.
+	SSLMode string `json:"ssl_mode"`
+	// WebTemplateID (GH #1624 / ADR-0169 Phase 3) is an admin web (nginx)
+	// template to seed this domain's nginx_custom_directives from. ADMIN-ONLY:
+	// the create op rejects it from a non-admin caller (web_template_admin_only).
+	// Empty/absent for every non-template create.
+	WebTemplateID string `json:"web_template_id"`
+	// DNSTemplateID (GH #1627) is an admin-defined custom DNS template a tenant
+	// selected at create. Unlike WebTemplateID it is NOT admin-only: any caller
+	// may pick a published template. When set, the create op overrides the mail
+	// posture to external ('custom') and the reconciler seeds the template's
+	// records into the fresh zone; it is mutually exclusive with an explicit
+	// mail provider and requires the panel to host DNS (manage_dns=true). The op
+	// validates existence and the exclusivity rules. Empty/absent for every
+	// non-template create.
+	DNSTemplateID string `json:"dns_template_id"`
+	// WebEnabled / ManageDNS (GH #1449) are the "Add Web Domain" service
+	// checkboxes: both default ON (nil == checked == current behaviour), so a
+	// caller only sends false to OPT OUT. WebEnabled=false → no vhost/docroot/
+	// PHP (a mail-only or DNS-only entry); ManageDNS=false → the panel does not
+	// host DNS for this domain (external DNS). Pointers so an absent field is
+	// the default-on, distinct from an explicit false.
+	WebEnabled *bool `json:"web_enabled"`
+	ManageDNS  *bool `json:"manage_dns"`
+	// IPAddress (GH #1540) is the apex IP of a DNS-only zone — the "pointed IP"
+	// of the Add DNS Zone flow. Only valid when web_enabled=false and DNS is on
+	// (validated in createDomainOp as a bare IPv4). Empty/absent for web and
+	// mail domains, whose apex is panel-managed.
+	IPAddress string `json:"ip_address"`
+	// IPv6Address (GH #1540 follow-up) is the optional apex IPv6 (AAAA) of a
+	// DNS-only zone. Same gate as IPAddress; validated as a bare IPv6.
+	IPv6Address string `json:"ip6_address"`
+}
+
+// normalizeDomainName canonicalizes a domain for storage (GH #884): trim edge
+// whitespace and lowercase. The rule lives in the domainops leaf (JAB-279) so
+// the operator CLI create path canonicalizes identically and the stored domain
+// identity cannot drift between adapters; this wrapper keeps the existing call
+// sites (create / rename / alias / automation) unchanged. Callers still run
+// validateDomainName on the result to enforce RFC shape.
+func normalizeDomainName(s string) string {
+	return domainops.NormalizeDomainName(s)
+}
+
+// validateDomainName validates domain name for security and RFC compliance
+// validateDomainName is the HTTP adapter over the shared domainops FQDN gate
+// (JAB-279 AC2/AC6). The leaf owns the rule so REST, automation, and the CLI
+// accept the identical set of names; this adapter maps each typed reason back to
+// the exact body string the handler returned before the extraction, so the wire
+// is unchanged.
+func validateDomainName(s string) error {
+	return domainNameError(domainops.ValidateDomainName(s))
+}
+
+// domainNameError maps a domainops name rejection to the body string the
+// handler returned before the extraction; nil and any other error map to nil.
+// domainops.Create returns the same sentinels, so its REST adapter reuses this.
+func domainNameError(err error) error {
+	switch {
+	case errors.Is(err, domainops.ErrDomainNameEmpty):
+		return fmt.Errorf("domain name cannot be empty")
+	case errors.Is(err, domainops.ErrDomainNameWhitespace):
+		return fmt.Errorf("domain name contains invalid whitespace characters")
+	case errors.Is(err, domainops.ErrDomainNameTooLong):
+		return fmt.Errorf("domain name exceeds 253 character limit")
+	case errors.Is(err, domainops.ErrDomainNameHTML):
+		return fmt.Errorf("domain name contains invalid HTML characters")
+	case errors.Is(err, domainops.ErrDomainNameTraversal):
+		return fmt.Errorf("domain name contains invalid path characters")
+	case errors.Is(err, domainops.ErrDomainNameNotFQDN):
+		return fmt.Errorf("domain name is not a valid FQDN (requires at least two labels and 2+ letter TLD)")
+	}
+	return nil
+}
+
+// isDomainNameError reports whether err is a domainops name rejection.
+func isDomainNameError(err error) bool { return domainNameError(err) != nil }
+
+// docRootError maps a domainops document-root rejection to the body string the
+// handler returned before the extraction. The admin rule yields outside-home
+// or traversal, the tenant rule traversal or outside-domain; the
+// "must be inside …" message is dynamic, so it is rebuilt from the owner and
+// domain. Any other error passes through.
+func docRootError(err error, username, domainName string) error {
+	switch {
+	case errors.Is(err, domainops.ErrDocRootOutsideHome):
+		return fmt.Errorf("document root must be under user's home directory")
+	case errors.Is(err, domainops.ErrDocRootTraversal):
+		return fmt.Errorf("document root contains invalid path traversal sequences")
+	case errors.Is(err, domainops.ErrDocRootOutsideDomain):
+		return fmt.Errorf("document root must be inside /home/%s/domains/%s/", username, domainName)
+	}
+	return err
+}
+
+// validateDocumentRoot validates document root path to prevent path traversal
+func validateDocumentRoot(docRoot, username, domainName string) error {
+	// The confinement rule lives in the domainops leaf (JAB-279) so the CLI
+	// create path enforces the identical check. This adapter maps the leaf's
+	// sentinels back to the exact body strings the HTTP handler returned before
+	// the extraction, so the wire is unchanged.
+	return docRootError(domainops.ValidateDocumentRoot(docRoot, username, domainName), username, domainName)
+}
+
+// validateTenantDocumentRoot is the stricter confinement for a NON-admin owner
+// changing their own domain's docroot (GH #526): the path must stay inside the
+// domain's OWN tree /home/<user>/domains/<domain>/ (so an app can point at a sub-
+// or parent dir like .../public), never another domain or elsewhere in the home.
+// Admins keep the looser validateDocumentRoot (anywhere under the owner's home).
+func validateTenantDocumentRoot(docRoot, username, domainName string) error {
+	// Stricter confinement, same extraction as validateDocumentRoot: the leaf
+	// owns the rule, this adapter restores the exact wire strings.
+	return docRootError(domainops.ValidateTenantDocumentRoot(docRoot, username, domainName), username, domainName)
+}
+
+type updateDomainRequest struct {
+	IsEnabled *bool `json:"is_enabled,omitempty"`
+	// DocRoot (GH #265) — admin-only change of the document root. Empty
+	// resets to the default /home/<user>/domains/<name>/public_html. The
+	// reconciler's per-tick domain.create mkdir -p's the new path + re-renders
+	// the vhost, so changing it is safe (old files are not moved).
+	DocRoot               *string `json:"doc_root,omitempty"`
+	NginxCustomDirectives *string `json:"nginx_custom_directives,omitempty"`
+	// NginxTenantDirectives (GH #1624 / ADR-0169 Phase 4) — a tenant-safe raw
+	// nginx snippet, gated on tenant_domain_options_enabled, validated with the
+	// tight tenant value-grammar. Separate from the admin-only field above.
+	NginxTenantDirectives *string                  `json:"nginx_tenant_directives,omitempty"`
+	RedirectAllTo         *string                  `json:"redirect_all_to,omitempty"`
+	RedirectAllType       *string                  `json:"redirect_all_type,omitempty"`
+	PageRedirects         *models.PageRedirects    `json:"page_redirects,omitempty"`
+	NginxRules            *models.NginxRules       `json:"nginx_rules,omitempty"`
+	NginxSafeOptions      *models.NginxSafeOptions `json:"nginx_safe_options,omitempty"`
+	IndexPriority         *string                  `json:"index_priority,omitempty"`
+	WebmailEnabled        *bool                    `json:"webmail_enabled,omitempty"`
+	// TempURLEnabled toggles the preview URL vhost block. Owner or admin.
+	TempURLEnabled *bool `json:"temp_url_enabled,omitempty"`
+	// AllowSubdomainDelegation (GH #1812) — the owner's opt-in for other tenants
+	// to self-service strict subdomains of this domain. Owner-settable on their
+	// own row (not admin-only): it only ever WIDENS access to the owner's own
+	// namespace, and CrossTenantSuffixCollision reads it in the parent direction.
+	// Pointer so an absent field leaves the stored value untouched.
+	AllowSubdomainDelegation *bool `json:"allow_subdomain_delegation,omitempty"`
+	// BotChallengeExempt — per-domain opt-out from the server-wide AppSec
+	// bot-detection challenge. ADMIN-ONLY: a tenant must not be able to weaken
+	// the operator's security posture on their own domain. Silently ignored
+	// for a non-admin PATCH (pointer pattern), never 403.
+	BotChallengeExempt *bool `json:"bot_challenge_exempt,omitempty"`
+	// BotChallengeInclude — per-domain opt-IN, effective only when the
+	// server-wide bot-detection scope is "selected". Owner or admin (#1467):
+	// opting a site in only adds protection. Set in the owner-or-admin section
+	// of update, not the admin-only block.
+	BotChallengeInclude *bool `json:"bot_challenge_include,omitempty"`
+	// BlockAICrawlers — refuse AI crawlers that identify themselves. Owner or
+	// admin: it only turns visitors away from the owner's own site.
+	BlockAICrawlers *bool `json:"block_ai_crawlers,omitempty"`
+	// RateLimitRPS / ConnectionLimit — M18 per-domain nginx request rate
+	// (requests per second per client IP, burst twice that) and concurrent
+	// connections per client IP. 0 = no limit. ADMIN-ONLY, silently ignored
+	// for a tenant like the other admin fields; an anti-noise filter, not a
+	// security control (ADR-0089).
+	RateLimitRPS    *uint32 `json:"rate_limit_rps,omitempty"`
+	ConnectionLimit *uint32 `json:"connection_limit,omitempty"`
+	// GH #648 (DMARCbis): per-domain settable np (non-existent subdomain
+	// policy) + t=y testing tag, folded into the canonical _dmarc record.
+	DmarcNP      *string `json:"dmarc_np,omitempty"`
+	DmarcTesting *bool   `json:"dmarc_testing,omitempty"`
+	// GH#181: mail provider + optional DKIM tokens. Pointers so an absent
+	// field in the PATCH leaves the columns untouched. When MailProvider is
+	// present, EmailEnabled + SkipAutoSAN are re-derived from it.
+	MailProvider    *string `json:"mail_provider,omitempty"`
+	M365Onmicrosoft *string `json:"m365_onmicrosoft,omitempty"`
+	GoogleDKIM      *string `json:"google_dkim,omitempty"`
+	// M24: per-domain IP binding. nullableUint64 distinguishes
+	// "absent in PATCH" (don't touch the column) from "explicitly null"
+	// (clear binding → fall back to server default for the family) from
+	// "set to ID" (rebind). PATCH `{}`-only callers retain prior
+	// behaviour exactly.
+	ListenIPv4ID nullableUint64 `json:"listen_ipv4_id,omitempty"`
+	ListenIPv6ID nullableUint64 `json:"listen_ipv6_id,omitempty"`
+	// SSLMode (GH #246) — switch TLS mode. 'custom' is set only via
+	// PUT /domains/:id/ssl/custom (needs the cert), not here.
+	SSLMode *string `json:"ssl_mode,omitempty"`
+	// GH #1462: per-domain CalDAV/CardDAV server override (hostname, optional
+	// host:port). Empty string clears it (DAV points back at mail.<domain>);
+	// absent leaves it untouched. Repoints the _caldavs/_carddavs SRV records.
+	CalDAVHost  *string `json:"caldav_host,omitempty"`
+	CardDAVHost *string `json:"carddav_host,omitempty"`
+}
+
+// davHostRe validates a CalDAV/CardDAV override: a DNS hostname (lower/mixed
+// case) with an optional :port. It is interpolated UNQUOTED into space-
+// separated SRV record content ("weight port target"), so anything but a bare
+// hostname[:port] — a space, control char, path, scheme — must be rejected
+// before it can corrupt the record or point discovery somewhere unintended.
+var davHostRe = regexp.MustCompile(`^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)(\.[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)+(:[0-9]{1,5})?$`)
+
+// validateDAVHost accepts an empty string (clears the override) or a
+// hostname[:port] that matches davHostRe with the host <=253 octets and any
+// port in 1..65535.
+func validateDAVHost(v string) error {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return nil
+	}
+	host := v
+	if i := strings.LastIndexByte(v, ':'); i > 0 {
+		port, err := strconv.Atoi(v[i+1:])
+		if err != nil || port < 1 || port > 65535 {
+			return errors.New("port must be 1-65535")
+		}
+		host = v[:i]
+	}
+	if len(host) > 253 {
+		return errors.New("host exceeds 253 characters")
+	}
+	if !davHostRe.MatchString(v) {
+		return errors.New("must be a hostname, optionally host:port (e.g. dav.example.com or dav.example.com:8443)")
+	}
+	return nil
+}
+
+// nullableUint64 is the M24 wrapper that lets a PATCH body distinguish
+// "field absent" from "field explicitly null". Gin's binding only invokes
+// UnmarshalJSON when the key is present in the body, so Set stays false
+// for absent fields. JSON null unmarshals to Set=true, Value=nil. JSON
+// number unmarshals to Set=true, Value=&n. Any other JSON shape returns
+// an error so the handler can 422.
+type nullableUint64 struct {
+	Set   bool
+	Value *uint64
+}
+
+func (n *nullableUint64) UnmarshalJSON(data []byte) error {
+	n.Set = true
+	if string(data) == "null" {
+		n.Value = nil
+		return nil
+	}
+	var v uint64
+	if err := json.Unmarshal(data, &v); err != nil {
+		return fmt.Errorf("listen_ipv*_id must be a positive integer or null: %w", err)
+	}
+	n.Value = &v
+	return nil
+}
+
+// sslBadge is the nested SSL-cert summary embedded in domain list rows so
+// the admin UI can differentiate self-signed from Let's Encrypt at a glance.
+type sslBadge struct {
+	Status    string     `json:"status"`
+	Issuer    *string    `json:"issuer,omitempty"`
+	IssuedAt  *time.Time `json:"issued_at,omitempty"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+}
+
+// domainListRow wraps a Domain with the optional SSL badge. Embedded so
+// existing consumers of the flat shape keep working.
+type domainListRow struct {
+	models.Domain
+	SSL *sslBadge `json:"ssl,omitempty"`
+	// Username is the owning hosting user's Linux account name, batched
+	// onto each row so the admin Domains table can show a meaningful
+	// owner column without a per-row lookup. nil when the owner can't be
+	// resolved (deleted user, admin-only row).
+	Username *string `json:"username,omitempty"`
+	// Denormalized listen-IP summaries — UI shows the address string
+	// without a second roundtrip per row. Always populated when
+	// ManagedIPs is wired: explicit binding ⇒ that row's address; null
+	// binding ⇒ family default address. nil only when the family default
+	// itself is missing (fresh install before a v6 was added etc.).
+	ListenIPv4 *ipSummary `json:"listen_ipv4,omitempty"`
+	ListenIPv6 *ipSummary `json:"listen_ipv6,omitempty"`
+	// Bytes30d is the prior-30-day bandwidth total in bytes harvested
+	// by the M13.1 goaccess pipeline. Populated on every list response
+	// when BWDaily is wired; omitted otherwise so older clients stay
+	// happy and a fresh install (no data yet) renders 0 not "missing".
+	Bytes30d *uint64 `json:"bytes_30d,omitempty"`
+	// TempURL is the full preview URL, populated when the domain has
+	// temp_url_enabled and a panel hostname is configured.
+	TempURL *string `json:"temp_url,omitempty"`
+	// Applications denormalizes this domain's One-Click app installs onto the
+	// row so the tenant Web Domains list can show an Application column without
+	// an N+1 (GH #1543). Ordered docroot-first; a domain may host several
+	// (/, /blog). omitempty drops both nil and an empty slice, so a domain with
+	// no apps ships no key (never a JSON null the SPA would trip on). Populated
+	// only when AppInstalls is wired; admin and tenant share this list handler,
+	// admin simply doesn't render the column.
+	Applications []domainAppSummary `json:"applications,omitempty"`
+	// Aliases lists the domain's web aliases (GH #1625) so the Web Domains
+	// list can show them under the name, in place of the document root.
+	// Same rules as Applications: one batch lookup, omitempty, dropped on
+	// error.
+	Aliases []domainAliasSummary `json:"aliases,omitempty"`
+}
+
+// domainAliasSummary is the per-row alias view (GH #1625): the hostname and
+// whether its ownership is proven. The cert state and the TXT record stay on
+// GET /domains/:id/aliases.
+type domainAliasSummary struct {
+	ID              string `json:"id"`
+	Hostname        string `json:"hostname"`
+	OwnershipStatus string `json:"ownership_status"`
+}
+
+// domainAppSummary is the per-row app view (GH #1543): just what the Web
+// Domains Application column needs — enough to show the badge, version, live
+// status, and mint a login. The full install record stays on GET /applications.
+type domainAppSummary struct {
+	ID           string  `json:"id"`
+	AppType      string  `json:"app_type"`
+	Version      *string `json:"version"`
+	Status       string  `json:"status"`
+	LastError    string  `json:"last_error,omitempty"`
+	Subdirectory string  `json:"subdirectory"`
+}
+
+// ipSummary is the denormalized {id, address} blob the UI consumes for
+// the per-domain listen IP. id may be 0 when this is a fall-through
+// "use server default" case where no managed_ip row exists for the family.
+type ipSummary struct {
+	ID      uint64 `json:"id"`
+	Address string `json:"address"`
+}
+
+// previewSlugConflict reports another temp-URL-enabled domain whose
+// preview slug collides with name ("" = none), through the domainops check
+// (JAB-279). Fail-open on a store error: the toggle is best-effort guarded,
+// and nginx first-wins is the backstop — but the skip is logged.
+func (h *domainHandler) previewSlugConflict(ctx context.Context, name, selfID string) string {
+	other, err := domainops.PreviewSlugConflict(ctx, h.cfg.Domains, name, selfID)
+	if err != nil {
+		slog.Warn("preview-slug collision check skipped (nginx first-wins is the backstop)",
+			"domain", name, "err", err)
+		return ""
+	}
+	return other
+}
+
+func (h *domainHandler) list(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthenticated"})
+		return
+	}
+
+	page, pageSize, opts := parseListOptions(c, defaultDomainsPageSize, maxDomainsPageSize)
+	// List rows never render the wide TEXT columns (DKIM material,
+	// disclaimer, nginx safe-options) — their consumers all fetch the
+	// single domain. Skip them so a full page doesn't drag megabytes of
+	// TEXT through MariaDB and the JSON encoder.
+	opts.OmitHeavyColumns = true
+
+	var domains []models.Domain
+	var total int64
+	var err error
+
+	if claims.IsAdmin {
+		// Admins can scope to a single owner via ?user_id (admin breadcrumbs /
+		// cross-entity links, #483). Validated as a ULID; empty = all domains.
+		if uid := c.Query("user_id"); uid != "" {
+			if !ids.IsValidULID(uid) {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user_id"})
+				return
+			}
+			domains, total, err = h.cfg.Domains.ListByUserID(c.Request.Context(), uid, opts)
+		} else {
+			domains, total, err = h.cfg.Domains.List(c.Request.Context(), opts)
+		}
+	} else {
+		domains, total, err = h.cfg.Domains.ListByUserID(c.Request.Context(), claims.UserID, opts)
+	}
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	if domains == nil {
+		domains = []models.Domain{}
+	}
+
+	// Enrich with SSL badge via a single batch lookup. Skipped cleanly if
+	// SSLCerts isn't wired (e.g. early-boot tests) so the list still works.
+	rows := make([]domainListRow, len(domains))
+	for i := range domains {
+		rows[i] = domainListRow{Domain: domains[i]}
+	}
+	if h.cfg.SSLCerts != nil && len(domains) > 0 {
+		domainIDs := make([]string, len(domains))
+		for i := range domains {
+			domainIDs[i] = domains[i].ID
+		}
+		certs, certErr := h.cfg.SSLCerts.FindByDomainIDs(c.Request.Context(), domainIDs)
+		if certErr == nil {
+			certMap := make(map[string]*models.SSLCertificate, len(certs))
+			for i := range certs {
+				certMap[certs[i].DomainID] = &certs[i]
+			}
+			for i := range rows {
+				rows[i].SSL = sslBadgeForDomain(&rows[i].Domain, certMap[rows[i].ID])
+			}
+		}
+		// On SSL lookup error we drop the badge silently — list response
+		// still ships flat domain data rather than 500ing.
+	}
+
+	// M13.1: denormalize prior-30-day bandwidth bytes onto each row so
+	// the admin/user Domains table can render the column without an
+	// N+1 fetch. Single batch lookup against bw_daily; on error we
+	// drop the field rather than 500ing — older clients ignore it.
+	if h.cfg.BWDaily != nil && len(domains) > 0 {
+		now := time.Now().UTC()
+		from := now.AddDate(0, 0, -29)
+		domainIDs := make([]string, len(domains))
+		for i := range domains {
+			domainIDs[i] = domains[i].ID
+		}
+		if bw, bwErr := h.cfg.BWDaily.SumByDomainIDs(c.Request.Context(), domainIDs, from, now); bwErr == nil {
+			for i := range rows {
+				v := bw[rows[i].ID]
+				rows[i].Bytes30d = &v
+			}
+		}
+	}
+
+	// Denormalize the owning user's Linux username onto each row so the
+	// admin table can show a meaningful owner. Single batch lookup; on
+	// error we drop the field rather than 500ing — the row's user_id is
+	// still on the wire as a fallback.
+	if h.cfg.Users != nil && len(domains) > 0 {
+		userIDs := make([]string, 0, len(domains))
+		seen := make(map[string]struct{}, len(domains))
+		for i := range domains {
+			if _, ok := seen[domains[i].UserID]; ok {
+				continue
+			}
+			seen[domains[i].UserID] = struct{}{}
+			userIDs = append(userIDs, domains[i].UserID)
+		}
+		users, userErr := h.cfg.Users.FindByIDs(c.Request.Context(), userIDs)
+		if userErr == nil {
+			usernameByID := make(map[string]*string, len(users))
+			for i := range users {
+				usernameByID[users[i].ID] = users[i].Username
+			}
+			for i := range rows {
+				rows[i].Username = usernameByID[rows[i].UserID]
+			}
+		}
+	}
+
+	// M24: denormalize listen_ipv4 / listen_ipv6 onto each row. Pool is
+	// capped at 100 (Step 2), so a single ListAll is cheaper than N
+	// FindByID calls. Errors silently drop the field rather than 500;
+	// the UI's per-IP page is the recovery path.
+	if h.cfg.ManagedIPs != nil && len(domains) > 0 {
+		ips, ipErr := h.cfg.ManagedIPs.ListAll(c.Request.Context())
+		if ipErr == nil {
+			ipByID := make(map[uint64]*models.ManagedIP, len(ips))
+			var defaultV4, defaultV6 *models.ManagedIP
+			for i := range ips {
+				ipByID[ips[i].ID] = &ips[i]
+				if ips[i].IsDefault {
+					switch ips[i].Family {
+					case "ipv4":
+						defaultV4 = &ips[i]
+					case "ipv6":
+						defaultV6 = &ips[i]
+					}
+				}
+			}
+			for i := range rows {
+				rows[i].ListenIPv4 = pickListenSummary(rows[i].ListenIPv4ID, ipByID, defaultV4)
+				rows[i].ListenIPv6 = pickListenSummary(rows[i].ListenIPv6ID, ipByID, defaultV6)
+			}
+		}
+	}
+
+	// Preview URLs: one settings lookup fills every enabled row's link.
+	if h.cfg.ServerSettings != nil {
+		needsPreview := false
+		for i := range rows {
+			if rows[i].TempURLEnabled {
+				needsPreview = true
+				break
+			}
+		}
+		if needsPreview {
+			if srv, sErr := h.cfg.ServerSettings.Get(c.Request.Context()); sErr == nil && srv != nil {
+				if base := models.EffectivePreviewBase(srv); base != "" {
+					for i := range rows {
+						if rows[i].TempURLEnabled {
+							u := "https://" + models.PreviewHost(rows[i].Name, base)
+							rows[i].TempURL = &u
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// GH #1543: denormalize each domain's One-Click app installs onto its row
+	// so the tenant Web Domains list can render an Application column without an
+	// N+1 fetch. Single batch lookup, grouped in memory (docroot-first, as the
+	// repo orders by subdirectory); on error we drop the field rather than
+	// 500ing — the standalone Applications page is the recovery path.
+	if h.cfg.AppInstalls != nil && len(domains) > 0 {
+		domainIDs := make([]string, len(domains))
+		for i := range domains {
+			domainIDs[i] = domains[i].ID
+		}
+		if installs, appErr := h.cfg.AppInstalls.ListByDomainIDs(c.Request.Context(), domainIDs); appErr == nil {
+			appsByDomain := make(map[string][]domainAppSummary, len(installs))
+			for i := range installs {
+				a := &installs[i]
+				appsByDomain[a.DomainID] = append(appsByDomain[a.DomainID], domainAppSummary{
+					ID:           a.ID,
+					AppType:      a.AppType,
+					Version:      a.Version,
+					Status:       a.Status,
+					LastError:    a.LastError,
+					Subdirectory: a.Subdirectory,
+				})
+			}
+			for i := range rows {
+				rows[i].Applications = appsByDomain[rows[i].ID]
+			}
+		}
+	}
+
+	// GH #1625: each domain's web aliases, for the list's secondary line.
+	if h.cfg.WebDomainAliases != nil && len(domains) > 0 {
+		domainIDs := make([]string, len(domains))
+		for i := range domains {
+			domainIDs[i] = domains[i].ID
+		}
+		if aliases, aErr := h.cfg.WebDomainAliases.ListByDomainIDs(c.Request.Context(), domainIDs); aErr == nil {
+			aliasesByDomain := make(map[string][]domainAliasSummary, len(domains))
+			for i := range aliases {
+				a := &aliases[i]
+				status := a.OwnershipStatus
+				if status != models.OwnershipVerified {
+					status = models.OwnershipPending // as ownershipView reads it
+				}
+				aliasesByDomain[a.DomainID] = append(aliasesByDomain[a.DomainID], domainAliasSummary{
+					ID:              a.ID,
+					Hostname:        a.Hostname,
+					OwnershipStatus: status,
+				})
+			}
+			for i := range rows {
+				rows[i].Aliases = aliasesByDomain[rows[i].ID]
+			}
+		}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"data":      rows,
+		"total":     total,
+		"page":      page,
+		"page_size": pageSize,
+	})
+}
+
+// pickListenSummary resolves a domain row's listen_ipv*_id to the
+// denormalized {id,address} blob using the prefetched batch maps.
+// Falls back to the family default when the binding is null; returns
+// nil only when no default is seeded for that family.
+func pickListenSummary(id *uint64, byID map[uint64]*models.ManagedIP, def *models.ManagedIP) *ipSummary {
+	if id != nil {
+		if row, ok := byID[*id]; ok {
+			return &ipSummary{ID: row.ID, Address: row.Address}
+		}
+	}
+	if def != nil {
+		return &ipSummary{ID: def.ID, Address: def.Address}
+	}
+	return nil
+}
+
+// enrichDomainResponse returns a domainListRow with the SSL badge and
+// listen-IP denormalization filled in for a single Domain — used by GET
+// /domains/:id and the PATCH response. The list path inlines its own
+// loop that batches IP lookups.
+func (h *domainHandler) enrichDomainResponse(ctx context.Context, d models.Domain) domainListRow {
+	row := domainListRow{Domain: d}
+	if h.cfg.SSLCerts != nil {
+		certs, err := h.cfg.SSLCerts.FindByDomainIDs(ctx, []string{d.ID})
+		if err == nil {
+			var cert *models.SSLCertificate
+			for i := range certs {
+				if certs[i].DomainID == d.ID {
+					cert = &certs[i]
+					break
+				}
+			}
+			row.SSL = sslBadgeForDomain(&d, cert)
+			// GH #1543: FindByID returns the raw row with an empty ssl_state
+			// (omitempty → the field vanishes), so the Web Domain Overview read
+			// "Off" even with a live cert. Fill the flat state from the cert we
+			// just fetched, using the same computation the list endpoints use —
+			// no extra query.
+			row.Domain.SSLState = h.cfg.Domains.ComputeSSLState(&d, cert)
+		}
+	}
+	if h.cfg.ManagedIPs != nil {
+		row.ListenIPv4 = h.resolveListenSummary(ctx, d.ListenIPv4ID, "ipv4")
+		row.ListenIPv6 = h.resolveListenSummary(ctx, d.ListenIPv6ID, "ipv6")
+	}
+	// The preview link, as the list fills it. Without it the Web Domain page
+	// (Overview tab, and the GH #1816 pending banner) never showed the link.
+	if d.TempURLEnabled && h.cfg.ServerSettings != nil {
+		if srv, err := h.cfg.ServerSettings.Get(ctx); err == nil && srv != nil {
+			if base := models.EffectivePreviewBase(srv); base != "" {
+				u := "https://" + models.PreviewHost(d.Name, base)
+				row.TempURL = &u
+			}
+		}
+	}
+	return row
+}
+
+// resolveListenSummary fetches the {id,address} blob for a domain's
+// listen_ipv*_id binding. Explicit binding ⇒ the bound row; nil binding
+// ⇒ the family default. Returns nil only when neither resolves (e.g.
+// the operator never seeded a v6 default).
+func (h *domainHandler) resolveListenSummary(ctx context.Context, id *uint64, family string) *ipSummary {
+	if id != nil {
+		row, err := h.cfg.ManagedIPs.FindByID(ctx, *id)
+		if err == nil {
+			return &ipSummary{ID: row.ID, Address: row.Address}
+		}
+		// Per F-H-2: FK RESTRICT means this should be unreachable, but
+		// if it does happen we fall through to default rather than emit
+		// a null. The operator UI surfaces a separate "missing IP"
+		// warning via the IP manager pages, not the per-domain GET.
+	}
+	row, err := h.cfg.ManagedIPs.FindDefaultByFamily(ctx, family)
+	if err != nil {
+		return nil
+	}
+	return &ipSummary{ID: row.ID, Address: row.Address}
+}
+
+// sslBadgeFromCert maps a cert row to the nested badge, filling Issuer
+// based on status so the UI doesn't have to encode the label logic.
+// sslBadgeForDomain derives the SSL badge from the domain's TLS mode AND its
+// cert row (GH #246). The cert status alone is misleading: a None-mode domain
+// keeps a revoked cert row, and a Self/None domain with no usable cert should
+// not read as "pending". Mode wins.
+func sslBadgeForDomain(d *models.Domain, cert *models.SSLCertificate) *sslBadge {
+	if d.SSLMode == models.SSLModeNone {
+		none := "None"
+		return &sslBadge{Status: "none", Issuer: &none}
+	}
+	// No usable cert yet (no row, or revoked after a mode switch).
+	if cert == nil || cert.Status == models.SSLStatusRevoked {
+		if d.SSLMode == models.SSLModeSelf {
+			iss := "Self-signed"
+			return &sslBadge{Status: "provisioning", Issuer: &iss}
+		}
+		// LE / custom with no cert yet: leave the badge off (UI shows its
+		// own issuing state) — unchanged behaviour.
+		return nil
+	}
+	return sslBadgeFromCert(cert)
+}
+
+func sslBadgeFromCert(cert *models.SSLCertificate) *sslBadge {
+	b := &sslBadge{
+		Status:    cert.Status,
+		IssuedAt:  cert.IssuedAt,
+		ExpiresAt: cert.ExpiresAt,
+	}
+	switch cert.Status {
+	case models.SSLStatusSelfSigned:
+		s := "Self-signed"
+		b.Issuer = &s
+	case models.SSLStatusIssued, models.SSLStatusRenewing:
+		s := "Let's Encrypt"
+		b.Issuer = &s
+	}
+	return b
+}
+
+func (h *domainHandler) get(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthenticated"})
+		return
+	}
+	domain, err := h.cfg.Domains.FindByID(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		if isNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	if !claims.IsAdmin && domain.UserID != claims.UserID {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
+	c.JSON(http.StatusOK, h.enrichDomainResponse(c.Request.Context(), *domain))
+}
+
+func (h *domainHandler) create(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthenticated"})
+		return
+	}
+
+	var req createDomainRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "validation_failed", "detail": err.Error()})
+		return
+	}
+
+	// GH #884: normalize (lowercase + trim) before anything consumes the name.
+	req.Name = normalizeDomainName(req.Name)
+
+	// SECURITY: validate the name (XSS / path traversal) BEFORE the HTML strip
+	// so a name carrying tags is rejected rather than silently sanitized. The
+	// op re-validates the stripped name (defense + for the automation caller),
+	// a no-op here.
+	if err := validateDomainName(req.Name); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_domain_name", "detail": err.Error()})
+		return
+	}
+	req.Name = htmlTagRe.ReplaceAllString(req.Name, "")
+
+	targetUserID := req.UserID
+	if !claims.IsAdmin {
+		targetUserID = claims.UserID
+	}
+
+	// JAB-233: the orchestration lives in createDomainOp so the automation
+	// account-create handler can reuse the exact GUI semantics.
+	dom, oerr := createDomainOp(c.Request.Context(), h, createDomainInput{
+		OwnerID:          targetUserID,
+		Name:             req.Name,
+		DocRoot:          req.DocRoot,
+		ActorIsAdmin:     claims.IsAdmin,
+		MailProvider:     req.MailProvider,
+		M365Onmicrosoft:  req.M365Onmicrosoft,
+		GoogleDKIM:       req.GoogleDKIM,
+		SSLMode:          req.SSLMode,
+		DNSTemplateID:    req.DNSTemplateID, // GH #1627 (tenant-selectable; validated + mutually exclusive with a mail provider in the op)
+		WebTemplateID:    req.WebTemplateID, // GH #1624 Phase 3 (admin-only; enforced in the op)
+		CreateWWW:        req.CreateWWW,
+		TempURLEnabled:   req.TempURLEnabled,
+		ReverseProxy:     req.ReverseProxy,
+		ReverseProxyPort: req.ReverseProxyPort,
+		// GH #1449: both default ON — only an explicit false opts out.
+		WebDisabled: req.WebEnabled != nil && !*req.WebEnabled,
+		DNSDisabled: req.ManageDNS != nil && !*req.ManageDNS,
+		// GH #1540: apex IP(s) for a DNS-only zone (validated web-off + family in op).
+		DNSApexIPv4: req.IPAddress,
+		DNSApexIPv6: req.IPv6Address,
+	})
+	if oerr != nil {
+		body := gin.H{"error": oerr.Code}
+		if oerr.Detail != "" {
+			body["detail"] = oerr.Detail
+		}
+		c.JSON(oerr.Status, body)
+		return
+	}
+
+	// GH #896: trigger an immediate targeted reconcile for the new domain so its
+	// DNS zone (and vhost) converge in SECONDS instead of waiting for the next
+	// periodic full reconcile. On an idle box the loop picks it up quickly, but
+	// on a box with many domains the full pass can lag minutes — during which a
+	// fresh domain doesn't resolve (dead page + certbot NXDOMAIN) even though the
+	// authoritative record is only a push away. This is the same Schedule the
+	// DNS-record and SSL-mode handlers already fire on a change.
+	if h.cfg.Reconciler != nil {
+		h.cfg.Reconciler.Schedule(dom.ID)
+	}
+
+	// EnableDomainEmailInline mutated domain in place on success so the response
+	// already carries email_enabled=true, dkim_selector, etc.
+	c.JSON(http.StatusCreated, dom)
+}
+
+// domainPatchTxErr carries the (status, code, detail) a validation failure
+// inside the PATCH apply transaction must surface. Returning it from the
+// transaction closure rolls the whole apply back (so a rejected mail_provider
+// or ssl_mode never leaves the general Update's columns persisted) while
+// letting the handler emit the exact JSON shape the pre-JAB-318 sequential
+// handler did. A plain (non-*domainPatchTxErr) error from the closure is a
+// persistence failure and maps to 500 internal, as before.
+type domainPatchTxErr struct {
+	status int
+	code   string
+	detail string
+}
+
+func (e *domainPatchTxErr) Error() string { return e.code }
+
+func (h *domainHandler) update(c *gin.Context) {
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthenticated"})
+		return
+	}
+
+	domain, err := h.cfg.Domains.FindByID(c.Request.Context(), c.Param("id"))
+	if err != nil {
+		if isNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	if !claims.IsAdmin && domain.UserID != claims.UserID {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
+
+	var req updateDomainRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusUnprocessableEntity, gin.H{"error": "validation_failed", "detail": err.Error()})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	if req.IsEnabled != nil && *req.IsEnabled != domain.IsEnabled {
+		domain.IsEnabled = *req.IsEnabled
+	}
+
+	// Bot-detection opt-IN — OWNER or admin (self-service). A tenant opting
+	// their own site INTO the challenge only adds protection, so unlike the
+	// opt-out (bot_challenge_exempt, admin-only above) it is safe for the owner
+	// to set. Ownership is already enforced by the forbidden gate above, so a
+	// tenant can only flip this on domains they own. Effective only in the
+	// server-wide "selected" scope; inert otherwise.
+	if req.BotChallengeInclude != nil {
+		domain.BotChallengeInclude = *req.BotChallengeInclude
+	}
+	if req.BlockAICrawlers != nil {
+		domain.BlockAICrawlers = *req.BlockAICrawlers
+	}
+
+	// Request limits: admin-only, written by their own repo method below
+	// (Domain.Update's allowlist leaves them out). Checked before any write.
+	var rateLimits *[2]uint32
+	if claims.IsAdmin && (req.RateLimitRPS != nil || req.ConnectionLimit != nil) {
+		rl := [2]uint32{domain.RateLimitRPS, domain.ConnectionLimit}
+		if req.RateLimitRPS != nil {
+			rl[0] = *req.RateLimitRPS
+		}
+		if req.ConnectionLimit != nil {
+			rl[1] = *req.ConnectionLimit
+		}
+		if rl[0] > maxDomainRateLimit || rl[1] > maxDomainRateLimit {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_rate_limit",
+				"detail": fmt.Sprintf("rate_limit_rps and connection_limit are 0 (no limit) to %d", maxDomainRateLimit)})
+			return
+		}
+		rateLimits = &rl
+	}
+
+	// Preview URL toggle — owner or admin. Enabling re-checks the slug
+	// collision (see previewSlugConflict).
+	if req.TempURLEnabled != nil && *req.TempURLEnabled != domain.TempURLEnabled {
+		if *req.TempURLEnabled {
+			if other := h.previewSlugConflict(ctx, domain.Name, domain.ID); other != "" {
+				c.JSON(http.StatusConflict, gin.H{"error": "temp_url_slug_conflict", "detail": "preview URL would collide with " + other})
+				return
+			}
+		}
+		domain.TempURLEnabled = *req.TempURLEnabled
+	}
+
+	// Nginx Custom Directives (raw textarea) AND Rule Builder
+	// (typed JSON rules) are admin-only. The threat model: a tenant
+	// with nginx_custom_directives can SSRF localhost services
+	// (panel-api, Bulwark, Stalwart admin, PHP-FPM sockets of other
+	// tenants), disclose files via `root /etc/dotnext/`,
+	// suppress CrowdSec via `access_log off;`, or redefine an
+	// auth_basic-protected location to drop the auth. nginx -t
+	// only catches syntax — none of those is a syntax error.
+	// proxy_pass targets in the Rule Builder are likewise unsafe
+	// without a target allowlist. Gate the entire surface here so
+	// the UI's tab-hiding can't be the only line of defense.
+	//
+	// Tenants posting these fields get them silently dropped (rather
+	// than 403'd) so they can still PATCH unrelated fields like
+	// is_enabled. Admin role bypasses the gate.
+	if claims.IsAdmin {
+		if req.NginxCustomDirectives != nil {
+			// GH #1580: this field is already admin-only (the gate above), so an
+			// admin gets the relaxed validator — the full directive range minus a
+			// small denylist — instead of the tenant safe-allowlist. nginx -t at
+			// apply time is the syntactic guard.
+			if msg := ValidateNginxDirectivesAdmin(*req.NginxCustomDirectives); msg != "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": msg})
+				return
+			}
+			domain.NginxCustomDirectives = req.NginxCustomDirectives
+		}
+
+		// Per-domain bot-detection opt-out (admin-only). The reconciler picks
+		// up the flag on its next pass, writes the exempt-hosts state file, and
+		// (while bot detection is on) has the agent re-render dotnext-bot-exempt.
+		if req.BotChallengeExempt != nil {
+			domain.BotChallengeExempt = *req.BotChallengeExempt
+		}
+
+		if req.NginxRules != nil {
+			allowInternalProxy := false
+			if h.cfg.ServerSettings != nil {
+				if st, sErr := h.cfg.ServerSettings.Get(ctx); sErr == nil && st != nil {
+					allowInternalProxy = st.NginxProxyAllowInternal
+				}
+			}
+			if err := validateNginxRulesWith(*req.NginxRules, allowInternalProxy); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			domain.NginxRules = *req.NginxRules
+		}
+
+		// DocRoot (GH #265): admin-only. Confine to the owner's home via
+		// validateDocumentRoot; empty resets to the canonical default.
+		if req.DocRoot != nil {
+			owner, oerr := h.cfg.Users.FindByID(ctx, domain.UserID)
+			if oerr != nil || owner == nil || owner.Username == nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "owner_lookup_failed"})
+				return
+			}
+			newRoot := strings.TrimSpace(*req.DocRoot)
+			if newRoot == "" {
+				newRoot = "/home/" + *owner.Username + "/domains/" + domain.Name + "/public_html"
+			}
+			if err := validateDocumentRoot(newRoot, *owner.Username, domain.Name); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_doc_root", "detail": err.Error()})
+				return
+			}
+			domain.DocRoot = newRoot
+		}
+	}
+
+	// GH #307: a non-admin owner may set a SAFE SUBSET of the Rule Builder
+	// (rewrite + custom_header) on their own domain when the admin has opted in
+	// (server_settings.tenant_domain_options_enabled). proxy_pass/ip_access stay
+	// admin-only (see the admin block above). The field is silently dropped when
+	// the opt-in is off, mirroring nginx_safe_options, so other fields still PATCH.
+	if !claims.IsAdmin && req.NginxRules != nil {
+		allowed := false
+		if h.cfg.ServerSettings != nil {
+			if st, sErr := h.cfg.ServerSettings.Get(ctx); sErr == nil && st != nil && st.TenantDomainOptionsEnabled {
+				allowed = true
+			}
+		}
+		if allowed {
+			if err := validateTenantNginxRules(*req.NginxRules); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_nginx_rules", "detail": err.Error()})
+				return
+			}
+			domain.NginxRules = *req.NginxRules
+		}
+	}
+
+	// GH #526: a non-admin owner may repoint their own domain's docroot within
+	// the domain's own tree (e.g. a framework's public/ subdir) when the admin
+	// has opted in (tenant_docroot_editable). Confined by
+	// validateTenantDocumentRoot; admins use the looser whole-home path above.
+	// Silently dropped when the opt-in is off so other fields still PATCH.
+	if !claims.IsAdmin && req.DocRoot != nil {
+		allowed := false
+		if h.cfg.ServerSettings != nil {
+			if st, sErr := h.cfg.ServerSettings.Get(ctx); sErr == nil && st != nil && st.TenantDocrootEditable {
+				allowed = true
+			}
+		}
+		if allowed {
+			owner, oerr := h.cfg.Users.FindByID(ctx, domain.UserID)
+			if oerr != nil || owner == nil || owner.Username == nil {
+				c.JSON(http.StatusInternalServerError, gin.H{"error": "owner_lookup_failed"})
+				return
+			}
+			newRoot := strings.TrimSpace(*req.DocRoot)
+			if newRoot == "" {
+				newRoot = "/home/" + *owner.Username + "/domains/" + domain.Name + "/public_html"
+			}
+			if err := validateTenantDocumentRoot(newRoot, *owner.Username, domain.Name); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_doc_root", "detail": err.Error()})
+				return
+			}
+			domain.DocRoot = newRoot
+		}
+	}
+
+	if req.RedirectAllTo != nil {
+		trimmed := strings.TrimSpace(*req.RedirectAllTo)
+		if trimmed == "" {
+			domain.RedirectAllTo = nil
+		} else {
+			if err := ValidateRedirectURL(trimmed); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+				return
+			}
+			domain.RedirectAllTo = &trimmed
+		}
+	}
+
+	// GH #648: DMARCbis np + testing tags (any authorised domain manager).
+	if req.DmarcNP != nil {
+		np := strings.TrimSpace(*req.DmarcNP)
+		if !dnscompile.ValidDMARCNP(np) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "dmarc_np must be empty, none, quarantine, or reject"})
+			return
+		}
+		domain.DmarcNP = np
+	}
+	if req.DmarcTesting != nil {
+		domain.DmarcTesting = *req.DmarcTesting
+	}
+	// GH #1462: per-domain CalDAV/CardDAV override (hostname[:port]; empty clears).
+	if req.CalDAVHost != nil {
+		v := strings.TrimSpace(*req.CalDAVHost)
+		if err := validateDAVHost(v); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_caldav_host", "detail": err.Error()})
+			return
+		}
+		domain.CalDAVHost = v
+	}
+	if req.CardDAVHost != nil {
+		v := strings.TrimSpace(*req.CardDAVHost)
+		if err := validateDAVHost(v); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_carddav_host", "detail": err.Error()})
+			return
+		}
+		domain.CardDAVHost = v
+	}
+
+	if req.RedirectAllType != nil {
+		trimmed := strings.TrimSpace(*req.RedirectAllType)
+		if trimmed == "" {
+			domain.RedirectAllType = nil
+		} else if !IsValidRedirectType(trimmed) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid redirect type"})
+			return
+		} else {
+			domain.RedirectAllType = &trimmed
+		}
+	}
+
+	if req.PageRedirects != nil {
+		if err := validatePageRedirects(*req.PageRedirects); err != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+			return
+		}
+		domain.PageRedirects = *req.PageRedirects
+	}
+
+	if req.WebmailEnabled != nil {
+		domain.WebmailEnabled = *req.WebmailEnabled
+	}
+	// GH #1812: the owner opts this domain in/out of subdomain delegation. A
+	// plain bool set on the owner's own row; the guard (CrossTenantSuffixCollision)
+	// reads it when another tenant later claims a subdomain of this domain.
+	if req.AllowSubdomainDelegation != nil {
+		domain.AllowSubdomainDelegation = *req.AllowSubdomainDelegation
+	}
+	if req.IndexPriority != nil {
+		p := strings.TrimSpace(*req.IndexPriority)
+		if !IsValidIndexPriority(p) {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_index_priority"})
+			return
+		}
+		domain.IndexPriority = p
+	}
+
+	// Tenant-safe nginx options (GH #307). Owner-settable ONLY when the admin
+	// has opted in (server_settings.tenant_domain_options_enabled); admins may
+	// always set them. These render to fixed vetted directives (max body, HSTS,
+	// security headers, gzip) — never raw config — so they don't carry the
+	// admin-only raw-directive surface. A non-admin owner with the opt-in off
+	// has the field silently dropped (so other fields still PATCH).
+	if req.NginxSafeOptions != nil {
+		allowed := claims.IsAdmin
+		if !allowed && h.cfg.ServerSettings != nil {
+			if st, sErr := h.cfg.ServerSettings.Get(ctx); sErr == nil && st != nil && st.TenantDomainOptionsEnabled {
+				allowed = true
+			}
+		}
+		if allowed {
+			if err := req.NginxSafeOptions.Validate(); err != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_nginx_options", "detail": err.Error()})
+				return
+			}
+			domain.NginxSafeOptions = *req.NginxSafeOptions
+		}
+	}
+
+	// GH #1624 / ADR-0169 Phase 4: a non-admin owner may set a raw "advanced
+	// directives" snippet on their own domain when the admin has opted in
+	// (tenant_domain_options_enabled), mirroring the typed Rule Builder subset
+	// and the safe-options toggle above. Unlike the admin-only
+	// nginx_custom_directives, this field is confined by the TENANT
+	// value-grammar (ValidateNginxDirectivesTenant): one statement per line, no
+	// blocks, and only add_header / expires / etag — so it cannot SSRF, disclose
+	// files, or suppress logging. The grammar is the field's invariant, so it is
+	// applied regardless of who writes it (an admin has their own raw field).
+	// Silently dropped when the opt-in is off (for a non-admin) so other fields
+	// still PATCH.
+	if req.NginxTenantDirectives != nil {
+		allowed := claims.IsAdmin
+		if !allowed && h.cfg.ServerSettings != nil {
+			if st, sErr := h.cfg.ServerSettings.Get(ctx); sErr == nil && st != nil && st.TenantDomainOptionsEnabled {
+				allowed = true
+			}
+		}
+		if allowed {
+			if msg := ValidateNginxDirectivesTenant(*req.NginxTenantDirectives); msg != "" {
+				c.JSON(http.StatusBadRequest, gin.H{"error": "invalid_nginx_directives", "detail": msg})
+				return
+			}
+			domain.NginxTenantDirectives = req.NginxTenantDirectives
+		}
+	}
+
+	// M24: per-domain IP binding — validate FK + family + (for non-admin)
+	// is_user_selectable. We resolve and validate before issuing any DB
+	// write so a bad ipv4 doesn't half-succeed against ipv6.
+	listenUpd, ipErr := h.resolveListenIPUpdate(ctx, claims.IsAdmin, req.ListenIPv4ID, req.ListenIPv6ID)
+	if ipErr != nil {
+		c.JSON(ipErr.Status, gin.H{"error": ipErr.Code, "detail": ipErr.Detail})
+		return
+	}
+
+	domain.UpdatedAt = time.Now().UTC()
+	// JAB-318 AC4: apply the general Update and every dedicated writer
+	// (listen_ips / mail_provider / ssl_mode) as ONE transaction. Before this
+	// they ran sequentially, so a writer failing mid-sequence left the row
+	// half-patched — the general Update's nginx/redirect columns persisted
+	// while ssl_mode did not. Field validation stays inside the closure in its
+	// original order: a rejected value returns a *domainPatchTxErr, which rolls
+	// the apply back so a partial patch is never committed, and the ssl_mode
+	// invariants keep reading the mail switch's post-write email_enabled (a
+	// same-request mail-off + ssl-none must see mail already disabled). The
+	// reconcile below is scheduled only after a clean commit.
+	txErr := h.cfg.Domains.Transaction(ctx, func(tx repository.DomainRepository) error {
+		if err := tx.Update(ctx, domain); err != nil {
+			return err
+		}
+
+		if rateLimits != nil {
+			if err := tx.SetRateLimits(ctx, domain.ID, rateLimits[0], rateLimits[1]); err != nil {
+				return err
+			}
+			domain.RateLimitRPS, domain.ConnectionLimit = rateLimits[0], rateLimits[1]
+		}
+
+		// Listen IPs are written via dedicated repo method — Domain.Update's
+		// allowlist intentionally excludes listen_ipv*_id. Mirror the in-memory
+		// struct so the response reflects the new binding.
+		if listenUpd.ChangeIPv4 || listenUpd.ChangeIPv6 {
+			if err := tx.SetListenIPs(ctx, domain.ID, listenUpd); err != nil {
+				return err
+			}
+			if listenUpd.ChangeIPv4 {
+				domain.ListenIPv4ID = listenUpd.IPv4ID
+			}
+			if listenUpd.ChangeIPv6 {
+				domain.ListenIPv6ID = listenUpd.IPv6ID
+			}
+		}
+
+		// GH#181 mail provider: dedicated repo method (Domain.Update's
+		// allowlist excludes these columns). Validate, derive the two mail
+		// flags, write. A switch re-publishes DNS + reissues the cert on the
+		// next reconcile (Schedule below).
+		if req.MailProvider != nil {
+			mp := *req.MailProvider
+			if !models.ValidMailProvider(mp) {
+				return &domainPatchTxErr{http.StatusBadRequest, "invalid_mail_provider", ""}
+			}
+			// GH #1627: 'custom' is the internal posture for a domain created from a
+			// DNS template — it is never a directly-selectable provider on a live
+			// switch (ValidMailProvider recognises it only so persisted rows pass),
+			// and a template domain's mail posture can't yet be switched away in
+			// this phase: doing so would strand the template's own external apex
+			// MX/SPF (unmarked, Managed=false) beside a re-asserted DotNext apex →
+			// two apex SPF = RFC 7208 permerror. Delete + recreate to change it.
+			if mp == models.MailProviderCustom {
+				return &domainPatchTxErr{http.StatusBadRequest, "mail_provider_custom_reserved", "the 'custom' posture is selected by choosing a DNS template at domain creation, not via a provider switch"}
+			}
+			if domain.MailProvider == models.MailProviderCustom {
+				return &domainPatchTxErr{http.StatusConflict, "template_posture_locked", "this domain was created from a DNS template; switching its mail posture is not yet supported — delete and recreate the domain to change it"}
+			}
+			var m365In, gdkimIn string
+			if req.M365Onmicrosoft != nil {
+				m365In = *req.M365Onmicrosoft
+			}
+			if req.GoogleDKIM != nil {
+				gdkimIn = *req.GoogleDKIM
+			}
+			m365Tenant, err := dnscompile.NormaliseM365Onmicrosoft(m365In)
+			if err != nil {
+				return &domainPatchTxErr{http.StatusBadRequest, "invalid_m365_onmicrosoft", err.Error()}
+			}
+			gdkim, err := dnscompile.ValidateGoogleDKIM(gdkimIn)
+			if err != nil {
+				return &domainPatchTxErr{http.StatusBadRequest, "invalid_google_dkim", err.Error()}
+			}
+			emailEnabled, skipSAN := models.DeriveMailFlags(mp)
+			if err := tx.UpdateMailProvider(ctx, domain.ID, repository.DomainMailProvider{
+				Provider:        mp,
+				EmailEnabled:    emailEnabled,
+				SkipAutoSAN:     skipSAN,
+				M365Onmicrosoft: strPtrOrNil(m365Tenant),
+				GoogleDKIM:      strPtrOrNil(gdkim),
+			}); err != nil {
+				return err
+			}
+			domain.MailProvider = mp
+			domain.EmailEnabled = emailEnabled
+			domain.SkipAutoSAN = skipSAN
+			domain.M365Onmicrosoft = strPtrOrNil(m365Tenant)
+			domain.GoogleDKIM = strPtrOrNil(gdkim)
+		}
+
+		// GH #246: TLS cert mode switch. Dedicated repo method (Domain.Update's
+		// allowlist excludes ssl_mode). Invariants guarded: the panel-primary
+		// domain must keep TLS, and a mail-enabled domain can't go to 'none'.
+		if req.SSLMode != nil {
+			mode := *req.SSLMode
+			if !models.ValidSSLMode(mode) {
+				return &domainPatchTxErr{http.StatusBadRequest, "invalid_ssl_mode", ""}
+			}
+			if mode == models.SSLModeCustom {
+				return &domainPatchTxErr{http.StatusBadRequest, "ssl_mode_custom_via_upload", "upload a custom cert via the SSL settings to switch to custom"}
+			}
+			// JAB-318 AC3: the protected-domain TLS invariants live in one leaf
+			// (models.SSLModeProtectedRefusal) shared with the SSL-disable
+			// endpoint and the CLI `domain set`, so the three doors that switch a
+			// domain to `none` cannot drift. Same code/detail/status as before.
+			if code, detail, refused := models.SSLModeProtectedRefusal(domain, mode); refused {
+				return &domainPatchTxErr{http.StatusUnprocessableEntity, code, detail}
+			}
+			if err := tx.UpdateSSLMode(ctx, domain.ID, mode); err != nil {
+				return err
+			}
+			domain.SSLMode = mode
+			domain.SSLEnabled = models.SSLEnabledForMode(mode)
+		}
+		return nil
+	})
+	if txErr != nil {
+		var pe *domainPatchTxErr
+		if errors.As(txErr, &pe) {
+			resp := gin.H{"error": pe.code}
+			if pe.detail != "" {
+				resp["detail"] = pe.detail
+			}
+			c.JSON(pe.status, resp)
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+
+	// Schedule reconciliation to sync the domain state with the agent — only
+	// after a clean commit, so a half-applied patch is never reconciled.
+	if h.cfg.Reconciler != nil {
+		h.cfg.Reconciler.Schedule(domain.ID)
+	}
+
+	c.JSON(http.StatusOK, h.enrichDomainResponse(ctx, *domain))
+}
+
+// listenIPError carries the (status, code, detail) tuple from
+// resolveListenIPUpdate so the caller can emit the right JSON shape
+// without resorting to multi-error sentinel checks.
+type listenIPError struct {
+	Status int
+	Code   string
+	Detail string
+}
+
+// resolveListenIPUpdate validates the listen_ipv*_id PATCH fields and
+// builds the repository.DomainListenIPs payload. Returns ChangeIPv4 /
+// ChangeIPv6 only for fields that were actually present in the request.
+//
+// Rules:
+//   - ManagedIPs repo not wired → 503 (the FK target table is the
+//     authoritative source; we won't accept blind writes).
+//   - IPv4 field carries an IPv6 address (or vice-versa) → 400.
+//   - Referenced row missing → 404.
+//   - Non-admin caller picking a row with is_user_selectable=false → 403.
+//   - Explicit null → unbind (fall back to server default at render time).
+func (h *domainHandler) resolveListenIPUpdate(ctx context.Context, isAdmin bool, v4, v6 nullableUint64) (repository.DomainListenIPs, *listenIPError) {
+	upd := repository.DomainListenIPs{}
+	if !v4.Set && !v6.Set {
+		return upd, nil
+	}
+	if h.cfg.ManagedIPs == nil {
+		return upd, &listenIPError{
+			Status: http.StatusServiceUnavailable,
+			Code:   "ip_pool_unavailable",
+			Detail: "managed IP pool is not configured on this server",
+		}
+	}
+	if v4.Set {
+		if v4.Value == nil {
+			upd.ChangeIPv4 = true
+			upd.IPv4ID = nil
+		} else {
+			row, err := h.cfg.ManagedIPs.FindByID(ctx, *v4.Value)
+			if err != nil {
+				if errors.Is(err, repository.ErrNotFound) {
+					return upd, &listenIPError{Status: http.StatusNotFound, Code: "listen_ipv4_not_found"}
+				}
+				return upd, &listenIPError{Status: http.StatusInternalServerError, Code: "internal"}
+			}
+			if row.Family != "ipv4" {
+				return upd, &listenIPError{Status: http.StatusBadRequest, Code: "listen_ipv4_family_mismatch", Detail: "managed_ip " + strconv.FormatUint(row.ID, 10) + " is not an IPv4 address"}
+			}
+			if !isAdmin && !row.IsUserSelectable {
+				return upd, &listenIPError{Status: http.StatusForbidden, Code: "listen_ipv4_not_user_selectable", Detail: "this IPv4 is not enabled for user selection — ask an administrator"}
+			}
+			upd.ChangeIPv4 = true
+			upd.IPv4ID = &row.ID
+		}
+	}
+	if v6.Set {
+		if v6.Value == nil {
+			upd.ChangeIPv6 = true
+			upd.IPv6ID = nil
+		} else {
+			row, err := h.cfg.ManagedIPs.FindByID(ctx, *v6.Value)
+			if err != nil {
+				if errors.Is(err, repository.ErrNotFound) {
+					return upd, &listenIPError{Status: http.StatusNotFound, Code: "listen_ipv6_not_found"}
+				}
+				return upd, &listenIPError{Status: http.StatusInternalServerError, Code: "internal"}
+			}
+			if row.Family != "ipv6" {
+				return upd, &listenIPError{Status: http.StatusBadRequest, Code: "listen_ipv6_family_mismatch", Detail: "managed_ip " + strconv.FormatUint(row.ID, 10) + " is not an IPv6 address"}
+			}
+			if !isAdmin && !row.IsUserSelectable {
+				return upd, &listenIPError{Status: http.StatusForbidden, Code: "listen_ipv6_not_user_selectable", Detail: "this IPv6 is not enabled for user selection — ask an administrator"}
+			}
+			upd.ChangeIPv6 = true
+			upd.IPv6ID = &row.ID
+		}
+	}
+	return upd, nil
+}
+
+func (h *domainHandler) delete(c *gin.Context) {
+	ctx := c.Request.Context()
+	domain, err := h.cfg.Domains.FindByID(ctx, c.Param("id"))
+	if err != nil {
+		if isNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "not_found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthenticated"})
+		return
+	}
+	if !claims.IsAdmin && domain.UserID != claims.UserID {
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "forbidden"})
+		return
+	}
+
+	// GH #1603 facet-preserving delete: mail + DNS are facets of this one row, so
+	// "delete the Web Domain, keep the Mail Domain / DNS Zone" cannot delete the
+	// row. When the caller opts to keep at least one facet (delete_mail=false
+	// and/or delete_dns=false, defaults true), tear down only the web facet and
+	// KEEP the row (web-off). A facet the domain doesn't have is a no-op.
+	deleteFiles := c.Query("delete_files") == "true"
+	hasMail := domain.EmailEnabled
+	hasDNS := !domain.DNSDisabled
+	deleteMail := c.Query("delete_mail") != "false"
+	deleteDNS := c.Query("delete_dns") != "false"
+	if (hasMail && !deleteMail) || (hasDNS && !deleteDNS) {
+		// The panel's own primary domain is never facet-deleted (its web is the
+		// panel). Mirror the full-delete row-layer protection.
+		if domain.IsPanelPrimary {
+			c.JSON(http.StatusForbidden, gin.H{"error": "panel_primary_protected"})
+			return
+		}
+		warnings, ferr := h.facetPreservingWebDelete(ctx, domain, hasMail && deleteMail, hasDNS && deleteDNS, deleteFiles)
+		if ferr != nil {
+			c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{
+			"kept":     gin.H{"mail": hasMail && !deleteMail, "dns": hasDNS && !deleteDNS},
+			"warnings": warnings,
+		})
+		return
+	}
+
+	// JAB-236: durable delete via the domain lifecycle module (JAB-279) —
+	// tombstone BEFORE the row goes (the row is the only natural handle),
+	// Stalwart purge + vhost + pdns teardown after it, retried by the
+	// reconciler sweep if the async attempt fails or the panel restarts.
+	// The user still sees the row gone immediately (async attempt).
+	_, err = domainops.Delete(ctx, domainops.DeleteDeps{
+		Domains:   h.cfg.Domains,
+		Teardowns: h.cfg.DomainTeardowns,
+		Ports:     h.cfg.PortAllocations,
+		Agent:     h.cfg.Agent,
+		// Log carries the failures the delete survives: a reverse-proxy port
+		// release that failed (the row was the port's last handle) and a host
+		// teardown left to the reconciler retry (JAB-279 AC4).
+		Log: slog.Default(),
+	}, domain.ID, domain.Name, true)
+	if err != nil {
+		// M6.4 (ADR-0048): the panel-primary row is delete-protected at
+		// the repo layer. Translate to 403 with a specific error code
+		// so the panel UI can render a tooltip instead of a generic 500.
+		// domainops.Delete guarantees NOTHING host-side ran in this case.
+		if errors.Is(err, repository.ErrCannotDeletePanelPrimary) {
+			c.JSON(http.StatusForbidden, gin.H{"error": "panel_primary_protected"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+
+	// GH #1382: opt-in "also delete the domain's files". Runs ONLY on this
+	// explicit, human-approved HTTP delete — never inside domainops.Delete,
+	// so the user-delete cascade and billing-cancel teardown paths can't destroy
+	// a customer's site implicitly. Best-effort AFTER a successful delete: done
+	// ONCE here (not tombstone-retried, so a retry can never delete files a
+	// re-added domain recreated), fired async so a large docroot can't stall the
+	// response past a proxy timeout, and on any failure the files simply remain
+	// (the pre-#1382 behavior). The agent removes the docroot AS THE TENANT UID.
+	if c.Query("delete_files") == "true" && domain.DocRoot != "" {
+		if owner, uerr := h.cfg.Users.FindByID(ctx, domain.UserID); uerr == nil &&
+			owner != nil && owner.Username != nil && *owner.Username != "" {
+			username, docroot, dname := *owner.Username, domain.DocRoot, domain.Name
+			target := domainDeleteFilesTarget(username, dname, docroot)
+			ag := h.cfg.Agent
+			go func() {
+				dctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+				defer cancel()
+				if _, aerr := ag.Call(dctx, "domain.docroot.delete", map[string]string{
+					"username": username,
+					"docroot":  target,
+				}); aerr != nil {
+					slog.Warn("domain delete: docroot cleanup failed; files left in place",
+						"domain", dname, "error", aerr)
+				}
+			}()
+		}
+	}
+
+	c.Status(http.StatusNoContent)
+}
+
+// domainDeleteFilesTarget picks what "also delete the files" removes (GH #1382
+// follow-up). It returns the whole per-domain folder
+// (/home/<user>/domains/<domain>) when the docroot lives inside it — which is
+// the normal layout, and where GH #526 confines any custom docroot too — so the
+// domain's public_html, logs and siblings all go, not just public_html. If the
+// docroot sits OUTSIDE that folder (e.g. a legacy/primary domain served from
+// ~/public_html) it returns the docroot unchanged, so we never remove an
+// unrelated or shared directory. The agent re-validates whatever we send.
+func domainDeleteFilesTarget(username, domainName, docroot string) string {
+	domainDir := "/home/" + username + "/domains/" + domainName
+	if strings.HasPrefix(docroot, domainDir+"/") {
+		return domainDir
+	}
+	return docroot
+}
+
+// allowedNginxDirectives is a per-line allowlist of nginx directives that users
+// can safely include in the server {} block. This is a FIRST line of defense;
+// the agent still runs nginx -t before applying, so malformed input is caught there.
+var allowedNginxDirectives = map[string]struct{}{
+	// Headers/response
+	"add_header":        {},
+	"add_trailer":       {},
+	"expires":           {},
+	"etag":              {},
+	"if_modified_since": {},
+	"return":            {},
+	// Rewrites
+	"rewrite":    {},
+	"set":        {},
+	"if":         {},
+	"break":      {},
+	"error_page": {},
+	// Proxy — proxy_pass removed (JAB-66): the structured Rule Builder is the
+	// only path for proxy_pass, and it SSRF-validates the target (JAB-65). A raw
+	// proxy_pass directive had no host guard at all.
+	"proxy_set_header":        {},
+	"proxy_hide_header":       {},
+	"proxy_pass_header":       {},
+	"proxy_buffering":         {},
+	"proxy_buffer_size":       {},
+	"proxy_buffers":           {},
+	"proxy_http_version":      {},
+	"proxy_read_timeout":      {},
+	"proxy_connect_timeout":   {},
+	"proxy_send_timeout":      {},
+	"proxy_redirect":          {},
+	"proxy_ssl_verify":        {},
+	"proxy_ssl_server_name":   {},
+	"proxy_request_buffering": {},
+	"proxy_cache_bypass":      {},
+	"proxy_no_cache":          {},
+	// Body/upload
+	"client_max_body_size":    {},
+	"client_body_buffer_size": {},
+	"client_body_timeout":     {},
+	"client_header_timeout":   {},
+	// FastCGI
+	"fastcgi_read_timeout": {},
+	"fastcgi_send_timeout": {},
+	"fastcgi_buffer_size":  {},
+	"fastcgi_buffers":      {},
+	"fastcgi_param":        {},
+	// Static/locations
+	"location":             {},
+	"try_files":            {},
+	"index":                {},
+	"autoindex":            {},
+	"autoindex_exact_size": {},
+	"autoindex_localtime":  {},
+	// sub_filter{,_once,_types} removed (JAB-66): arbitrary content injection /
+	// response splitting into proxied responses.
+	"charset":       {},
+	"default_type":  {},
+	"types":         {},
+	"log_not_found": {},
+	// Access
+	"allow":   {},
+	"deny":    {},
+	"satisfy": {},
+	// auth_basic{,_user_file} removed (JAB-66): auth_basic_user_file is an
+	// arbitrary-file read / existence oracle (point it at /etc/shadow). Use the
+	// structured Directory Privacy feature, which manages the htpasswd file.
+	"limit_except":   {},
+	"limit_req":      {},
+	"limit_req_zone": {},
+	"limit_conn":     {},
+	// Gzip
+	"gzip":            {},
+	"gzip_types":      {},
+	"gzip_min_length": {},
+	"gzip_comp_level": {},
+	"gzip_vary":       {},
+	"gzip_disable":    {},
+	"gzip_proxied":    {},
+	// Caching
+	"open_file_cache":          {},
+	"open_file_cache_valid":    {},
+	"open_file_cache_min_uses": {},
+	"open_file_cache_errors":   {},
+}
+
+// ValidateNginxDirectives is the STRICT, allowlist-based validator used for the
+// tenant/default path: only directives on allowedNginxDirectives pass. proxy_pass
+// and other raw-target directives are intentionally absent (JAB-66); tenants get
+// reverse proxying only through the SSRF-validated Rule Builder.
+func ValidateNginxDirectives(directives string) string {
+	return scanNginxDirectives(directives, func(directive, _ string) string {
+		if _, allowed := allowedNginxDirectives[directive]; !allowed {
+			return "forbidden directive: " + directive
+		}
+		return ""
+	})
+}
+
+// adminDeniedNginxDirectives is the DENYLIST for the admin path (GH #1580): an
+// administrator may use the full range of nginx directives the panel renders
+// into the server block — including proxy_pass and the rest of the reverse-proxy
+// family, which the Rule Builder's RootOverridden flow already anticipates — with
+// nginx -t as the syntactic guard at apply time. Only these few remain blocked,
+// because nginx -t does NOT catch them and they have no legitimate use in a
+// per-domain custom block:
+//
+//   - root / alias: serve arbitrary paths (e.g. `root /etc/dotnext/`) over
+//     HTTP — file disclosure. Admins set a custom docroot via the DocRoot field,
+//     which confines it to the owner's home.
+//   - include: pulls arbitrary files into this server block as nginx config —
+//     could splice another tenant's config or leak secrets. The panel's own
+//     per-CMS include is already in the template.
+//   - auth_basic_user_file: an arbitrary-file read / existence oracle (point it
+//     at /etc/shadow). Directory Privacy manages the htpasswd file safely.
+//   - load_module: main-context only; a paste here is a nonsense footgun.
+var adminDeniedNginxDirectives = map[string]struct{}{
+	"root":                 {},
+	"alias":                {},
+	"include":              {},
+	"auth_basic_user_file": {},
+	"load_module":          {},
+}
+
+// ValidateNginxDirectivesAdmin is the RELAXED validator for admin-authored custom
+// directives (GH #1580). It keeps every structural guard ValidateNginxDirectives
+// applies (null bytes, nesting depth, balanced braces — which also stops a paste
+// from closing the server block early and escaping into the main context), but
+// replaces the safe-directive allowlist with a small denylist of the few
+// directives nginx -t can't catch and that have no legitimate per-domain use.
+func ValidateNginxDirectivesAdmin(directives string) string {
+	return scanNginxDirectives(directives, func(directive, cleaned string) string {
+		if _, denied := adminDeniedNginxDirectives[directive]; denied {
+			return "forbidden directive: " + directive
+		}
+		// Value-blocked footguns: the "off" form suppresses security logging /
+		// strips inherited auth — neither is a syntax error, so nginx -t won't
+		// stop them. A custom log PATH or an auth realm string is fine.
+		switch directive {
+		case "access_log", "auth_basic":
+			for _, arg := range nginxDirectiveArgs(cleaned) {
+				if arg == "off" {
+					return "forbidden directive: " + directive + " off"
+				}
+			}
+		}
+		return ""
+	})
+}
+
+// Tenant advanced-directives grammar (GH #1624 / ADR-0169 Phase 4).
+//
+// The admin raw field (ValidateNginxDirectivesAdmin) trusts nginx -t as its
+// backstop and allows proxy_pass and the rest — safe only because an admin
+// authors it. A tenant field cannot: raw tenant nginx would mean SSRF to
+// localhost, file disclosure via root/alias, CrowdSec suppression via
+// `access_log off`, and (critically) the shared scanNginxDirectives only
+// inspects the FIRST token of each line, so `add_header X a; proxy_pass ...;`
+// on one line would slip proxy_pass past a naive allowlist. So the tenant
+// grammar is deliberately tiny and exhaustive: a single statement per line, no
+// blocks at all, and only response-shaping directives that cannot route,
+// redirect, or read files.
+const (
+	tenantDirectivesMaxBytes = 8 * 1024
+	tenantDirectivesMaxLines = 64
+)
+
+// tenantRawAllowedDirectives — the only directives a tenant may use raw. All are
+// response-shaping and non-routing: they cannot SSRF, redirect, or disclose
+// files. return/rewrite (redirects already exist as typed rules + redirect_all_to;
+// raw return can preempt /.well-known/acme-challenge and open-redirect via $vars),
+// error_page (the template already sets it at server scope — a tenant copy
+// duplicates it), gzip (NginxSafeOptions already emits it — duplicate → nginx -t
+// fails), and location/proxy_pass/root/fastcgi_param are all excluded by design.
+var tenantRawAllowedDirectives = map[string]struct{}{
+	"add_header": {},
+	"expires":    {},
+	"etag":       {},
+}
+
+// tenantHeaderNameRe — a conservative HTTP response-header field-name charset.
+var tenantHeaderNameRe = regexp.MustCompile(`^[A-Za-z0-9-]+$`)
+
+// tenantExpiresRe — nginx `expires` value forms: a (possibly negative) time with
+// an optional unit, the daily @HH[hMM][m] form, or a keyword. `modified` is
+// handled separately as an optional leading token.
+var tenantExpiresRe = regexp.MustCompile(`^(-?\d+[smhdwMy]?|@\d{1,2}(h\d{1,2}m?)?|epoch|max|off)$`)
+
+// ValidateNginxDirectivesTenant validates a tenant-authored raw nginx snippet.
+// Empty string is fine (clearing the field). Returns "" when acceptable,
+// otherwise a human-readable reason. This is intentionally strict: it is the
+// only thing standing between a tenant textarea and the server block, and a
+// PATCH that stores syntactically valid-but-broken config would surface only as
+// a later nginx -t failure that drops the tenant's own vhost.
+func ValidateNginxDirectivesTenant(directives string) string {
+	if len(directives) > tenantDirectivesMaxBytes {
+		return fmt.Sprintf("advanced directives exceed %d KB", tenantDirectivesMaxBytes/1024)
+	}
+	if strings.Count(directives, "\n")+1 > tenantDirectivesMaxLines {
+		return fmt.Sprintf("advanced directives exceed %d lines", tenantDirectivesMaxLines)
+	}
+	// Control characters: allow tab + newline (this is a multi-line field);
+	// reject everything else, including a bare \r that would be response
+	// splitting inside a quoted add_header value.
+	for _, c := range directives {
+		if c < 32 && c != '\t' && c != '\n' {
+			return "advanced directives contain invalid control characters"
+		}
+	}
+	// No blocks whatsoever. A single { or } enables location shadowing, nested
+	// add_header inheritance games, or closing the server block early to escape
+	// into the main context. add_header / expires / etag never need braces.
+	if strings.ContainsAny(directives, "{}") {
+		return "advanced directives may not contain blocks ({ })"
+	}
+	// Reject backslashes outright. Our quote tracking (countUnquotedSemicolons /
+	// splitNginxArgs) is a naive per-character toggle, but nginx's real
+	// tokenizer treats \" and \\ as escapes (mirrored by this codebase's own
+	// nginxrules.quoteNginxString). So an input like `add_header X "abc\"def;`
+	// looks string-closed to us — one trailing unquoted ';' — yet stays open in
+	// nginx, swallowing the following config (e.g. the rate-limit directives) or
+	// failing nginx -t. None of add_header / expires / etag's legitimate values
+	// need a backslash, so ban it and keep the grammar exhaustive.
+	if strings.ContainsRune(directives, '\\') {
+		return "advanced directives may not contain a backslash"
+	}
+	return scanNginxDirectives(directives, checkTenantDirective)
+}
+
+// checkTenantDirective is the per-line check for the tenant grammar. cleaned is
+// the comment-stripped, trimmed line; directive is its lowercased first token.
+func checkTenantDirective(directive, cleaned string) string {
+	// Enforce exactly one complete statement per line: one UNQUOTED ';' and it
+	// must be the final character. This is what makes the shared scanner's
+	// first-token-only check sound for the tenant path — a second statement on
+	// the same line (e.g. a hidden proxy_pass) is rejected outright. The ';'
+	// counter is quote-aware because header values legitimately contain ';'
+	// (CSP, Link).
+	semis, balanced := countUnquotedSemicolons(cleaned)
+	if !balanced {
+		return "advanced directives: unbalanced quotes"
+	}
+	if semis != 1 || !strings.HasSuffix(cleaned, ";") {
+		return "advanced directives: each line must be a single statement ending in ';'"
+	}
+	if _, ok := tenantRawAllowedDirectives[directive]; !ok {
+		return "advanced directives: '" + directive + "' is not allowed (only add_header, expires, etag)"
+	}
+	args := splitNginxArgs(cleaned) // quote-aware tokens after the directive name
+	switch directive {
+	case "add_header":
+		// add_header <name> <value> [always];
+		if len(args) < 2 {
+			return "advanced directives: add_header requires a name and a value"
+		}
+		if len(args) > 3 || (len(args) == 3 && args[2] != "always") {
+			return "advanced directives: add_header takes 'name value [always]' (quote a value with spaces)"
+		}
+		if !tenantHeaderNameRe.MatchString(args[0]) {
+			return "advanced directives: invalid header name " + strconv.Quote(args[0])
+		}
+		if _, denied := tenantManagedResponseHeaders[strings.ToLower(args[0])]; denied {
+			return "advanced directives: response header " + strconv.Quote(args[0]) + " is managed by the panel and can't be set here"
+		}
+	case "expires":
+		// expires [modified] <time|epoch|max|off>;
+		vals := args
+		if len(vals) > 0 && vals[0] == "modified" {
+			vals = vals[1:]
+		}
+		if len(vals) != 1 || !tenantExpiresRe.MatchString(vals[0]) {
+			return "advanced directives: expires takes a time (e.g. 30d, 5m, max, off)"
+		}
+	case "etag":
+		if len(args) != 1 || (args[0] != "on" && args[0] != "off") {
+			return "advanced directives: etag takes 'on' or 'off'"
+		}
+	}
+	return ""
+}
+
+// countUnquotedSemicolons counts ';' that fall outside single/double quotes and
+// reports whether the quotes in the line are balanced. Mirrors countBraces'
+// quote handling so a ';' inside a header value (CSP, Link) is not counted.
+func countUnquotedSemicolons(line string) (count int, balanced bool) {
+	inSingle, inDouble := false, false
+	for _, ch := range line {
+		switch ch {
+		case '\'':
+			if !inDouble {
+				inSingle = !inSingle
+			}
+		case '"':
+			if !inSingle {
+				inDouble = !inDouble
+			}
+		case ';':
+			if !inSingle && !inDouble {
+				count++
+			}
+		}
+	}
+	return count, !inSingle && !inDouble
+}
+
+// splitNginxArgs returns the quote-aware argument tokens of a directive line
+// (everything after the first token), with a single trailing unquoted ';'
+// dropped and surrounding quotes stripped from each token. A quoted value keeps
+// its inner spaces as one token: `add_header CSP "a b" always;` -> ["CSP", "a b",
+// "always"]. Unlike nginxDirectiveArgs it is quote-aware for spaces and does not
+// lowercase (header names/values are case-preserving).
+func splitNginxArgs(cleaned string) []string {
+	// Drop the single trailing ';' (countUnquotedSemicolons already guaranteed
+	// exactly one, unquoted, at the end).
+	s := strings.TrimSuffix(strings.TrimSpace(cleaned), ";")
+	var tokens []string
+	var cur strings.Builder
+	inSingle, inDouble, has := false, false, false
+	flush := func() {
+		if has {
+			tokens = append(tokens, cur.String())
+			cur.Reset()
+			has = false
+		}
+	}
+	for _, ch := range s {
+		switch {
+		case ch == '\'' && !inDouble:
+			inSingle = !inSingle
+			has = true
+		case ch == '"' && !inSingle:
+			inDouble = !inDouble
+			has = true
+		case (ch == ' ' || ch == '\t') && !inSingle && !inDouble:
+			flush()
+		default:
+			cur.WriteRune(ch)
+			has = true
+		}
+	}
+	flush()
+	if len(tokens) == 0 {
+		return nil
+	}
+	return tokens[1:] // drop the directive name
+}
+
+// scanNginxDirectives runs the structural safety checks shared by both nginx
+// validators (null-byte rejection, comment stripping, brace balance + nesting
+// cap) and calls check(directive, cleaned) for every directive line — directive
+// lowercased, cleaned = the comment-stripped, trimmed line. A non-empty return
+// from check rejects the whole input with that message.
+func scanNginxDirectives(directives string, check func(directive, cleaned string) string) string {
+	// Reject if input contains null bytes (binary/injection attempt).
+	if strings.ContainsRune(directives, '\x00') {
+		return "forbidden directive: null byte detected"
+	}
+
+	lines := strings.Split(directives, "\n")
+	blockDepth := 0
+	maxNestingDepth := 3
+
+	for _, line := range lines {
+		// Strip comments while respecting strings.
+		cleaned := stripComments(line)
+		cleaned = strings.TrimSpace(cleaned)
+
+		// Empty lines are allowed.
+		if cleaned == "" {
+			continue
+		}
+
+		// Count opening and closing braces in this line (respecting strings).
+		opens, closes := countBraces(cleaned)
+
+		for i := 0; i < opens; i++ {
+			blockDepth++
+			if blockDepth > maxNestingDepth {
+				return "forbidden directive: nesting depth exceeded (max " + strconv.Itoa(maxNestingDepth) + ")"
+			}
+		}
+		for i := 0; i < closes; i++ {
+			blockDepth--
+			if blockDepth < 0 {
+				return "forbidden directive: unbalanced braces (extra closing })"
+			}
+		}
+
+		// Handle lines that are purely {, }, or {}.
+		if cleaned == "{" || cleaned == "}" || cleaned == "{}" {
+			continue
+		}
+
+		// Extract the directive name (first token).
+		directive := extractDirective(cleaned)
+		if directive == "" {
+			continue
+		}
+
+		// Skip if the first token is a brace.
+		if directive == "{" || directive == "}" {
+			continue
+		}
+
+		directive = strings.ToLower(directive)
+		if msg := check(directive, cleaned); msg != "" {
+			return msg
+		}
+	}
+
+	// Ensure braces are balanced.
+	if blockDepth != 0 {
+		return "forbidden directive: unbalanced braces (unclosed {)"
+	}
+
+	return ""
+}
+
+// nginxDirectiveArgs returns the lowercased argument tokens of a directive line
+// (everything after the directive name), stripped of a trailing ';' and
+// surrounding quotes — enough to spot the `off` value form of access_log /
+// auth_basic. `access_log off;` -> ["off"]; `auth_basic "realm";` -> ["realm"].
+func nginxDirectiveArgs(cleaned string) []string {
+	fields := strings.FieldsFunc(cleaned, func(r rune) bool { return r == ' ' || r == '\t' })
+	if len(fields) <= 1 {
+		return nil
+	}
+	args := make([]string, 0, len(fields)-1)
+	for _, f := range fields[1:] {
+		f = strings.TrimRight(f, ";")
+		f = strings.Trim(f, `"'`)
+		args = append(args, strings.ToLower(f))
+	}
+	return args
+}
+
+// countBraces counts opening and closing braces in a line, respecting quoted strings.
+func countBraces(line string) (opens, closes int) {
+	inSingleQuote := false
+	inDoubleQuote := false
+
+	for _, ch := range line {
+		switch ch {
+		case '\'':
+			if !inDoubleQuote {
+				inSingleQuote = !inSingleQuote
+			}
+		case '"':
+			if !inSingleQuote {
+				inDoubleQuote = !inDoubleQuote
+			}
+		case '{':
+			if !inSingleQuote && !inDoubleQuote {
+				opens++
+			}
+		case '}':
+			if !inSingleQuote && !inDoubleQuote {
+				closes++
+			}
+		}
+	}
+	return
+}
+
+// stripComments removes everything from # onwards, but respects # inside
+// single or double-quoted strings.
+func stripComments(line string) string {
+	inSingleQuote := false
+	inDoubleQuote := false
+
+	for i, ch := range line {
+		switch ch {
+		case '\'':
+			if !inDoubleQuote {
+				inSingleQuote = !inSingleQuote
+			}
+		case '"':
+			if !inSingleQuote {
+				inDoubleQuote = !inDoubleQuote
+			}
+		case '#':
+			if !inSingleQuote && !inDoubleQuote {
+				return line[:i]
+			}
+		}
+	}
+	return line
+}
+
+// extractDirective returns the first whitespace-delimited token from a line.
+func extractDirective(line string) string {
+	fields := strings.FieldsFunc(line, func(r rune) bool {
+		return r == ' ' || r == '\t'
+	})
+	if len(fields) == 0 {
+		return ""
+	}
+	return fields[0]
+}
+
+func ValidateRedirectURL(s string) error {
+	u, err := url.Parse(s)
+	if err != nil {
+		return fmt.Errorf("invalid destination URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("destination URL must use http or https scheme")
+	}
+	if u.Host == "" {
+		return fmt.Errorf("destination URL must have a host")
+	}
+	return nil
+}
+
+func IsValidRedirectType(s string) bool {
+	switch s {
+	case "301", "302", "307", "308":
+		return true
+	default:
+		return false
+	}
+}
+
+func validatePageRedirects(prs models.PageRedirects) error {
+	if len(prs) > 100 {
+		return fmt.Errorf("too many redirects (max 100)")
+	}
+	for i, pr := range prs {
+		if !strings.HasPrefix(pr.Source, "/") {
+			return fmt.Errorf("entry %d: source must start with /", i)
+		}
+		// Reject whitespace and control chars in the source. The wildcard branch
+		// of redirects.Compile renders the source UNQUOTED into
+		// `rewrite ^<escapeRegex(source)>/?(.*)$ ...`; a literal space lets a
+		// tenant complete a two-argument rewrite and then inject a sibling
+		// directive (e.g. proxy_pass to an internal service) inside their own
+		// location block, past validateProxyPassTarget. escapeRegex already
+		// neutralizes `{`/`}` (so no new location block can be opened) and a lone
+		// `;` only breaks `nginx -t`, so banning the whitespace an injection needs
+		// closes it at the boundary. A redirect source is a URL path prefix and
+		// never needs a literal space/tab/CR. (GH #1624 hardening, sibling of the
+		// rewrite-pattern quoting fix #1736.)
+		if strings.ContainsAny(pr.Source, " \t\r\n\x00") {
+			return fmt.Errorf("entry %d: source must not contain spaces or control characters", i)
+		}
+		if err := ValidateRedirectURL(pr.Destination); err != nil {
+			return fmt.Errorf("entry %d: invalid page redirect destination: %w", i, err)
+		}
+		if !IsValidRedirectType(pr.Type) {
+			return fmt.Errorf("entry %d: invalid type for page redirect: %s", i, pr.Type)
+		}
+		// Wildcard only supports 301 and 302
+		if pr.Wildcard && pr.Type != "301" && pr.Type != "302" {
+			return fmt.Errorf("entry %d: wildcard redirects only support 301 or 302", i)
+		}
+	}
+	return nil
+}
+
+func isValidNginxRuleType(s string) bool {
+	switch s {
+	case "custom_header", "rewrite", "proxy_pass", "ip_access", "php_setting", "max_upload_size", "static_alias", "media_alias", "deny_paths", "static_cache", "front_controller":
+		return true
+	}
+	return false
+}
+
+// validateNginxRules checks each rule has the fields required by its
+// Type. Field-level constraints (e.g. header name format, valid CIDR)
+// are intentionally lenient — nginx -t on the agent is the final check.
+
+// validateNginxRules checks each rule has the fields required by its
+// Type. Field-level constraints (e.g. header name format, valid CIDR)
+// are intentionally lenient — nginx -t on the agent is the final check.
+// maxNginxRules caps the number of typed nginx rules per domain. It is a
+// soft DoS/abuse bound, not a correctness limit -- `nginx -t` on the agent is
+// the real validator. Raised from 50 (GH #301): real .htaccess conversions and
+// framework routing can need hundreds of rewrites.
+const maxNginxRules = 500
+
+func validateNginxRules(rules models.NginxRules) error {
+	return validateNginxRulesWith(rules, false)
+}
+
+// validateNginxRulesWith is validateNginxRules with the server's
+// nginx_proxy_allow_internal policy applied to proxy_pass targets.
+func validateNginxRulesWith(rules models.NginxRules, allowInternalProxy bool) error {
+	if len(rules) > maxNginxRules {
+		return fmt.Errorf("too many rules (max %d)", maxNginxRules)
+	}
+	frontControllers := 0
+	for i, r := range rules {
+		if !isValidNginxRuleType(r.Type) {
+			return fmt.Errorf("rule %d: unknown type %q", i, r.Type)
+		}
+		switch r.Type {
+		case "custom_header":
+			if r.Name == "" {
+				return fmt.Errorf("rule %d: header name required", i)
+			}
+			if r.Value == "" {
+				return fmt.Errorf("rule %d: header value required", i)
+			}
+			// Name renders UNQUOTED into `add_header <name> <value>;`. The
+			// separators (space/tab/CR/LF/`:`/`;`) already can't appear; also
+			// reject `{`/`}`/`#`/`"`/`\` so a name can neither open a block nor
+			// comment out the rest of the line and break `nginx -t`.
+			if strings.ContainsAny(r.Name, " \t\n\r:;{}#\"\\") {
+				return fmt.Errorf("rule %d: invalid chars in header name", i)
+			}
+		case "rewrite":
+			if r.Pattern == "" || r.Replacement == "" {
+				return fmt.Errorf("rule %d: pattern and replacement required", i)
+			}
+			if err := validateRewritePattern(r.Pattern, 256); err != nil {
+				return fmt.Errorf("rule %d: %v", i, err)
+			}
+			switch r.Flag {
+			case "", "last", "break", "redirect", "permanent":
+			default:
+				return fmt.Errorf("rule %d: invalid flag %q", i, r.Flag)
+			}
+		case "proxy_pass":
+			if r.Path == "" || r.Target == "" {
+				return fmt.Errorf("rule %d: path and target required", i)
+			}
+			if !strings.HasPrefix(r.Target, "http://") && !strings.HasPrefix(r.Target, "https://") {
+				return fmt.Errorf("rule %d: target must be an http(s) URL", i)
+			}
+			if err := validateProxyPassTargetWith(r.Target, allowInternalProxy); err != nil {
+				return fmt.Errorf("rule %d: %v", i, err)
+			}
+			if r.ReadTimeout != "" && !isNginxDuration(r.ReadTimeout) {
+				return fmt.Errorf("rule %d: read_timeout must be an nginx duration (e.g. \"60s\", \"24h\")", i)
+			}
+		case "ip_access":
+			if r.Path == "" {
+				return fmt.Errorf("rule %d: path required", i)
+			}
+			if r.Mode != "allow_list" && r.Mode != "deny_list" {
+				return fmt.Errorf("rule %d: mode must be allow_list or deny_list", i)
+			}
+			// allow_list with zero IPs compiles to a bare `deny all;` — a
+			// valid, most-restrictive config (an .htaccess `Deny from all`
+			// converts to exactly this). A deny_list with zero IPs would deny
+			// nobody (a no-op), so still require at least one there.
+			if r.Mode == "deny_list" && len(r.IPs) == 0 {
+				return fmt.Errorf("rule %d: deny_list needs at least one IP", i)
+			}
+		case "php_setting":
+			if r.Name == "" || r.Value == "" {
+				return fmt.Errorf("rule %d: name and value required", i)
+			}
+			if why := nginxrules.PHPSettingRefusal(r.Name, r.Value); why != "" {
+				return fmt.Errorf("rule %d: %s", i, why)
+			}
+		case "max_upload_size":
+			if r.Size == "" {
+				return fmt.Errorf("rule %d: size required", i)
+			}
+			// Size renders UNQUOTED into `client_max_body_size <size>;`. An
+			// anchored allowlist keeps a stray `;`/space out of the directive and
+			// also fails a fat-fingered value loudly instead of at `nginx -t`.
+			if !isNginxSize(r.Size) {
+				return fmt.Errorf("rule %d: size must be an nginx byte size (e.g. \"50m\", \"1g\", \"1048576\")", i)
+			}
+		case "static_alias", "media_alias":
+			// Serves a filesystem dir (Path=location, Target=alias dir). Used by
+			// framework apps (Django STATIC_ROOT / MEDIA_ROOT). Admin-only (not in
+			// the tenant safe set). Constrain the alias to under /home/ so it can
+			// never be pointed at /etc or another system path (file disclosure),
+			// even by an admin PATCH; these aliases are always a tenant app dir.
+			if r.Path == "" || r.Target == "" {
+				return fmt.Errorf("rule %d: path and target required", i)
+			}
+			if !strings.HasPrefix(r.Target, "/home/") || strings.Contains(r.Target, "..") {
+				return fmt.Errorf("rule %d: %s target must be an absolute path under /home/ with no ..", i, r.Type)
+			}
+			if strings.ContainsAny(r.Target, " \t\n\r;{}") {
+				return fmt.Errorf("rule %d: invalid chars in %s target", i, r.Type)
+			}
+		case "deny_paths":
+			// GH #1624: block files by extension. The panel builds the regex from
+			// this list (nginxrules.extensionAlternation), so the only thing a
+			// tenant supplies is bare extensions — validateExtensionList enforces
+			// [A-Za-z0-9]+ per extension, which is the regex-injection boundary.
+			if err := validateExtensionList(r.Extensions, r.Type); err != nil {
+				return fmt.Errorf("rule %d: %v", i, err)
+			}
+		case "static_cache":
+			// GH #1624: long-cache files by extension. Same extension boundary as
+			// deny_paths, plus an nginx `expires` duration.
+			if err := validateExtensionList(r.Extensions, r.Type); err != nil {
+				return fmt.Errorf("rule %d: %v", i, err)
+			}
+			if r.Duration == "" {
+				return fmt.Errorf("rule %d: static_cache needs a duration (e.g. \"30d\", \"1h\", \"max\")", i)
+			}
+			if !isNginxExpires(r.Duration) {
+				return fmt.Errorf("rule %d: static_cache duration must be an nginx expires value (e.g. \"30d\", \"1h\", \"max\", \"off\")", i)
+			}
+		case "front_controller":
+			// GH #1999: the fallback of the domain's own `location /`. The agent
+			// renders it as the last try_files argument, so the grammar is the
+			// injection boundary: one nginx token, a .php path from the docroot,
+			// and only the nginx variables frontcontroller.Variables lists. A
+			// vhost has one `location /`, so a domain has at most one.
+			frontControllers++
+			if frontControllers > 1 {
+				return fmt.Errorf("rule %d: a domain can have only one front_controller rule", i)
+			}
+			if err := frontcontroller.Validate(r.Script, r.Query); err != nil {
+				return fmt.Errorf("rule %d: %v", i, err)
+			}
+		}
+		// Forbid control characters everywhere to prevent newline injection into vhost
+		allText := r.Name + r.Value + r.Pattern + r.Replacement + r.Target + r.Path + r.Size + r.ReadTimeout + r.Duration + r.Script + r.Query + strings.Join(r.Extensions, "")
+		for _, c := range allText {
+			if c < 32 && c != '\t' {
+				return fmt.Errorf("rule %d: contains invalid control chars", i)
+			}
+		}
+		for _, ip := range r.IPs {
+			// Each entry renders UNQUOTED into `allow <ip>;` / `deny <ip>;`.
+			// Require a real IP or CIDR so nothing else (e.g. a value carrying a
+			// `;`) can reach the directive. The `allow all;`/`deny all;` fallback
+			// is emitted by the compiler, not taken from this list.
+			if !isValidIPOrCIDR(ip) {
+				return fmt.Errorf("rule %d: invalid IP or CIDR %q", i, ip)
+			}
+		}
+	}
+	return nil
+}
+
+const (
+	// maxExtensionsPerRule / maxExtensionLen bound a deny_paths / static_cache
+	// extension list. Soft abuse limits — nginx -t on the agent is the real
+	// validator — but they also keep the compiled `\.( … )$` alternation small.
+	maxExtensionsPerRule = 32
+	maxExtensionLen      = 16
+)
+
+// extensionCharRE is the extension charset for deny_paths / static_cache. Bare
+// letters/digits only — no dot, slash, or regex metacharacter. This is the
+// regex-injection boundary: nginxrules.extensionAlternation joins these verbatim
+// into `\.( … )$`, so anything but [A-Za-z0-9] could break out of the group.
+var extensionCharRE = regexp.MustCompile(`^[A-Za-z0-9]+$`)
+
+// phpFamilyExtensionRE matches extensions nginx would otherwise hand to PHP-FPM:
+// php, php7, php8, phtml, phar, pht, phps. Rejected in BOTH new rule types.
+// static_cache: serving one of these as a static file discloses PHP source
+// (e.g. wp-config.php with DB credentials). deny_paths: the template's
+// `location ~ \.php$` (rendered earlier in the vhost) wins the first-match, so a
+// tenant deny_paths for php is a silent no-op — reject it rather than mislead.
+var phpFamilyExtensionRE = regexp.MustCompile(`^(?i:php[0-9]*|phtml|phar|pht|phps)$`)
+
+// templateCachedExtensions are the extensions the agent vhost template already
+// long-caches in its own `location ~* \.(css|js|…)$` block, which is rendered
+// BEFORE the tenant rule directives — so nginx's first-match rule means a tenant
+// static_cache for one of these never takes effect. Reject them with a clear
+// message rather than store a dead rule. Mirrors the template list in
+// panel-agent/internal/commands/domain_create.go.
+var templateCachedExtensions = map[string]struct{}{
+	"css": {}, "js": {}, "jpg": {}, "jpeg": {}, "png": {}, "gif": {},
+	"ico": {}, "svg": {}, "webp": {}, "woff": {}, "woff2": {}, "ttf": {}, "eot": {},
+	// The template also caches HTML (`location ~* \.html?$`, 5m) in the same
+	// cache_enabled block, ahead of the tenant rules.
+	"html": {}, "htm": {},
+}
+
+// validateExtensionList checks a deny_paths / static_cache extension list.
+// ruleType tailors the rejections (static_cache also refuses the
+// already-template-cached extensions).
+func validateExtensionList(exts []string, ruleType string) error {
+	if len(exts) == 0 {
+		return fmt.Errorf("%s needs at least one file extension", ruleType)
+	}
+	if len(exts) > maxExtensionsPerRule {
+		return fmt.Errorf("%s: too many extensions (max %d)", ruleType, maxExtensionsPerRule)
+	}
+	for _, e := range exts {
+		norm := strings.ToLower(strings.TrimSpace(e))
+		if norm == "" {
+			return fmt.Errorf("%s: empty extension", ruleType)
+		}
+		if len(norm) > maxExtensionLen {
+			return fmt.Errorf("%s: extension %q too long (max %d chars)", ruleType, e, maxExtensionLen)
+		}
+		if !extensionCharRE.MatchString(norm) {
+			return fmt.Errorf("%s: extension %q may contain only letters and digits (no dot or symbols)", ruleType, e)
+		}
+		if phpFamilyExtensionRE.MatchString(norm) {
+			if ruleType == "static_cache" {
+				return fmt.Errorf("%s: extension %q would serve PHP source as a static file — refused", ruleType, e)
+			}
+			return fmt.Errorf("%s: extension %q is handled by the PHP location and can't be blocked this way", ruleType, e)
+		}
+		// The vhost template's own static-asset location (`location ~* \.(css|
+		// js|…|html)$`) renders BEFORE the tenant rule directives, and nginx
+		// takes the first-matching regex location — so a deny_paths OR
+		// static_cache rule for one of those extensions would never fire. Reject
+		// both rather than silently store a dead rule (a silent no-op is worst
+		// for deny_paths, where the tenant believes a file is blocked when it is
+		// not). Erring toward rejection is the safe direction; when server
+		// caching is off the template block is absent, but the validator can't
+		// see that per-domain flag, so the conservative reject stands.
+		if _, cached := templateCachedExtensions[norm]; cached {
+			return fmt.Errorf("%s: %q is served by the server's built-in static-asset handling (which is matched first), so a rule here would not take effect", ruleType, e)
+		}
+	}
+	return nil
+}
+
+// isNginxExpires reports whether s is a value the nginx `expires` directive
+// accepts: a time with an optional unit (30d, 5m, -1), or the keywords epoch /
+// max / off / the daily @HH[hMM] form. Reuses the tenant raw-directives grammar
+// (tenantExpiresRe).
+//
+// It validates the RAW string — no trimming. tenantExpiresRe is fully anchored,
+// so any surrounding whitespace (ASCII space/tab OR a Unicode space such as
+// U+00A0 NBSP that a copy-paste from a document can smuggle in) fails the match.
+// This matters because Duration is rendered VERBATIM into `expires <dur>;`
+// (unlike Extensions, which extensionAlternation re-trims at render time): a
+// value that validated-when-trimmed but rendered-raw would pass here yet break
+// `nginx -t`, and a tenant's bad vhost is torn down rather than reverted.
+func isNginxExpires(s string) bool {
+	return tenantExpiresRe.MatchString(s)
+}
+
+// nginxSizeRe matches an nginx byte-size value: digits with an optional k/m/g
+// suffix (case-insensitive), e.g. "50m", "1g", "1048576". The max_upload_size
+// rule renders it UNQUOTED into `client_max_body_size <size>;`, so the anchored
+// allowlist keeps any separator out of the directive.
+var nginxSizeRe = regexp.MustCompile(`^\d+[kKmMgG]?$`)
+
+func isNginxSize(s string) bool {
+	return nginxSizeRe.MatchString(s)
+}
+
+// isValidIPOrCIDR reports whether s is a bare IP address or a CIDR network. The
+// ip_access rule renders each entry UNQUOTED into `allow <ip>;` / `deny <ip>;`,
+// so anything that is not an address is rejected at the boundary.
+func isValidIPOrCIDR(s string) bool {
+	if net.ParseIP(s) != nil {
+		return true
+	}
+	_, _, err := net.ParseCIDR(s)
+	return err == nil
+}
+
+// redosNestedQuantRE flags the classic catastrophic-backtracking shape at save
+// time: a group that itself contains a + or * quantifier and is ITSELF quantified
+// with + or * — e.g. (a+)+, (.*)*, (\d+)*.
+//
+// This is a best-effort fail-fast, NOT the primary defense. nginx runs the
+// rewrite under PCRE with a match limit (the PCRE/PCRE2 default), so a
+// pathological pattern does NOT pin a worker: catastrophic backtracking hits the
+// limit, pcre2_match returns MATCHLIMIT (error -47), the rewrite simply doesn't
+// match, and the request continues. Verified on nginx 1.24 — a crafted
+// non-matching request against `^/(a|a)+$` stays flat at ~0.16s regardless of
+// input length (a bounded CPU amplification), not an unbounded hang. The runtime
+// already caps the damage; this regex only rejects the obvious shape early.
+//
+// It deliberately does NOT try to catch every ReDoS shape — alternation overlap
+// like (a|ab)+, or adjacent quantifiers like a*a*. A heuristic broad enough to
+// catch those also flags disjoint, perfectly safe patterns such as (en|fr|de)+,
+// the same over-strict false-reject that GH #1652 had to undo. Given the PCRE
+// match-limit backstop that trade isn't worth it. Go's RE2 is linear and won't
+// surface ReDoS by running, so textual matching is all we have here.
+var redosNestedQuantRE = regexp.MustCompile(`\([^)]*[+*][^)]*\)\s*[+*]`)
+
+// validateRewritePattern guards the nginx `rewrite` pattern (JAB-72), which is
+// rendered verbatim (unquoted) into the vhost. Cap the length, reject nested
+// quantifiers (ReDoS), and reject grossly invalid regex syntax. nginx runs the
+// MATCH under PCRE, so the syntax check accepts the PCRE lookahead assertions
+// ((?!…), (?=…)) that Go's RE2 rejects outright — front-controller apps
+// (DokuWiki, WordPress) legitimately use negative lookahead to exclude asset
+// dirs, e.g. ^/(?!lib/)(?!_media/)(.*)$ (GH #1652) — while still rejecting
+// genuinely malformed patterns.
+func validateRewritePattern(pattern string, maxLen int) error {
+	if len(pattern) > maxLen {
+		return fmt.Errorf("rewrite pattern too long (%d > %d chars)", len(pattern), maxLen)
+	}
+	// Defense-in-depth (GH #1624): the pattern is rendered into the vhost as a
+	// quoted nginx token (nginxrules.Compile), which already neutralizes `;`,
+	// `{`, `}` and whitespace. We still reject raw whitespace at the boundary —
+	// a URI-matching regex never needs a literal space or tab (`\s` covers it),
+	// and a space is the separator an injection payload would rely on, so
+	// rejecting it fails such input loudly at save time rather than leaning
+	// solely on the quoting.
+	if strings.ContainsAny(pattern, " \t") {
+		return fmt.Errorf("rewrite pattern must not contain spaces or tabs")
+	}
+	if redosNestedQuantRE.MatchString(pattern) {
+		return fmt.Errorf("rewrite pattern has nested quantifiers (ReDoS risk)")
+	}
+	// Substitute the two PCRE lookahead openers with the RE2-supported
+	// non-capturing group `(?:` and compile the probe. This admits exactly
+	// lookahead assertions (which nginx's PCRE runs fine) while still
+	// syntax-checking the rest of the pattern — paren balance, quantifiers,
+	// bad escapes — through RE2. Lookbehind ((?<=), (?<!)), backreferences
+	// (\1), recursion ((?R)) and other PCRE-only constructs are left untouched
+	// and stay rejected; backreferences are the genuinely exponential case and
+	// remain blocked. A pattern that is valid PCRE but not RE2 is backstopped
+	// at apply time by a per-vhost `nginx -t` (#1702).
+	probe := strings.NewReplacer("(?!", "(?:", "(?=", "(?:").Replace(pattern)
+	if _, err := regexp.Compile(probe); err != nil {
+		return fmt.Errorf("rewrite pattern is not valid regex: %v", err)
+	}
+	return nil
+}
+
+// validateProxyPassTarget blocks SSRF via the proxy_pass rule type (JAB-65).
+// proxy_pass is admin-only, but a compromised admin session could otherwise
+// point a public domain at an internal service (MariaDB/Redis/panel-api socket)
+// and read its responses through the vhost. Reject unix-socket upstreams and
+// literal loopback / private / link-local / unspecified targets; external
+// hostnames and public IPs still work. Hostnames are NOT DNS-resolved here
+// (resolution is TOCTOU vs DNS-rebind) — the literal-address classes are the
+// ones the acceptance criteria enumerate.
+func validateProxyPassTarget(target string) error {
+	return validateProxyPassTargetWith(target, false)
+}
+
+// validateProxyPassTargetWith applies the same checks, but with allowInternal
+// (Server Settings → Nginx, nginx_proxy_allow_internal) it admits localhost
+// and loopback / private-range IPs — for apps the admin runs on this host or
+// the LAN. Unix sockets, link-local (169.254.169.254 cloud metadata) and the
+// unspecified address stay rejected, as does the directive-smuggling check.
+func validateProxyPassTargetWith(target string, allowInternal bool) error {
+	// nginx's unix upstream form is `http://unix:/path:/`; url.Parse mangles it,
+	// so match the scheme token directly before parsing.
+	if strings.Contains(strings.ToLower(target), "unix:") {
+		return fmt.Errorf("target may not be a unix socket")
+	}
+	// The target renders UNQUOTED into `proxy_pass <target>;`. url.Parse accepts a
+	// space or `;` in the path (host stays valid), so without this an admin could
+	// smuggle a second `proxy_pass http://169.254.169.254; #` past the host checks
+	// below and reach an internal address. A real http(s) target never contains
+	// raw whitespace, `;`, `{` or `}` — they would be percent-encoded — so reject
+	// them at the boundary.
+	if strings.ContainsAny(target, " \t\r\n;{}") {
+		return fmt.Errorf("target must not contain whitespace, ';', '{' or '}'")
+	}
+	u, err := url.Parse(target)
+	if err != nil {
+		return fmt.Errorf("target is not a valid URL: %v", err)
+	}
+	host := u.Hostname()
+	if host == "" {
+		return fmt.Errorf("target has no host")
+	}
+	// A zone (fe80::1%eth0) scopes an address to an interface; no upstream
+	// needs one, and ParseIP doesn't read it, so it would skip the checks below.
+	if strings.Contains(host, "%") {
+		return fmt.Errorf("target may not carry an IPv6 zone")
+	}
+	// nginx resolves the host with getaddrinfo, which also reads the inet_aton
+	// forms (127.1, 2130706433, 0x7f000001, 0177.0.0.1) as IPv4. ParseIP
+	// doesn't, so they would skip the address checks below: a numeric host must
+	// be written as four decimal numbers.
+	if net.ParseIP(host) == nil && isNumericHost(host) {
+		return fmt.Errorf("write the target address as four decimal numbers (a.b.c.d), not %q", host)
+	}
+	if isLocalhostName(host) && !allowInternal {
+		return fmt.Errorf("target may not be localhost")
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		if ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+			return fmt.Errorf("target may not point at an internal address (%s)", host)
+		}
+		if !allowInternal && (ip.IsLoopback() || ip.IsPrivate()) {
+			return fmt.Errorf("target may not point at an internal address (%s); allow it in Server Settings → Nginx", host)
+		}
+	}
+	return nil
+}
+
+// numericHostPart is one part of a host an IPv4 parser might read as a number:
+// decimal or octal digits, or 0x and hex digits (an empty 0x included).
+var numericHostPart = regexp.MustCompile(`^(0[xX][0-9a-fA-F]*|[0-9]+)$`)
+
+// isNumericHost reports whether every dot-separated part of host (an optional
+// trailing dot aside) looks like a number. It is wider than glibc's inet_aton
+// on purpose (any part count, octal 8/9, empty 0x), so a resolver that reads
+// more forms than glibc can't turn one into an address that skips the checks.
+// No real hostname is all numbers: a top-level domain has a letter.
+func isNumericHost(host string) bool {
+	for _, p := range strings.Split(strings.TrimSuffix(host, "."), ".") {
+		if !numericHostPart.MatchString(p) {
+			return false
+		}
+	}
+	return true
+}
+
+// isLocalhostName reports whether the resolver answers host with loopback:
+// localhost and any *.localhost name, in any case, with or without the
+// trailing dot.
+func isLocalhostName(host string) bool {
+	h := strings.ToLower(strings.TrimSuffix(host, "."))
+	return h == "localhost" || strings.HasSuffix(h, ".localhost")
+}
+
+// tenantSafeNginxRuleTypes are the Rule Builder types a non-admin owner may set
+// on their own domain (GH #307). proxy_pass is excluded (SSRF to localhost
+// services — panel-api/Bulwark/Stalwart/other tenants' FPM sockets), as are
+// ip_access/php_setting/max_upload_size (admin surface / covered by
+// nginx_safe_options).
+var tenantSafeNginxRuleTypes = map[string]struct{}{
+	"rewrite":       {},
+	"custom_header": {},
+	// GH #1624 typed location rules. Both are panel-rendered from a validated
+	// extension list (no tenant-supplied regex, no reverse-proxy/file-path
+	// surface), so they carry no more trust surface than the extension charset:
+	//   - deny_paths  -> location ~* \.(…)$ { deny all; }
+	//   - static_cache -> location ~* \.(…)$ { expires <dur>; }   (no add_header)
+	"deny_paths":   {},
+	"static_cache": {},
+	// GH #1999: the fallback of the domain's `location /`. Panel-rendered from a
+	// script path and a query in the frontcontroller grammar (one nginx token,
+	// allowlisted variables only). Existing files are still served first, and
+	// the script is a .php file in the tenant's own docroot that a visitor can
+	// already request directly, so it adds no reach.
+	"front_controller": {},
+}
+
+// tenantManagedResponseHeaders are response-header names a tenant custom_header
+// rule may NOT set (ADR-0169 Phase 2). Both classes are a value-independent name
+// hazard, so this is a denylist on the name — not a value grammar:
+//
+//   - The four security headers the panel renders itself: NginxSafeOptions.Render
+//     (models/nginx_safe_options.go) emits them at server scope, and the agent
+//     vhost template re-declares three of them per PHP location (JAB-70, because
+//     a location's own add_header suppresses inherited server-scope ones). A
+//     tenant custom_header lands at server scope (nginxrules.Compile), so a
+//     tenant add_header here duplicates or weakens panel-managed hardening — e.g.
+//     `Strict-Transport-Security: max-age=0` voids HSTS. The panel owns these
+//     names; a tenant "strengthening" value is still wrong (duplicate headers).
+//   - Content-Length / Transfer-Encoding: add_header with either produces a
+//     malformed response nginx will still emit (request-smuggling-adjacent).
+//
+// Not denied: Set-Cookie / Content-Security-Policy / Cache-Control — the tenant's
+// own domain, the tenant's call. Names are lower-cased; header names are
+// case-insensitive, so we match case- and surrounding-whitespace-insensitively.
+//
+// Shared: both the typed custom_header path (validateTenantNginxRules, Phase 2)
+// and the raw advanced-directives path (ValidateNginxDirectivesTenant, Phase 4)
+// deny the same set — a tenant add_header must not override a panel-managed
+// header by either route.
+var tenantManagedResponseHeaders = map[string]struct{}{
+	"strict-transport-security": {},
+	"x-frame-options":           {},
+	"x-content-type-options":    {},
+	"referrer-policy":           {},
+	"content-length":            {},
+	"transfer-encoding":         {},
+}
+
+// validateTenantNginxRules enforces the tenant-safe subset on top of the full
+// structural validateNginxRules: only rewrite + custom_header, a rewrite
+// replacement must be a LOCAL path (no scheme or host) so it can never become
+// an open redirect or a proxy to an internal service, and a custom_header may
+// not override a panel-managed response header (ADR-0169 Phase 2).
+func validateTenantNginxRules(rules models.NginxRules) error {
+	for i, r := range rules {
+		if _, ok := tenantSafeNginxRuleTypes[r.Type]; !ok {
+			return fmt.Errorf("rule %d: type %q is not available to tenants", i, r.Type)
+		}
+		if r.Type == "rewrite" {
+			rep := strings.TrimSpace(r.Replacement)
+			if strings.Contains(rep, "://") || strings.HasPrefix(rep, "//") {
+				return fmt.Errorf("rule %d: rewrite target must be a local path (no scheme or host)", i)
+			}
+			// JAB-72: tenants get a stricter pattern length cap than admins.
+			if err := validateRewritePattern(r.Pattern, 128); err != nil {
+				return fmt.Errorf("rule %d: %v", i, err)
+			}
+		}
+		if r.Type == "custom_header" {
+			name := strings.ToLower(strings.TrimSpace(r.Name))
+			if _, denied := tenantManagedResponseHeaders[name]; denied {
+				return fmt.Errorf("rule %d: response header %q is managed by the panel and can't be set here", i, r.Name)
+			}
+		}
+	}
+	return validateNginxRules(rules)
+}
+
+func IsValidIndexPriority(s string) bool {
+	switch s {
+	case "html_first", "php_first", "html_only", "php_only", "full":
+		return true
+	}
+	return false
+}
+
+func domainLinuxUser(email string) string {
+	if i := strings.IndexByte(email, '@'); i > 0 {
+		return email[:i]
+	}
+	return "user"
+}
+
+// bandwidth returns per-day bytes + monthly totals for a single domain.
+// Default window: prior 30 days inclusive of today. Query parameter
+// `from` accepts YYYY-MM-DD to override; `to` defaults to today UTC.
+//
+// Response shape:
+//
+//	{
+//	  "domain_id": "01...",
+//	  "from": "2026-04-09", "to": "2026-05-09",
+//	  "bytes_total": 12345678, "requests_total": 9876,
+//	  "daily": [
+//	    {"day": "2026-05-08", "bytes_total": 1234, "requests_total": 56},
+//	    ...
+//	  ],
+//	  "countries": [
+//	    {"country_code": "US", "bytes_total": 900, "requests_total": 40},
+//	    ...
+//	  ]
+//	}
+//
+// countries is the window's traffic per country, most requests first, and
+// is empty on hosts without the GeoIP database. Its requests are the
+// requests goaccess counts as valid, so they can sum to less than
+// requests_total. The window is at most bwMaxWindowDays long.
+//
+// Authorization mirrors GET /domains/:id: admins read any, users only
+// their own. Domain ownership is verified via the existing FindByID
+// path, which already 404s on cross-tenant lookup.
+func (h *domainHandler) bandwidth(c *gin.Context) {
+	if h.cfg.BWDaily == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "bandwidth feature not wired"})
+		return
+	}
+	claims := ginctx.Claims(c)
+	if claims == nil {
+		c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthenticated"})
+		return
+	}
+	domainID := c.Param("id")
+	dom, err := h.cfg.Domains.FindByID(c.Request.Context(), domainID)
+	if err != nil {
+		if isNotFound(err) {
+			c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
+			return
+		}
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	if !claims.IsAdmin && dom.UserID != claims.UserID {
+		c.JSON(http.StatusNotFound, gin.H{"error": "domain not found"})
+		return
+	}
+
+	now := time.Now().UTC()
+	to := now
+	from := now.AddDate(0, 0, -29) // 30 days inclusive
+	if v := c.Query("from"); v != "" {
+		if t, err := time.Parse("2006-01-02", v); err == nil {
+			from = t
+		}
+	}
+	if v := c.Query("to"); v != "" {
+		if t, err := time.Parse("2006-01-02", v); err == nil {
+			to = t
+		}
+	}
+	if earliest := to.AddDate(0, 0, -(bwMaxWindowDays - 1)); from.Before(earliest) {
+		from = earliest
+	}
+
+	bytesTotal, reqsTotal, err := h.cfg.BWDaily.SumForDomain(c.Request.Context(), dom.ID, from, to)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	daily, err := h.cfg.BWDaily.SumPerDayForDomain(c.Request.Context(), dom.ID, from, to)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	// Go marshals a nil slice as JSON `null`, not `[]`. The SPA's
+	// DomainBandwidthCard does `data.daily.map(...)` (data is truthy,
+	// daily is null) → TypeError → the whole DomainEdit page renders
+	// blank (no error boundary). A domain with no bw_daily rows yet
+	// (fresh / pre-goaccess-scan) must return an empty array.
+	if daily == nil {
+		daily = []repository.DailyPoint{}
+	}
+	countries, err := h.cfg.BWDaily.SumCountriesForDomain(c.Request.Context(), dom.ID, from, to)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+		return
+	}
+	if countries == nil {
+		countries = []repository.CountryPoint{}
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"domain_id":      dom.ID,
+		"from":           from.Format("2006-01-02"),
+		"to":             to.Format("2006-01-02"),
+		"bytes_total":    bytesTotal,
+		"requests_total": reqsTotal,
+		"daily":          daily,
+		"countries":      countries,
+	})
+}
+
+// bwMaxWindowDays bounds the bandwidth window a caller can ask for. The
+// ledger is pruned at 90 days by default; a year leaves room for a longer
+// retention setting.
+const bwMaxWindowDays = 366
+
+// maxDomainRateLimit bounds rate_limit_rps and connection_limit. nginx takes
+// more, but past this a limit no longer filters anything.
+const maxDomainRateLimit = 10000
+
+// isNginxDuration accepts nginx's standard duration shape: a positive
+// integer followed by one of `ms s m h d` (or none = seconds). Used to
+// validate proxy_read_timeout on the rule-builder proxy_pass entry
+// without pulling in nginx's full grammar.
+func isNginxDuration(v string) bool {
+	if v == "" {
+		return false
+	}
+	i := 0
+	for i < len(v) && v[i] >= '0' && v[i] <= '9' {
+		i++
+	}
+	if i == 0 {
+		return false
+	}
+	switch v[i:] {
+	case "", "ms", "s", "m", "h", "d":
+		return true
+	}
+	return false
+}
+
+// strPtrOrNil returns nil for an empty string, else a pointer to it — so
+// the optional mail-provider DKIM tokens write SQL NULL when absent.
+func strPtrOrNil(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}

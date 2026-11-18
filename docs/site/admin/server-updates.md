@@ -1,0 +1,169 @@
+# Server Updates
+
+`/dotnext-admin/updates`. Run `dotnext-cli update` from the panel UI as a transient systemd unit.
+
+## What an update does
+
+1. `git fetch origin main`
+2. `git reset --hard origin/main`
+3. Rebuild `dotnext-api-api` and `dotnext-agent` (Go).
+4. `npm ci && npm run build` for `frontend`.
+5. Apply pending database migrations.
+6. Re-apply install-time host configurations the agent owns (nginx drop-ins, php-fpm pool directories, AppSec rules, FastCGI cache keyzone). The principle is "`install.sh` is truth, not runbook" — anything needed for a fresh host to work is also re-applied on every update.
+7. Reload nginx, restart the panel API, restart the agent, restart Bulwark, in that order.
+8. Report success or the first failure line.
+
+## Why transient systemd units
+
+If the update were to run inside the panel API itself, the panel restart in step 7 would kill the update process mid-step. The page would then look hung; the operator would have no idea whether the update succeeded.
+
+Running each update as a `systemd-run --transient --unit=dotnext-update-<timestamp>` job sidesteps this. The page subscribes to the unit's journal, so:
+
+- The panel can restart itself mid-update without interrupting the update process.
+- The operator can close and reopen the page; the live log reattaches.
+- A failed update leaves a named unit (`dotnext-update-2026-05-27-…`) that `journalctl -u <unit>` retains for the operator to inspect afterwards.
+
+The transient-unit pattern was live-verified on 192.168.100.150.
+
+## Automatic updates
+
+Each switch and time on the **Automatic Updates** card is saved as soon as you change it. There is no Save button.
+
+**OS security updates** applies Debian/Ubuntu security patches through `unattended-upgrades`. It is on by default. To turn it off, confirm the risk in the dialog that opens; the setting is saved when you click **Disable security updates**. While it is off, the card shows a red warning.
+
+**DotNext panel self-update** on this page turns automatic updates on. It is off by default. When it is on, `dotnext-autoupdate.timer` runs `dotnext-cli update -f` daily at the time you pick (default 04:30).
+
+**Security advisories** is on by default, including on servers installed before the setting existed. When DotNext publishes a security advisory, the server applies its fix within the hour, even with panel self-update off. It installs the patched packages, or it runs `dotnext-cli update`. On the stable channel, that update moves the server to the current stable release. On the development channel, it moves the server to main. Turned off, the server only sends the admins the advisory alert with the commands to run.
+
+## Why a fixed bug came back
+
+The most confusing failure this system produces is a bug that was fixed, merged,
+and then re-appeared in production. It is almost always deploy drift, and the
+mechanism is worth understanding because the symptom points away from the cause.
+
+**A merged fix is inert until the binary on that box updates.** That much is
+obvious. What is not obvious is that an out-of-date binary does not merely *lack*
+the fix — it can actively **undo** one.
+
+Several host configuration files are rendered from templates **embedded in the
+Go binary**, not read from disk: the CRS before-plugin, the AppSec config, nginx
+drop-ins, PHP-FPM pool files. Step 6 of every update, and the reconciler on its
+own schedule, re-render those files from whatever template the running binary
+carries. So on a box whose binary predates a fix:
+
+- a hand-applied correction is **overwritten** by the old embedded template on the
+  next reconcile, and
+- it comes back silently, because re-rendering a managed file is normal behaviour,
+  not an error.
+
+Two production incidents on one fleet in three weeks came from exactly this:
+
+- An AppArmor fix existed but was not deployed; config convergence restored the
+  shipped (unfixed) template overnight and took a customer's site down a **second**
+  time.
+- CRS false-positive exclusions for WooCommerce checkout merged on one day, and
+  real customers were still getting 4-hour CrowdSec bans mid-checkout the **next**
+  day, because `appsec render-config` on the old binary rewrote the exclusion file
+  from the old embedded template.
+
+### Checking for drift
+
+```
+dotnext-cli version                 # the commit this box is actually running
+```
+
+The Updates page (`/dotnext-admin/updates`) shows how many commits the box is
+behind its release channel; the same number is available from the admin API at
+`GET /api/v1/admin/updates/state` as `behind_count`. There is no CLI flag for it
+today — `dotnext-cli version` plus the panel is the check.
+
+Any non-zero behind-count means at least one merged fix is not in force here, and
+that config convergence may be actively re-applying pre-fix templates.
+
+### Avoiding it
+
+Enable auto-update on the **stable** channel. Stable is by definition the
+reviewed, promoted build, which is what unattended convergence wants: the box
+converges on fixes without an operator remembering to deploy each one.
+
+Auto-update ships **off**, so this is opt-in — configure it on the Updates page
+(`/dotnext-admin/updates`), which drives the `dotnext-autoupdate.timer` through the
+reconciler. A fleet that is not
+auto-updating needs a deliberate deploy step after every merge that matters, and
+"we merged the fix" is not the same statement as "the fix is in force".
+
+### Release channels and signatures
+
+- **Stable** moves about once a month. A stable box installs a release only
+  when it carries the DotNext release signature.
+- **Development** installs every main release as soon as CI publishes it,
+  checked against its sha256, without the release signature.
+- **Security fixes** reach boxes on both channels within the hour, through a
+  signed hotfix release and the signed advisory feed (see below).
+
+A new server installs the current stable release and follows the stable
+channel. Installed with `DOTNEXT_RELEASE_CHANNEL=development`, it installs the
+newest main build and follows the development channel
+([Installation](../installation.md)).
+
+Builds from 35d7d468d to ae219af25 (22 and 23 October 2026) require the
+signature on every channel. A development box on one of them moves once, to the
+first signed release that carries this change, and streams main from there.
+
+### Switching a box to the stable channel
+
+A box that followed main (the development channel) usually runs a newer build
+than the `stable` release. Switching it to stable never moves it backwards:
+`dotnext-cli update` sees that `stable` is behind the build it runs, prints
+"staying on the current build until a newer stable release is promoted", and
+keeps that build. The box picks up the next stable release once one is promoted
+past it.
+
+### Fixes between stable releases
+
+`stable` is promoted about once a month. An urgent fix can reach stable boxes
+sooner, two ways:
+
+- **Vendor packages** (PHP, nginx, OpenSSL, CrowdSec, Node, the Docker CLI and
+  containerd) update by themselves every day through unattended-upgrades. The
+  services that use an upgraded library are then reloaded or restarted. The
+  Docker daemon (`docker-ce`) is the one exception: upgrade it yourself.
+- **DotNext's own code** ships as a hotfix release: `stable` moves to the stable
+  build plus the fix, with a prebuilt release like any other. Stable boxes take it
+  at their next update.
+
+Neither waits for the next daily run when the fix is urgent. Every server
+checks DotNext's security advisories once an hour (**Security advisory check**
+on Admin → Cron Jobs). For a new advisory it installs the pending security
+updates or starts the panel update right away, unless an admin turned
+**Security advisories** off on the Updates page. It also sends the admins a
+**Security advisory** notification that says what was done and what still
+needs them.
+
+Before it moves the checkout, `dotnext-cli update` also checks the newest migration in
+the channel's target. If the target would not know the schema the database is
+already at, the update stops with "refusing to update" and changes nothing. This
+check runs before anything is reset or installed; the later check right before the
+binary swap still runs too.
+
+## Common failure modes
+
+| Symptom | Cause | Resolution |
+|---|---|---|
+| `git reset --hard` fails | Local edits to a tracked file. | Investigate via `git status` before discarding; once safe, retry. |
+| `npm ci` ENOTEMPTY | Race condition cleaning `node_modules`. | Retry; second run succeeds. |
+| `npm run build` exit 137 | Vite OOM on a small VM. | The installer caps `NODE_OPTIONS=--max-old-space-size` and auto-creates swap on first OOM. If it persists, increase VM RAM. |
+| Migration `Dirty database version N` | A previous migration failed mid-flight. | `dotnext-cli migrate up` to retry. |
+| Service fails to start in step 7 | Unit file shipped by the new commit references a path that does not exist yet. | `dotnext-cli repair --diagnose` will identify; usually a follow-up commit fixes within hours. |
+
+## Post-update hint
+
+On any failure, the panel prints a hint pointing at `dotnext-cli repair --diagnose`. The hint was added after recurring deploy scars where the operator needed `repair` next anyway.
+
+## CLI
+
+```bash
+dotnext-cli update                 # download the release, migrate and restart
+dotnext-cli update --force         # run the full cycle even when there is no new release
+dotnext-cli update --from-source   # build on this host instead of downloading the release
+```

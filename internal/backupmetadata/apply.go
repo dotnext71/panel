@@ -1,0 +1,1592 @@
+// Apply is the inverse of Build: takes an AccountMetadata bundle
+// recovered from a stage=meta restic snapshot and inserts the
+// per-user rows back into the panel DB.
+//
+// M30.2 disaster-recovery support. Idempotent: rows that already
+// exist by primary key are left alone (FindByID success → skip);
+// missing rows are inserted with the manifest's IDs preserved so
+// references between rows (domain → ssl_cert, domain → php_pool,
+// etc.) stay valid.
+//
+// Out of scope (deferred):
+//   - mailboxes / forwarders / autoresponders / shares — stalwart
+//     spool rebuild lives in the agent's mail stage, not here
+//   - domain_dnssec_keys — pdnsutil drives this; metadata is a cache
+//   - egress policy / requests / limit overrides — scoped to M34
+package backupmetadata
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	internalbackup "github.com/dotnext-panel/dotnext/internal/backup"
+	"github.com/dotnext-panel/dotnext/internal/dbreserve"
+	"github.com/dotnext-panel/dotnext/internal/domainops"
+	"github.com/dotnext-panel/dotnext/internal/forwarderops"
+	"github.com/dotnext-panel/dotnext/internal/ftpops"
+	"github.com/dotnext-panel/dotnext/internal/kratosclient"
+	"github.com/dotnext-panel/dotnext/internal/mailaddr"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+	"github.com/dotnext-panel/dotnext/internal/sshkeyops"
+)
+
+// reservedMailboxLocal reports whether a restored mailbox's local part is one
+// the panel keeps for itself (GH #1637), in any spelling that resolves to it.
+// A backup is input: a mailbox there would share its Stalwart principal with
+// the domain directory's host.
+func reservedMailboxLocal(local, domain string) bool {
+	if canon, _, err := mailaddr.Canonicalise(local + "@" + domain); err == nil {
+		return mailaddr.CheckNotReserved(canon) != nil
+	}
+	return mailaddr.CheckNotReserved(strings.ToLower(strings.TrimSpace(local))) != nil
+}
+
+// ApplyResult counts what landed during a single Apply call.
+// The CLI prints these so the operator sees concretely what came back.
+type ApplyResult struct {
+	UserCreated    bool
+	PHPPools       int
+	PHPPoolIni     int
+	Domains        int
+	SSLCerts       int
+	Mailboxes      int
+	Forwarders     int
+	Databases      int
+	DatabaseUsers  int
+	DatabaseGrants int
+	AppInstalls    int
+	DockerApps     int
+	SSHKeys        int
+	CronJobs       int
+	FtpAccounts    int
+	Skipped        int
+	Errors         []string
+	// WebmailBranding counts the domains whose webmail branding was restored
+	// (GH #2502).
+	WebmailBranding int
+	// LoginRestored is true when the user's Kratos identity exists AND has a
+	// password credential after the apply — i.e. the account can actually sign
+	// in with its old password. When false, LoginNote says why + what to do
+	// (typically: issue a recovery link). Both are set only when a KratosClient
+	// was provided and the bundle carried a user email.
+	LoginRestored bool
+	LoginNote     string
+}
+
+// Apply walks the metadata bundle and inserts missing rows into the
+// panel DB. Returns a non-nil ApplyResult even on partial failures;
+// per-row errors are collected in Result.Errors so a domain failure
+// doesn't abort the database/cron path.
+// restoredOwnership decides a restored domain's ownership (GH #1816 /
+// ADR-0170 decision 2). Every restore that recreates a domain row is
+// admin-run (the admin restore API, `dotnext account restore`), so the
+// administrator vouches for the name — except for a row the archive itself
+// records as pending, which is never promoted by a restore.
+func restoredOwnership(dm internalbackup.MetadataDomain) domainops.OwnershipDecision {
+	if dm.OwnershipStatus != "" && dm.OwnershipStatus != models.OwnershipVerified {
+		return domainops.OwnershipDecision{}
+	}
+	return domainops.OwnershipDecision{Verified: true, Method: models.OwnershipMethodRestore}
+}
+
+func Apply(ctx context.Context, m *internalbackup.AccountMetadata, d Deps) ApplyResult {
+	r := ApplyResult{}
+	if m == nil {
+		return r
+	}
+	now := time.Now().UTC()
+	dropSkippedParts(m, d)
+
+	// 1) User row first — every other table FKs to user_id.
+	created, uerr := applyUser(ctx, m, d, now)
+	if uerr != nil {
+		r.Errors = append(r.Errors, "user: "+uerr.Error())
+		// no point inserting child rows without the parent
+		return r
+	}
+	r.UserCreated = created
+
+	// 2) PHP pools + ini overrides — domains reference pools by id.
+	// poolIDs maps each backup pool id to the pool that stands for it on this
+	// server; a backup pool missing from it was not restored (GH #1993).
+	poolIDs := map[string]string{}
+	// GH #1993: the account's default pool is its earliest-created one, and
+	// the backup lists the default first. defaultAt is when the pool that
+	// stands for it here was created (it can be a pool the reconciler made
+	// after now); every other pool is created after it, in the backup's order.
+	defaultAt := now
+	if d.PHPPools != nil {
+		for i, p := range m.PHPPools {
+			if existing, err := d.PHPPools.FindByID(ctx, p.ID); err == nil && existing != nil {
+				// SECURITY: an uploaded bundle is untrusted. A pool with this id
+				// that another account owns runs PHP as that account's user;
+				// binding a restored domain to it would hand the domain that
+				// user's privileges.
+				if existing.UserID != m.User.ID {
+					r.Errors = append(r.Errors, fmt.Sprintf("php_pool %s: not restored: a pool with this id belongs to another account", p.ID))
+					continue
+				}
+				if i == 0 && existing.CreatedAt.After(defaultAt) {
+					defaultAt = existing.CreatedAt
+				}
+				poolIDs[p.ID] = existing.ID
+				restoreExistingPool(ctx, d, &r, m.User.ID, existing, p)
+				continue
+			} else if err != nil && !errors.Is(err, repository.ErrNotFound) {
+				r.Errors = append(r.Errors, fmt.Sprintf("php_pool %s: lookup: %v", p.ID, err))
+				continue
+			}
+			// GH #1993: an account created on this server before the restore
+			// already has its own pool for the default PHP version, under
+			// another id. One pool per (user, version) is allowed, so the
+			// backup's pool of that version is this one.
+			if existing, err := d.PHPPools.FindByUserAndVersion(ctx, m.User.ID, p.PHPVersion); err == nil && existing != nil {
+				if i == 0 && existing.CreatedAt.After(defaultAt) {
+					defaultAt = existing.CreatedAt
+				}
+				poolIDs[p.ID] = existing.ID
+				restoreExistingPool(ctx, d, &r, m.User.ID, existing, p)
+				continue
+			} else if err != nil && !errors.Is(err, repository.ErrNotFound) {
+				r.Errors = append(r.Errors, fmt.Sprintf("php_pool %s: lookup PHP %s pool: %v", p.ID, p.PHPVersion, err))
+				continue
+			}
+			createdAt := defaultAt.Add(time.Duration(i) * time.Microsecond)
+			pool := &models.PHPPool{
+				ID:                        p.ID,
+				UserID:                    m.User.ID,
+				PHPVersion:                p.PHPVersion,
+				PmMode:                    p.PmMode,
+				PmMaxChildren:             p.PmMaxChildren,
+				ProcessIdleTimeoutSeconds: p.ProcessIdleTimeoutSeconds,
+				Status:                    "pending",
+				CreatedAt:                 createdAt,
+				UpdatedAt:                 createdAt,
+			}
+			if d.Untrusted {
+				notes, err := restoredPoolTuning(ctx, d, m.User.ID, pool)
+				if err != nil {
+					r.Errors = append(r.Errors, fmt.Sprintf("php_pool %s: not restored: %v", p.ID, err))
+					continue
+				}
+				for _, n := range notes {
+					r.Errors = append(r.Errors, fmt.Sprintf("php_pool %s: %s", p.ID, n))
+				}
+			}
+			if err := d.PHPPools.Create(ctx, pool); err != nil {
+				r.Errors = append(r.Errors, fmt.Sprintf("php_pool %s: create: %v", p.ID, err))
+				continue
+			}
+			poolIDs[p.ID] = p.ID
+			r.PHPPools++
+			restorePoolIni(ctx, d, &r, p.ID, p.IniOverrides)
+		}
+	}
+
+	// 3) Domains + SSL certs.
+	// refused holds the domains CheckDomain turned down (GH #1898); none of
+	// their mailboxes, forwarders or app installs are restored either.
+	refused := map[string]bool{}
+	// SECURITY: an uploaded bundle is untrusted, and every id in it was chosen
+	// by whoever made the file. These hold the rows that belong to the account
+	// being restored, restored now or already its own; a child row the bundle
+	// ties to anything else is not restored (GH #1993).
+	ownDomains := map[string]bool{}
+	ownMailboxes := map[string]bool{}
+	ownDatabases := map[string]bool{}
+	// domainIDs, mailboxIDs, dbIDs and dbUserIDs map a backup row id to the
+	// row that stands for it on this server: the restored row, or the
+	// account's own row of the same name created here before the restore
+	// (GH #1993). Child rows are attached through them.
+	domainIDs := map[string]string{}
+	// domainRows holds the row each of them stands for, as it is here: the
+	// restored row or the account's own. The aliases are checked against it.
+	domainRows := map[string]*models.Domain{}
+	mailboxIDs := map[string]string{}
+	dbIDs := map[string]string{}
+	dbUserIDs := map[string]string{}
+	// account is the account's username on THIS server. Every path the bundle
+	// names is moved off the bundle's username onto it and checked against
+	// it: the bundle's username is only a claim by whoever made the file.
+	account := restoreAccountUsername(ctx, m, d)
+	bundleUser := ""
+	if m.User.Username != nil {
+		bundleUser = *m.User.Username
+	}
+	if d.Domains != nil {
+		for _, dm := range m.Domains {
+			if existing, err := d.Domains.FindByID(ctx, dm.ID); err == nil && existing != nil {
+				if existing.UserID != m.User.ID {
+					refused[dm.ID] = true
+					r.Errors = append(r.Errors, fmt.Sprintf("domain %s (%s): not restored: a domain with this id belongs to another account", dm.ID, dm.Name))
+					continue
+				}
+				ownDomains[dm.ID] = true
+				domainIDs[dm.ID] = dm.ID
+				domainRows[dm.ID] = existing
+				r.Skipped++
+				if d.OverwriteRows {
+					overwriteDomain(ctx, d, &r, m.User.ID, bundleUser, account, existing, dm, poolIDs)
+				}
+				continue
+			} else if err != nil && !errors.Is(err, repository.ErrNotFound) {
+				refused[dm.ID] = true
+				r.Errors = append(r.Errors, fmt.Sprintf("domain %s: lookup: %v", dm.ID, err))
+				continue
+			}
+			// GH #1993: the account may already have this domain here under
+			// another id, created on this server before the restore. Its
+			// mailboxes, forwarders and app installs are restored under it.
+			if existing, err := d.Domains.FindByName(ctx, dm.Name); err == nil && existing != nil {
+				if existing.UserID != m.User.ID {
+					refused[dm.ID] = true
+					r.Errors = append(r.Errors, fmt.Sprintf("domain %s (%s): not restored: a domain with this name belongs to another account", dm.ID, dm.Name))
+					continue
+				}
+				ownDomains[existing.ID] = true
+				domainIDs[dm.ID] = existing.ID
+				domainRows[dm.ID] = existing
+				r.Skipped++
+				if d.OverwriteRows {
+					overwriteDomain(ctx, d, &r, m.User.ID, bundleUser, account, existing, dm, poolIDs)
+				}
+				continue
+			} else if err != nil && !errors.Is(err, repository.ErrNotFound) {
+				refused[dm.ID] = true
+				r.Errors = append(r.Errors, fmt.Sprintf("domain %s (%s): lookup: %v", dm.ID, dm.Name, err))
+				continue
+			}
+			row := &models.Domain{
+				ID:                    dm.ID,
+				UserID:                m.User.ID,
+				Name:                  dm.Name,
+				DocRoot:               rehomePath(dm.DocRoot, "/home", bundleUser, account),
+				IsEnabled:             dm.IsEnabled,
+				NginxCustomDirectives: dm.NginxCustomDirectives,
+				RedirectAllTo:         dm.RedirectAllTo,
+				RedirectAllType:       dm.RedirectAllType,
+				IndexPriority:         dm.IndexPriority,
+				SSLEnabled:            dm.SSLEnabled,
+				PHPPoolID:             dm.PHPPoolID,
+				PHPMemoryLimit:        dm.PHPMemoryLimit,
+				PHPUploadMaxFilesize:  dm.PHPUploadMaxFilesize,
+				PHPPostMaxSize:        dm.PHPPostMaxSize,
+				PHPMaxInputVars:       dm.PHPMaxInputVars,
+				PHPMaxExecutionTime:   dm.PHPMaxExecutionTime,
+				PHPMaxInputTime:       dm.PHPMaxInputTime,
+				RateLimitRPS:          dm.RateLimitRPS,
+				ConnectionLimit:       dm.ConnectionLimit,
+				EmailEnabled:          dm.EmailEnabled,
+				DkimSelector:          dm.DkimSelector,
+				DkimPublicKey:         dm.DkimPublicKey,
+				CatchallTarget:        dm.CatchallTarget,
+				DisclaimerEnabled:     dm.DisclaimerEnabled,
+				DisclaimerText:        dm.DisclaimerText,
+				DNSSECEnabled:         dm.DNSSECEnabled,
+				CreatedAt:             now,
+				UpdatedAt:             now,
+			}
+			setBackupPHPSettings(row, dm, bundleUser, account)
+			setRestoredMailSettings(row, dm)
+			for _, p := range setRestoredWebSettings(row, dm, bundleUser, account) {
+				r.Errors = append(r.Errors, fmt.Sprintf("domain %s (%s): %s", dm.ID, dm.Name, p))
+			}
+			// Custom nginx directives are admin-only raw config, checked only by
+			// the relaxed admin rules. From an uploaded file they are config
+			// written by whoever made it (GH #1993): what the import can convert
+			// becomes typed rules, which CheckDomain holds to the owner's rules.
+			if d.Untrusted && row.NginxCustomDirectives != nil && strings.TrimSpace(*row.NginxCustomDirectives) != "" {
+				for _, n := range convertUploadedDirectives(row) {
+					r.Errors = append(r.Errors, fmt.Sprintf("domain %s (%s): %s", dm.ID, dm.Name, n))
+				}
+			}
+			for _, n := range setRestoredSSLMode(row, dm) {
+				r.Errors = append(r.Errors, fmt.Sprintf("domain %s (%s): %s", dm.ID, dm.Name, n))
+			}
+			if d.CheckDomain == nil {
+				refused[dm.ID] = true
+				r.Errors = append(r.Errors, fmt.Sprintf("domain %s (%s): not restored: the restore checks are not wired", dm.ID, dm.Name))
+				continue
+			}
+			warnings, cerr := d.CheckDomain(ctx, row, account)
+			if cerr != nil {
+				refused[dm.ID] = true
+				r.Errors = append(r.Errors, fmt.Sprintf("domain %s (%s): not restored: %v", dm.ID, dm.Name, cerr))
+				continue
+			}
+			if err := domainops.ApplyOwnershipDecision(&row.OwnershipState, restoredOwnership(dm), now); err != nil {
+				refused[dm.ID] = true
+				r.Errors = append(r.Errors, fmt.Sprintf("domain %s (%s): not restored: ownership token: %v", dm.ID, dm.Name, err))
+				continue
+			}
+			for _, w := range warnings {
+				r.Errors = append(r.Errors, fmt.Sprintf("domain %s (%s): %s", dm.ID, dm.Name, w))
+			}
+			if d.Untrusted {
+				for _, n := range restoredPHPLimitsPolicy(ctx, d, m.User.ID, row) {
+					r.Errors = append(r.Errors, fmt.Sprintf("domain %s (%s): %s", dm.ID, dm.Name, n))
+				}
+			}
+			// Bind the domain to the pool that stands for its backup pool here.
+			// A pool that wasn't restored leaves it unbound: the reconciler binds
+			// an unbound domain to the account's default pool, where pointing at
+			// the missing id would fail the row on its foreign key (GH #1993).
+			if row.PHPPoolID != nil && d.PHPPools != nil {
+				if id, ok := poolIDs[*row.PHPPoolID]; ok {
+					row.PHPPoolID = &id
+				} else {
+					row.PHPPoolID = nil
+					r.Errors = append(r.Errors, fmt.Sprintf("domain %s (%s): its PHP pool was not restored; it uses the account's default PHP pool", dm.ID, dm.Name))
+				}
+			}
+			// These columns default on, and GORM's insert turns a false one
+			// into true, on the row as well. The update writes the backup's.
+			enabled, ssl, webmail := row.IsEnabled, row.SSLEnabled, row.WebmailEnabled
+			if err := d.Domains.Create(ctx, row); err != nil {
+				// Without the row its mailboxes, forwarders and app installs
+				// can't be stored either; skip them so this stays the error.
+				refused[dm.ID] = true
+				r.Errors = append(r.Errors, fmt.Sprintf("domain %s (%s): create: %v", dm.ID, dm.Name, err))
+				continue
+			}
+			if !enabled || !ssl || !webmail {
+				row.IsEnabled, row.SSLEnabled, row.WebmailEnabled = enabled, ssl, webmail
+				if err := d.Domains.Update(ctx, row); err != nil {
+					r.Errors = append(r.Errors, fmt.Sprintf("domain %s (%s): left on, as a new domain is (enabled, SSL, webmail): %v", dm.ID, dm.Name, err))
+				}
+			}
+			if dm.MTASTSEnabled {
+				enableRestoredMTASTS(ctx, d, func(format string, args ...any) {
+					r.Errors = append(r.Errors, fmt.Sprintf("domain %s (%s): ", dm.ID, dm.Name)+fmt.Sprintf(format, args...))
+				}, row)
+			}
+			ownDomains[dm.ID] = true
+			domainIDs[dm.ID] = dm.ID
+			domainRows[dm.ID] = row
+			r.Domains++
+			customServed := false
+			if dm.SSLCertificate != nil && d.SSLCerts != nil {
+				cert := &models.SSLCertificate{
+					ID:           dm.SSLCertificate.ID,
+					DomainID:     dm.ID,
+					Status:       dm.SSLCertificate.Status,
+					RenewalCount: dm.SSLCertificate.RenewalCount,
+					LastError:    dm.SSLCertificate.LastError,
+					Staging:      dm.SSLCertificate.Staging,
+					CertPath:     dm.SSLCertificate.CertPath,
+					KeyPath:      dm.SSLCertificate.KeyPath,
+					CreatedAt:    now,
+					UpdatedAt:    now,
+				}
+				// SECURITY: the vhost renderers write these paths into nginx
+				// configs as root. Keep them only when they name this domain's
+				// own files; otherwise the certificate is issued again.
+				switch {
+				case !ownCertFiles(row.Name, cert.CertPath, cert.KeyPath):
+					r.Errors = append(r.Errors, fmt.Sprintf("ssl_cert %s (%s): its certificate files are not this domain's own; it will be issued again", cert.ID, row.Name))
+					cert.CertPath, cert.KeyPath, cert.Status = nil, nil, models.SSLStatusPending
+				case !knownSSLStatus[cert.Status]:
+					r.Errors = append(r.Errors, fmt.Sprintf("ssl_cert %s (%s): status %q is not one the panel knows; it will be issued again", cert.ID, row.Name, cert.Status))
+					cert.CertPath, cert.KeyPath, cert.Status = nil, nil, models.SSLStatusPending
+				case cert.CertPath != nil && !certFileOnServer(*cert.CertPath):
+					// GH #1993: on another server the row would name files
+					// that aren't there: the vhost serves plain HTTP, and
+					// nothing re-issues an issued row. Install the backup's
+					// certificate when it may and passes the checks;
+					// otherwise start over like a new domain.
+					if ok, note := installRestoredCert(ctx, d, row, cert, dm.SSLCertificate, now); !ok {
+						r.Errors = append(r.Errors, fmt.Sprintf("ssl_cert %s (%s): %s", cert.ID, row.Name, note))
+						cert.CertPath, cert.KeyPath, cert.Status = nil, nil, models.SSLStatusPending
+					}
+				case cert.Status == models.SSLStatusIssuing || cert.Status == models.SSLStatusPendingACMERetry:
+					// Mid-issue on the old server; no pass picks these up here
+					// (an ACME retry needs its retry time, which isn't restored).
+					cert.CertPath, cert.KeyPath, cert.Status = nil, nil, models.SSLStatusPending
+				}
+				if err := d.SSLCerts.Create(ctx, cert); err != nil {
+					r.Errors = append(r.Errors, fmt.Sprintf("ssl_cert %s: create: %v", cert.ID, err))
+					continue
+				}
+				r.SSLCerts++
+				customServed = cert.Status == models.SSLStatusCustom
+			}
+			// A custom-certificate domain left without its certificate would
+			// serve no HTTPS: nothing issues one in that mode.
+			if row.SSLMode == models.SSLModeCustom && !customServed {
+				if err := d.Domains.UpdateSSLMode(ctx, row.ID, models.SSLModeLE); err != nil {
+					r.Errors = append(r.Errors, fmt.Sprintf("domain %s (%s): its custom certificate was not restored, and switching it to Let's Encrypt failed: %v", dm.ID, dm.Name, err))
+				} else {
+					r.Errors = append(r.Errors, fmt.Sprintf("domain %s (%s): its custom certificate was not restored; it gets a Let's Encrypt certificate", dm.ID, dm.Name))
+				}
+			}
+		}
+	}
+
+	// 3a) Web domain aliases (GH #1625, GH #1993), once every domain is in:
+	// an alias must not take a name a domain of the same backup has.
+	// Webmail branding (GH #2502) alongside.
+	for _, dm := range m.Domains {
+		if dom := domainRows[dm.ID]; dom != nil && len(dm.Aliases) > 0 {
+			restoreDomainAliases(ctx, d, &r, dm, dom, now)
+		}
+		if dom := domainRows[dm.ID]; dom != nil && dm.WebmailBranding != nil {
+			restoreWebmailBranding(ctx, d, &r, dm, dom, now)
+		}
+	}
+
+	// 3b) Mailboxes (+ autoresponders + shares) and forwarders.
+	// Stalwart reads dotnext_panel.mailboxes via its SQL directory
+	// (ADR-0042), so recreating the row restores the account's auth +
+	// quota immediately. The Maildir MESSAGE content lives in a separate
+	// backup stage and is NOT replayed here — the restore command
+	// surfaces that as a warning.
+	for di := range m.Domains {
+		dm := m.Domains[di]
+		domID, ok := domainIDs[dm.ID]
+		if refused[dm.ID] || !ok {
+			continue
+		}
+		if d.Mailboxes != nil {
+			for _, mb := range dm.Mailboxes {
+				if reservedMailboxLocal(mb.LocalPart, dm.Name) {
+					r.Errors = append(r.Errors, fmt.Sprintf("mailbox %s: not restored: %s@%s is reserved for the domain directory", mb.ID, mb.LocalPart, dm.Name))
+					continue
+				}
+				existing, err := d.Mailboxes.FindByID(ctx, mb.ID)
+				if errors.Is(err, repository.ErrNotFound) {
+					// GH #1993: the account may already have this address
+					// here, created before the restore under another id.
+					existing, err = d.Mailboxes.FindByEmail(ctx, mb.LocalPart+"@"+dm.Name)
+				}
+				if err != nil && !errors.Is(err, repository.ErrNotFound) {
+					r.Errors = append(r.Errors, fmt.Sprintf("mailbox %s: not restored: lookup: %v", mb.ID, err))
+					continue
+				}
+				hadMailbox := err == nil && existing != nil
+				if hadMailbox {
+					// Its autoresponder and shares below are written by mailbox
+					// id, so a mailbox of another domain stays untouched.
+					if existing.DomainID != domID {
+						r.Errors = append(r.Errors, fmt.Sprintf("mailbox %s: not restored: a mailbox with this id or address belongs to another domain", mb.ID))
+						continue
+					}
+					ownMailboxes[existing.ID] = true
+					mailboxIDs[mb.ID] = existing.ID
+					r.Skipped++
+					if d.OverwriteRows {
+						overwriteMailbox(ctx, d, &r, existing, mb, mb.LocalPart+"@"+dm.Name)
+					}
+				} else {
+					// The database refuses a mailbox where an alias, group or
+					// shared resource is; clearing the address first would take
+					// that alias off its account in Stalwart's registry.
+					held, err := repository.MailboxAddressHeld(ctx, d.Mailboxes, domID, mb.LocalPart)
+					if err != nil {
+						r.Errors = append(r.Errors, fmt.Sprintf("mailbox %s: not restored: address check: %v", mb.ID, err))
+						continue
+					}
+					if held {
+						r.Errors = append(r.Errors, fmt.Sprintf("mailbox %s: not restored: %s@%s already belongs to an alias, group or shared resource", mb.ID, mb.LocalPart, dm.Name))
+						continue
+					}
+					// A stale registry alias at this address would sign the
+					// restored mailbox in to another account.
+					if d.MailAddresses == nil {
+						r.Errors = append(r.Errors, fmt.Sprintf("mailbox %s: not restored: the mail server client is not wired", mb.ID))
+						continue
+					}
+					if err := d.MailAddresses.ReleaseAddress(ctx, mb.LocalPart+"@"+dm.Name); err != nil {
+						r.Errors = append(r.Errors, fmt.Sprintf("mailbox %s: not restored: clear %s@%s on the mail server: %v", mb.ID, mb.LocalPart, dm.Name, err))
+						continue
+					}
+					row := &models.Mailbox{
+						ID:           mb.ID,
+						DomainID:     domID,
+						LocalPart:    mb.LocalPart,
+						EmailCached:  mb.EmailCached,
+						PasswordHash: mb.PasswordHash,
+						PasswordEnc:  mb.PasswordEnc,
+						QuotaBytes:   mb.QuotaBytes,
+						IsDisabled:   mb.IsDisabled,
+						CreatedAt:    now,
+						UpdatedAt:    now,
+					}
+					if err := d.Mailboxes.Create(ctx, row); err != nil {
+						r.Errors = append(r.Errors, fmt.Sprintf("mailbox %s: create: %v", mb.ID, err))
+						continue
+					}
+					ownMailboxes[mb.ID] = true
+					mailboxIDs[mb.ID] = mb.ID
+					r.Mailboxes++
+				}
+				mbID := mailboxIDs[mb.ID]
+				// Autoresponder is keyed by the mailbox PK; Update upserts.
+				// Keeping what is there, a mailbox that already has one keeps it.
+				restoreAR := mb.Autoresponder != nil && d.Autoresponders != nil
+				if restoreAR && d.KeepExisting && hadMailbox {
+					cur, err := d.Autoresponders.FindByMailboxID(ctx, mbID)
+					switch {
+					case err == nil && cur != nil:
+						r.Skipped++
+						restoreAR = false
+					case err != nil && !errors.Is(err, repository.ErrNotFound):
+						r.Errors = append(r.Errors, fmt.Sprintf("autoresponder %s: not restored: lookup: %v", mb.ID, err))
+						restoreAR = false
+					}
+				}
+				if restoreAR {
+					ar := &models.EmailAutoresponder{
+						MailboxID: mbID,
+						Enabled:   mb.Autoresponder.Enabled,
+						Subject:   mb.Autoresponder.Subject,
+						TextBody:  mb.Autoresponder.TextBody,
+						HTMLBody:  mb.Autoresponder.HTMLBody,
+						FromDate:  parseMetaTime(mb.Autoresponder.FromDate),
+						ToDate:    parseMetaTime(mb.Autoresponder.ToDate),
+					}
+					if err := d.Autoresponders.Update(ctx, ar); err != nil {
+						r.Errors = append(r.Errors, fmt.Sprintf("autoresponder %s: %v", mb.ID, err))
+					}
+				}
+				// Mailbox shares owned by this mailbox.
+				if d.MailboxShares != nil {
+					for _, sh := range mb.SharedWith {
+						if existing, err := d.MailboxShares.FindByID(ctx, sh.ID); err == nil && existing != nil {
+							r.Skipped++
+							continue
+						}
+						var rights models.Rights
+						if sh.Rights != "" {
+							_ = json.Unmarshal([]byte(sh.Rights), &rights)
+						}
+						sharedWith := sh.SharedWithMailboxID
+						if id, ok := mailboxIDs[sharedWith]; ok {
+							sharedWith = id
+						}
+						share := &models.MailboxShare{
+							ID:                  sh.ID,
+							OwnerMailboxID:      mbID,
+							SharedWithMailboxID: sharedWith,
+							Rights:              rights,
+							CreatedAt:           now,
+						}
+						if err := d.MailboxShares.Create(ctx, share); err != nil {
+							r.Errors = append(r.Errors, fmt.Sprintf("mailbox_share %s: create: %v", sh.ID, err))
+						}
+					}
+				}
+				// GH #2017: the senders the mailbox trusts. The reconciler
+				// writes them into Stalwart on its next tick.
+				if d.TrustedSenders != nil && len(mb.TrustedSenders) > 0 {
+					restoreTrustedSenders(ctx, d, &r, mbID, mb.ID, mb.TrustedSenders)
+				}
+			}
+		}
+		if d.Forwarders != nil {
+			// Imported forwarders only reach Stalwart via forwarder.apply — the DB
+			// row alone does nothing (GH #1795 follow-up). Map each mailbox id to
+			// its email so an enabled restored forwarder can be converged after the
+			// loop; mailboxes with no cached email fall back to first-mutation
+			// self-heal.
+			mbEmail := map[string]string{}
+			for _, mb := range dm.Mailboxes {
+				if id, ok := mailboxIDs[mb.ID]; ok && mb.EmailCached != "" {
+					mbEmail[id] = mb.EmailCached
+				}
+			}
+			convergeFwds := map[string]string{}
+			for _, fw := range dm.Forwarders {
+				if existing, err := d.Forwarders.FindByID(ctx, fw.ID); err == nil && existing != nil {
+					r.Skipped++
+					continue
+				}
+				fwMailbox := fw.MailboxID
+				if fwMailbox != nil {
+					if id, ok := mailboxIDs[*fwMailbox]; ok {
+						fwMailbox = &id
+					}
+				}
+				if fwMailbox != nil && !ownMailboxes[*fwMailbox] {
+					r.Errors = append(r.Errors, fmt.Sprintf("forwarder %s: not restored: its mailbox is not one of this account's restored mailboxes", fw.ID))
+					continue
+				}
+				row := &models.EmailForwarder{
+					ID:        fw.ID,
+					MailboxID: fwMailbox,
+					DomainID:  domID,
+					Type:      fw.Type,
+					LocalPart: fw.LocalPart,
+					Target:    fw.Target,
+					Enabled:   fw.Enabled,
+					CreatedAt: now,
+					UpdatedAt: now,
+				}
+				if err := d.Forwarders.Create(ctx, row); err != nil {
+					r.Errors = append(r.Errors, fmt.Sprintf("forwarder %s: create: %v", fw.ID, err))
+					continue
+				}
+				r.Forwarders++
+				if row.Enabled && row.MailboxID != nil {
+					if email, ok := mbEmail[*row.MailboxID]; ok {
+						convergeFwds[*row.MailboxID] = email
+					}
+				}
+			}
+			// Best-effort push. nil agent (e.g. the backup scheduler) skips this;
+			// the rows converge on the first later forwarder mutation instead.
+			if d.Agent != nil {
+				for mbID, email := range convergeFwds {
+					// nil autoresponders: the reconcile sweep re-converges the full
+					// composite (forwards + autoresponder) on its next tick (GH #1795).
+					if cErr := forwarderops.Converge(ctx, d.Agent, d.Forwarders, d.Autoresponders, mbID, email); cErr != nil {
+						r.Errors = append(r.Errors, fmt.Sprintf("forwarder converge %s: %v", email, cErr))
+					}
+				}
+			}
+		}
+	}
+
+	// 4) Databases + db_users + grants.
+	if d.Databases != nil {
+		// SECURITY (GH #1993): a database or database-user row is a handle
+		// the account's owner can drop, dump, restore or re-password through
+		// the panel. Never this server's own, nor a name another account has
+		// (an older backup can hold one the account has since handed over,
+		// e.g. `dotnext db chown`); from an uploaded file, only names in the
+		// account's own namespace.
+		dbRows, dbUserRows := m.Databases, m.DatabaseUsers
+		otherDBs, otherDBUsers, accountDBs, listErr := accountDatabaseNames(ctx, d, m.User.ID)
+		if listErr != nil {
+			r.Errors = append(r.Errors, fmt.Sprintf("databases: not restored: %v", listErr))
+			dbRows, dbUserRows = nil, nil
+		}
+		// The account's package limits on databases and database users hold
+		// here as in the panel; unreadable, nothing is added.
+		var limits restoreDBLimits
+		if len(dbRows) > 0 || len(dbUserRows) > 0 {
+			var limErr error
+			if limits, limErr = readRestoreDBLimits(ctx, d, m.User.ID); limErr != nil {
+				r.Errors = append(r.Errors, fmt.Sprintf("databases: not restored: %v", limErr))
+				dbRows, dbUserRows = nil, nil
+			}
+		}
+		dbNameToID := make(map[string]string, len(dbRows))
+		// ownByName is the account's own databases and database users by
+		// name, loaded on the first name conflict (GH #1993).
+		var ownByName *ownDatabaseRows
+		lookupOwn := func() *ownDatabaseRows {
+			if ownByName == nil {
+				o, err := listOwnDatabaseRows(ctx, d, m.User.ID)
+				if err != nil {
+					r.Errors = append(r.Errors, fmt.Sprintf("databases: %v", err))
+				}
+				ownByName = o
+			}
+			return ownByName
+		}
+		// The database users and grants this restore creates get their
+		// MariaDB side after the loop (createRestoredDBAccounts).
+		var newDBUsers []restoredDBAccount
+		var newGrants []*models.DatabaseUserGrant
+		// The account's own database users the backup also has; with
+		// OverwriteRows they may take the backup's password.
+		var existingDBUsers []existingDBUser
+		for _, db := range dbRows {
+			if why := restoredDatabaseRefusal(db.Name, account, d.Untrusted, otherDBs); why != "" {
+				r.Errors = append(r.Errors, fmt.Sprintf("database %s (%s): not restored: %s", db.ID, db.Name, why))
+				continue
+			}
+			if d.Untrusted && !d.RestoredDatabases[db.Name] && !accountDBs[db.Name] {
+				r.Errors = append(r.Errors, fmt.Sprintf("database %s (%s): not restored: the restore didn't load its data into a database of this account", db.ID, db.Name))
+				continue
+			}
+			dbNameToID[db.Name] = db.ID
+			row := &models.Database{
+				ID:        db.ID,
+				UserID:    m.User.ID,
+				Name:      db.Name,
+				Engine:    db.Engine,
+				Charset:   db.Charset,
+				Collation: db.Collation,
+				CreatedAt: now,
+				UpdatedAt: now,
+			}
+			err := limits.createDatabase(ctx, d.Databases, row)
+			var limitErr *restoreLimitError
+			if errors.As(err, &limitErr) {
+				// The limit is checked before the insert, so a database
+				// already here reads as over it: it is the conflict below.
+				if existing, ferr := d.Databases.FindByID(ctx, db.ID); ferr == nil && existing != nil {
+					err = repository.ErrConflict
+				} else if _, ok := lookupOwn().dbs[db.Name]; ok {
+					err = repository.ErrConflict
+				}
+			}
+			if err != nil {
+				if errors.As(err, &limitErr) {
+					r.Errors = append(r.Errors, fmt.Sprintf("database %s (%s): not restored: %v", db.ID, db.Name, limitErr))
+					continue
+				}
+				if errors.Is(err, repository.ErrConflict) {
+					if existing, ferr := d.Databases.FindByID(ctx, db.ID); ferr == nil && existing != nil && existing.UserID == m.User.ID {
+						ownDatabases[db.ID] = true
+						dbIDs[db.ID] = db.ID
+					} else if id, ok := lookupOwn().dbs[db.Name]; ok {
+						// GH #1993: the account already has this database here
+						// under another id, created before the restore.
+						ownDatabases[id] = true
+						dbIDs[db.ID] = id
+						dbNameToID[db.Name] = id
+					}
+					r.Skipped++
+					continue
+				}
+				r.Errors = append(r.Errors, fmt.Sprintf("database %s (%s): create: %v", db.ID, db.Name, err))
+				continue
+			}
+			ownDatabases[db.ID] = true
+			dbIDs[db.ID] = db.ID
+			r.Databases++
+		}
+		if d.DatabaseUsers != nil {
+			for _, du := range dbUserRows {
+				if why := restoredDBUserRefusal(du.Username, account, d.Untrusted, otherDBUsers); why != "" {
+					r.Errors = append(r.Errors, fmt.Sprintf("db_user %s (%s): not restored: %s", du.ID, du.Username, why))
+					continue
+				}
+				dbu := &models.DatabaseUser{
+					ID:           du.ID,
+					UserID:       m.User.ID,
+					Username:     du.Username,
+					Engine:       restoredDBUserEngine(du, m.Databases),
+					PasswordHash: du.PasswordHash,
+					CreatedAt:    now,
+					UpdatedAt:    now,
+				}
+				err := limits.createDatabaseUser(ctx, d.DatabaseUsers, dbu)
+				var limitErr *restoreLimitError
+				if errors.As(err, &limitErr) {
+					// As for databases: one already here is the conflict below.
+					if existing, ferr := d.DatabaseUsers.FindByID(ctx, du.ID); ferr == nil && existing != nil {
+						err = repository.ErrConflict
+					} else if _, ok := lookupOwn().users[du.Username]; ok {
+						err = repository.ErrConflict
+					} else {
+						r.Errors = append(r.Errors, fmt.Sprintf("db_user %s (%s): not restored: %v", du.ID, du.Username, limitErr))
+						continue
+					}
+				}
+				if err != nil {
+					if errors.Is(err, repository.ErrConflict) {
+						// Grants below attach to this user id: only to one
+						// that is this account's own.
+						existing, ferr := d.DatabaseUsers.FindByID(ctx, du.ID)
+						switch {
+						case ferr == nil && existing != nil && existing.UserID == m.User.ID:
+							dbUserIDs[du.ID] = du.ID
+							existingDBUsers = append(existingDBUsers, existingDBUser{id: du.ID, backup: du})
+						case ferr == nil && existing != nil:
+							r.Errors = append(r.Errors, fmt.Sprintf("db_user %s: not restored: a database user with this id belongs to another account", du.ID))
+							continue
+						default:
+							// GH #1993: the account may already have this
+							// database user here under another id.
+							id, ok := lookupOwn().users[du.Username]
+							if !ok {
+								r.Errors = append(r.Errors, fmt.Sprintf("db_user %s (%s): not restored: a database user with this name belongs to another account", du.ID, du.Username))
+								continue
+							}
+							dbUserIDs[du.ID] = id
+							existingDBUsers = append(existingDBUsers, existingDBUser{id: id, backup: du})
+						}
+						r.Skipped++
+					} else {
+						r.Errors = append(r.Errors, fmt.Sprintf("db_user %s: create: %v", du.ID, err))
+						continue
+					}
+				} else {
+					dbUserIDs[du.ID] = du.ID
+					r.DatabaseUsers++
+					newDBUsers = append(newDBUsers, restoredDBAccount{row: dbu, nativeHash: du.NativePasswordHash, pgVerifier: du.PostgresPasswordVerifier})
+				}
+				if d.DatabaseGrants != nil {
+					for _, g := range du.Grants {
+						gid := g.ID
+						if gid == "" {
+							continue
+						}
+						dbID := g.DatabaseID
+						if id, ok := dbIDs[dbID]; ok {
+							dbID = id
+						}
+						if dbID == "" && g.DatabaseName != "" {
+							dbID = dbNameToID[g.DatabaseName]
+						}
+						if dbID == "" {
+							r.Errors = append(r.Errors, fmt.Sprintf("db_grant %s: unresolved database", gid))
+							continue
+						}
+						if !ownDatabases[dbID] {
+							r.Errors = append(r.Errors, fmt.Sprintf("db_grant %s: not restored: its database is not one of this account's", gid))
+							continue
+						}
+						gr := &models.DatabaseUserGrant{
+							ID:             gid,
+							DatabaseID:     dbID,
+							DatabaseUserID: dbUserIDs[du.ID],
+							GrantLevel:     g.GrantLevel,
+							Privileges:     g.Privileges,
+							CreatedAt:      now,
+							UpdatedAt:      now,
+						}
+						if err := d.DatabaseGrants.Create(ctx, gr); err != nil {
+							if errors.Is(err, repository.ErrConflict) {
+								r.Skipped++
+								continue
+							}
+							r.Errors = append(r.Errors, fmt.Sprintf("db_grant %s: create: %v", gid, err))
+							continue
+						}
+						r.DatabaseGrants++
+						newGrants = append(newGrants, gr)
+					}
+				}
+			}
+		}
+		if d.Agent != nil {
+			createRestoredDBAccounts(ctx, d, m.User.ID, newDBUsers, newGrants, &r)
+		}
+		// After the grants are made: a password is set only on a user whose
+		// every grant is on a database this file restored.
+		if d.OverwriteRows && d.DatabaseUsers != nil {
+			overwriteDBUserPasswords(ctx, d, m.User.ID, existingDBUsers, &r)
+		}
+	}
+
+	// 5) App installs.
+	if d.AppInstalls != nil {
+		for _, ai := range m.AppInstalls {
+			if id, ok := domainIDs[ai.DomainID]; ok {
+				ai.DomainID = id
+			}
+			if ai.DBID != nil {
+				if id, ok := dbIDs[*ai.DBID]; ok {
+					ai.DBID = &id
+				}
+			}
+			if refused[ai.DomainID] {
+				r.Errors = append(r.Errors, fmt.Sprintf("app_install %s: not restored: its domain was refused", ai.ID))
+				continue
+			}
+			if !ownDomains[ai.DomainID] {
+				r.Errors = append(r.Errors, fmt.Sprintf("app_install %s: not restored: its domain is not one of this account's", ai.ID))
+				continue
+			}
+			if ai.DBID != nil && *ai.DBID != "" && !ownDatabases[*ai.DBID] {
+				r.Errors = append(r.Errors, fmt.Sprintf("app_install %s: not restored: its database is not one of this account's", ai.ID))
+				continue
+			}
+			row := &models.ApplicationInstall{
+				ID:            ai.ID,
+				UserID:        m.User.ID,
+				DomainID:      ai.DomainID,
+				DBID:          ai.DBID,
+				Version:       ai.Version,
+				AdminUsername: ai.AdminUsername,
+				AdminEmail:    ai.AdminEmail,
+				Locale:        ai.Locale,
+				UseWWW:        ai.UseWWW,
+				Subdirectory:  ai.Subdirectory,
+				Status:        ai.Status,
+				AppType:       ai.AppType,
+				CreatedAt:     now,
+				UpdatedAt:     now,
+			}
+			if err := d.AppInstalls.Create(ctx, row); err != nil {
+				if errors.Is(err, repository.ErrConflict) {
+					r.Skipped++
+					continue
+				}
+				r.Errors = append(r.Errors, fmt.Sprintf("app_install %s: create: %v", ai.ID, err))
+				continue
+			}
+			r.AppInstalls++
+		}
+	}
+
+	// 5b) Docker apps (GH #954): rebuild the panel row + published ports so the
+	// restored app is panel-managed. The DATA tree + compose-up land via the
+	// stage=docker restore (#1017); without this row the app is orphaned on disk.
+	if d.DockerApps != nil && len(m.DockerApps) > 0 {
+		// An app's data lives in one global dir per effective slug, so a
+		// restored app must not take a slug an app with another owner uses.
+		apps := m.DockerApps
+		existing, listErr := d.DockerApps.ListAll(ctx)
+		if listErr != nil {
+			r.Errors = append(r.Errors, fmt.Sprintf("docker_apps: not restored: list this server's apps: %v", listErr))
+			apps = nil
+		}
+		for _, a := range apps {
+			// GH #1993: a server-level app from an uploaded file would be an
+			// admin-level app chosen by whoever made it.
+			if a.ServerLevel && d.Untrusted {
+				r.Errors = append(r.Errors, fmt.Sprintf("docker_app %s (%s): not restored: a server-level app can't be restored from an uploaded backup", a.ID, a.Slug))
+				continue
+			}
+			// Server-level apps (GH #1360) restore with UserID NULL so they
+			// stay admin/server-level; tenant apps are (re)owned by the
+			// account being restored. Re-owning a server-level app to the
+			// admin would wrongly subject it to tenant validation + slice
+			// scoping on the next reconcile.
+			var owner *string
+			if !a.ServerLevel {
+				uid := m.User.ID
+				owner = &uid
+			}
+			if bad := malformedDockerSlug(a); bad != "" {
+				r.Errors = append(r.Errors, fmt.Sprintf("docker_app %s: not restored: %q is not an app name", a.ID, bad))
+				continue
+			}
+			slug, taken := dockerSlugTaken(existing, a, owner)
+			if taken {
+				r.Errors = append(r.Errors, fmt.Sprintf("docker_app %s: not restored: another account's app already uses %q", a.ID, slug))
+				continue
+			}
+			if d.Untrusted && !d.RestoredDockerSlugs[slug] && !accountHasApp(existing, slug, m.User.ID) {
+				r.Errors = append(r.Errors, fmt.Sprintf("docker_app %s: not restored: the restore didn't restore its data into an app folder of this account (%q)", a.ID, slug))
+				continue
+			}
+			row := &models.DockerApp{
+				ID: a.ID, UserID: owner, Slug: a.Slug, InstanceSlug: a.InstanceSlug,
+				Name: a.Name, CatalogVersion: a.CatalogVersion, ImageSHA: a.ImageSHA,
+				Status: a.Status, UpdateMode: a.UpdateMode,
+				CPULimit: a.CPULimit, MemoryLimit: a.MemoryLimit, PIDsLimit: a.PIDsLimit,
+				CreatedAt: now, UpdatedAt: now,
+			}
+			if err := d.DockerApps.Create(ctx, row); err != nil {
+				if errors.Is(err, repository.ErrConflict) {
+					r.Skipped++
+					continue
+				}
+				r.Errors = append(r.Errors, fmt.Sprintf("docker_app %s: create: %v", a.ID, err))
+				continue
+			}
+			for _, p := range a.Ports {
+				port := &models.DockerAppPublishedPort{
+					ID: p.ID, AppID: a.ID, PortName: p.PortName, ContainerPort: p.ContainerPort,
+					BindInterface: p.BindInterface, HostPort: p.HostPort, Protocol: p.Protocol,
+					ReverseProxy: p.ReverseProxy, Enabled: p.Enabled, CreatedAt: now,
+				}
+				if err := d.DockerApps.CreatePort(ctx, port); err != nil {
+					r.Errors = append(r.Errors, fmt.Sprintf("docker_app %s port %s: create: %v", a.ID, p.PortName, err))
+				}
+			}
+			r.DockerApps++
+		}
+	}
+
+	// 6) SSH keys. Persist through the shared restore operation (JAB-292 AC4) so
+	// this is no longer a direct ssh_keys writer and per-owner authorized_keys
+	// convergence has one coalescing point. Backup restore follows the
+	// reconciler-tick convergence model the rest of restored state uses (see
+	// applyRestoreMetadata), so the batch carries no Scheduler — restored keys
+	// re-converge on the next tick, not immediately.
+	//
+	// SECURITY (GH #1993): an SSH key is a login to the account. From an
+	// uploaded file it is restored only into an account the restore created,
+	// whose home holds nothing but the file's data: the file's author never
+	// gets a login to data they didn't supply. Into an account that was
+	// already here each key the account doesn't have is listed instead.
+	if d.SSHKeys != nil && d.Untrusted && !d.AccountCreated {
+		have := map[string]bool{}
+		if existing, err := d.SSHKeys.ListByUserID(ctx, m.User.ID); err == nil {
+			for _, k := range existing {
+				have[k.Fingerprint] = true
+			}
+		}
+		for _, k := range m.SSHKeys {
+			if !have[k.Fingerprint] {
+				r.Errors = append(r.Errors, fmt.Sprintf("ssh_key %q: not restored: an uploaded backup brings SSH keys back only into an account the restore created; check the key, then add it under SSH Keys", k.Name))
+			}
+		}
+	} else if d.SSHKeys != nil {
+		batch := sshkeyops.NewRestoreBatch(sshkeyops.Deps{Keys: d.SSHKeys})
+		for _, k := range m.SSHKeys {
+			row := &models.SSHKey{
+				ID:          k.ID,
+				UserID:      m.User.ID,
+				Name:        k.Name,
+				PublicKey:   k.PublicKey,
+				Fingerprint: k.Fingerprint,
+				CreatedAt:   now,
+			}
+			if err := batch.Restore(ctx, row); err != nil {
+				if errors.Is(err, sshkeyops.ErrDuplicate) {
+					r.Skipped++
+					continue
+				}
+				r.Errors = append(r.Errors, fmt.Sprintf("ssh_key %s: create: %v", k.ID, err))
+				continue
+			}
+			r.SSHKeys++
+		}
+		batch.Flush()
+	}
+
+	// 7) Cron jobs.
+	if d.CronJobs != nil {
+		for _, cj := range m.CronJobs {
+			row := &models.CronJob{
+				ID:        cj.ID,
+				UserID:    m.User.ID,
+				Name:      cj.Name,
+				Command:   cj.Command,
+				Schedule:  cj.Schedule,
+				Enabled:   cj.Enabled,
+				CreatedAt: now,
+				UpdatedAt: now,
+			}
+			if err := d.CronJobs.Create(ctx, row); err != nil {
+				if errors.Is(err, repository.ErrConflict) {
+					r.Skipped++
+					continue
+				}
+				r.Errors = append(r.Errors, fmt.Sprintf("cron_job %s: create: %v", cj.ID, err))
+				continue
+			}
+			r.CronJobs++
+		}
+	}
+
+	// 7b) FTP/SFTP subaccounts (GH #1361). Rebuild the row as-is: the
+	// reconciler reprovisions the system user/jail/quota from these fields on
+	// its next tick, reusing the stored UID (its owned files carry it) and
+	// JailPath. The login PASSWORD is NOT in the panel DB — the agent restores
+	// it into /etc/shadow from the metadata's PasswordShadow (see the agent
+	// restore staging path); without that the reconciler sets a throwaway and
+	// the tenant must reset. QuotaMB is restored verbatim (a restore onto a
+	// smaller package can overcommit the split — the reconciler's cap check is
+	// advisory here). Username embeds the SOURCE tenant prefix and is restored
+	// as-is; the home and jail paths move to this server's username.
+	if d.FtpAccounts != nil {
+		for _, a := range m.FtpAccounts {
+			// The reconciler provisions the system user, home and jail from
+			// these paths: keep them inside this account's own home and jail
+			// directory, never another account's.
+			home := rehomePath(a.HomePath, "/home", bundleUser, account)
+			if !pathWithin(home, "/home", account) {
+				r.Errors = append(r.Errors, fmt.Sprintf("ftp_account %s: not restored: home %q is outside /home/%s", a.ID, a.HomePath, account))
+				continue
+			}
+			jail := a.JailPath
+			if jail != "" {
+				jail = rehomePath(jail, ftpops.JailRoot, bundleUser, account)
+				if !pathWithin(jail, ftpops.JailRoot, account) {
+					r.Errors = append(r.Errors, fmt.Sprintf("ftp_account %s: not restored: jail %q is outside %s/%s", a.ID, a.JailPath, ftpops.JailRoot, account))
+					continue
+				}
+			}
+			row := &models.FtpAccount{
+				ID:           a.ID,
+				UserID:       m.User.ID,
+				Username:     a.Username,
+				HomePath:     home,
+				FTPAccess:    a.FTPAccess,
+				SFTPAccess:   a.SFTPAccess,
+				WebDAVAccess: a.WebDAVAccess,
+				IsEnabled:    a.IsEnabled,
+				UID:          a.UID,
+				Isolated:     a.Isolated,
+				QuotaMB:      a.QuotaMB,
+				JailPath:     jail,
+				CreatedAt:    now,
+				UpdatedAt:    now,
+			}
+			if err := d.FtpAccounts.Create(ctx, row); err != nil {
+				if errors.Is(err, repository.ErrConflict) {
+					r.Skipped++
+					continue
+				}
+				r.Errors = append(r.Errors, fmt.Sprintf("ftp_account %s: create: %v", a.ID, err))
+				continue
+			}
+			r.FtpAccounts++
+			if d.Untrusted && !d.FtpPasswordsStaged[a.Username] {
+				r.Errors = append(r.Errors, fmt.Sprintf("ftp_account %s: restored without its password; set a new one under FTP Accounts. An uploaded backup brings an FTP password back only into an account the restore created, from a backup that has it", a.Username))
+			}
+		}
+	}
+
+	// 8) Kratos identity restoration
+	//
+	// SECURITY (GH #1993): never from an uploaded file. The exported identity
+	// (traits, state, metadata, password hash) is whatever the file says;
+	// importing it would add a sign-in identity to this server that the file
+	// chose (same reasoning as step 9's gate). An account restored from an
+	// upload keeps the sign-in it has here (a new one gets a random password
+	// and a recovery link).
+	if m.Kratos != nil && m.Kratos.ExportedIdentity != "" && d.Untrusted {
+		r.Errors = append(r.Errors, "login: the sign-in identity in the uploaded file was not imported; the account keeps the sign-in it has on this server")
+	} else if m.Kratos != nil && m.Kratos.ExportedIdentity != "" && d.KratosClient != nil {
+		var exportedIdentity kratosclient.ExportedIdentity
+		if err := json.Unmarshal([]byte(m.Kratos.ExportedIdentity), &exportedIdentity); err != nil {
+			r.Errors = append(r.Errors, fmt.Sprintf("kratos identity: unmarshal: %v", err))
+		} else {
+			if err := d.KratosClient.ImportIdentities(ctx, []kratosclient.ExportedIdentity{exportedIdentity}); err != nil {
+				r.Errors = append(r.Errors, fmt.Sprintf("kratos identity: import: %v", err))
+			}
+		}
+	}
+
+	// 9) Login verification (GH #954). The steps above can each half-succeed
+	// (applyUser creates an identity only when the panel hash is a usable
+	// bcrypt; the bundle's exported identity may predate credential capture;
+	// an identity may exist from a prior run). Resolve the ground truth —
+	// does an identity exist for this email, and does it hold a password? —
+	// so the operator gets a definitive login status instead of a swallowed
+	// warning, and a fresh (password-less) identity is minted when none
+	// exists so a recovery link can actually be issued.
+	//
+	// SECURITY (GH #1408): gated on `created`. The email + is_admin + password
+	// hash read here are bundle-controlled, and the restore-from-UPLOAD path
+	// remaps only user.id — not the email — into an EXISTING target user
+	// (created=false). Ungated, an uploaded tar carrying an attacker's email +
+	// is_admin=true + a known hash would MINT a matching (admin) Kratos identity
+	// on this box: privilege escalation. We only ever mint/verify for a user we
+	// just created this run (a trusted same-box snapshot or a sanitized
+	// create-from-manifest, both non-admin per applyUser); an
+	// upload-into-existing-user restore never touches Kratos here.
+	if created && d.KratosClient != nil && m.User.Email != "" {
+		username := ""
+		if m.User.Username != nil {
+			username = *m.User.Username
+		}
+		id, err := d.KratosClient.IdentityIDByEmail(ctx, m.User.Email)
+		switch {
+		case err != nil:
+			r.LoginNote = fmt.Sprintf("kratos lookup failed (%v) — verify Kratos is up, then issue a recovery link", err)
+		case id == "":
+			// No identity at all. Mint one so the account is recoverable:
+			// with the panel bcrypt when the bundle carried a usable one
+			// (login works immediately), otherwise credential-less (login
+			// needs a recovery link).
+			pwd := m.User.PasswordHash
+			if pwd != "" && pwd != "!" && len(pwd) >= 59 {
+				traits := kratosclient.AdminTraits{Email: m.User.Email, Username: username, IsAdmin: m.User.IsAdmin}
+				if _, cerr := d.KratosClient.CreateIdentityWithPassword(ctx, traits, pwd); cerr == nil || errors.Is(cerr, kratosclient.ErrIdentityExisted) {
+					r.LoginRestored = true
+					r.LoginNote = "identity created with the preserved password — the user signs in with their old password"
+				} else {
+					r.LoginNote = fmt.Sprintf("identity create failed (%v) — issue a recovery link after fixing", cerr)
+				}
+			} else {
+				r.LoginNote = "no identity and no usable password hash in the bundle — issue a recovery link: dotnext user password " + username + " --link"
+			}
+		default:
+			hasPW, herr := d.KratosClient.IdentityHasPassword(ctx, id)
+			switch {
+			case herr != nil:
+				r.LoginNote = fmt.Sprintf("identity %s present but password check failed (%v)", id, herr)
+			case hasPW:
+				r.LoginRestored = true
+				r.LoginNote = "identity present with a password credential — the user signs in with their old password"
+			default:
+				r.LoginNote = "identity present but has NO password credential — issue a recovery link: dotnext user password " + username + " --link"
+			}
+		}
+	}
+	return r
+}
+
+// applyUser inserts the user row when missing. Returns (created, err).
+// Existing row → no-op (created=false). PasswordHash falls back to "!"
+// when the manifest didn't carry one (older snapshots).
+func applyUser(ctx context.Context, m *internalbackup.AccountMetadata, d Deps, now time.Time) (bool, error) {
+	users := d.users()
+	if users == nil {
+		return false, errors.New("user repo not provided in Deps")
+	}
+	if existing, err := users.FindByID(ctx, m.User.ID); err == nil && existing != nil {
+		return false, nil
+	} else if err != nil && !errors.Is(err, repository.ErrNotFound) {
+		return false, fmt.Errorf("lookup: %w", err)
+	}
+	// SECURITY (GH #1408): refuse to CREATE an admin user from a backup bundle.
+	// An account backup is only ever a non-admin tenant (admins host nothing and
+	// are never account-backed-up), so is_admin=true here is a malformed or
+	// crafted bundle — and creating an admin from an attacker-controllable
+	// uploaded tar is a privilege-escalation. The row is only reached on the
+	// CREATE path (an existing user no-ops above), so a legitimate
+	// same-box/#954 restore of a non-admin is unaffected.
+	if m.User.IsAdmin {
+		return false, errors.New("refusing to create an admin user from a backup bundle")
+	}
+	pwd := m.User.PasswordHash
+	if pwd == "" {
+		pwd = "!" // locked — operator must reset via Kratos recovery
+	}
+
+	// Try to create Kratos identity if we have a client and valid password hash
+	var kratosIdentityID *string
+	if d.KratosClient != nil && pwd != "" && pwd != "!" && len(pwd) >= 59 {
+		username := ""
+		if m.User.Username != nil {
+			username = *m.User.Username
+		}
+		traits := kratosclient.AdminTraits{
+			Email:    m.User.Email,
+			Username: username,
+			IsAdmin:  m.User.IsAdmin,
+		}
+		if identityID, err := d.KratosClient.CreateIdentityWithPassword(ctx, traits, pwd); err == nil {
+			kratosIdentityID = &identityID
+		} else {
+			// Log warning but don't fail the user restore
+			if d.Log != nil {
+				d.Log.Warn("failed to create kratos identity during restore", "user_id", m.User.ID, "error", err)
+			}
+		}
+	}
+
+	row := &models.User{
+		ID:                    m.User.ID,
+		Email:                 m.User.Email,
+		Username:              m.User.Username,
+		NameFirst:             m.User.NameFirst,
+		NameLast:              m.User.NameLast,
+		PasswordHash:          pwd,
+		IsAdmin:               m.User.IsAdmin,
+		PackageID:             m.User.PackageID,
+		LinuxUID:              m.User.LinuxUID,
+		MysqladminUsername:    m.User.MysqladminUsername,
+		MysqladminPasswordEnc: m.User.MysqladminPasswordEnc,
+		KratosIdentityID:      kratosIdentityID,
+		CreatedAt:             now,
+		UpdatedAt:             now,
+	}
+	if err := users.Create(ctx, row); err != nil {
+		return false, fmt.Errorf("create: %w", err)
+	}
+	return true, nil
+}
+
+var restoredDBNameRe = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
+
+// restoredDatabaseRefusal says why a database row named name may not be
+// restored for account, or "".
+func restoredDatabaseRefusal(name, account string, untrusted bool, others map[string]bool) string {
+	switch {
+	case dbreserve.Database(name):
+		return "it is one of this server's own databases"
+	case others[name]:
+		return "another account has a database with this name"
+	case !untrusted:
+		return ""
+	case !restoredDBNameRe.MatchString(name) || !accountNameRe.MatchString(account) ||
+		len(name) <= len(account)+1 || !strings.HasPrefix(name, account+"_"):
+		return fmt.Sprintf("a database from an uploaded backup must be named %s_<name>", account)
+	}
+	return ""
+}
+
+// restoredDBUserRefusal is restoredDatabaseRefusal for a database user.
+func restoredDBUserRefusal(name, account string, untrusted bool, others map[string]bool) string {
+	switch {
+	case dbreserve.User(name):
+		return "it is one of this server's own database accounts"
+	case strings.HasSuffix(strings.ToLower(name), "_mysqladmin"):
+		return "it is the account's phpMyAdmin account, which the panel manages itself"
+	case strings.HasSuffix(strings.ToLower(name), "_pgadmin"):
+		return "it is the account's Adminer role, which the panel manages itself"
+	case others[name]:
+		return "another account has a database user with this name"
+	case !untrusted:
+		return ""
+	case !restoredDBNameRe.MatchString(name) || !accountNameRe.MatchString(account) ||
+		len(name) <= len(account)+1 || !strings.HasPrefix(name, account+"_"):
+		return fmt.Sprintf("a database user from an uploaded backup must be named %s_<name>", account)
+	}
+	return ""
+}
+
+// accountDatabaseNames returns the database and database-user names rows of
+// accounts other than userID hold, and the database names userID's own rows
+// hold.
+func accountDatabaseNames(ctx context.Context, d Deps, userID string) (dbs, users, own map[string]bool, err error) {
+	dbs, users, own = map[string]bool{}, map[string]bool{}, map[string]bool{}
+	rows, _, err := d.Databases.List(ctx, repository.ListOptions{})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("list this server's databases: %w", err)
+	}
+	for _, r := range rows {
+		if r.UserID != userID {
+			dbs[r.Name] = true
+		} else {
+			own[r.Name] = true
+		}
+	}
+	if d.DatabaseUsers != nil {
+		urows, _, err := d.DatabaseUsers.List(ctx, repository.ListOptions{})
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("list this server's database users: %w", err)
+		}
+		for _, r := range urows {
+			if r.UserID != userID {
+				users[r.Username] = true
+			}
+		}
+	}
+	return dbs, users, own, nil
+}
+
+// ownDatabaseRows maps the names of an account's own databases and database
+// users to their ids.
+type ownDatabaseRows struct {
+	dbs, users map[string]string
+}
+
+// listOwnDatabaseRows lists userID's own databases and database users by
+// name. On error it returns what it could list (never nil).
+func listOwnDatabaseRows(ctx context.Context, d Deps, userID string) (*ownDatabaseRows, error) {
+	o := &ownDatabaseRows{dbs: map[string]string{}, users: map[string]string{}}
+	rows, _, err := d.Databases.List(ctx, repository.ListOptions{})
+	if err != nil {
+		return o, fmt.Errorf("list this server's databases: %w", err)
+	}
+	for _, r := range rows {
+		if r.UserID == userID {
+			o.dbs[r.Name] = r.ID
+		}
+	}
+	if d.DatabaseUsers != nil {
+		urows, _, err := d.DatabaseUsers.List(ctx, repository.ListOptions{})
+		if err != nil {
+			return o, fmt.Errorf("list this server's database users: %w", err)
+		}
+		for _, r := range urows {
+			if r.UserID == userID {
+				o.users[r.Username] = r.ID
+			}
+		}
+	}
+	return o, nil
+}
+
+// dockerSlugRe is the agent's rule for a docker app slug (validateSlug): the
+// slugs name the app's data directory and compose project.
+var dockerSlugRe = regexp.MustCompile(`^[a-z][a-z0-9-]{1,31}$`)
+
+// malformedDockerSlug returns a's slug or instance slug when it isn't a plain
+// app name, else "".
+func malformedDockerSlug(a internalbackup.MetadataDockerApp) string {
+	if !dockerSlugRe.MatchString(a.Slug) {
+		return a.Slug
+	}
+	if a.InstanceSlug != "" && !dockerSlugRe.MatchString(a.InstanceSlug) {
+		return a.InstanceSlug
+	}
+	return ""
+}
+
+// accountHasApp reports whether the account userID already has an app whose
+// data folder is slug.
+func accountHasApp(existing []*models.DockerApp, slug, userID string) bool {
+	for _, e := range existing {
+		if e != nil && e.UserID != nil && *e.UserID == userID && e.EffectiveSlug() == slug {
+			return true
+		}
+	}
+	return false
+}
+
+// dockerSlugTaken reports whether an app on this server other than a, with an
+// owner other than owner (nil = server-level), already uses a's effective
+// slug, and returns that slug.
+func dockerSlugTaken(existing []*models.DockerApp, a internalbackup.MetadataDockerApp, owner *string) (string, bool) {
+	slug := a.InstanceSlug
+	if slug == "" {
+		slug = a.Slug
+	}
+	for _, e := range existing {
+		if e == nil || e.ID == a.ID || e.EffectiveSlug() != slug {
+			continue
+		}
+		sameOwner := (e.UserID == nil && owner == nil) || (e.UserID != nil && owner != nil && *e.UserID == *owner)
+		if !sameOwner {
+			return slug, true
+		}
+	}
+	return slug, false
+}
+
+// knownSSLStatus is every status an ssl_certificates row can hold.
+var knownSSLStatus = map[string]bool{
+	models.SSLStatusPending: true, models.SSLStatusIssuing: true, models.SSLStatusIssued: true,
+	models.SSLStatusFailed: true, models.SSLStatusRevoked: true, models.SSLStatusRenewing: true,
+	models.SSLStatusSelfSigned: true, models.SSLStatusCustom: true, models.SSLStatusPendingACMERetry: true,
+}
+
+// certFileOnServer reports whether a certificate file is on this server. Only
+// "no such file" counts as missing: a file the panel can't stat is assumed
+// there.
+var certFileOnServer = func(path string) bool {
+	_, err := os.Stat(path)
+	return !errors.Is(err, fs.ErrNotExist)
+}
+
+// certFileDirs are the two layouts the panel writes a domain's certificate
+// in: certbot's lineage (issued and custom certificates) and the self-signed
+// placeholder.
+var certFileDirs = []string{"/etc/letsencrypt/live/", "/etc/ssl/dotnext-selfsigned/"}
+
+// ownCertFiles reports whether cert and key are domain's own certificate
+// files in one of certFileDirs, or both unset.
+func ownCertFiles(domain string, cert, key *string) bool {
+	if cert == nil || key == nil {
+		return cert == nil && key == nil
+	}
+	if domain == "" || strings.HasPrefix(domain, ".") || strings.ContainsAny(domain, "/\\") {
+		return false
+	}
+	for _, dir := range certFileDirs {
+		if *cert == dir+domain+"/fullchain.pem" && *key == dir+domain+"/privkey.pem" {
+			return true
+		}
+	}
+	return false
+}
+
+// restorePoolIni restores a backup pool's PHP settings onto poolID and
+// reports whether it changed any. A setting the pool has keeps its value,
+// unless OverwriteRows gives it the backup's. A setting from an uploaded file
+// passes the pool page's checks first (GH #1993).
+func restorePoolIni(ctx context.Context, d Deps, r *ApplyResult, poolID string, overrides []internalbackup.MetadataPHPPoolIniOverride) bool {
+	if d.PHPPoolIni == nil || len(overrides) == 0 {
+		return false
+	}
+	current, err := d.PHPPoolIni.ListByPool(ctx, poolID)
+	if err != nil {
+		r.Errors = append(r.Errors, fmt.Sprintf("php_pool %s: list ini overrides: %v", poolID, err))
+		return false
+	}
+	have := make(map[string]*models.PHPPoolIniOverride, len(current))
+	for i := range current {
+		have[current[i].Directive] = &current[i]
+	}
+	now := time.Now().UTC()
+	changed := false
+	for _, o := range overrides {
+		if d.Untrusted {
+			kind, value, problem := uploadedIniOverride(o)
+			if problem != "" {
+				r.Errors = append(r.Errors, fmt.Sprintf("php_pool_ini %s: not restored: %s", o.ID, problem))
+				continue
+			}
+			o.Kind, o.Value = kind, value
+		}
+		if cur, ok := have[o.Directive]; ok {
+			if !d.OverwriteRows || (cur.Value == o.Value && cur.Kind == o.Kind) {
+				r.Skipped++
+				continue
+			}
+			cur.Value, cur.Kind, cur.UpdatedAt = o.Value, o.Kind, now
+			if err := d.PHPPoolIni.Update(ctx, cur); err != nil {
+				r.Errors = append(r.Errors, fmt.Sprintf("php_pool_ini %s: update: %v", o.ID, err))
+				continue
+			}
+			r.PHPPoolIni++
+			changed = true
+			continue
+		}
+		ov := &models.PHPPoolIniOverride{
+			ID:        o.ID,
+			PoolID:    poolID,
+			Directive: o.Directive,
+			Value:     o.Value,
+			Kind:      o.Kind,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		if err := d.PHPPoolIni.Create(ctx, ov); err != nil {
+			r.Errors = append(r.Errors, fmt.Sprintf("php_pool_ini %s: create: %v", o.ID, err))
+			continue
+		}
+		have[o.Directive] = ov
+		r.PHPPoolIni++
+		changed = true
+	}
+	return changed
+}
+
+// restoreAccountUsername is the username of the account being restored: this
+// server's row when it has one, else the bundle's.
+func restoreAccountUsername(ctx context.Context, m *internalbackup.AccountMetadata, d Deps) string {
+	if users := d.users(); users != nil {
+		if u, err := users.FindByID(ctx, m.User.ID); err == nil && u != nil && u.Username != nil && *u.Username != "" {
+			return *u.Username
+		}
+	}
+	if m.User.Username != nil {
+		return *m.User.Username
+	}
+	return ""
+}
+
+// accountNameRe is a panel username (userops' rule); it can't be "." or "..".
+var accountNameRe = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+
+// pathWithin reports whether the absolute path p, cleaned, is base/account or
+// inside it. An account name that isn't a panel username admits nothing.
+func pathWithin(p, base, account string) bool {
+	if !accountNameRe.MatchString(account) || !filepath.IsAbs(p) {
+		return false
+	}
+	root := base + "/" + account
+	c := filepath.Clean(p)
+	return c == root || strings.HasPrefix(c, root+"/")
+}
+
+// rehomePath moves p from base/from to base/to when it is that directory or
+// inside it: the backup names the account's paths under the username it had
+// where the backup was made. Any other path comes back unchanged for the
+// caller's own check.
+func rehomePath(p, base, from, to string) string {
+	if from == to || !accountNameRe.MatchString(from) || !accountNameRe.MatchString(to) || !filepath.IsAbs(p) {
+		return p
+	}
+	old := base + "/" + from
+	c := filepath.Clean(p)
+	if c == old || strings.HasPrefix(c, old+"/") {
+		return base + "/" + to + c[len(old):]
+	}
+	return p
+}
+
+// users is the user repo accessor on Deps. Builder Deps doesn't carry
+// it (Build is given the user as a parameter); Apply needs read+write
+// for upsert. Stored as a separate field on a new ApplyDeps would
+// require duplicating the struct, so add it as a nullable lookup
+// here and have callers extend Deps via the Users field below.
+func (d Deps) users() repository.UserRepository { return d.Users }
+
+// parseMetaTime parses a timeRFC ("2006-01-02T15:04:05Z") string back to
+// a *time.Time, returning nil for empty or unparseable input.
+func parseMetaTime(s string) *time.Time {
+	if s == "" {
+		return nil
+	}
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return nil
+	}
+	return &t
+}

@@ -1,0 +1,77 @@
+[Unit]
+Description=dotNext backup retention sweep (M30 — restic forget + prune)
+Documentation=https://github.com/dotnext71/panel/blob/main/docs/adr/0075-backup-restore-restic.md
+After=dotnext-api.service network-online.target mariadb.service dotnext-autoupdate.service
+# dotnext-autoupdate.service: an admin can move the self-update to any time.
+# When a sweep is due while an update is running, this ordering makes it
+# wait for the update to finish instead of running against a half-swapped
+# install. It orders only; it never starts an update.
+# No Requires=dotnext-api.service. The CLI reads server_settings to pick
+# up keep-daily/weekly/monthly knobs but the panel may be transiently down
+# during boot; install.sh enables this timer in the install foundation
+# step before the panel unit lands. A failed run is tolerated — the timer
+# fires again at 05:00 the next day. `Restart=no` matches the M22 reaper.
+#
+# mariadb.service is listed explicitly rather than relied on transitively
+# through dotnext-api.service. `dotnext backup retention apply` opens its
+# own connection, so "the panel started" says nothing about whether the
+# socket is there yet. Without this the Persistent=true catch-up run — the
+# one that fires at boot after a host was off at 05:00 — loses the race
+# and dies with
+#
+#   open db: open mariadb: dial unix /var/run/mysqld/mysqld.sock:
+#   connect: no such file or directory
+#
+# Observed on a 2 GB / 2 vCPU host where mariadb took 44s to accept
+# connections. Restart=no means that run is simply lost, so on a host
+# that is powered off overnight retention can go indefinitely without
+# ever completing a sweep while looking merely "failed once" each boot.
+
+[Service]
+Type=oneshot
+# JAB-273: contain this all-tenant maintenance job in the resource-limited
+# dotnext-maintenance.slice (MemoryMax=50%, low CPU/IO weight) so a sweep can
+# never exhaust the box and lock the operator out of sshd; nice + idle IO keep
+# it yielding to tenants and the control plane.
+Slice=dotnext-maintenance.slice
+Nice=19
+IOSchedulingClass=idle
+ExecStart=/usr/local/bin/dotnext-cli backup retention apply
+StandardOutput=journal
+StandardError=journal
+
+# Restic needs a writable cache dir. ProtectHome=read-only blocks
+# /root/.cache, so point RESTIC_CACHE_DIR at a path under
+# ReadWritePaths instead. HOME stays pinned so any restic codepath
+# that falls back to $HOME also lands somewhere sane.
+Environment=HOME=/root
+Environment=RESTIC_CACHE_DIR=/var/lib/dotnext-backups/.cache/restic
+
+# Restic prune walks every pack file in /var/lib/dotnext-backups/repo/. On
+# a multi-GB repo this can hit several minutes of CPU + disk I/O; the
+# 05:00 schedule keeps it off-peak. ProtectHome=read-only because the
+# retention sweep never touches /home; it only purges restic packs.
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/dotnext-backups
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+
+# Runs as root (the default — no User= directive). Rationale: the
+# agent invokes restic as root for every backup (it has to traverse
+# /home/<user>/* which only root can read), so restic creates
+# 0600 root-owned packs in /var/lib/dotnext-backups/repo/. Retention
+# must read+write those same packs to forget+prune; running as root
+# matches the agent's identity and avoids a chown -R after every
+# backup. The systemd hardening above (PrivateTmp, ProtectSystem,
+# ReadWritePaths=/var/lib/dotnext-backups) keeps the blast radius
+# narrow.
+
+Restart=no

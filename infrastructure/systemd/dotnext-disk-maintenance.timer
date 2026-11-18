@@ -1,0 +1,14 @@
+[Unit]
+Description=Run dotnext-disk-maintenance.service daily
+Documentation=https://github.com/dotnext71/panel/blob/main/infrastructure/systemd/disk-maintenance
+
+[Timer]
+# Daily, a few minutes after midnight, with jitter so a fleet doesn't all
+# sweep at once. Persistent=true fires a missed run after the host wakes.
+OnCalendar=*-*-* 00:07:00
+RandomizedDelaySec=15m
+Persistent=true
+Unit=dotnext-disk-maintenance.service
+
+[Install]
+WantedBy=timers.target

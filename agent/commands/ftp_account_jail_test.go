@@ -1,0 +1,305 @@
+package commands
+
+import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strconv"
+	"syscall"
+	"testing"
+)
+
+// TestQuotaEnabledOn covers the GH #1053 isolated-create preflight: quota is
+// "on" only when `quotaon -pu` reports it. The command EXIT CODE is ignored on
+// purpose — `quotaon -p` returns non-zero even when quota is fully enabled on
+// the fleet OS (Debian 13, observed live: "... is on (enforced)", exit 1), so
+// gating on the exit code was a false negative that dead-ended isolated FTP.
+// Only the printed "is on" text is authoritative; a missing binary / unsupported
+// fs (empty output) or an "is off" line still fail closed.
+func TestQuotaEnabledOn(t *testing.T) {
+	orig := execCommandContext
+	t.Cleanup(func() { execCommandContext = orig })
+
+	cases := []struct {
+		name string
+		out  string
+		rc   int
+		want bool
+	}{
+		{"on, exit 0", "user quota on / (/dev/root) is on", 0, true},
+		// The regression: quota IS on but quotaon -p exits non-zero (Debian 13).
+		{"on but exit 1 (debian13 quotaon -p)", "user quota on / (/dev/sda1) is on (enforced)", 1, true},
+		{"off, exit 1", "user quota on / is off", 1, false},
+		{"binary error, empty output", "", 127, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, rc := tc.out, tc.rc
+			execCommandContext = func(ctx context.Context, name string, args ...string) *exec.Cmd {
+				// Emit the canned output AND the exit code together, so the real
+				// CombinedOutput + exit-status path is exercised through the seam.
+				return exec.CommandContext(ctx, "sh", "-c", "printf '%s\\n' \""+out+"\"; exit "+strconv.Itoa(rc))
+			}
+			if got := quotaEnabledOn(context.Background(), "/"); got != tc.want {
+				t.Fatalf("quotaEnabledOn=%v want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func testTenant() *ftpTenant {
+	return &ftpTenant{Username: "bob", UID: 1001, GID: 1001, HomeDir: "/home/bob"}
+}
+
+func TestFtpJailPathFor(t *testing.T) {
+	t.Setenv("DOTNEXT_FTP_JAIL_ROOT", "/var/lib/dotnext-ftp-jails")
+	got := ftpJailPathFor(testTenant(), "bob_printer")
+	want := "/var/lib/dotnext-ftp-jails/bob/bob_printer"
+	if got != want {
+		t.Fatalf("ftpJailPathFor = %q, want %q", got, want)
+	}
+}
+
+// TestIsolatedPasswdHome pins the GH #1720 fix: the /etc/passwd home written
+// for an isolated subaccount must carry the literal "/./" marker so vsftpd
+// (passwd_chroot_enable=YES) chroots to the root-owned jail and lands the
+// session in the bind-mounted /data — the same start dir sshd gives. A home
+// without the marker dumps the user at the empty jail root (the locked-dir bug).
+func TestIsolatedPasswdHome(t *testing.T) {
+	t.Setenv("DOTNEXT_FTP_JAIL_ROOT", "/var/lib/dotnext-ftp-jails")
+	jail := ftpJailPathFor(testTenant(), "bob_printer")
+
+	got := isolatedPasswdHome(jail)
+	if want := jail + "/./" + ftpJailMountpoint; got != want {
+		t.Fatalf("isolatedPasswdHome=%q, want %q (the /./ marker is the fix)", got, want)
+	}
+	// The marker resolves on disk to the jail's bind-mounted data dir, proving
+	// the session lands on tenant files, not the empty root-owned jail root.
+	if want := filepath.Join(jail, ftpJailMountpoint); filepath.Clean(got) != want {
+		t.Fatalf("clean(isolatedPasswdHome)=%q, want %q", filepath.Clean(got), want)
+	}
+}
+
+// TestIsolatedHomeNeedsRehome pins the GH #1720 reconciler parity: ensure_jail
+// must re-home an isolated account whose passwd home predates the "/./" landing
+// fix (the bare jail root) and must leave a marker home untouched. Without the
+// re-home, the reporter's already-created account would keep landing at the
+// empty jail root even after the host gains passwd_chroot_enable=YES.
+func TestIsolatedHomeNeedsRehome(t *testing.T) {
+	t.Setenv("DOTNEXT_FTP_JAIL_ROOT", "/var/lib/dotnext-ftp-jails")
+	jail := ftpJailPathFor(testTenant(), "bob_printer")
+
+	// Pre-fix account: passwd home is the bare jail root → must be re-homed.
+	if want, need := isolatedHomeNeedsRehome(jail, jail); !need || want != isolatedPasswdHome(jail) {
+		t.Fatalf("bare-jail home: need=%v want=%q, expected re-home to %q", need, want, isolatedPasswdHome(jail))
+	}
+	// Post-fix account: passwd home already carries the marker → no re-home.
+	if _, need := isolatedHomeNeedsRehome(isolatedPasswdHome(jail), jail); need {
+		t.Fatal("marker home: expected no re-home, ensure_jail would churn usermod every tick")
+	}
+}
+
+// TestVsftpdHonoursPasswdChroot pins the GH #1720 fail-closed gate: the re-home
+// runs ONLY on a host whose vsftpd enables passwd_chroot_enable. A missing conf
+// or a conf without the directive must read as false, so ensure_jail leaves the
+// safe bare-jail home instead of chrooting vsftpd into the tenant-writable /data.
+func TestVsftpdHonoursPasswdChroot(t *testing.T) {
+	conf := filepath.Join(t.TempDir(), "vsftpd.conf")
+	t.Setenv("DOTNEXT_VSFTPD_CONF", conf)
+
+	// Missing conf → fail closed.
+	if vsftpdHonoursPasswdChroot() {
+		t.Fatal("missing vsftpd.conf must fail closed (no re-home)")
+	}
+	// Present but directive absent → fail closed.
+	if err := os.WriteFile(conf, []byte("chroot_local_user=YES\nallow_writeable_chroot=YES\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if vsftpdHonoursPasswdChroot() {
+		t.Fatal("conf without passwd_chroot_enable=YES must fail closed")
+	}
+	// Directive present → honoured.
+	if err := os.WriteFile(conf, []byte("chroot_local_user=YES\npasswd_chroot_enable=YES\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if !vsftpdHonoursPasswdChroot() {
+		t.Fatal("conf with passwd_chroot_enable=YES must be honoured")
+	}
+}
+
+func TestValidateIsolatedCreate(t *testing.T) {
+	t.Setenv("DOTNEXT_FTP_JAIL_ROOT", "/var/lib/dotnext-ftp-jails")
+	tenant := testTenant()
+	goodJail := ftpJailPathFor(tenant, "bob_printer")
+
+	base := func() ftpAccountCreateParams {
+		return ftpAccountCreateParams{
+			TenantUsername: "bob",
+			Username:       "bob_printer",
+			HomePath:       "/home/bob/ftp/printer",
+			Password:       "x",
+			Isolated:       true,
+			UID:            1000000001,
+			QuotaMB:        100,
+			QuotaMount:     "/home",
+			JailPath:       goodJail,
+		}
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(p *ftpAccountCreateParams)
+		wantErr bool
+	}{
+		{"happy", func(p *ftpAccountCreateParams) {}, false},
+		{"uid below floor", func(p *ftpAccountCreateParams) { p.UID = 1002 }, true},
+		{"uid equals tenant", func(p *ftpAccountCreateParams) { p.UID = uint32(tenant.UID) }, true},
+		{"zero quota", func(p *ftpAccountCreateParams) { p.QuotaMB = 0 }, true},
+		{"no quota mount", func(p *ftpAccountCreateParams) { p.QuotaMount = "" }, true},
+		{"jail mismatch", func(p *ftpAccountCreateParams) { p.JailPath = "/tmp/evil" }, true},
+		{"jail not canonical (wrong tenant)", func(p *ftpAccountCreateParams) {
+			p.JailPath = "/var/lib/dotnext-ftp-jails/other/bob_printer"
+		}, true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			p := base()
+			tc.mutate(&p)
+			aerr := validateIsolatedCreate(p, tenant)
+			if (aerr != nil) != tc.wantErr {
+				t.Fatalf("validateIsolatedCreate err=%v, wantErr=%v", aerr, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestValidateFtpSSHDAccountJailChroot proves the sshd validator accepts a
+// root-owned jail chroot (GH #1145) as well as the legacy /home chroot, and
+// still rejects an arbitrary path.
+func TestValidateFtpSSHDAccountJailChroot(t *testing.T) {
+	t.Setenv("DOTNEXT_FTP_JAIL_ROOT", "/var/lib/dotnext-ftp-jails")
+	tests := []struct {
+		name      string
+		chrootDir string
+		startDir  string
+		wantErr   bool
+	}{
+		{"legacy home chroot", "/home/bob", "/ftp/printer", false},
+		{"jail chroot", "/var/lib/dotnext-ftp-jails/bob/bob_printer", "/data", false},
+		{"arbitrary path rejected", "/etc", "/", true},
+		{"jail with dotdot rejected", "/var/lib/dotnext-ftp-jails/bob/../etc", "/", true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			aerr := validateFtpSSHDAccount(ftpSSHDSyncAccount{
+				Username:  "bob_printer",
+				ChrootDir: tc.chrootDir,
+				StartDir:  tc.startDir,
+			})
+			if (aerr != nil) != tc.wantErr {
+				t.Fatalf("validateFtpSSHDAccount(%q) err=%v, wantErr=%v", tc.chrootDir, aerr, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestTeardownIsolatedJailPreservesSourceOnSameFs is the regression guard for
+// the same-device data-loss bug: on the fleet /home is not a separate mount, so
+// a bind mount does NOT change st_dev at the mountpoint. A stat-based "is it
+// mounted?" probe returns false, so a naive teardown would skip the unmount and
+// RemoveAll straight through the LIVE bind mount into the tenant's real files.
+// teardownIsolatedJail must unmount blind (until EINVAL) BEFORE removing, so the
+// jail goes and the source subtree survives. Root-gated (bind mount needs
+// CAP_SYS_ADMIN) + GH #994 host-mutation gate.
+func TestTeardownIsolatedJailPreservesSourceOnSameFs(t *testing.T) {
+	requireHostMutationAllowed(t)
+	if os.Geteuid() != 0 {
+		t.Skip("bind mount needs root")
+	}
+	root := t.TempDir() // source + jail both under TMPDIR = same filesystem
+	t.Setenv("DOTNEXT_FTP_JAIL_ROOT", filepath.Join(root, "jails"))
+
+	src := filepath.Join(root, "home", "sub")
+	if err := os.MkdirAll(src, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(src, "keep.txt")
+	if err := os.WriteFile(marker, []byte("tenant-data"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	jail := filepath.Join(ftpJailRoot(), "bob", "bob_printer")
+	mp := filepath.Join(jail, ftpJailMountpoint)
+	if err := os.MkdirAll(mp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mount(src, mp, "", syscall.MS_BIND, ""); err != nil {
+		t.Fatalf("bind mount: %v", err)
+	}
+	// Guarantee cleanup even if an assertion below fails before teardown runs.
+	defer func() { _ = syscall.Unmount(mp, syscall.MNT_DETACH) }()
+
+	if _, err := os.Stat(filepath.Join(mp, "keep.txt")); err != nil {
+		t.Fatalf("marker not visible through the mount (setup broken): %v", err)
+	}
+
+	if aerr := teardownIsolatedJail(context.Background(), jail); aerr != nil {
+		t.Fatalf("teardown returned error: %v", aerr)
+	}
+	if _, err := os.Stat(jail); !os.IsNotExist(err) {
+		t.Fatalf("jail not removed after teardown: stat err=%v", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("SOURCE DATA DELETED by teardown — marker gone: %v", err)
+	}
+}
+
+// TestTeardownIsolatedJail_AbsentMountpointSkipsUnmount is the GH #1226 / Nightly
+// regression: tearing down an account that was never provisioned (absent jail)
+// must be idempotent success WITHOUT issuing umount2(). On a real host that
+// syscall returns ENOENT and the old EINVAL/ENOENT branch swallowed it, but in an
+// unprivileged CI container (no CAP_SYS_ADMIN) the kernel checks the capability
+// before the path and returns EPERM, which fell through to a hard failure. The
+// existence guard skips the syscall entirely when the mountpoint is absent, so
+// this passes at any privilege level. Uses the seam to PROVE the syscall is never
+// issued (a privileged local run would otherwise mask the regression).
+func TestTeardownIsolatedJail_AbsentMountpointSkipsUnmount(t *testing.T) {
+	calls := 0
+	orig := ftpJailUnmount
+	t.Cleanup(func() { ftpJailUnmount = orig })
+	ftpJailUnmount = func(string, int) error { calls++; return syscall.EPERM }
+
+	// Jail (and therefore its "data" mountpoint) does not exist.
+	jail := filepath.Join(t.TempDir(), "bob", "nosuchacct")
+	if aerr := teardownIsolatedJail(context.Background(), jail); aerr != nil {
+		t.Fatalf("absent teardown must be idempotent success, got %v", aerr)
+	}
+	if calls != 0 {
+		t.Fatalf("umount2() must NOT be issued for an absent mountpoint; called %d times", calls)
+	}
+}
+
+// TestTeardownIsolatedJail_PresentPathSurfacesUnmountError proves the existence
+// guard did NOT weaken the data-safety invariant: when the mountpoint EXISTS and
+// the unmount fails for a reason other than EINVAL/ENOENT, teardown must surface
+// the error and must NOT RemoveAll (a RemoveAll through a still-live bind mount
+// would delete tenant data). Driven through the seam so it needs no privilege.
+func TestTeardownIsolatedJail_PresentPathSurfacesUnmountError(t *testing.T) {
+	orig := ftpJailUnmount
+	t.Cleanup(func() { ftpJailUnmount = orig })
+	ftpJailUnmount = func(string, int) error { return syscall.EPERM }
+
+	jail := filepath.Join(t.TempDir(), "jail")
+	mp := filepath.Join(jail, ftpJailMountpoint)
+	if err := os.MkdirAll(mp, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aerr := teardownIsolatedJail(context.Background(), jail)
+	if aerr == nil {
+		t.Fatal("present mountpoint with a failing unmount must surface an error, got nil")
+	}
+	if _, err := os.Stat(jail); err != nil {
+		t.Fatalf("jail must be preserved when unmount fails (RemoveAll must not run): stat err=%v", err)
+	}
+}

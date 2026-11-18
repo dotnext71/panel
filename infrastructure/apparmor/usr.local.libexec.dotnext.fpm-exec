@@ -1,0 +1,138 @@
+# AppArmor profile — dotnext-fpm-app (GH #690)
+#
+# Confines per-user PHP-FPM workloads (WordPress + other tenant PHP). Attaches
+# to the fpm-exec wrapper (/usr/local/libexec/dotnext/fpm-exec), which execs
+# php-fpm<ver> `ix` (inherit), so the workers run under this profile too.
+#
+# Ships in COMPLAIN mode: it only LOGS would-deny events (apparmor="ALLOWED"),
+# never blocks — so it can never break a running site. The operator reviews
+# per-profile soak-readiness (GH #688: 0 would-deny over the window) and flips
+# to enforce per-host via `dotnext apparmor flip-mature --profile dotnext-fpm-app`.
+#
+# Kernel-gated: install_apparmor() skips ALL dotnext profiles on kernels lacking
+# /sys/kernel/security/apparmor/features/unix (broken unix-socket mediation),
+# so this is never loaded where it would EACCES the FPM listen socket.
+#
+# This is a shared WORKLOAD-CLASS profile (all per-user FPM masters exec the same
+# fpm-exec path); per-tenant filesystem isolation stays with POSIX ownership.
+# The profile's job is defense-in-depth: deny a compromised tenant PHP access to
+# system secrets, other users' homes, and arbitrary execution.
+# GH #705: pin AppArmor 3.0 ABI — predates unix-socket mediation, so
+# these broken-mediation kernels (Debian 13/Ubuntu 24.04) SKIP unix
+# mediation for this profile; attaching it can't EACCES a unix connect()
+# while still confining files/caps/network. Verified on .86.
+abi <abi/3.0>,
+
+#include <tunables/global>
+
+profile dotnext-fpm-app /usr/local/libexec/dotnext/fpm-exec flags=(attach_disconnected) {
+  #include <abstractions/base>
+  #include <abstractions/nameservice>
+
+  # fpm-exec wrapper (bash) reads the runtime version then execs php-fpm.
+  /usr/local/libexec/dotnext/fpm-exec r,
+  /bin/bash rix,
+  /usr/bin/bash rix,
+  # PHP mail() runs sendmail_path via popen(3) — that is `/bin/sh -c`, and
+  # Debian's /bin/sh is dash. Without these the enforce-mode profile kills
+  # the sh exec before the shim's Px transition is even reached (JAB-230).
+  /bin/sh rix,
+  /bin/dash rix,
+  /usr/bin/dash rix,
+  /usr/bin/cat rix,
+  /run/php/dotnext-*/phpver r,
+  /usr/sbin/php-fpm* rix,
+
+  # PHP runtime + per-user pool config.
+  /etc/php/** r,
+  /usr/lib/php/** mr,
+  /etc/dotnext/fpm/*.conf r,
+  # snuffleupagus rules (GH #359): the PHP ext reads its config at worker
+  # startup; without this the worker fatals "Could not open ... active.rules:
+  # Permission denied" and php-fpm 502s.
+  /etc/dotnext/snuffleupagus/ r,
+  /etc/dotnext/snuffleupagus/** r,
+
+  # Microsoft ODBC Driver for SQL Server (sqlsrv / pdo_sqlsrv). The extension
+  # dlopen()s the driver at connect time, so the profile — not open_basedir —
+  # gates it. Without these the load fails and sqlsrv reports IMSSP -49
+  # "This extension requires the Microsoft ODBC Driver for SQL Server" even
+  # though the driver is installed, which reads as a missing-package problem
+  # and sends operators down a reinstall rabbit hole (a production box, 2026-07-19:
+  # denial was on /opt/microsoft/ while msodbcsql18 had been installed for a
+  # month). Read-only; drivers are root-owned so this grants no tenant write.
+  /opt/microsoft/ r,
+  /opt/microsoft/** mr,
+  /etc/odbcinst.ini r,
+  /etc/odbc.ini r,
+
+  # Tenant docroots (POSIX perms enforce per-user isolation; this layer bounds
+  # escape to system files, not cross-tenant). Two layouts: native dotNext +
+  # cPanel/DA use domains/<dom>/; HestiaCP-migrated accounts use web/<dom>/
+  # (JAB-37 — the enforced profile denied restored Nextcloud PHP under web/
+  # even though POSIX perms + open_basedir allowed it).
+  #
+  # GH #1001: the whole per-domain tree is granted, not just <dom>/public_html.
+  # A custom document root (admin GH #265 / tenant GH #526) may point at the
+  # domain base itself or a sibling of public_html — e.g. a Laravel/Symfony app
+  # whose docroot is .../public, or an app that keeps shared code one level up.
+  # Scoping the read to public_html/** made every such docroot 403 with
+  # "Unable to open primary script ... (Permission denied)" even though the
+  # panel accepted the docroot and POSIX perms + open_basedir allowed it. The
+  # tree is the tenant's own space; cross-tenant isolation is still POSIX, and
+  # the deny rules below still bound escape to system files.
+  /home/*/domains/*/ r,
+  /home/*/domains/*/** rwkl,
+  /home/*/web/*/ r,
+  /home/*/web/*/** rwkl,
+  # Tenant PHP error logs (cPanel/DA convention ~/logs/php.error.log —
+  # tenants point error_log there via php.ini/ini_set; migrated accounts
+  # arrive with it preset). Owner-scoped: a worker only touches its own
+  # user's logs dir. No exec. Live enforce denial observed 2026-08-01.
+  owner /home/*/logs/ r,
+  owner /home/*/logs/** rw,
+
+  # Temp + sessions.
+  /tmp/ r,
+  /tmp/** rwk,
+  /var/lib/php/sessions/** rwk,
+  /run/php/** rw,
+
+  # PHP mail() submission shim (JAB-230). Px — the shim runs under its OWN
+  # profile (dotnext-sendmail, in usr.local.libexec.dotnext.dotnext-sendmail),
+  # so a compromised tenant worker exec'ing it gains network submit +
+  # cred-read only, and the shim gains none of the docroot/session write
+  # surface of this profile.
+  /usr/local/libexec/dotnext/dotnext-sendmail Px -> dotnext-sendmail,
+
+  # Backing services over unix sockets.
+  unix (connect, receive, send) type=stream,
+  /run/redis/redis.sock rw,
+  /run/mysqld/ r,
+  /run/mysqld/mysqld.sock rw,
+  # PHP's mysqli.default_socket is /var/run/mysqld/mysqld.sock (Debian).
+  /var/run/mysqld/mysqld.sock rw,
+
+  # Logs.
+  /var/log/php*.log w,
+
+  # Hard denies — a tenant RCE must never reach these even if a POSIX bug existed.
+  deny /etc/shadow r,
+  deny /etc/gshadow r,
+  deny /root/** rwklx,
+  deny /home/*/.ssh/** rwklx,
+  deny /etc/dotnext/migration-secrets/** rwklx,
+
+  # The system D-Bus. Tenant PHP has no use for systemd, logind or any other
+  # system service on it (abstractions/nameservice would allow the socket
+  # through dbus-strict). An explicit deny holds in complain mode too, so this
+  # applies whatever mode the profile is in.
+  deny /run/dbus/system_bus_socket rw,
+  deny /var/run/dbus/system_bus_socket rw,
+
+  # Site-specific rules, kept across updates: dotnext update overwrites this
+  # file but not /etc/apparmor.d/local/usr.local.libexec.dotnext.fpm-exec. After editing that
+  # file, reload with: apparmor_parser -r /etc/apparmor.d/usr.local.libexec.dotnext.fpm-exec
+  # A deny rule above still wins over an allow rule added there.
+  include if exists <local/usr.local.libexec.dotnext.fpm-exec>
+}

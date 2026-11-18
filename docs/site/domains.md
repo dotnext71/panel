@@ -1,0 +1,82 @@
+# Domains
+
+A **Domain** is a hosted vhost owned by exactly one user. Each domain row in the panel DB drives a real nginx vhost — the reconciler converges them on every tick.
+
+## Per-domain settings
+
+Edit a domain via `/dotnext-admin/domains/edit/:id` (admin) or `/dotnext-api/domains/edit/:id` (owner).
+
+| Setting | What it does |
+|---|---|
+| **Domain name** | The vhost server_name (set at create time; rename = delete + recreate). |
+| **PHP version** | Which Sury PHP-FPM pool the vhost passes `.php` to. Selected from the versions enabled on the host. |
+| **PHP settings** | Per-user (not per-domain) overrides; see PHP Settings. |
+| **SSL** | Enable Let's Encrypt for this domain (HTTP-01). Reconciler issues within ≤60 s and reloads nginx. |
+| **DNSSEC** | Enable DNSSEC signing for the zone. Generates KSK + ZSK; displays the DS record to publish at the parent registrar. |
+| **Listen IP** | Pick from the admin's managed IP pool. Default: server's primary IP. Apex DNS records auto-update. |
+| **Redirects** | HTTP → HTTPS (always emitted when SSL is on); per-path redirects (planned). |
+| **Aliases** | Additional `server_name` values that resolve to the same vhost + same docroot. |
+| **Cache** | Per-domain opt-in FastCGI micro-cache, with a safe-bypass for cart / admin / authenticated cookies and a manual purge. Default off. |
+| **Document root** | Set the docroot when adding the domain, confined to the owner's home tree. |
+| **Environment variables** | Per-domain env vars passed to the FPM pool. |
+| **Web / Mail / DNS** | Each service is an **independent per-domain flag** — a domain can run any combination. Turning **Mail** on adds DKIM keys + MX hint + Stalwart Domain entry; **DNS** on manages the zone in PowerDNS; **Web** on builds the nginx vhost. |
+| **Statistics** | Requests and bandwidth per day and visitors by country for the last 7, 30 or 90 days, from the nightly access-log count (country only on hosts with CrowdSec's GeoLite2 database). Same tab for the admin (Edit Domain) and the tenant (Web Domain page); see [Domains (User) → Statistics](user/domains.md#statistics). |
+| **Reverse proxy** | Instead of serving files, proxy the domain to a local app on a chosen loopback port. Tenants pick the port through an SSRF-safe validator with an agent-side bind check; ports come from a shared loopback-port allocator so two tenants can't collide. |
+
+**Keep a reverse-proxied app running.** The panel allocates the port and nginx
+proxies the domain to it, but the process listening on the port is the
+account's own. Only that account can open the port; another account's
+connections are dropped. While the process is stopped, though, the port is
+free, and any process that starts listening on it receives the domain's
+requests. Run the app so that it is restarted as soon as it exits, rather
+than once from a shell, with `nohup` or from an `@reboot` cron job. Python
+apps and Docker apps are started and restarted by the panel.
+
+## Domain lifecycle
+
+```
+create  → DB row inserted → reconciler builds vhost, requests cert if SSL=on
+disable → is_enabled=0      → reconciler serves the shared "Site Disabled" page
+delete  → DB row removed    → reconciler tears down vhost, revokes cert, drops Stalwart domain
+```
+
+A disabled domain's vhost serves one page shared by every disabled domain
+(Admin → Server Settings → Page templates → **Disabled site**) instead of the
+docroot; its mail keeps working. A bandwidth suspension disables the domain
+the same way (see [Resource limits](resource-limits.md#bandwidth-limit)).
+
+The reconciler is the only thing that re-applies vhosts; never edit nginx site files by hand — they'll be overwritten on the next tick.
+
+**Delete also removes files (opt-in).** Domain delete keeps the document root by
+default; tick **also delete files** (default off) to remove the docroot
+tree at the same time.
+
+**Change owner.** An admin can reassign a domain to a different user;
+the vhost, DNS, and mail follow the new owner on the next reconcile. The
+domain's Python apps, Git repository settings and Composer project folder
+setting belong to the old owner and are deleted; the new owner sets them up
+again. The site's files are kept and move with the domain. A Docker app of the
+old owner is unlinked from the domain and keeps running with its data; a
+server-level Docker app stays linked.
+
+## What lives outside the vhost
+
+- **DNS records** are managed under DNS (PowerDNS auth backend, MariaDB-backed).
+- **Mailboxes** for this domain live under Mail.
+- **Databases** belong to the user, not the domain.
+
+## CLI
+
+```bash
+dotnext-cli domain list                 # all domains
+dotnext-cli domain create <name> --user <id> --web-enabled --manage-dns --mail
+dotnext-cli domain enable <name|id>
+dotnext-cli domain disable <name|id>
+dotnext-cli domain delete <name|id>
+```
+
+`dotnext-cli domain create` takes `--web-enabled`, `--manage-dns`, and `--mail` to set
+the independent Web / Mail / DNS service flags at create time.
+
+See [platform/cli-reference.md](./platform/cli-reference.md) for the full,
+generated flag reference.

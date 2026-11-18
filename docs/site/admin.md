@@ -1,0 +1,46 @@
+# Admin Shell
+
+Lives at `/dotnext-admin`. Top-level pages:
+
+| Page | Path | Purpose |
+|---|---|---|
+| Dashboard | `/dotnext-admin/dashboard` | Host health, meters and build; counts (users, domains, mailboxes, applications); tabs for recent activity, users / domains / databases, packages, backups and alerts; services status. |
+| Users | `/dotnext-admin/users` | Create / edit / delete panel users; reset password; reset 2FA; suspend; assign package; rename username in place; impersonate (scoped, time-bounded, audited); at-a-glance resource counts + monthly bandwidth. |
+| Packages | `/dotnext-admin/packages` | Bundles of quotas (disk, bandwidth, mailboxes, domains, DBs, PHP-INI overrides). |
+| Domains | `/dotnext-admin/domains` | All hosted domains across all users; per-domain settings (PHP, SSL, DNSSEC, listen IP, redirects, aliases, cache). |
+| DNS | `/dotnext-admin/dns` | All DNS zones; per-domain DNSSEC enable + DS record display. |
+| SSL | `/dotnext-admin/ssl` | Cross-user SSL state; LE issuance retry buttons; the panel's own certs on the Panel SSL tab (`?tab=panel`). |
+| Mail | `/dotnext-admin/mail/deliverability`, `/throttles` | Deliverability dashboard (DKIM / SPF / DMARC / MTA-STS state per domain), outbound throttle policy. |
+| Databases (Admin Ops) | Server Settings → Database | Root password rotation, curated config tune (`innodb_buffer_pool_size`, etc.), maintenance, processlist + kill, admin phpMyAdmin SSO. |
+| IPs | `/dotnext-admin/ips` | Manage the IPv4 pool exposed for per-domain listen-IP selection. |
+| Security | `/dotnext-admin/security` | CrowdSec decisions + blocklists + allowlists + alerts; AppSec WAF; AppArmor profile status; Snuffleupagus PHP hardening; AIDE host-integrity; per-user egress firewall; malware scans; UFW port baseline; CrowdSec test-IP card. |
+| Server Status | `/dotnext-admin/server-status` | Errgroup-aggregated live status of all services with 5 s polling; per-service start/stop/restart controls (behind an off-toggle). |
+| Resource Limits | (per-user under Users → Edit) | POSIX quota + cgroup v2 slice + nginx `limit_req` per user. |
+| PHP | `/dotnext-admin/php-pools` | Installed PHP versions, per-version FPM tuning, server-wide extension manager. |
+| Applications | `/dotnext-admin/applications` | App registry (WP + 14 others); per-app version pin and global enable. |
+| Logs | `/dotnext-admin/logs` | Tail panel / agent / nginx / Stalwart / Kratos / Bulwark / PowerDNS / CrowdSec. |
+| Audit | `/dotnext-admin/audit` | Append-only audit log (every privileged mutation). |
+| Server Settings | `/dotnext-admin/settings` | Panel hostname; primary mail domain; default IP pool; DB admin sections; notifications channels; AppSec policy; updates source. |
+| Notifications | `/dotnext-admin/notifications/{channels,events,routing,test}` | Configure channels (in-app, email, Slack, Telegram, Discord, ntfy, Web Push, SMS, webhook); per-event routing (category rail); test send; owns an **Owner** column for tenant-owned channels. |
+| Updates | `/dotnext-admin/updates` | Run `dotnext-cli update` from the UI as a transient systemd unit (survives panel restart mid-update); Update Center reports OS security-update state. |
+| Support | `/dotnext-admin/support` | Generate an encrypted diag bundle (enclosed.cc), `mailto:` ticket. |
+| Migrations | `/dotnext-admin/migrations` | Ingest cPanel / DirectAdmin / Hestia / WHM archives, track restore progress. |
+| Backups | `/dotnext-admin/backups` | Destinations (local / sftp / s3 / b2 / azure / gcs / rest), schedules, retention, restore; Full Server container backup + restore-from-upload. |
+| Automation | `/dotnext-admin/automation` | Scoped API tokens for the opt-in Automation API (read-only endpoints on :443 for firewalled billing hosts). |
+| Terminal | `/dotnext-admin/terminal` | Web terminal (root). |
+
+## Sidebar groups
+
+The sidebar groups pages by activity:
+
+- **Overview** — Dashboard, Server Status, Audit.
+- **Hosting** — Users, Packages, Domains, Applications, IPs.
+- **Mail & DNS** — Mail (deliverability + throttles), DNS, SSL.
+- **System** — Server Settings, PHP, Security, Resource Limits, Logs, Updates, Backups, Migrations.
+- **Other** — Notifications, Support, Automation, Terminal, Profile.
+
+## What is intentionally *not* here
+
+- **OIDC / Hydra** — rolled back. The panel does not act as an OIDC provider.
+- **ModSecurity** — replaced by CrowdSec AppSec.
+- **filebrowser** — replaced by the in-panel AntD File Manager.

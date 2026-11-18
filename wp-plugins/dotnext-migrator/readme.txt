@@ -1,0 +1,29 @@
+=== DotNext Migrator ===
+Contributors: dotnext
+Tags: migration, migrate, transfer
+Requires at least: 5.6
+Requires PHP: 7.4
+Stable tag: 0.1.2
+License: GPLv2 or later
+
+Migrate this WordPress site into a DotNext panel with no SSH access. Generate a
+one-time token; the DotNext panel pulls the database and files over an
+authenticated REST API.
+
+== Description ==
+FIRST CUT (0.1.0): secure token auth + ping/manifest/db-export/files-manifest/file
+endpoints under /wp-json/dotnext-migrator/v1/. DB export uses mysqldump with a
+temp defaults-file (password never on the command line). Resumable chunked
+transport and a pure-PHP export fallback are planned. Pairs with the DotNext
+panel's WordPress-plugin migration flow.
+
+== Changelog ==
+
+= 0.1.2 =
+* files-archive: stream the whole tree as ONE gzip tarball (was file-by-file — very slow over the internet).
+
+= 0.1.1 =
+* db-export: pure-PHP \$wpdb fallback when php-fpm disables proc_open (mysqldump path 501'd on DotNext + hardened hosts).
+= 0.1.0 =
+* First cut: token auth, ping, manifest, db-export (mysqldump), file endpoints
+  with realpath containment.

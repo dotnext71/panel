@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# dotnext-hostname-heartbeat.sh — JAB-213. Daily check-in so the service knows
+# this label is still in use (abandoned labels are reclaimed) and so the box
+# learns when its public IP changed. Installed only when the box uses a free
+# dotnexthosted.com hostname (i.e. /etc/dotnext/hostname.env exists).
+set -euo pipefail
+
+ENV=/etc/dotnext/hostname.env
+[[ -r "$ENV" ]] || exit 0
+# Read values WITHOUT executing the file. `source` would run any shell
+# metacharacters the hosted service put in a value — this script runs as root
+# from a timer/renew hook, so a token containing $(...) or backticks would be
+# root code execution on every fire, forever. Parse instead.
+jh_env() {
+  local line
+  line="$(grep -m1 "^$1=" "$ENV" 2>/dev/null)" || return 1
+  printf '%s' "${line#*=}"
+}
+TOKEN="$(jh_env TOKEN)"
+API="$(jh_env API)"
+FQDN="$(jh_env FQDN)"
+[[ -n "${TOKEN:-}" && -n "${API:-}" ]] || exit 0
+
+# -4: the service compares the IPv4 source with the label to notice an IP move.
+# The token goes in the body on stdin, never in argv.
+resp="$(printf '{"token":"%s"}' "$TOKEN" | curl -4 -sS --max-time 30 -w $'\n%{http_code}' -H 'Content-Type: application/json' \
+        --data-binary @- "${API}/v1/heartbeat" 2>/dev/null)" || exit 0
+code="${resp##*$'\n'}"
+body="${resp%$'\n'*}"
+
+if [[ "$code" == "403" ]]; then
+  logger -t dotnext-hostname "heartbeat: label revoked or token invalid — the free hostname ${FQDN:-?} is no longer ours"
+  exit 0
+fi
+if [[ "$code" != "200" ]]; then
+  exit 0   # transient; try again tomorrow
+fi
+
+if printf '%s' "$body" | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin).get("ip_moved") else 1)' 2>/dev/null; then
+  logger -t dotnext-hostname "heartbeat: this server's public IP changed — the free hostname ${FQDN:-?} no longer matches. Re-run the hostname setup to get a new label."
+fi

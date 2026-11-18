@@ -1,0 +1,419 @@
+package commands
+
+import (
+	"bytes"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/json"
+	"encoding/pem"
+	"log/slog"
+	"math/big"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/dotnext-panel/dotnext/internal/panelcert"
+)
+
+// seamHSTSSnippet points panelHSTSSnippetPath at a temp file pre-seeded with the
+// HSTS-ON header, and restores it. Returns the temp path.
+func seamHSTSSnippet(t *testing.T) string {
+	t.Helper()
+	snip := filepath.Join(t.TempDir(), "dotnext-panel-hsts.conf")
+	if err := os.WriteFile(snip, []byte("add_header Strict-Transport-Security \"max-age=31536000\" always;\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := panelHSTSSnippetPath
+	panelHSTSSnippetPath = snip
+	t.Cleanup(func() { panelHSTSSnippetPath = old })
+	return snip
+}
+
+// GH #1507: regenerating a self-signed cert must clear the HSTS snippet — HSTS
+// over an untrusted cert hard-blocks the browser with no exception path.
+func TestPanelSelfSign_WritesHSTSOffOnRegen(t *testing.T) {
+	certPath, _, _ := setupPanelSelfSign(t)
+	snip := seamHSTSSnippet(t)
+	_ = os.Remove(certPath) // no cert on disk → force a self-signed regen
+
+	resp, err := callPanelSelfSign(t, "box.example.com", "")
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if !resp.Regenerated {
+		t.Fatalf("expected a self-signed regen, got %+v", resp)
+	}
+	got, _ := os.ReadFile(snip)
+	if strings.Contains(string(got), "Strict-Transport-Security") {
+		t.Errorf("HSTS snippet must be OFF after a self-signed regen, got:\n%s", got)
+	}
+}
+
+// Preserving a real CA cert must NOT touch the HSTS snippet (it stays ON).
+func TestPanelSelfSign_LeavesHSTSWhenPreservingCACert(t *testing.T) {
+	certPath, keyPath, _ := setupPanelSelfSign(t)
+	writeTestCert(t, certPath, keyPath, "Let's Encrypt", "box.example.com",
+		[]string{"box.example.com", "mail.box.example.com"}, time.Now().AddDate(0, 3, 0))
+	snip := seamHSTSSnippet(t)
+	before, _ := os.ReadFile(snip)
+
+	resp, err := callPanelSelfSign(t, "box.example.com", "")
+	if err != nil {
+		t.Fatalf("handler: %v", err)
+	}
+	if resp.Regenerated {
+		t.Fatalf("CA cert must be preserved, not regenerated")
+	}
+	after, _ := os.ReadFile(snip)
+	if string(before) != string(after) {
+		t.Errorf("HSTS snippet must be untouched when a CA cert is preserved")
+	}
+}
+
+// writeTestCert writes a self-signed cert+key with the given issuer/subject
+// Organization, CN, and DNS SANs — a test double for "a cert already on
+// disk". org=="" produces a cert whose issuer Organization is empty.
+func writeTestCert(t *testing.T, certPath, keyPath, org, cn string, dnsSANs []string, notAfter time.Time) {
+	t.Helper()
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatalf("key: %v", err)
+	}
+	serial, _ := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	subj := pkix.Name{CommonName: cn}
+	if org != "" {
+		subj.Organization = []string{org}
+	}
+	tmpl := x509.Certificate{
+		SerialNumber:          serial,
+		Subject:               subj,
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              notAfter,
+		KeyUsage:              x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:              dnsSANs,
+		BasicConstraintsValid: true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &tmpl, &tmpl, &priv.PublicKey, priv)
+	if err != nil {
+		t.Fatalf("create cert: %v", err)
+	}
+	if err := os.WriteFile(certPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}), 0o644); err != nil {
+		t.Fatalf("write cert: %v", err)
+	}
+	keyDER, _ := x509.MarshalPKCS8PrivateKey(priv)
+	if err := os.WriteFile(keyPath, pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}), 0o600); err != nil {
+		t.Fatalf("write key: %v", err)
+	}
+}
+
+// setupPanelSelfSign points the package paths at a temp dir and stubs the
+// reload/restart seam, returning the paths and a pointer to a "reload was
+// called" flag. Restores the globals on cleanup.
+func setupPanelSelfSign(t *testing.T) (certPath, keyPath string, reloaded *bool) {
+	t.Helper()
+	dir := t.TempDir()
+	certPath = filepath.Join(dir, "panel.crt")
+	keyPath = filepath.Join(dir, "panel.key")
+
+	oc, ok, or := panelSelfSignCertPath, panelSelfSignKeyPath, panelSelfSignReloadFn
+	called := false
+	panelSelfSignCertPath = certPath
+	panelSelfSignKeyPath = keyPath
+	panelSelfSignReloadFn = func(context.Context) { called = true }
+	t.Cleanup(func() {
+		panelSelfSignCertPath, panelSelfSignKeyPath, panelSelfSignReloadFn = oc, ok, or
+	})
+	return certPath, keyPath, &called
+}
+
+func callPanelSelfSign(t *testing.T, hostname, ip string) (sslPanelSelfSignResponse, error) {
+	t.Helper()
+	params, _ := json.Marshal(sslPanelSelfSignParams{Hostname: hostname, IP: ip})
+	raw, err := sslPanelSelfSignHandler(context.Background(), params)
+	if err != nil {
+		return sslPanelSelfSignResponse{}, err
+	}
+	b, _ := json.Marshal(raw)
+	var resp sslPanelSelfSignResponse
+	if e := json.Unmarshal(b, &resp); e != nil {
+		t.Fatalf("unmarshal resp: %v", e)
+	}
+	return resp, nil
+}
+
+func readCertCN_SANs(t *testing.T, certPath string) (*x509.Certificate, string) {
+	t.Helper()
+	data, err := os.ReadFile(certPath)
+	if err != nil {
+		t.Fatalf("read cert: %v", err)
+	}
+	block, _ := pem.Decode(data)
+	cert, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatalf("parse cert: %v", err)
+	}
+	return cert, cert.Subject.CommonName
+}
+
+// TestPanelSelfSign_PreservesLECert is the #1 regression guard (advisor):
+// a deployed Let's Encrypt cert (issuer O="Let's Encrypt") must NEVER be
+// clobbered by the self-signed regen, even when its CN doesn't match the
+// requested hostname.
+func TestPanelSelfSign_PreservesLECert(t *testing.T) {
+	certPath, keyPath, reloaded := setupPanelSelfSign(t)
+	writeTestCert(t, certPath, keyPath, "Let's Encrypt", "old.example.com",
+		[]string{"old.example.com"}, time.Now().AddDate(0, 3, 0))
+	before, _ := os.ReadFile(certPath)
+
+	resp, err := callPanelSelfSign(t, "new.example.com", "")
+	if err != nil {
+		t.Fatalf("handler err: %v", err)
+	}
+	if resp.Regenerated {
+		t.Fatalf("LE cert was regenerated — must be preserved")
+	}
+	after, _ := os.ReadFile(certPath)
+	if string(before) != string(after) {
+		t.Fatalf("LE cert bytes changed — must be untouched")
+	}
+	if *reloaded {
+		t.Fatalf("reload/restart fired for a preserved cert (needless churn)")
+	}
+}
+
+// GH #2166: an EXPIRED Let's Encrypt cert is no longer a live cert to
+// preserve; it is replaced with a self-signed one for the hostname.
+func TestPanelSelfSign_ReplacesExpiredLECert(t *testing.T) {
+	certPath, keyPath, reloaded := setupPanelSelfSign(t)
+	writeTestCert(t, certPath, keyPath, "Let's Encrypt", "host.example.com",
+		[]string{"host.example.com"}, time.Now().Add(-time.Hour))
+
+	resp, err := callPanelSelfSign(t, "host.example.com", "")
+	if err != nil {
+		t.Fatalf("handler err: %v", err)
+	}
+	if !resp.Regenerated {
+		t.Fatalf("expired LE cert kept (%q) — must be replaced", resp.Reason)
+	}
+	cert, cn := readCertCN_SANs(t, certPath)
+	if cn != "host.example.com" || len(cert.Issuer.Organization) == 0 || cert.Issuer.Organization[0] != "DotNext Panel" {
+		t.Fatalf("got CN %q issuer %v, want a self-signed cert for host.example.com", cn, cert.Issuer.Organization)
+	}
+	if !*reloaded {
+		t.Fatalf("no reload after replacing the cert")
+	}
+}
+
+// GH #2166: the reconciler and the admin's Regenerate action can dispatch at
+// once. A second run waits for the first, then finds its cert up to date, so
+// the cert and key on disk always belong together.
+func TestPanelSelfSign_RunsOneAtATime(t *testing.T) {
+	certPath, keyPath, _ := setupPanelSelfSign(t)
+	release := make(chan struct{})
+	entered := make(chan struct{}, 2)
+	panelSelfSignReloadFn = func(context.Context) {
+		entered <- struct{}{}
+		<-release
+	}
+
+	first := make(chan error, 1)
+	go func() { _, err := callPanelSelfSign(t, "host.example.com", ""); first <- err }()
+	<-entered
+
+	second := make(chan sslPanelSelfSignResponse, 1)
+	go func() {
+		resp, err := callPanelSelfSign(t, "host.example.com", "")
+		if err != nil {
+			t.Errorf("second run: %v", err)
+		}
+		second <- resp
+	}()
+	select {
+	case resp := <-second:
+		t.Fatalf("second run finished while the first was still reloading: %+v", resp)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+	if err := <-first; err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	if resp := <-second; resp.Regenerated {
+		t.Fatalf("second run regenerated again (%q); want up to date", resp.Reason)
+	}
+	if _, err := tls.LoadX509KeyPair(certPath, keyPath); err != nil {
+		t.Fatalf("cert and key don't match: %v", err)
+	}
+}
+
+// TestPanelSelfSign_RegeneratesOnHostnameDrift: a self-signed cert for the
+// old hostname is replaced with one for the new hostname (CN + mail SAN),
+// and services are reloaded.
+func TestPanelSelfSign_RegeneratesOnHostnameDrift(t *testing.T) {
+	certPath, keyPath, reloaded := setupPanelSelfSign(t)
+	writeTestCert(t, certPath, keyPath, panelSelfSignOrg, "old.example.com",
+		[]string{"old.example.com", "mail.old.example.com", "localhost"}, time.Now().AddDate(5, 0, 0))
+
+	resp, err := callPanelSelfSign(t, "new.example.com", "203.0.113.9")
+	if err != nil {
+		t.Fatalf("handler err: %v", err)
+	}
+	if !resp.Regenerated {
+		t.Fatalf("expected regenerated=true, got reason %q", resp.Reason)
+	}
+	if !*reloaded {
+		t.Fatalf("reload/restart was not fired after regen")
+	}
+	cert, cn := readCertCN_SANs(t, certPath)
+	if cn != "new.example.com" {
+		t.Fatalf("CN not updated: %q", cn)
+	}
+	wantSAN := map[string]bool{"new.example.com": false, "mail.new.example.com": false, "localhost": false}
+	for _, d := range cert.DNSNames {
+		if _, ok := wantSAN[d]; ok {
+			wantSAN[d] = true
+		}
+	}
+	for name, seen := range wantSAN {
+		if !seen {
+			t.Fatalf("missing DNS SAN %q (have %v)", name, cert.DNSNames)
+		}
+	}
+	// IP SANs: loopback + the passed public IP.
+	var haveLoop, havePub bool
+	for _, ip := range cert.IPAddresses {
+		if ip.String() == "127.0.0.1" {
+			haveLoop = true
+		}
+		if ip.String() == "203.0.113.9" {
+			havePub = true
+		}
+	}
+	if !haveLoop || !havePub {
+		t.Fatalf("IP SANs wrong: %v", cert.IPAddresses)
+	}
+	// Issuer Organization must carry our marker so a later run treats it as
+	// regenerable (and install.sh's preserve-guard classifies it correctly).
+	if got := panelCertIssuerOrg(cert); got != panelSelfSignOrg {
+		t.Fatalf("issuer O = %q, want %q", got, panelSelfSignOrg)
+	}
+}
+
+// TestPanelSelfSign_NoChurnWhenCovered: an unexpired self-signed cert that
+// already covers the FQDN is left as-is and no reload fires.
+func TestPanelSelfSign_NoChurnWhenCovered(t *testing.T) {
+	certPath, keyPath, reloaded := setupPanelSelfSign(t)
+	writeTestCert(t, certPath, keyPath, panelSelfSignOrg, "host.example.com",
+		[]string{"host.example.com", "mail.host.example.com", "localhost"}, time.Now().AddDate(5, 0, 0))
+	before, _ := os.ReadFile(certPath)
+
+	resp, err := callPanelSelfSign(t, "host.example.com", "")
+	if err != nil {
+		t.Fatalf("handler err: %v", err)
+	}
+	if resp.Regenerated {
+		t.Fatalf("cert regenerated despite already covering the FQDN")
+	}
+	if *reloaded {
+		t.Fatalf("reload fired for a no-op")
+	}
+	after, _ := os.ReadFile(certPath)
+	if string(before) != string(after) {
+		t.Fatalf("cert bytes changed on a no-op")
+	}
+}
+
+// TestPanelSelfSign_RegeneratesWhenMissing: no cert on disk → generate one.
+// The agent logs a rewritten cert BEFORE it restarts the panel: when the panel
+// dispatched the verb, the restart ends the process waiting to log the reply,
+// so this is the only record of when, why and which cert.
+func TestPanelSelfSign_LogsTheNewCertBeforeTheRestart(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		existing   bool
+		newKey     bool
+		wantReason string
+	}{
+		{name: "missing cert", wantReason: "cert missing or unreadable"},
+		{name: "new key for a current cert", existing: true, newKey: true, wantReason: "new key requested"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			certPath, _, _ := setupPanelSelfSign(t)
+			seamHSTSSnippet(t)
+			if tc.existing {
+				if _, err := callPanelSelfSign(t, "host.example.com", ""); err != nil {
+					t.Fatalf("seed cert: %v", err)
+				}
+			}
+			var buf bytes.Buffer
+			old := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+			t.Cleanup(func() { slog.SetDefault(old) })
+			var atRestart string
+			panelSelfSignReloadFn = func(context.Context) { atRestart = buf.String() }
+
+			params, _ := json.Marshal(sslPanelSelfSignParams{Hostname: "host.example.com", NewKey: tc.newKey})
+			if _, err := sslPanelSelfSignHandler(context.Background(), params); err != nil {
+				t.Fatalf("handler err: %v", err)
+			}
+			data, err := os.ReadFile(certPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			d, err := panelcert.Describe(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, want := range []string{
+				"panel self-signed cert written",
+				"hostname=host.example.com",
+				`reason="` + tc.wantReason + `"`,
+				d.FingerprintSHA256,
+				"not_after=" + d.NotAfter.UTC().Format(time.RFC3339),
+			} {
+				if !strings.Contains(atRestart, want) {
+					t.Errorf("log at the restart lacks %q:\n%s", want, atRestart)
+				}
+			}
+		})
+	}
+}
+
+func TestPanelSelfSign_RegeneratesWhenMissing(t *testing.T) {
+	certPath, _, reloaded := setupPanelSelfSign(t)
+	resp, err := callPanelSelfSign(t, "fresh.example.com", "")
+	if err != nil {
+		t.Fatalf("handler err: %v", err)
+	}
+	if !resp.Regenerated {
+		t.Fatalf("expected regenerated=true for missing cert")
+	}
+	if !*reloaded {
+		t.Fatalf("reload not fired")
+	}
+	if _, cn := readCertCN_SANs(t, certPath); cn != "fresh.example.com" {
+		t.Fatalf("CN = %q", cn)
+	}
+}
+
+func TestPanelSelfSign_InvalidHostname(t *testing.T) {
+	setupPanelSelfSign(t)
+	if _, err := callPanelSelfSign(t, "not a host", ""); err == nil {
+		t.Fatalf("expected error for invalid hostname")
+	}
+}
+
+func TestPanelSelfSign_InvalidIP(t *testing.T) {
+	setupPanelSelfSign(t)
+	if _, err := callPanelSelfSign(t, "host.example.com", "999.999.1.1"); err == nil {
+		t.Fatalf("expected error for invalid ip")
+	}
+}

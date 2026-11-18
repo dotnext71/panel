@@ -1,0 +1,231 @@
+package commands
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"time"
+
+	"github.com/dotnext-panel/dotnext/agentwire"
+)
+
+type systemResolverSetParams struct {
+	Resolvers    []string `json:"resolvers"`
+	SearchDomain string   `json:"search_domain"`
+}
+
+// hostnameRe validates a single RFC-1123 hostname. No multi-label search-path
+// support in the UI today — one domain max, to keep the UX simple. Matches
+// systemd-resolved's acceptable Domains= entry for the common case.
+var hostnameRe = regexp.MustCompile(`^(?i)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$`)
+
+// resolverLimits cap what goes into the drop-in so a runaway caller can't
+// blow up resolved.conf.d.
+const (
+	maxResolvers        = 8
+	maxSearchDomainLen  = 253
+	resolvedRestartWait = 5 * time.Second
+)
+
+func systemResolverSetHandler(ctx context.Context, params json.RawMessage) (any, error) {
+	if len(params) == 0 {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: "params required"}
+	}
+	var p systemResolverSetParams
+	if err := json.Unmarshal(params, &p); err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: fmt.Sprintf("parse params: %v", err)}
+	}
+	if err := validateResolvers(p.Resolvers); err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: err.Error()}
+	}
+	if err := validateSearchDomain(p.SearchDomain); err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInvalidArgument, Message: err.Error()}
+	}
+
+	// Capture the service state at entry so the restart path only runs on
+	// hosts that actually run systemd-resolved. If it's inactive, the admin
+	// has been told so by the UI ("drop-in will still be written, but
+	// changes won't take effect until the service is running") — we honor
+	// that contract: persist the drop-in and return. Trying to start an
+	// inactive service here would just fail on hosts that use a different
+	// resolver stack (NetworkManager, resolvconf, plain /etc/resolv.conf),
+	// and the rollback would then make the feature unusable on those hosts.
+	wasActive := systemdResolvedActive()
+
+	previous, _ := os.ReadFile(resolvedDropInPath) // #nosec G304 — fixed path
+	newContent := renderResolvedDropIn(p.Resolvers, p.SearchDomain)
+	if err := atomicWriteResolvedDropIn(resolvedDropInPath, newContent); err != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("write drop-in: %v", err)}
+	}
+
+	if wasActive {
+		if err := restartSystemdResolved(ctx); err != nil {
+			// Rollback to previous content so the host isn't left with an
+			// invalid drop-in keeping resolved in a failed state.
+			if previous != nil {
+				_ = atomicWriteResolvedDropIn(resolvedDropInPath, previous)
+			} else {
+				_ = os.Remove(resolvedDropInPath)
+			}
+			_ = restartSystemdResolved(ctx) // best-effort recover
+			return nil, &agentwire.AgentError{
+				Code:    agentwire.CodeFailedPrecondition,
+				Message: fmt.Sprintf("systemd-resolved restart failed; rolled back drop-in: %v", err),
+			}
+		}
+	}
+
+	// Read back to prove the write + restart took. Truth is on disk.
+	resolvers, search, source, rerr := readResolverDropIn(resolvedDropInPath)
+	if rerr != nil {
+		return nil, &agentwire.AgentError{Code: agentwire.CodeInternal, Message: fmt.Sprintf("verify drop-in: %v", rerr)}
+	}
+	return systemResolverGetResponse{
+		Active:       systemdResolvedActive(),
+		Resolvers:    resolvers,
+		SearchDomain: search,
+		Source:       source,
+	}, nil
+}
+
+func validateResolvers(resolvers []string) error {
+	if len(resolvers) == 0 {
+		return fmt.Errorf("at least one resolver required")
+	}
+	if len(resolvers) > maxResolvers {
+		return fmt.Errorf("too many resolvers (max %d)", maxResolvers)
+	}
+	seen := map[string]bool{}
+	for _, r := range resolvers {
+		r = strings.TrimSpace(r)
+		if r == "" {
+			return fmt.Errorf("empty resolver entry")
+		}
+		addr, err := netip.ParseAddr(r)
+		if err != nil {
+			return fmt.Errorf("invalid IP %q", r)
+		}
+		if addr.IsUnspecified() || addr.IsMulticast() {
+			return fmt.Errorf("resolver %q must be a usable unicast address", r)
+		}
+		if seen[r] {
+			return fmt.Errorf("duplicate resolver %q", r)
+		}
+		seen[r] = true
+	}
+	return nil
+}
+
+func validateSearchDomain(d string) error {
+	d = strings.TrimSpace(d)
+	if d == "" {
+		return nil
+	}
+	if len(d) > maxSearchDomainLen {
+		return fmt.Errorf("search domain too long")
+	}
+	if !hostnameRe.MatchString(d) {
+		return fmt.Errorf("invalid search domain %q", d)
+	}
+	return nil
+}
+
+// renderResolvedDropIn produces the drop-in content. systemd-resolved.conf(5)
+// specifies DNS= as a space-separated list of addresses (optionally with a
+// `#server-name` suffix for DoT SAN verification) and Domains= as a
+// space-separated list. Section header [Resolve] is required.
+//
+// DoT default (2026-06): the drop-in always emits `DNSOverTLS=opportunistic`
+// so systemd-resolved attempts encrypted DNS first and falls back to plain
+// UDP only when the upstream rejects TLS. For known public resolvers
+// (Cloudflare / Google / Quad9 / etc — see dotSAN) the IP is rendered as
+// `IP#SAN` so resolved validates the upstream cert strictly. Custom
+// operator IPs are written without a SAN suffix (still TLS-attempted,
+// best-effort verification) so corporate / private DNS still works.
+//
+// Why this is the default: LXC / cloud hosts often have outbound UDP/53
+// blocked by the hypervisor or carrier firewall (incident 2026-06-01 on
+// 10.0.3.14). DoT uses TCP/853 which is universally reachable and gives
+// us encryption-in-flight for free. The recursor on the host is
+// configured separately by install.sh to forward through
+// 127.0.0.53 (the resolved stub), so every recursive query traverses
+// this DoT chain.
+func renderResolvedDropIn(resolvers []string, search string) []byte {
+	var b strings.Builder
+	b.WriteString("# Managed by dotnext-api — edits via /dotnext-admin/settings → DNS.\n")
+	b.WriteString("# To revert: remove this file and `systemctl restart systemd-resolved`.\n")
+	b.WriteString("[Resolve]\n")
+	b.WriteString("DNS=")
+	for i, r := range resolvers {
+		if i > 0 {
+			b.WriteString(" ")
+		}
+		b.WriteString(r)
+		if san := dotSuffixFor(r); san != "" {
+			b.WriteString("#")
+			b.WriteString(san)
+		}
+	}
+	b.WriteString("\n")
+	b.WriteString("DNSOverTLS=opportunistic\n")
+	if search = strings.TrimSpace(search); search != "" {
+		b.WriteString("Domains=")
+		b.WriteString(search)
+		b.WriteString("\n")
+	}
+	return []byte(b.String())
+}
+
+// atomicWriteResolvedDropIn writes content to a sibling temp file and renames
+// over the target, so systemd-resolved never sees a half-written file.
+var atomicWriteResolvedDropIn = func(path string, content []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(dir, ".dotnext-resolved-*.tmp")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+	if _, err := tmp.Write(content); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o644); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpPath, path)
+}
+
+// restartSystemdResolved runs `systemctl restart systemd-resolved.service`
+// and waits up to resolvedRestartWait for the unit to report active. Without
+// the poll, a fast-returning restart can leave the service in "activating"
+// while the caller already returned success.
+var restartSystemdResolved = func(ctx context.Context) error {
+	if _, err := runSystemctl(ctx, "restart", "systemd-resolved.service"); err != nil {
+		return err
+	}
+	deadline := time.Now().Add(resolvedRestartWait)
+	for time.Now().Before(deadline) {
+		if systemdResolvedActive() {
+			return nil
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("systemd-resolved did not reach active within %s", resolvedRestartWait)
+}
+
+func init() {
+	Default.Register("system.resolver.set", systemResolverSetHandler)
+}

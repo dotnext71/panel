@@ -1,0 +1,91 @@
+dotNext Control Panel — Third-Party Notices & Attribution
+=========================================================
+
+Copyright (C) 2026 dotNext Contributors
+
+This project is licensed under the MIT License
+(SPDX-License-Identifier: MIT). See LICENSE for the full license text.
+
+1. Upstream Origin & Relicensing Authorization
+----------------------------------------------
+dotNext is derived from the DotNext Panel codebase. The original project rights
+holders granted explicit permission to rebrand the project as dotNext,
+reorganize and rewrite the source code, remove original product branding, and
+relicense eligible first-party components from AGPL-3.0 to MIT.
+
+All non-relicensed components, WordPress plugin packages explicitly maintained
+under GPL-2.0-or-later, and third-party works retain their respective licenses
+and copyright notices below.
+
+-------------------------------------------------------------------------------
+
+2. Repository Components with Distinct Licenses
+-----------------------------------------------
+
+2.1 CrowdSec Stalwart Parser & Scenario Assets
+Path: install/crowdsec/stalwart/LICENSE
+License: MIT License
+Notice preserved verbatim:
+
+  MIT License
+
+  Copyright (c) 2026 Nethanja
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+2.2 WordPress Companion Plugins
+Paths: wp-plugins/dotnext-cache/, wp-plugins/dotnext-migrator/
+License: GNU General Public License v2.0 or later (SPDX-License-Identifier: GPL-2.0-or-later)
+Note: Retained under GPL-2.0-or-later for WordPress plugin ecosystem compatibility.
+
+-------------------------------------------------------------------------------
+
+3. Go & Frontend Build Dependencies
+-----------------------------------
+dotNext imports open-source libraries declared in `go.mod`, `support-claim/go.mod`,
+`frontend/package.json` (and lockfiles), and composer asset metadata. Each
+dependency remains licensed under its respective upstream open-source license
+(including MIT, BSD-2-Clause, BSD-3-Clause, Apache-2.0, ISC, and MPL-2.0). No
+claim is made that third-party dependencies are relicensed to MIT.
+
+-------------------------------------------------------------------------------
+
+4. External System & Runtime Components Provisioned by the Installer
+--------------------------------------------------------------------
+When deploying a host, the dotNext installer downloads, installs, or configures
+independent third-party software packages from upstream OS repositories and
+pinned releases. Each component remains governed solely by its own license:
+
+- Ory Kratos — Apache License 2.0
+- Stalwart Mail Server — GNU Affero General Public License v3.0 (AGPL-3.0)
+- Bulwark Webmail — GNU Affero General Public License v3.0 (AGPL-3.0)
+- Snuffleupagus PHP Hardening — GNU Lesser General Public License v3.0 (LGPL-3.0)
+- CrowdSec Engine & Bouncers — MIT License
+- Linux Malware Detect (LMD) — GNU General Public License v2.0 (GPL-2.0)
+- YARA-X — BSD 3-Clause License
+- Restic — BSD 2-Clause License
+- phpMyAdmin — GNU General Public License v2.0 (GPL-2.0)
+- Adminer — Apache License 2.0 or GNU General Public License v2.0 (GPL-2.0)
+- NGINX — 2-Clause BSD License
+- MariaDB — GNU General Public License v2.0 (GPL-2.0)
+- PowerDNS Authoritative Server & Recursor — GNU General Public License v2.0 (GPL-2.0)
+- PostgreSQL — The PostgreSQL License
+- Redis / Valkey — BSD 3-Clause License
+- Certbot — Apache License 2.0
+- Linux OS packages (Bubblewrap, Auditd, AIDE, Quota, GoAccess, etc.) — Respective distro licenses

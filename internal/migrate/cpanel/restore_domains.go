@@ -1,0 +1,385 @@
+package cpanel
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/dotnext-panel/dotnext/internal/agent"
+	"github.com/dotnext-panel/dotnext/internal/domainops"
+	"github.com/dotnext-panel/dotnext/internal/htaccess"
+	"github.com/dotnext-panel/dotnext/internal/ids"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+)
+
+// DomainImportResult is returned to the restore-stage caller for
+// progress reporting + manifest update.
+type DomainImportResult struct {
+	Created      int
+	EmailEnabled int
+	Skipped      []string
+	// Failed names domains whose agent-side create FAILED, as opposed to ones
+	// deliberately skipped (already present, filtered out). JAB-214: these used
+	// to land in Skipped alongside benign entries, so the restore reported
+	// "domains: created=0" plus a skip line and still exited 0 — while the
+	// account had no vhost, no DNS zone and no mail routing. A domain is a core
+	// area; the caller promotes these to criticals, which downgrades the run to
+	// DEGRADED and exits non-zero unless --allow-degraded.
+	Failed []string
+	// HtaccessRulesImported counts typed Rule Builder entries converted from
+	// migrated .htaccess files (ADR-0130). HtaccessWarnings carries the
+	// per-domain "not converted" advisories for the migration manifest.
+	HtaccessRulesImported int
+	HtaccessWarnings      []string
+}
+
+type domainEmailEnableResp struct {
+	Ok            bool   `json:"ok"`
+	DKIMSelector  string `json:"dkim_selector"`
+	DKIMPublicKey string `json:"dkim_public_key"`
+}
+
+// zoneHasWWWRecord reports whether the source BIND zone publishes a
+// www.<domain> address record (A/AAAA/CNAME) — the signal that the source
+// account actually serves www. cPanel (and Plesk/Hestia/CloudPanel) alias www
+// by default, so most migrated domains match; one that genuinely lacks www
+// stays apex-only. A zone that can't be opened or parsed returns false
+// (conservative: no unwanted www SAN). JAB-249.
+func zoneHasWWWRecord(zonePath, domainName string) bool {
+	f, err := os.Open(zonePath)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	zone, _, ok := ParseBINDZone(f, domainName)
+	if !ok {
+		return false
+	}
+	want := "www." + strings.ToLower(domainName)
+	for _, rec := range zone.Records {
+		switch rec.Type {
+		case "A", "AAAA", "CNAME":
+			if strings.EqualFold(rec.Name, want) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ImportDomains creates panel domain rows + nginx vhosts for every
+// zone file found in the parsed tarball. If a domain's mail directory
+// exists under the tarball's MailRoot, email is enabled on the spot so
+// the ImportMailboxes stage that follows can deliver into Stalwart.
+//
+// Idempotent: existing domains (matched by name) are skipped rather
+// than duplicated.
+func ImportDomains(
+	ctx context.Context,
+	domainsRepo repository.DomainRepository,
+	agentCli agent.AgentInterface,
+	parsed *ParsedTarball,
+	targetUserID string,
+	targetUsername string,
+) (*DomainImportResult, error) {
+	if parsed == nil {
+		return nil, fmt.Errorf("ImportDomains: parsed nil")
+	}
+	res := &DomainImportResult{}
+	mailDomains := scanMailDomains(parsed)
+	// dotnext convention: every domain docroot lives at
+	//   /home/<user>/domains/<dom>/public_html/
+	// regardless of source layout. M35.8 ImportHomeSplit rsyncs
+	// per-domain content into that target, so the nginx vhost +
+	// FPM pool point at the right path. Source-layout-specific
+	// overrides (DA already-resolved DocRoots) still win when set.
+	docRootFor := func(name string) string {
+		if parsed.DocRoots != nil {
+			if override, ok := parsed.DocRoots[name]; ok && override != "" {
+				return override
+			}
+		}
+		return filepath.Join("/home", targetUsername, "domains", name, "public_html")
+	}
+
+	type domainEntry struct {
+		name    string
+		docRoot string
+		// createWWW mirrors whether the SOURCE zone publishes a www.<domain>
+		// address record (JAB-249). The panel gates the www cert SAN behind
+		// CreateWWW (#915); migration never set it, so a migrated domain that
+		// actually serves www was issued an apex-only cert →
+		// ERR_CERT_COMMON_NAME_INVALID on https://www.<domain>.
+		createWWW bool
+	}
+	// Build the create list from the UNION of the source's DNS zones and its web
+	// domains, deduped by name. GH #1606: ZoneFiles and DomainNames were an
+	// either/or — ZoneFiles when present, DomainNames only as a fallback when
+	// empty — so a web domain WITHOUT a matching source zone was silently dropped
+	// whenever the account had at least one zone. (Hestia's JAB-28 zone feeding
+	// made this bite: an account with some zoned domains lost every web-only
+	// domain, e.g. a subdomain served from the web with DNS hosted off-box.)
+	// Zone-derived entries come first because they carry createWWW from the
+	// source zone; a web-only domain has no zone to read, so it stays apex-only
+	// (createWWW=false), matching the old DomainNames-branch default.
+	// webNames / zoneNames record which source list each name came from, so an
+	// importer that enumerates web and DNS separately (parsed.SeparateWebDNSLists,
+	// e.g. Hestia) can be created with the right facets: a name only in the web
+	// list is web-only (dns_disabled), a name only in the zone list is DNS-only
+	// (web_disabled), a name in both is full-facet. GH #1606.
+	zoneNames := map[string]bool{}
+	webNames := map[string]bool{}
+	var entries []domainEntry
+	seen := map[string]bool{}
+	for _, zonePath := range parsed.ZoneFiles {
+		domainName := strings.TrimSuffix(filepath.Base(zonePath), ".db")
+		if domainName == "" {
+			res.Skipped = append(res.Skipped, fmt.Sprintf("domain_skip:empty_name_from_%s", zonePath))
+			continue
+		}
+		zoneNames[domainName] = true
+		if seen[domainName] {
+			continue
+		}
+		seen[domainName] = true
+		entries = append(entries, domainEntry{
+			name:      domainName,
+			docRoot:   docRootFor(domainName),
+			createWWW: zoneHasWWWRecord(zonePath, domainName),
+		})
+	}
+	for _, name := range parsed.DomainNames {
+		if name == "" {
+			continue
+		}
+		webNames[name] = true
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		entries = append(entries, domainEntry{name: name, docRoot: docRootFor(name)})
+	}
+
+	for _, e := range entries {
+		domainName := e.name
+		if _, err := domainsRepo.FindByName(ctx, domainName); err == nil {
+			res.Skipped = append(res.Skipped, "domain_skip:already_exists:"+domainName)
+			continue
+		}
+
+		// Facets (GH #1606): only an importer that lists web and DNS separately
+		// (parsed.SeparateWebDNSLists) downgrades a single-list name; otherwise
+		// every domain is full-facet (web + DNS), the historical behavior for
+		// cpanel/DA/CloudPanel/Plesk.
+		isWeb, isDNS := true, true
+		if parsed.SeparateWebDNSLists {
+			isWeb, isDNS = webNames[domainName], zoneNames[domainName]
+		}
+
+		domainID := ids.NewULID()
+		docRoot := e.docRoot
+		if !isWeb {
+			// A DNS-only zone is docroot-less — no vhost, no PHP, no web SSL.
+			docRoot = ""
+		}
+
+		// Build the web vhost ONLY for a web facet. A DNS-only zone gets no
+		// vhost; its zone is created by the ImportDNS stage and the reconciler
+		// serves DNS alone (web_disabled row).
+		if isWeb {
+			if _, err := agentCli.Call(ctx, "domain.create", map[string]any{
+				"domain_id":      domainID,
+				"domain":         domainName,
+				"username":       targetUsername,
+				"doc_root":       docRoot,
+				"index_priority": "html_first",
+			}); err != nil {
+				res.Skipped = append(res.Skipped, fmt.Sprintf("domain_skip:agent_create_failed:%s:%v", domainName, err))
+				res.Failed = append(res.Failed, fmt.Sprintf("%s (%v)", domainName, err))
+				continue
+			}
+		}
+
+		now := time.Now()
+		d := &models.Domain{
+			ID:            domainID,
+			UserID:        targetUserID,
+			Name:          domainName,
+			DocRoot:       docRoot,
+			IsEnabled:     true,
+			IndexPriority: "html_first",
+			GhostState:    "unchecked",
+			// GH #1606: honour the source's facets so a migration recreates the
+			// right resource TYPES — a web-only domain gets no managed DNS zone,
+			// a DNS-only zone gets no web vhost. Full-facet when both (or when the
+			// importer doesn't separate the lists).
+			WebDisabled: !isWeb,
+			DNSDisabled: !isDNS,
+			// JAB-249: carry the source's www presence so the issued LE cert
+			// covers www.<domain> (the #1069 SAN-drift reconciler adds the SAN
+			// on its next reachable-gated pass). Domains whose source has no
+			// www record stay apex-only (unchanged default). Web-off rows have no
+			// web cert, so www is moot there.
+			CreateWWW: e.createWWW && isWeb,
+			CreatedAt: now,
+			UpdatedAt: now,
+		}
+		// #327: a source domain with NO mail must not inherit dotnext's
+		// mail-by-default. MailProvider "none" makes the reconciler's
+		// includeMail=false (no MX/SPF/DMARC/mail-A bootstrap); email_enabled
+		// off keeps the DKIM + mail-cert reconcilers away. Mail domains fall
+		// through to domain.email_enable below (provider stays the "dotnext"
+		// default).
+		if !mailDomains[domainName] {
+			d.MailProvider = models.MailProviderNone
+			d.EmailEnabled = false
+		}
+
+		// .htaccess -> typed Rule Builder entries (ADR-0130). The source
+		// docroot was rsynced into docRoot by the home-split step that runs
+		// before this stage, so a .htaccess present there converts to typed
+		// NginxRules now, persisted with the row (the reconciler renders them
+		// into the vhost on its next tick — nginx -t gated). An absent
+		// .htaccess is the common case and is a silent no-op; unconverted
+		// lines surface as per-domain manifest warnings, never dropped quietly.
+		// .htaccess conversion only applies to a web facet (a DNS-only zone has
+		// no docroot to read).
+		if isWeb {
+			applyMigratedHtaccess(filepath.Join(docRoot, ".htaccess"), domainName, d, res)
+		}
+
+		// GH #1816 / ADR-0170 decision 2: an administrator pulled this name
+		// from another server, so it is created proven (method migration).
+		if err := markMigratedOwnership(d, now); err != nil {
+			res.Skipped = append(res.Skipped, fmt.Sprintf("domain_skip:ownership_token:%s:%v", domainName, err))
+			res.Failed = append(res.Failed, fmt.Sprintf("%s (%v)", domainName, err))
+			if isWeb {
+				delCtx, dcancel := context.WithTimeout(ctx, 60*time.Second)
+				_, _ = agentCli.Call(delCtx, "domain.delete", map[string]string{"domain": domainName})
+				dcancel()
+			}
+			continue
+		}
+
+		if err := domainsRepo.Create(ctx, d); err != nil {
+			// JAB-57: for a web facet, domain.create already built the nginx
+			// vhost (+ enabled symlink) but the panel row failed to land — an
+			// unmanaged vhost that serves traffic and collides with a retry
+			// (whose collision check keys on the domains row, now absent). Roll
+			// it back: domain.delete removes the vhost + reloads nginx. The
+			// docroot under /home is left (harmless; overwritten by the
+			// home-split rsync on retry). A DNS-only entry built no vhost, so
+			// there is nothing to roll back.
+			if isWeb {
+				delCtx, dcancel := context.WithTimeout(ctx, 60*time.Second)
+				_, delErr := agentCli.Call(delCtx, "domain.delete", map[string]string{"domain": domainName})
+				dcancel()
+				if delErr != nil {
+					res.Skipped = append(res.Skipped, fmt.Sprintf("domain_skip:db_create_failed_AND_vhost_rollback_failed:%s:row=%v:delete=%v", domainName, err, delErr))
+				} else {
+					res.Skipped = append(res.Skipped, fmt.Sprintf("domain_skip:db_create_failed_vhost_rolled_back:%s:%v", domainName, err))
+				}
+			} else {
+				res.Skipped = append(res.Skipped, fmt.Sprintf("domain_skip:db_create_failed:%s:%v", domainName, err))
+			}
+			continue
+		}
+		res.Created++
+
+		if !mailDomains[domainName] {
+			continue
+		}
+
+		raw, err := agentCli.Call(ctx, "domain.email_enable", map[string]any{
+			"domain_id":   domainID,
+			"domain_name": domainName,
+		})
+		if err != nil {
+			res.Skipped = append(res.Skipped, fmt.Sprintf("email_skip:enable_failed:%s:%v", domainName, err))
+			continue
+		}
+		var emailResp domainEmailEnableResp
+		if err := json.Unmarshal(raw, &emailResp); err != nil {
+			res.Skipped = append(res.Skipped, fmt.Sprintf("email_skip:decode_failed:%s:%v", domainName, err))
+			continue
+		}
+
+		enabledAt := time.Now()
+		if err := domainsRepo.UpdateEmailState(ctx, domainID, repository.DomainEmailState{
+			Enabled:        true,
+			DkimSelector:   &emailResp.DKIMSelector,
+			DkimPublicKey:  &emailResp.DKIMPublicKey,
+			EmailEnabledAt: &enabledAt,
+		}); err != nil {
+			res.Skipped = append(res.Skipped, fmt.Sprintf("email_skip:db_update_failed:%s:%v", domainName, err))
+			continue
+		}
+		res.EmailEnabled++
+	}
+	return res, nil
+}
+
+// scanMailDomains returns the set of domain names that have a mail
+// directory under the tarball's MailRoot (i.e. domains that had
+// mailboxes in the source panel).
+func scanMailDomains(parsed *ParsedTarball) map[string]bool {
+	result := make(map[string]bool)
+	mailRoot := parsed.MailRoot
+	if mailRoot == "" && parsed.HomeDir != "" {
+		mailRoot = filepath.Join(parsed.HomeDir, "mail")
+	}
+	if mailRoot == "" {
+		return result
+	}
+	entries, err := os.ReadDir(mailRoot)
+	if err != nil {
+		return result
+	}
+	for _, e := range entries {
+		if e.IsDir() {
+			result[e.Name()] = true
+		}
+	}
+	return result
+}
+
+// applyMigratedHtaccess reads the .htaccess at path (if any), converts it to
+// typed NginxRules on d, and records counts/warnings on res. Best-effort: a
+// missing file is normal and silent; conversion never fails the migration.
+// Capped at the per-domain rule limit (extra rules are reported, not applied).
+func applyMigratedHtaccess(path, domainName string, d *models.Domain, res *DomainImportResult) {
+	raw, err := os.ReadFile(path)
+	if err != nil || len(raw) == 0 {
+		return
+	}
+	conv := htaccess.Convert(string(raw), "/")
+	rules := conv.Rules
+	// Mirror the API's per-domain rule cap (GH #301).
+	const maxImportRules = 500
+	if len(rules) > maxImportRules {
+		res.HtaccessWarnings = append(res.HtaccessWarnings,
+			fmt.Sprintf("%s: .htaccess produced %d rules; only the first %d were imported", domainName, len(rules), maxImportRules))
+		rules = rules[:maxImportRules]
+	}
+	if len(rules) > 0 {
+		d.NginxRules = models.NginxRules(rules)
+		res.HtaccessRulesImported += len(rules)
+	}
+	for _, w := range conv.Warnings {
+		res.HtaccessWarnings = append(res.HtaccessWarnings,
+			fmt.Sprintf("%s: %s", domainName, w.Reason))
+	}
+}
+
+// markMigratedOwnership records that an administrator vouched for a migrated
+// name (GH #1816 / ADR-0170): every cPanel/DirectAdmin/HestiaCP import is
+// admin-run, so the row is created verified with method "migration".
+func markMigratedOwnership(d *models.Domain, now time.Time) error {
+	return domainops.ApplyOwnershipDecision(&d.OwnershipState,
+		domainops.OwnershipDecision{Verified: true, Method: models.OwnershipMethodMigration}, now.UTC())
+}

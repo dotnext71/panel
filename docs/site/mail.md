@@ -1,0 +1,377 @@
+# Mail
+
+DotNext's mail stack is [**Stalwart**](https://stalw.art) (SMTP submission + MTA + JMAP + IMAP, single process) + **Bulwark**, a Next.js JMAP webmail served per-tenant on `mail.<domain>`.
+
+Mail is an optional module (Server Settings → Modules). It needs the DNS module installed and running first, so the Mail switch stays off until DNS shows **active** ([DNS](./dns.md)).
+
+## Per-mailbox
+
+- Authentication: per-mailbox password, bcrypt-hashed in the panel's database. Stalwart reads it through a read-only SQL directory, so the password is changed in the panel: **Rotate password** on the mailbox (Mail → a domain → Mailboxes), by the account owner or an admin. Webmail's password change is refused.
+- Quota: per-mailbox MiB, enforced by Stalwart.
+- Webmail: **Bulwark** at `https://mail.<domain>/`. Its sign-in page asks for the address and password only: it always signs in to this server, so it has no JMAP server field. One-click SSO from a mailbox (Mail Domains → a domain → Accounts) uses the self-deleting `dotnext-sso-*.php` file (not the earlier magic-link/mu-plugin approach, which failed).
+- IMAP / SMTP submission: `imap.<panel-hostname>:993` (TLS), `smtp.<panel-hostname>:465` (TLS) or `:587` (STARTTLS).
+- Autoconfig / autodiscover: Apple `mobileconfig`, Thunderbird `autoconfig.xml`, Outlook `autodiscover.xml` (see [platform/mail-autoconfig.md](./platform/mail-autoconfig.md)).
+- Calendars + contacts: the mail vhost serves CalDAV / CardDAV and `/.well-known/caldav|carddav`, and the `_caldavs._tcp` / `_carddavs._tcp` SRV records point clients at it, so mail apps find a mailbox's calendars and contacts on their own. The panel no longer shows per-mailbox DAV URLs; an external-DNS domain gets the two SRV records in its mail DNS record list.
+
+## App passwords
+
+Webmail's **Settings → Security** lets a mailbox create app passwords for its mail apps. Stalwart checks an app password itself, apart from the mailbox password the panel keeps, so the panel removes app passwords when they must stop working:
+
+- **Password changed in the panel**: the app passwords made before the change, or in the minute after it, are removed. Until the panel's flush of Stalwart's login cache reaches it, webmail and JMAP still take the old password for a few seconds, so an app password made in that minute may have been made with the old one. Webmail opened from the panel in that minute is signed out about a minute later; open it again.
+- **Mailbox disabled, or its owner suspended**: all of the mailbox's app passwords are removed. Enabling the mailbox or unsuspending the owner does not bring them back; the user creates new ones.
+- The reconciler's `mail.credentials` pass checks every mailbox when the panel starts, when a mailbox's password or sign-in state changes, a minute after a password change, and every 10 minutes, and removes what the rules above would. It also covers changes made outside these actions, such as a domain that is no longer verified. The first start after the update that added it removes every app password made before the update.
+
+Opening webmail from the panel signs in with a short-lived app password of the same kind, so the same rules apply to it.
+
+Stalwart API keys are not available to mailboxes: `install_stalwart_apply` disables them on the built-in **User** role (next to the lockdown below), and the reconciler removes any that exist.
+
+## Mail Domains
+
+Mail is organised **per domain**, not as one flat page. `/dotnext-api/mail-domains`
+lists your **Mail Domains**: the domains with mail on, sortable, with an SSL
+column, a live queue count, Disable and Delete in each row's menu, and a
+**Create Mail Domain** button. Click a domain to drill into its accounts and
+settings. Old `/dotnext-api/mail` links land here.
+
+Per-domain tabs:
+
+- **Mailboxes** — create, change password, set quota, delete.
+- **Forwarders** — forward `alice@example.com` to one or more external addresses.
+- **Autoresponders** — vacation responder per mailbox, with start/end window and subject template.
+- **Catch-all** — send unmatched recipients to a chosen mailbox or `:drop` / `:reject`.
+- **Disclaimer** — append HTML / plaintext disclaimer server-side to outbound mail per domain.
+- **Shared Folders** — create IMAP shared folders for the team; manage ACLs.
+- **Webmail branding** (in **Settings**) — the name, company name, logos,
+  favicon and login-page links webmail shows on `mail.<domain>`; empty fields
+  keep the server-wide branding. The owner sets it when their package has
+  `webmail_branding_enabled` ([Hosting packages](admin/hosting-packages.md)),
+  an admin for any domain. See [Webmail branding](user/email.md#webmail-branding).
+- **CalDAV / CardDAV override** — repoint a domain's calendar + contacts SRV
+  records at an external server instead of the built-in Stalwart DAV.
+- **Logs** and **Statistics** — scoped to the selected domain (sortable Mail Logs
+  columns); the old flat Mail page is retired.
+
+### DKIM signing
+
+Every mail domain signs its outgoing mail twice: with an Ed25519 key, published
+at `dotnext._domainkey.<domain>`, and with a 2048-bit RSA key, published at
+`dotnextrsa._domainkey.<domain>`. Gmail, Outlook and most checking tools don't
+verify Ed25519 signatures, so for them the RSA signature is the one that passes
+and aligns with the From domain for DMARC.
+
+On a zone this server hosts, both records are published automatically. A
+domain set up before the RSA key existed gets its key and record on the first
+reconcile after the update.
+
+If the domain's DNS is hosted elsewhere, add the `dotnextrsa._domainkey` TXT
+record there as well (Mail DNS records lists it). The key is about 400
+characters, longer than one TXT string holds: most providers' forms take the
+value as it is and split it themselves, and **Copy all** writes it already
+split for a zone-file import. Until the record is published, receivers find no
+key for the RSA signature.
+
+**Rotate DKIM** on the domain's mail page (or `dotnext-cli domain email-dkim-rotate
+<domain>`) replaces both keys. The mail server signs with the new keys from the
+next message, and both TXT records are republished with them; a domain whose
+DNS is hosted elsewhere needs both records updated there. The selectors stay
+the same, so receivers that cached the old records fail the new signatures
+until those expire, and a message signed before the rotation and still waiting
+for a retry fails at its receiver. The previous private keys stay in
+`/etc/dotnext/dkim` as `<domain>.key.old` and `<domain>.rsa.key.old`: a
+record, not a rollback. If the RSA key can't be rotated, the Ed25519 one still
+is, and the rotation says so.
+
+Before this release, Rotate DKIM changed the key file and the published record
+but not the key the mail server signs with, so the domain's mail failed DKIM
+after a rotation. The first reconcile after the update finds such a domain (the
+mail server's key differs from the key file, and the key file's key is the one
+published) and gives the mail server the published key.
+
+A renamed domain keeps its keys: the files follow it to the new name. Deleting a
+domain deletes its key files once its signatures are gone, so a domain added
+later under the same name gets new keys. Turning mail off, or a mail-only
+delete, keeps them, and turning mail back on signs with them again.
+
+### Mail-only delete
+
+A domain can have **just its mail torn down while the web domain stays** —
+deletes mailboxes, forwarders, DKIM, and the Stalwart domain entry
+without removing the vhost or DNS zone.
+
+### Mail off, or mail hosted elsewhere
+
+When a domain's email is off, or its mail provider is anything but DotNext
+(Google Workspace, Microsoft 365, No mail, or a custom DNS template), this
+server stops acting as the domain's mail server:
+
+- Mail sent from this server to the domain (a contact form, a WordPress
+  notification, another account on the server) goes to the domain's MX, like
+  mail to any other domain. It is no longer delivered here, or refused with
+  "Mailbox does not exist".
+- Mail for the domain that arrives without signing in is refused with
+  `550 5.7.1`: the domain's mail is received by its own MX, not here.
+- Mailboxes left on the domain are kept. They still sign in, keep the mail
+  they have and can send, but new mail for them goes to the domain's MX, so
+  move their mail before switching provider. While mailboxes are left, the
+  panel asks first, and says how many, before it turns email off (the
+  domain's Email switch, or Disable on Mail Domains) or saves another mail
+  provider.
+- The website's own mail (PHP `mail()`) keeps working: it signs in as the
+  domain's send-only `noreply@`.
+
+The panel applies a change within a minute. The mail server's routing for
+these domains is set up by the installer, so an existing server gets it at
+its next `dotnext-cli update`. If the mail server's outbound route, queue schedule
+or recipient-stage script was changed by hand, the update leaves them as they
+are and prints a warning, and such domains stay local.
+
+## Mail groups
+
+A mail group is an address on a domain whose members are mailboxes on the same domain. There are two types, fixed at creation, each on its own tab of the mail domain: **Distribution lists** (next to Forwarders) and **Groups** (shared workspaces). A group cannot take a mailbox's address, and a mailbox cannot take a group's (see [One owner per address](./user/mailboxes.md#one-owner-per-address)).
+
+- **Distribution list** — every member receives their own copy of each message in their own inbox. A list of member mailboxes only is projected as a Stalwart mailing list whose recipients are the members that can receive mail (disabled and send-only mailboxes are left out), with no limit on how many. A list with outside addresses, or with **Internal delivery only**, is delivered by a Sieve script that redirects to each recipient instead (see below). A list with no recipients has nothing at its address, so senders get a `550` instead of mail that is accepted and dropped.
+- **Shared workspace** — one shared inbox that members open in webmail (no copies are delivered), plus a shared calendar, contacts and files, and send-as the group address. It has mailbox members only.
+
+### Outside addresses on a distribution list
+
+A distribution list can also deliver to addresses on other mail servers, a Gmail address for example. Add them under **Manage members → Outside addresses** (or `PUT /api/v1/mailgroups/{id}/external-members` with `{"addresses": [...]}`). An address on the list's own domain is refused: add that mailbox as a member instead. A `+tag` is kept, so `someone+lists@gmail.com` receives the list as written.
+
+The administrator sets how many outside addresses one list may hold in **Server Settings → Email → Distribution lists** (default 20, at most 20, 0 allows none). Lowering the limit keeps the addresses lists already hold; a list over it can remove addresses but not add new ones.
+
+A list with outside addresses is delivered by a Sieve script on the list's address that redirects to each recipient, member mailboxes included. Every copy leaves with the list's address as its envelope sender, so the receiving provider checks your server (SPF), not the original sender's. The message itself is not changed and still shows the original sender in From, so a provider can still file mail from someone outside your domain as spam when that sender's domain asks for strict checks (DMARC). A failed delivery to an outside address is not reported back to the sender or the members, and a bounce that reaches the list's address is dropped rather than copied to everyone on the list.
+
+Stalwart allows 20 redirects per message, so a list with outside addresses holds at most **20 recipients, member mailboxes and outside addresses together**: a change that would take such a list past 20, including the first outside address on a list of 20 or more mailboxes, is refused with `422 too_many_members`. Removing the last outside address makes the list a mailing list again, with no limit.
+
+**Internal delivery only** accepts mail from senders in the group's own domain and rejects everyone else; a list's outside addresses still receive what the list accepts. On a distribution list it uses the same Sieve redirect, with the same limit of **20 recipients, member mailboxes and outside addresses together**: going past that, or turning internal-only on for a larger list, is refused with `422 too_many_members`.
+
+Distribution lists are re-applied to Stalwart by the reconciler whenever the list or a member changes (and every 15 minutes), so a failed save heals on its own. On servers set up by an earlier release, a distribution list was stored as a shared inbox that members could not see. The first reconcile after the update converts each one. Any mail already in that inbox is copied into every member's inbox first, and the old inbox is removed only after every copy succeeded.
+
+## Scanner uploads to a shared Files folder
+
+A network scanner or copier that sends scans by FTP or SFTP can drop them into a shared **Files** folder, where the mailboxes and groups granted on it see them in webmail under Files. On the mail domain's **Shared Resources** tab, make a Files resource, pick **Scanner** in its row actions, and turn it on with a login name, a password and a space limit (or `dotnext-cli shared-resource scanner enable --resource <id>`).
+
+- **Its own login and folder.** The scanner gets an FTP/SFTP login, `<owner>_<login>`, homed at `~/domains/<domain>/scans/<resource>`. That is in the domain's directory but outside `public_html`, so scans are never on the website. The scanner uploads into the folder the login starts in: `/data` for an isolated login (see below), `/` otherwise; the drawer and `dotnext-cli shared-resource scanner status` show which. The login counts as one of the package's FTP/SFTP accounts, so the package must include them.
+- **How it connects.** Where the server has disk quota, the login is isolated (its own system user, kept to its folder, with the space limit as its quota, taken out of the account's own disk quota) and connects by SFTP, or by FTPS when the administrator has turned the FTP server on. Without disk quota a login shares the account's system user, and an SFTP session would reach the whole home folder, so the scanner login is FTPS only; turning a scanner on then needs the FTP server on, or it is refused with `409 scanner_unconfined`.
+- **Moving.** Every 30 seconds the panel moves finished files from the drop folder into the shared folder, oldest first and up to 20 per pass. A file is finished when it has not changed for a minute and the FTP server no longer holds it open. Dot files and partial names (`.part`, `.tmp`, `.filepart`, `.crdownload` and the like) wait. A file leaves the drop folder only after it is in the shared folder, so a failed pass is retried without losing or doubling a scan. A name already in the folder gets a number: `scan (1).pdf`.
+- **Space.** The space limit caps what the shared folder holds. When it is full, new scans wait in the drop folder and the drawer says why; members make room by deleting scans. A file larger than webmail accepts also waits, with the reason shown. Scans in the shared folder are stored by the mail server and do not count against the account's disk quota.
+- **Who sees the scans.** Grant mailboxes or groups on the resource. **Read + delete** (Files resources only) lets members open and delete scans but not add, rename or change files. **Read**, **Read/Write** and **Admin** work as on every shared resource.
+- **Turning off** removes the login. Scans already moved stay in the shared folder, and files still in the drop folder stay there. Deleting the resource, or deleting the scanner's login on the FTP accounts page, turns the scanner off on the next pass.
+- **Renaming the domain** is refused while the scanner's login lives in the domain's directory, as for any FTP login there: turn the scanner off first.
+
+## Per-domain deliverability (admin)
+
+`/dotnext-admin/mail/deliverability` — for every domain, shows:
+
+- DKIM key presence + DNS publication state
+- SPF record presence + soft/hard fail
+- DMARC record + policy
+- MTA-STS policy + MX host alignment (per-domain MTA-STS)
+
+Buttons:
+- **Rotate DKIM** — replace the domain's Ed25519 and RSA DKIM keys and republish both records (see [DKIM signing](#dkim-signing)).
+
+## Website mail: local mail server or a smarthost
+
+Sites send email with PHP `mail()`, which contact forms and WordPress use. PHP
+runs the `dotnext-sendmail` shim as the site's user. **Server Settings → Email →
+Website mail** picks where the shim's mail goes:
+
+- **The local mail server** (the default). The shim logs in to the mail
+  module's Stalwart as `noreply@<domain>`, a send-only identity the panel
+  creates for each domain. This needs the mail module; the card warns when it
+  is off.
+- **A smarthost**: your own mail relay (an SMTP server, or a service such as
+  Amazon SES, Mailgun or your mail provider). Use it when the server doesn't
+  run the mail module, or when outgoing mail must leave through your own mail
+  system. Ports 25, 465, 587 and 2525. Encryption is STARTTLS (required, never
+  opportunistic), TLS from the start, or none; a login is never sent without
+  encryption, and the certificate is always checked. Saving tests the
+  smarthost first and saves nothing if the test fails; **Test** checks the
+  form without saving. The password is stored encrypted and never shown again;
+  it is only used with the host and username it was saved for.
+
+How the smarthost mode works:
+
+- The shim can't hold the smarthost login: anything it can read, the site's
+  PHP can read too. It hands the message to the **website mail relay**
+  (`dotnext-mailrelay.service`, the agent binary run as `dotnext-agent
+  mailrelay`) over `/run/dotnext-mailrelay/relay.sock`. The relay runs as its
+  own `dotnext-mailrelay` system user, never root, and only it can read the
+  login (`/etc/dotnext/mailrelay/relay.json`, 0640
+  root:dotnext-mailrelay). The agent starts the relay when the smarthost is
+  selected and stops it, deleting the login, when it isn't.
+- The relay learns which account sent a message from the socket (the caller's
+  UID), never from the message. The envelope sender is `noreply@` one of that
+  account's domains: the From domain when the account owns it, otherwise its
+  oldest domain.
+- The From header is restricted too, because the smarthost can't tell which
+  site sent a message. A message keeps its From only when that is one address
+  in a domain the account owns. Otherwise From becomes the `noreply@` address
+  (the display name is kept) and the original address moves to Reply-To, so a
+  contact form that puts the visitor in From still gets replies to the
+  visitor. Like sendmail, the relay adds a `Date` and a `Message-ID` when the
+  message has none (PHP's `mail()` writes neither, and some providers refuse
+  mail without a Message-ID).
+- Who can send through the smarthost: accounts with a Linux user and a hosting
+  package whose **Websites can send email** switch is on, that aren't admins
+  or suspended, with their enabled, ownership-verified domains. Accounts
+  without a package can't. The card shows how many accounts can send,
+  and after a save lists the ones the server left out with the reason.
+- An account can have two messages in flight at once, and a message must
+  arrive within 30 seconds, so one site can't hold the relay for the others.
+  There is no local queue: if the smarthost is down or answers 4xx, `mail()`
+  returns false and the failure is logged. One line per message goes to the
+  journal (`journalctl -u dotnext-mailrelay`), without the message content.
+- SPF and DKIM for the sites' domains are the smarthost's job: add the
+  smarthost to each domain's SPF record as your provider documents.
+
+The **Websites can send email** package switch applies to the local mail
+server too: a site whose package has it off gets no `noreply@` relay identity.
+
+## Spam filter
+
+Stalwart gives every incoming message a spam score. **Server Settings → Email
+→ Spam filter** sets what happens at each score:
+
+| Threshold | Default | At or above it, the message |
+|---|---|---|
+| Move to Junk | 5 | goes to the mailbox's Junk folder |
+| Reject | 15 | is refused at SMTP time; the sending server gets an error, so the sender knows |
+| Discard | 20 | is dropped without telling anyone |
+
+- Each threshold is at most 100. Reject and discard can be turned off (stored
+  as 0); when on, each must be above the Junk threshold.
+- Stalwart checks reject before discard. With rejecting on, a discard
+  threshold at or above the reject threshold never applies (the defaults are
+  like this: mail scoring 20 is rejected, not discarded).
+- A higher Junk threshold files fewer real messages as Junk and lets more spam
+  reach the Inbox.
+- The thresholds are server-wide. The panel stores them and the reconciler
+  applies them to Stalwart within a minute, followed by a settings reload
+  (Stalwart keeps the old thresholds until it reloads). An install or
+  `dotnext-cli update` no longer sets them, so an admin's values stay. A threshold
+  changed directly on Stalwart is put back within ten minutes.
+- A message's `X-Spam-Status` and `X-Spam-Result` headers show its score and
+  the rules behind it.
+
+Mail from a sender in the mailbox's contacts (any of its address books in
+webmail) is not treated as spam (`X-Spam-Status: No, reason=card-exists`),
+as long as the sender's domain passes SPF or DMARC; a forged sender with the
+same address still goes through the filter. A mailbox's own filter rules
+(Sieve) can't move a message out of Junk.
+
+### Trusted senders (per mailbox)
+
+Each mailbox has a list of senders it trusts: **Edit mailbox → Trusted
+senders**, or `GET` / `POST` / `DELETE /api/v1/mailboxes/{id}/trusted-senders`.
+The rows live in `mailbox_trusted_senders` (migration 000320). The agent verb
+`mailbox.trusted_senders.apply` writes them as contact cards in a **Trusted
+senders** address book of the mailbox's Stalwart account, and the spam filter
+trusts them like any contact (above).
+
+- **Matching.** Stalwart matches a sender to a card exactly, ignoring case
+  (tested on Stalwart 0.16.24). So addresses are stored lowercased, with the
+  domain in punycode, and keep a +tag: `news+weekly@x.com` and `news@x.com`
+  are different senders.
+- **Limit.** A mailbox can trust up to 500 senders.
+- **Which cards the panel manages.** Only the cards it wrote, marked by uid
+  `urn:dotnext:trusted:<address>`. A card of the panel's that the user moved
+  to another address book is moved back. The user's own contacts are left
+  alone, even at a trusted address.
+- **Adding.** The panel sends the mailbox's list to Stalwart at once. If
+  that fails, the row is kept and the answer carries a `warning`.
+- **Removing.** The panel sends the list to Stalwart first, and deletes the
+  row only after Stalwart has taken it. If Stalwart can't, the answer is
+  `502 mail_server_unavailable` and the sender stays on the list. So the
+  list never shows a sender as removed while Stalwart still trusts it.
+- **Reconciler.** The `mailbox.trusted_senders` pass retries failed pushes
+  and re-applies each mailbox's list every hour. It runs only for domains
+  whose mail DotNext hosts.
+- **New mailboxes.** A mailbox that has never signed in gets its Stalwart
+  account created, so the first message from a trusted sender is already
+  trusted.
+- **Backups.** A backup carries each mailbox's list (`trusted_senders`). A
+  restore adds it back, checking each address the way the API does.
+
+## Outbound throttles
+
+`/dotnext-admin/mail/throttles` — per-sender + per-domain rate limit (msgs / minute, msgs / hour, recipients / message). Bulwark enforces; CrowdSec sees throttle hits and can escalate.
+
+## Stalwart reports
+
+Stalwart ingests inbound TLS-RPT, MTA-STS-RPT, and DMARC aggregate reports into the panel DB. Visible per-domain under Deliverability.
+
+## Expression filters
+
+Admin-defined Stalwart expressions for routing / drop / quarantine. UI under Server Settings → Mail.
+
+## Mail storage on another disk
+
+Stalwart keeps all mail, message bodies included, in `/var/lib/stalwart`. To put it on another disk, mount the disk there, or bind-mount a directory of it there. Don't point Stalwart at a new path: its systemd sandbox lets it write only to `/var/lib/stalwart`, `/etc/stalwart` and `/etc/dotnext`, and its AppArmor profile allows only the same. With the disk mounted at `/var/lib/stalwart`, neither needs a change, and the system backup, which copies `/var/lib/stalwart`, still includes the mail.
+
+1. Stop Stalwart: `systemctl stop dotnext-stalwart`.
+2. Copy the directory onto the new disk, keeping owners and permissions:
+   ```bash
+   rsync -aHAX /var/lib/stalwart/ /mnt/maildisk/stalwart/
+   ```
+3. Move the old directory aside, create an empty one, and bind-mount the copy over it:
+   ```bash
+   mv /var/lib/stalwart /var/lib/stalwart.old
+   mkdir /var/lib/stalwart
+   echo '/mnt/maildisk/stalwart /var/lib/stalwart none bind 0 0' >> /etc/fstab
+   systemctl daemon-reload
+   mount /var/lib/stalwart
+   ```
+4. Make Stalwart wait for the mount, so it never starts on the empty directory, and start it:
+   ```bash
+   mkdir -p /etc/systemd/system/dotnext-stalwart.service.d
+   printf '[Unit]\nRequiresMountsFor=/var/lib/stalwart\n' > /etc/systemd/system/dotnext-stalwart.service.d/30-mail-disk.conf
+   systemctl daemon-reload
+   systemctl start dotnext-stalwart
+   ```
+5. Once mail works, delete `/var/lib/stalwart.old`.
+
+`dotnext-cli update` keeps the fstab line and the drop-in. Account backups export each mailbox through Stalwart, so they include its mail wherever it is stored.
+
+If Stalwart's blob store already points at a path outside `/var/lib/stalwart`, that path needs three things: a `ReadWritePaths=` and a `RequiresMountsFor=` line in a drop-in like the one above, and a rule in `/etc/apparmor.d/local/usr.local.bin.stalwart-mail` (see [AppArmor → Custom rules](./admin/apparmor.md#custom-rules)). The system backup doesn't include that path.
+
+A server set up either way isn't moved to Stalwart 1.0 by `dotnext-cli update`: see [Moving to Stalwart 1.0](#moving-to-stalwart-10).
+
+## Moving to Stalwart 1.0
+
+Stalwart 1.0 can't open a 0.16 mail store. So `dotnext-cli update` moves a server from 0.16 to 1.0 by copying the data with Stalwart's migration tool:
+
+1. A server on a 0.16 release older than 0.16.27 first gets 0.16.27, the release the tool copies from.
+2. The tool copies the mail into a new store beside `/var/lib/stalwart` while 0.16 keeps serving. This needs free space for about one and a half times the store, plus 1 GB.
+3. Stalwart stops for the final copy, about half a minute on a small server, and starts again on 1.0. If 1.0 doesn't come up, the update switches back to 0.16.
+4. The 0.16 store stays at `/var/lib/stalwart-0.16`, and its binary at `/opt/stalwart-0.16`, so the server can be switched back. Remove them once mail works on 1.0.
+
+After the move:
+- Mail apps that signed in with OAuth sign in again once. Apps that use a password aren't affected.
+- Calendar and contact apps fetch their data again once.
+- Search in mail is incomplete until Stalwart has rebuilt its index.
+- A mailbox that turned on encryption at rest itself has to turn it on again.
+
+The update moves only DotNext's own layout. The server stays on 0.16, keeps working, and the update says why in these cases:
+- `/var/lib/stalwart` is a mount point or a symlink (see [Mail storage on another disk](#mail-storage-on-another-disk));
+- the blob store points outside `/var/lib/stalwart`.
+
+Moving such a server needs the migration tool run by hand.
+
+## Architecture choices
+
+- **DB-as-truth, reconciler-converged.** Mailboxes / forwarders / autoresponders are panel-DB rows; Stalwart's JMAP API is called by the agent on every change.
+- **Self-deleting SSO file** for webmail one-click. Not a magic-link plugin, not a session cookie hand-off — the panel writes `/dotnext-sso-<43-char-nonce>.php` into the mail vhost, redirects the user to it; the file `flock`s + `unlink`s itself on first hit or after 60 s.
+- **Unix sockets only.** Stalwart admin HTTP pinned to `127.0.0.1:8080`; MariaDB skip-networking; nothing exposes mailbox auth over TCP outside the SMTP/IMAP ports themselves.
+- **Cross-domain directory isolation.** Stalwart keeps all accounts in one flat directory — its per-tenant isolation is an Enterprise-only feature, and DotNext runs the OSS edition. Left at Stalwart's defaults, any authenticated mailbox can enumerate every account on the server across all domains via JMAP `Principal/query` or the WebDAV principal-search family (surfaced by the webmail's calendar/file share picker and recipient autocomplete). `install_stalwart_apply` converges the built-in **User** role to disable those enumeration permissions (`jmapPrincipalQuery`, `jmapPrincipalQueryChanges`, `jmapPrincipalChanges`, `davPrincipalList/Match/Search/SearchPropSet`) via `disabledPermissions`, which takes precedence and fails closed. The same patch disables API keys (`sysApiKey*`, see [App passwords](#app-passwords)). `jmapPrincipalGet` / `GetAvailability` stay enabled — they need a known principal id, so they can't enumerate — preserving self-account reads and free/busy. **Trade-off:** in-webmail sharing-by-search no longer works (the picker resolves targets through the same query); a user shares by knowing the exact address. True per-domain scoping would require Stalwart Enterprise + per-domain tenants. Same-domain recipient suggestions come back through the domain directory (next bullet).
+- **Domain directory.** Each mail domain with mailboxes gets a read-only address book, `<domain> directory`. It lists the domain's enabled mailboxes (display name and address) and is shared read-only with them. Webmail suggests recipients from it; Bulwark reads contacts at sign-in, so a new mailbox appears in an open session after the next sign-in. CardDAV clients do not discover it (a mailbox's `addressbook-home-set` lists only its own home) but can add `/dav/card/dotnext-directory%40<domain>/default/` by URL. System relays, the panel's notification sender (`dotnext-notify@<panel hostname>`), send-only and disabled mailboxes are left out. The book belongs to a Stalwart Group principal at `dotnext-directory@<domain>`. That local part is reserved at every create door and at backup restore, and the address receives no mail. The reconciler converges the directory through the agent verb `mail.directory.apply` (20 domains per tick, hourly audit). The directory is skipped for a domain where a mailbox, group or shared resource already holds its address. The domain purge removes the Group with the other accounts.
+
+## CLI
+
+```bash
+dotnext-cli mailbox list --domain example.com
+dotnext-cli mailbox create --domain example.com --local user --quota-mb 1024
+dotnext-cli mailbox set-quota user@example.com 2048
+dotnext-cli mailbox passwd user@example.com
+dotnext-cli mailbox delete user@example.com
+```

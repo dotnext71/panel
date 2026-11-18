@@ -1,0 +1,467 @@
+// filesApi.ts — typed wrappers around the /api/v1/files endpoints.
+import { apiClient, UPLOAD_CHUNK_BYTES } from "../../../apiClient";
+import { getActAs } from "../../../impersonation";
+
+export type FileEntry = {
+  name: string;
+  is_dir: boolean;
+  size: number;
+  mode: string;
+  mod_time: string;
+  is_symlink: boolean;
+  // Only meaningful for is_dir entries; absent/false for files. Drives
+  // the tree's chevron visibility — a folder with no subfolders is
+  // rendered as a leaf (no expand arrow).
+  has_subdirs?: boolean;
+};
+
+export type FileListResponse = {
+  path: string;
+  entries: FileEntry[];
+};
+
+export type FilePreviewResponse = {
+  path: string;
+  size: number;
+  content: string;
+  // Server-sniffed content type (Go's http.DetectContentType on first 512 B).
+  // Used by the editor to refuse binary files before they land in Monaco —
+  // loading a 1 MiB JPEG into a text editor is a mess the user shouldn't see.
+  mime_type?: string;
+  // JAB-191: true when the bytes are not editable text -- either sniffed binary,
+  // or text that is not valid UTF-8 (latin1/windows-1252 PHP and HTML, common on
+  // legacy sites). Those come back with an EMPTY content field because the bytes
+  // travelled as base64, so the editor must refuse rather than open a blank
+  // buffer and save that blank over the user's file.
+  is_binary?: boolean;
+};
+
+export async function filesHome(): Promise<{ path: string }> {
+  const r = await apiClient.get<{ path: string }>("/files/home");
+  return r.data;
+}
+
+export async function filesList(path: string): Promise<FileListResponse> {
+  const r = await apiClient.get<FileListResponse>("/files", { params: { path } });
+  return r.data;
+}
+
+export async function filesTree(path: string): Promise<FileListResponse> {
+  const r = await apiClient.get<FileListResponse>("/files/tree", { params: { path } });
+  return r.data;
+}
+
+export async function filesPreview(path: string): Promise<FilePreviewResponse> {
+  const r = await apiClient.get<FilePreviewResponse>("/files/preview", {
+    params: { path },
+  });
+  return r.data;
+}
+
+export function filesDownloadURL(path: string): string {
+  // window.open() and <img src> can't set the X-DotNext-Act-As header the
+  // apiClient interceptor injects, so an admin impersonating a tenant would
+  // otherwise hit /files/download as themselves and get not_in_scope. The
+  // backend honors ?act_as on GET (ResolveImpersonation), so carry the active
+  // grant in the query string — mirrors MyProfileBackupCard's download.
+  const actAs = getActAs();
+  const base = `/api/v1/files/download?path=${encodeURIComponent(path)}`;
+  return actAs ? `${base}&act_as=${encodeURIComponent(actAs.id)}` : base;
+}
+
+export interface UploadOpts {
+  overwrite?: boolean;
+  // name overrides the destination filename (used for "keep both" auto-rename
+  // on a collision). Defaults to the File's own name.
+  name?: string;
+  // GH #1410: abort an in-flight upload (Cancel button). Forwarded to axios;
+  // aborting throws a CanceledError the caller treats as "cancelled".
+  signal?: AbortSignal;
+}
+
+// GH #1410: is the panel being reached by a bare IP rather than a domain? Then
+// there's no Cloudflare/reverse-proxy body cap in the path (CF can't be reached
+// without an SNI hostname), so a big upload can go as one direct request instead
+// of being chunked to dodge a cap that isn't there. Strips IPv6 brackets first.
+export function isIPHost(hostname: string): boolean {
+  const h = hostname.replace(/^\[|\]$/g, "");
+  if (h === "localhost") return true;
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(h)) return true; // IPv4
+  return h.includes(":"); // bracket-stripped IPv6 literal
+}
+
+export async function filesUpload(
+  dirPath: string,
+  file: File,
+  onProgress?: (frac: number) => void,
+  opts?: UploadOpts,
+  base = "/files",
+): Promise<void> {
+  const fd = new FormData();
+  fd.append("file", file);
+  const q = new URLSearchParams({ path: dirPath });
+  if (opts?.overwrite) q.set("overwrite", "true");
+  if (opts?.name) q.set("name", opts.name);
+  await apiClient.post(`${base}/upload?${q.toString()}`, fd, {
+    headers: { "Content-Type": "multipart/form-data" },
+    // GH #1410: an upload is bounded by its own progress, not the client's
+    // default request timeout — a large file (or a slow uplink) legitimately
+    // takes longer than 60s and was failing with "timeout of 15000ms exceeded".
+    timeout: 0,
+    signal: opts?.signal,
+    onUploadProgress: (e) => {
+      if (!onProgress) return;
+      const total = e.total ?? file.size;
+      if (total > 0) onProgress(Math.min(1, e.loaded / total));
+    },
+  });
+}
+
+// filesUploadChunked — chunked upload for files > 100 MB. Sends the
+// file as N sequential POSTs of `chunkSize` bytes each, the last one
+// flagged `final=1` so the backend finalises (moves /tmp into scope).
+// `onProgress` is called with a 0..1 fraction after each chunk.
+//
+// Resumable: if a previous upload for the same file (keyed by dir + name
+// + size + lastModified) was interrupted, we reuse that upload_id and
+// ask the server how many bytes landed, then skip ahead to the next
+// chunk boundary. The key lives in localStorage under `dotnext:upload:`
+// and is cleaned on successful ingest.
+export async function filesUploadChunked(
+  dirPath: string,
+  file: File,
+  // GH #1410: 80 MB chunks, the same size as the DB restore upload — ~8x fewer
+  // requests for a big file, still under the ~100 MB proxy/Cloudflare request
+  // cap chunking exists to dodge. Each chunk opts out of the client timeout
+  // (progress-bounded).
+  chunkSize = UPLOAD_CHUNK_BYTES,
+  onProgress?: (frac: number) => void,
+  opts?: UploadOpts,
+  base = "/files",
+): Promise<void> {
+  const destName = opts?.name ?? file.name;
+  const resumeKey = `dotnext:upload:${dirPath}|${destName}|${file.size}|${file.lastModified}`;
+  let uploadId = readResumeId(resumeKey);
+  // Resume by BYTE OFFSET (the server's current staging size), not by chunk
+  // index. The server appends only at offset == current size (else 409
+  // bad_offset), so resuming at exactly `written` is safe for ANY chunk size —
+  // a partial upload started under a different chunk size (e.g. an older build)
+  // still resumes cleanly instead of 409-looping. GH #1410.
+  let offset = 0;
+  if (uploadId) {
+    // See how much the server has already. If 404, the staging file is
+    // gone (panel restart, cleanup job) and we start fresh.
+    try {
+      const r = await apiClient.get<{ written: number }>(
+        `${base}/upload-chunk-status`,
+        { params: { upload_id: uploadId } },
+      );
+      offset = r.data.written || 0;
+    } catch {
+      // Stale or missing — drop the key and regenerate.
+      uploadId = null;
+      clearResumeId(resumeKey);
+    }
+  }
+  // A staged size past the file is corrupt or a foreign upload_id collision —
+  // drop it and start fresh under a new id (a new staging file) rather than send
+  // a bad offset that would 409-loop against the mismatched staging file.
+  if (uploadId && offset > file.size) {
+    clearResumeId(resumeKey);
+    uploadId = null;
+  }
+  if (!uploadId) {
+    uploadId =
+      typeof crypto !== "undefined" && "randomUUID" in crypto
+        ? crypto.randomUUID()
+        : `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    writeResumeId(resumeKey, uploadId);
+    offset = 0;
+  }
+  if (onProgress) onProgress(file.size > 0 ? offset / file.size : 0);
+  // do/while so a zero-byte file (and a resume where every byte already landed
+  // but the final marker never did) still sends one final chunk to finalise —
+  // moving the staging file into scope.
+  do {
+    const end = Math.min(offset + chunkSize, file.size);
+    const blob = file.slice(offset, end);
+    const isLast = end >= file.size;
+    const params = new URLSearchParams({
+      upload_id: uploadId,
+      offset: String(offset),
+      path: dirPath,
+      name: destName,
+      ...(isLast ? { final: "1" } : {}),
+      ...(isLast && opts?.overwrite ? { overwrite: "true" } : {}),
+    });
+    const chunkStart = offset;
+    await apiClient.post(`${base}/upload-chunk?${params.toString()}`, blob, {
+      headers: { "Content-Type": "application/octet-stream" },
+      timeout: 0, // GH #1410: a slow chunk mustn't hit the client request timeout
+      signal: opts?.signal,
+      // GH #1410: report progress WITHIN the chunk, not just at its boundary —
+      // at 80 MB chunks a boundary-only bar jumps ~13% at a time and the speed
+      // read-out would only refresh every several seconds.
+      onUploadProgress: (e) => {
+        if (onProgress && file.size > 0) {
+          onProgress(Math.min(1, (chunkStart + e.loaded) / file.size));
+        }
+      },
+    });
+    offset = end;
+  } while (offset < file.size);
+  // The within-chunk onUploadProgress above drives the live bar + speed; one
+  // final tick guarantees 100% (and covers a zero-byte file, which fires no
+  // upload-progress events) without a per-boundary sample dragging the EMA down.
+  if (onProgress) onProgress(1);
+  // Success — forget the resume key.
+  clearResumeId(resumeKey);
+}
+
+// Small localStorage helpers. Wrapped in try/catch because the SPA can
+// be loaded in a privacy-mode browser where setItem throws — we still
+// want the upload to work, just without resume.
+function readResumeId(key: string): string | null {
+  try {
+    return typeof localStorage !== "undefined" ? localStorage.getItem(key) : null;
+  } catch {
+    return null;
+  }
+}
+
+function writeResumeId(key: string, id: string): void {
+  try {
+    if (typeof localStorage !== "undefined") localStorage.setItem(key, id);
+  } catch {
+    // Best-effort; we tolerate losing resume state.
+  }
+}
+
+function clearResumeId(key: string): void {
+  try {
+    if (typeof localStorage !== "undefined") localStorage.removeItem(key);
+  } catch {
+    // Best-effort.
+  }
+}
+
+// filesWrite overwrites the content of an existing file (or creates it
+// if missing) with the given UTF-8 string. Powers the Monaco editor's
+// Save action — binary-safe reads/writes are a Phase-3 concern.
+export async function filesWrite(path: string, content: string): Promise<void> {
+  await apiClient.post("/files/write", { path, content });
+}
+
+export async function filesMkdir(path: string): Promise<void> {
+  await apiClient.post("/files/mkdir", { path });
+}
+
+export interface FilesExtractResult {
+  dest: string;
+  extracted: number;
+  skipped: number;
+}
+
+// filesExtract unpacks an archive (.zip/.tar/.tar.gz/.tgz/.tar.bz2/.gz) into
+// dest (default: the archive's own directory). The agent enforces zip-slip,
+// symlink, and decompression-bomb defenses.
+export async function filesExtract(
+  path: string,
+  dest?: string,
+): Promise<FilesExtractResult> {
+  const { data } = await apiClient.post<FilesExtractResult>("/files/extract", {
+    path,
+    dest,
+  });
+  return data;
+}
+
+// GH #1392: async extract. filesExtractStart kicks off the extraction as a
+// background job on the agent and returns immediately with a job id (HTTP 202);
+// the caller polls filesJobStatus for a progress bar. Same defenses as the
+// blocking filesExtract — the agent runs the identical extract core.
+export async function filesExtractStart(
+  path: string,
+  dest?: string,
+): Promise<{ job_id: string }> {
+  const { data } = await apiClient.post<{ job_id: string }>(
+    "/files/extract",
+    { path, dest },
+    { params: { async: 1 } },
+  );
+  return data;
+}
+
+// Per-op completion payload carried under `result`. Extract fills
+// extracted/skipped/dest; copy (GH #1392) fills bytes/src_path/dst_path. All
+// optional so one shape covers both job kinds.
+export interface FilesJobResult {
+  dest?: string;
+  extracted?: number;
+  skipped?: number;
+  bytes?: number;
+  src_path?: string;
+  dst_path?: string;
+}
+
+export interface FilesJobStatus {
+  job_id: string;
+  status: "running" | "done" | "error";
+  done: number;
+  // 0 = unknown → indeterminate. Extract counts entries; a streamed tar reports
+  // 0. Copy counts bytes; done/total is a byte fraction.
+  total: number;
+  // Omitted by the agent (omitempty) until the job seals — only a done job
+  // carries a result — so treat it as optional at every read.
+  result?: FilesJobResult;
+  error?: string;
+  started_at: string;
+}
+
+// filesJobStatus polls a background file-operation job (GH #1392). The backend
+// returns the job only to the tenant that started it; an unknown/foreign id is
+// a 404 (surfaced as a rejected promise), which the poller treats as "the job
+// is gone — refresh the folder".
+export async function filesJobStatus(jobId: string): Promise<FilesJobStatus> {
+  const { data } = await apiClient.get<FilesJobStatus>(
+    `/files/jobs/${encodeURIComponent(jobId)}`,
+  );
+  return data;
+}
+
+export async function filesRename(path: string, newName: string): Promise<void> {
+  await apiClient.post("/files/rename", { path, new_name: newName });
+}
+
+// filesMove relocates a file or directory into a different parent
+// directory. Distinct from rename (same-parent only). Powers the
+// drag-and-drop flow — dragging a row onto a folder row moves the
+// source into that folder, preserving the basename.
+export async function filesMove(path: string, destDir: string): Promise<void> {
+  await apiClient.post("/files/move", { path, dest_dir: destDir });
+}
+
+// filesChmod sets Unix permission bits on a single file or directory.
+// `mode` is a 3- or 4-digit octal string ("755", "0644", "1777"); the
+// agent parses + masks to the low 12 bits. Bulk chmod from the UI
+// loops this per entry so per-item failures surface individually.
+export async function filesChmod(path: string, mode: string): Promise<void> {
+  await apiClient.post("/files/chmod", { path, mode });
+}
+
+// filesCopy recursively copies a scoped path into a different parent
+// directory, preserving mode and symlink targets. Basename preserved
+// server-side — the caller sends the destination *folder*, not the
+// destination path.
+export async function filesCopy(path: string, destDir: string): Promise<void> {
+  await apiClient.post("/files/copy", { path, dest_dir: destDir });
+}
+
+// GH #1392: async copy. filesCopyStart kicks off the recursive copy as a
+// background job on the agent and returns immediately with a job id (HTTP 202);
+// the caller polls filesJobStatus for a byte-percentage progress bar. Same
+// escape-proof copy core + validation as the blocking filesCopy.
+export async function filesCopyStart(
+  path: string,
+  destDir: string,
+): Promise<{ job_id: string }> {
+  const { data } = await apiClient.post<{ job_id: string }>(
+    "/files/copy",
+    { path, dest_dir: destDir },
+    { params: { async: 1 } },
+  );
+  return data;
+}
+
+// filesArchive posts the selection and streams back a tar.gz download.
+// One request = one archive — the backend creates a scratch file, streams
+// it out, and unlinks as part of the same round-trip. Returns the Blob
+// so the caller can trigger a save-as on the user's machine.
+export async function filesArchive(paths: string[]): Promise<Blob> {
+  const r = await apiClient.post<Blob>(
+    "/files/archive",
+    { paths },
+    { responseType: "blob" },
+  );
+  return r.data;
+}
+
+export async function filesDelete(path: string, recursive = false): Promise<void> {
+  await apiClient.delete("/files", {
+    params: { path, ...(recursive ? { recursive: "true" } : {}) },
+  });
+}
+
+// filesDu computes REAL recursive sizes (GH #657) for a directory's children —
+// unlike files.list, which reports a folder's inode size. On-demand only
+// (expensive on large trees). Reuses the disk-usage endpoint, which runs the
+// same filesafe-scoped `files.du` agent verb, so no new route is needed.
+export type FilesDuEntry = {
+  name: string;
+  is_dir: boolean;
+  size: number;
+  has_subdirs: boolean;
+};
+
+export type FilesDuResponse = {
+  path: string;
+  total: number;
+  entries: FilesDuEntry[];
+};
+
+export async function filesDu(path: string): Promise<FilesDuResponse> {
+  const r = await apiClient.get<FilesDuResponse>("/me/disk-usage/files", {
+    params: { path },
+  });
+  return r.data;
+}
+
+// GH #1184: bundle the whole surface into one object so FileManagerPage can be
+// driven by an injected API — the tenant page passes this; the admin File
+// Manager passes an /admin/files-backed object with the same shape. Keeps the
+// two file managers byte-identical in layout/behaviour with no drift.
+export type FilesApi = {
+  home: typeof filesHome;
+  list: typeof filesList;
+  tree: typeof filesTree;
+  preview: typeof filesPreview;
+  downloadURL: typeof filesDownloadURL;
+  upload: typeof filesUpload;
+  uploadChunked: typeof filesUploadChunked;
+  write: typeof filesWrite;
+  mkdir: typeof filesMkdir;
+  extract: typeof filesExtract;
+  extractStart: typeof filesExtractStart;
+  jobStatus: typeof filesJobStatus;
+  rename: typeof filesRename;
+  move: typeof filesMove;
+  chmod: typeof filesChmod;
+  copy: typeof filesCopy;
+  copyStart: typeof filesCopyStart;
+  archive: typeof filesArchive;
+  delete: typeof filesDelete;
+  du: typeof filesDu;
+};
+
+export const tenantFilesApi: FilesApi = {
+  home: filesHome,
+  list: filesList,
+  tree: filesTree,
+  preview: filesPreview,
+  downloadURL: filesDownloadURL,
+  upload: filesUpload,
+  uploadChunked: filesUploadChunked,
+  write: filesWrite,
+  mkdir: filesMkdir,
+  extract: filesExtract,
+  extractStart: filesExtractStart,
+  jobStatus: filesJobStatus,
+  rename: filesRename,
+  move: filesMove,
+  chmod: filesChmod,
+  copy: filesCopy,
+  copyStart: filesCopyStart,
+  archive: filesArchive,
+  delete: filesDelete,
+  du: filesDu,
+};

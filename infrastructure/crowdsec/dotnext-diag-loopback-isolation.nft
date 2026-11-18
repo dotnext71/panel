@@ -1,0 +1,42 @@
+# Managed by dotnext install.sh (JAB-368) — do not edit.
+#
+# CrowdSec's prometheus listener on 127.0.0.1:6060 is UNAUTHENTICATED and, on
+# `level: full`, also serves Go /debug/pprof (heap/goroutine dumps → info leak;
+# CPU profiling → mild local DoS) alongside /metrics. The listener cannot be
+# disabled — `cscli metrics` (the panel's CrowdSec metrics source) requires it —
+# so instead we make it unreachable from tenant code.
+#
+# JAB-352 blocked the SSH *forwarding* path to loopback services, but a tenant's
+# own app code (per-user PHP-FPM workers, CGI) or an interactive tenant shell
+# (the ssh-shell shares the net namespace) can open a loopback socket to
+# 127.0.0.1:6060 directly — a vector independent of SSH forwarding.
+#
+# Match on skuid, NOT cgroup: tenant PHP-FPM runs under system.slice
+# (dotnext-fpm@<user>.service) and tenant shells under user.slice — neither is in
+# dotnext.slice/dotnext-user.slice — but ALL tenant execution contexts run as a
+# real user (uid >= 1000, dotnext's login UID_MIN). Root (cscli metrics) and every
+# system service (uid < 1000, including the panel user ~997) are unaffected.
+# skuid also needs no cgroupv2 path, so this loads cleanly at boot (no
+# ConditionPathExists window).
+#
+# A future metrics scraper (Zabbix) runs as a system user (<1000) / in
+# system.slice → unaffected. Separate `add`/`flush` table idiom so a re-apply on
+# `dotnext update` replaces the rules rather than appending duplicates.
+# GH #1229: this ruleset now also underpins opt-in SSH TCP forwarding for VS Code
+# Remote-SSH (dotnext-ssh-forward group). A per-uid nft drop cannot tell a tenant
+# app connection from an SSH-forwarded one (both run as the tenant uid), so it can
+# only block ports a tenant app never needs. The set below is exactly that:
+# sensitive control/admin/diagnostic loopback services that no tenant workload
+# uses — CrowdSec (6060 pprof/metrics, 7422, 8081 LAPI), Stalwart admin/internal
+# (8446, 18181), the pdns authoritative backend (5300), the panel itself (8443),
+# the mailhook (8462), and CUPS (631). The tenant-facing data services a hosted
+# app legitimately reaches over loopback — MariaDB 3306, PostgreSQL 5432, the DNS
+# recursor 53, Redis — are DELIBERATELY absent, so their DSNs keep working. With
+# these dropped for tenant uids, enabling forwarding for the opt-in group can never
+# tunnel into a sensitive service.
+define dotnext_blocked_loopback_ports = { 631, 5300, 6060, 7422, 8081, 8443, 8446, 8462, 18181 }
+add table inet dotnext_diag_isolation
+flush table inet dotnext_diag_isolation
+add chain inet dotnext_diag_isolation output { type filter hook output priority filter; policy accept; }
+add rule inet dotnext_diag_isolation output meta skuid >= 1000 ip daddr 127.0.0.1 tcp dport $dotnext_blocked_loopback_ports drop
+add rule inet dotnext_diag_isolation output meta skuid >= 1000 ip6 daddr ::1 tcp dport $dotnext_blocked_loopback_ports drop

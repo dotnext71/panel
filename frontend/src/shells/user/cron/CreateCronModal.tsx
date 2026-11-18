@@ -1,0 +1,241 @@
+import { useTranslation } from "react-i18next";
+import { useEffect, useState } from "react";
+import {
+  Drawer,
+  Form,
+  Grid,
+  Input,
+  Radio,
+  Button,
+  Space,
+  Divider,
+  Typography,
+} from "antd";
+import { App } from "antd";
+import {
+  createCronJob,
+  updateCronJob,
+  type CronJob,
+} from "../../../apiClient";
+import { CRON_SCHEDULE_OPTIONS } from "../../../utils/cronSchedule";
+import { CronCommandHelp } from "../../../components/cron/CronCommandHelp";
+import { cronErrorHeadline, type CronErrorData } from "../../../components/cron/cronErrorHeadline";
+
+interface CreateCronModalProps {
+  open: boolean;
+  onClose: () => void;
+  onSuccess: () => void;
+  initial?: CronJob | null;
+}
+
+export const CreateCronModal = ({
+  open,
+  onClose,
+  onSuccess,
+  initial,
+}: CreateCronModalProps) => {
+  const { t } = useTranslation();
+  const [form] = Form.useForm();
+  const [loading, setLoading] = useState(false);
+  const [scheduleMode, setScheduleMode] = useState<string>("0 * * * *");
+  const [customSchedule, setCustomSchedule] = useState("");
+
+  // Sync the whole form every time the drawer opens (GH #854 schedule picker,
+  // GH #1686 name/command). This component stays mounted across opens, so state
+  // initializers see only the very first `initial` (null on page load) — every
+  // edit then showed the "Hourly" default no matter what the job's real
+  // schedule was, and saving silently rewrote the schedule to hourly.
+  //
+  // The same class bit `name`/`command`: they populated from the Form's
+  // `initialValues`, but the `form` instance lives in this never-unmounting
+  // component with antd's default `preserve`. Opening once in Create mode seeds
+  // the store with name:""/command:"" (the create defaults); those persist, so
+  // on the next Edit open `initialValues` no longer overrides the already-set
+  // (empty) fields — they stayed blank until a full-app refresh cleared the
+  // store, and a Save from that blank form silently wiped the job. (resetFields
+  // on submit/cancel re-applies whatever `initialValues` was at that mount, so
+  // it leaves the previous open's values behind — empties after a Create open,
+  // the last job after an Edit open; the open-effect covers that path too.)
+  // Driving name/command from this open-effect (like the schedule picker) makes
+  // Edit populate immediately. destroyOnClose remounts only the Drawer's
+  // children (the Form), not this component's state or the persistent form store.
+  useEffect(() => {
+    if (!open) return;
+    if (initial) {
+      form.setFieldsValue({ name: initial.name, command: initial.command });
+      const isPreset = CRON_SCHEDULE_OPTIONS.some((p) => p.value === initial.schedule);
+      setScheduleMode(isPreset ? initial.schedule : "advanced");
+      setCustomSchedule(isPreset ? "" : initial.schedule);
+    } else {
+      form.setFieldsValue({ name: "", command: "" });
+      setScheduleMode("0 * * * *");
+      setCustomSchedule("");
+    }
+  }, [open, initial, form]);
+  const { message: antMessage } = App.useApp();
+  const screens = Grid.useBreakpoint();
+  const isDesktop = screens.lg ?? (typeof window !== "undefined" ? window.innerWidth >= 992 : true);
+
+  const isEditing = !!initial;
+
+  const handleSubmit = async (values: {
+    name: string;
+    command: string;
+  }) => {
+    setLoading(true);
+    try {
+      const schedule = scheduleMode === "advanced" ? customSchedule : scheduleMode;
+
+      if (!schedule || schedule.trim() === "") {
+        antMessage.error("Please enter a schedule");
+        setLoading(false);
+        return;
+      }
+
+      if (isEditing && initial) {
+        await updateCronJob(initial.id, {
+          name: values.name,
+          command: values.command,
+          schedule,
+        });
+        antMessage.success("Cron job updated successfully");
+      } else {
+        await createCronJob({
+          name: values.name,
+          command: values.command,
+          schedule,
+        });
+        antMessage.success("Cron job created successfully");
+      }
+
+      form.resetFields();
+      setScheduleMode("0 * * * *");
+      setCustomSchedule("");
+      onSuccess();
+    } catch (error: unknown) {
+      const err = error as { response?: { data?: CronErrorData }; message?: string };
+      // Backend response shape: { error: 'validation_failed', field: 'command'|'schedule'|'name', code: <ErrCode>, detail: <string> }.
+      // cronErrorHeadline owns the code→headline map and field routing so this
+      // door and the admin door stay in lockstep (GH #1686 item 5).
+      const { field, headline } = cronErrorHeadline(err?.response?.data, err?.message);
+      if (field) {
+        form.setFields([{ name: field, errors: [headline] }]);
+      }
+      antMessage.error(headline);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleModalClose = () => {
+    form.resetFields();
+    setScheduleMode("0 * * * *");
+    setCustomSchedule("");
+    onClose();
+  };
+
+  return (
+    <Drawer
+      title={isEditing ? "Edit Cron Job" : "Create Cron Job"}
+      open={open}
+      onClose={handleModalClose}
+      width={isDesktop ? 600 : undefined}
+      placement="right"
+      destroyOnClose
+    >
+      <Form
+        form={form}
+        layout="vertical"
+        onFinish={handleSubmit}
+        initialValues={{
+          name: initial?.name || "",
+          command: initial?.command || "",
+        }}
+      >
+        <Form.Item
+          label={t("createcronmodal.name")}
+          name="name"
+          rules={[
+            { required: true, message: "Please enter a job name" },
+            { max: 100, message: "Name must be 100 characters or less" },
+          ]}
+        >
+          <Input placeholder="e.g., WordPress Cron Cleanup" />
+        </Form.Item>
+
+        <Form.Item
+          label={t("createcronmodal.command")}
+          name="command"
+          rules={[
+            { required: true, message: "Please enter a command" },
+          ]}
+          extra="One command per line — they run in order and stop at the first failure. Command help below lists what a line may run."
+        >
+          <Input.TextArea
+            placeholder={
+              "wp --path=/home/user/example.com/public_html keyhook-properties generate-xml --file=/home/user/example.com/public_html/props.xml\n" +
+              "wp --path=/home/user/example.com/public_html all-import run 1 --force-run"
+            }
+            rows={4}
+            style={{ fontFamily: "monospace" }}
+          />
+        </Form.Item>
+
+        <Form.Item>
+          <CronCommandHelp />
+        </Form.Item>
+
+        <Divider style={{ margin: "16px 0" }} />
+
+        <Form.Item label={t("createcronmodal.schedule")}>
+          <Radio.Group
+            value={scheduleMode}
+            onChange={(e) => setScheduleMode(e.target.value)}
+          >
+            {CRON_SCHEDULE_OPTIONS.map((preset) => (
+              <Radio key={preset.value} value={preset.value}>
+                {preset.label}
+              </Radio>
+            ))}
+          </Radio.Group>
+        </Form.Item>
+
+        {scheduleMode === "advanced" && (
+          <Form.Item
+            label={t("createcronmodal.cron_expression")}
+            rules={[
+              { required: true, message: "Please enter a cron expression" },
+            ]}
+          >
+            <Input
+              placeholder="0 * * * *"
+              value={customSchedule}
+              onChange={(e) => setCustomSchedule(e.target.value)}
+              style={{ fontFamily: "monospace" }}
+            />
+          </Form.Item>
+        )}
+
+        {scheduleMode === "advanced" && (
+          <Form.Item>
+            <Typography.Text type="secondary">
+              5-field cron expression (minute hour day month weekday).{" "}
+              <a href="https://crontab.guru" target="_blank" rel="noopener noreferrer">
+                Learn more
+              </a>
+            </Typography.Text>
+          </Form.Item>
+        )}
+
+        <Form.Item style={{ marginBottom: 0 }}>
+          <Space>
+            <Button type="primary" htmlType="submit" loading={loading}>
+              {isEditing ? "Update" : "Create"}
+            </Button>
+            <Button onClick={handleModalClose}>Cancel</Button>
+          </Space>
+        </Form.Item>
+      </Form>
+    </Drawer>
+  );
+};

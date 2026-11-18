@@ -1,0 +1,127 @@
+package reconciler
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/dotnext-panel/dotnext/internal/agent"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+)
+
+// webmailGatePkgRepo is a minimal PackageRepository whose List returns a
+// fixed slice (or an error) — enough to drive the GH #1628 slice-2 package
+// entitlement gate. Everything else embeds the interface (nil) and is never
+// called by reconcileWebmailVhosts.
+type webmailGatePkgRepo struct {
+	repository.PackageRepository
+	pkgs    []models.HostingPackage
+	listErr error
+}
+
+func (f *webmailGatePkgRepo) List(context.Context, repository.ListOptions) ([]models.HostingPackage, int64, error) {
+	if f.listErr != nil {
+		return nil, 0, f.listErr
+	}
+	return f.pkgs, int64(len(f.pkgs)), nil
+}
+
+func wmPtr(s string) *string { return &s }
+
+// wmGateReconciler builds a webmail reconciler wired with the given domain,
+// user, and package fakes plus SSL (required — reconcileWebmailVhosts returns
+// early when sslCerts is nil) and a server-wide-enabled settings row.
+func wmGateReconciler(dr *fakeDomainRepo, ur *fakeUserRepo, pr repository.PackageRepository, ag agent.AgentInterface) *Reconciler {
+	r := New(dr, ur, ag, slog.Default(), Config{}).WithSSLCerts(newFakeSSLCertRepo()).WithPackages(pr)
+	r.serverSettings = &fakeServerSettingsRepo{settings: &models.ServerSettings{WebmailEnabled: true}}
+	return r
+}
+
+// TestWebmail_PackageEntitlementOff_RemovesVhost is the GH #1628 slice-2
+// bug-layer test: a user whose hosting package has webmail DISABLED must not
+// get a mail vhost even when the per-user toggle and the domain are both ON.
+// Before slice 2 the reconciler ignored the package field, so this domain got
+// a vhost_apply and the daemon started — RED until the package AND-gate lands.
+func TestWebmail_PackageEntitlementOff_RemovesVhost(t *testing.T) {
+	ag := &paramsWebmailAgent{}
+	dr := newFakeDomainRepo()
+	dr.domains["d1"] = &models.Domain{OwnershipState: verifiedOwnership, ID: "d1", Name: "example.com", UserID: "u1", EmailEnabled: true, WebmailEnabled: true}
+	ur := &fakeUserRepo{users: map[string]*models.User{
+		"u1": {ID: "u1", PackageID: wmPtr("p1")},
+	}}
+	pr := &webmailGatePkgRepo{pkgs: []models.HostingPackage{{ID: "p1", WebmailEnabled: false}}}
+
+	wmGateReconciler(dr, ur, pr, ag).reconcileWebmailVhosts(context.Background())
+
+	// GH #2082: the domain still has mail, so only the challenge-only :80
+	// block stays — no webmail, and no :443 server.
+	require.Len(t, ag.applies, 1, "package webmail OFF leaves only the challenge-only block")
+	assert.Equal(t, true, ag.applies[0]["challenge_only"])
+	assert.NotContains(t, ag.applies[0], "ssl_cert_path")
+	assert.False(t, ag.has("service.start"), "no webmail domain remains active → daemon must not start")
+}
+
+// TestWebmail_NoPackage_KeepsVhost pins the #282 exception: an account with NO
+// hosting package (PackageID nil) keeps webmail ON — a deliberate deviation
+// from #282's privileged-feature DENY default, decided in the #1628 plan. The
+// package OFF in the repo is a decoy the user is not on.
+func TestWebmail_NoPackage_KeepsVhost(t *testing.T) {
+	ag := &fakeWebmailAgent{}
+	dr := newFakeDomainRepo()
+	dr.domains["d1"] = &models.Domain{OwnershipState: verifiedOwnership, ID: "d1", Name: "example.com", UserID: "u1", EmailEnabled: true, WebmailEnabled: true}
+	ur := &fakeUserRepo{users: map[string]*models.User{
+		"u1": {ID: "u1", PackageID: nil},
+	}}
+	pr := &webmailGatePkgRepo{pkgs: []models.HostingPackage{{ID: "p1", WebmailEnabled: false}}}
+
+	wmGateReconciler(dr, ur, pr, ag).reconcileWebmailVhosts(context.Background())
+
+	assert.True(t, ag.has("service.start"), "no package = webmail ON (#282 exception) → daemon starts")
+	assert.False(t, ag.has("webmail.vhost_remove"), "no package must not remove the vhost")
+}
+
+// TestWebmail_PerUserToggleIgnored_KeepsVhost is the GH #1628 slice-3 bug-layer
+// test: the per-user webmail toggle (users.webmail_enabled, #316) is retired, so
+// a user whose per-user flag is OFF still gets a mail vhost as long as the
+// package entitlement and the domain flag are ON. Before slice 3 the reconciler
+// ANDed the per-user flag, so this user's domain was removed — RED until the
+// per-user gate is dropped.
+func TestWebmail_PerUserToggleIgnored_KeepsVhost(t *testing.T) {
+	ag := &fakeWebmailAgent{}
+	dr := newFakeDomainRepo()
+	dr.domains["d1"] = &models.Domain{OwnershipState: verifiedOwnership, ID: "d1", Name: "example.com", UserID: "u1", EmailEnabled: true, WebmailEnabled: true}
+	ur := &fakeUserRepo{users: map[string]*models.User{
+		// Per-user flag OFF, but on a webmail-ON package — the retired gate must
+		// no longer remove the vhost.
+		"u1": {ID: "u1", PackageID: wmPtr("p1")},
+	}}
+	pr := &webmailGatePkgRepo{pkgs: []models.HostingPackage{{ID: "p1", WebmailEnabled: true}}}
+
+	wmGateReconciler(dr, ur, pr, ag).reconcileWebmailVhosts(context.Background())
+
+	assert.True(t, ag.has("service.start"), "retired per-user webmail flag (#1628 slice 3) → package ON keeps the vhost")
+	assert.False(t, ag.has("webmail.vhost_remove"), "the removed per-user toggle must no longer tear down the vhost")
+}
+
+// TestWebmail_PackageListError_FailsOpen: a packages.List error must fail OPEN
+// (treat everyone as ON), mirroring the pre-#1628 per-user gate — a transient
+// DB blip must never tear down every tenant's webmail vhost.
+func TestWebmail_PackageListError_FailsOpen(t *testing.T) {
+	ag := &fakeWebmailAgent{}
+	dr := newFakeDomainRepo()
+	dr.domains["d1"] = &models.Domain{OwnershipState: verifiedOwnership, ID: "d1", Name: "example.com", UserID: "u1", EmailEnabled: true, WebmailEnabled: true}
+	ur := &fakeUserRepo{users: map[string]*models.User{
+		"u1": {ID: "u1", PackageID: wmPtr("p1")},
+	}}
+	pr := &webmailGatePkgRepo{listErr: errors.New("db down")}
+
+	wmGateReconciler(dr, ur, pr, ag).reconcileWebmailVhosts(context.Background())
+
+	assert.True(t, ag.has("service.start"), "packages.List error fails open → webmail ON")
+	assert.False(t, ag.has("webmail.vhost_remove"), "must not tear down vhosts on a package-list error")
+}

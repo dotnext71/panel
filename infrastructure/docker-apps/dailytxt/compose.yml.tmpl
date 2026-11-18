@@ -1,0 +1,26 @@
+services:
+  dailytxt:
+    image: {{ .ImageChannel }}
+    container_name: dotnext-app-{{ .Slug }}
+    restart: unless-stopped
+    environment:
+      SECRET_TOKEN: {{ q (index .Env "SECRET_TOKEN") }}
+      ALLOW_REGISTRATION: {{ q (index .Env "ALLOW_REGISTRATION") }}
+      ADMIN_PASSWORD: {{ q (index .Env "ADMIN_PASSWORD") }}
+    volumes:
+      - {{ .DataRoot }}/data:/app/data
+    ports:
+{{- with index .Ports "http" }}
+      - "{{ .BindInterface }}:{{ .HostPort }}:{{ .ContainerPort }}/{{ .Protocol }}"
+{{- end }}
+    deploy:
+      resources:
+        limits:
+          cpus: "{{ .CPULimit }}"
+          memory: {{ .MemoryLimit }}
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://127.0.0.1:80/ || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s

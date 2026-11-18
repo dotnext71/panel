@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily reclaim of moved-away dotnexthosted.com labels (JAB-213)
+
+[Timer]
+OnCalendar=*-*-* 04:17:00
+RandomizedDelaySec=600
+Persistent=true
+
+[Install]
+WantedBy=timers.target

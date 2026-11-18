@@ -1,0 +1,531 @@
+// Package mailboxops is the shared Mailbox Lifecycle (JAB-291): the create,
+// password-rotation, quota, and delete operations the REST handlers and the
+// operator CLI both route through, so address canonicalization, the quota
+// default/floor, password generation/hash/sealing, the duplicate rule, and the
+// display_name/send_only fields have one owner and cannot drift between the two.
+//
+// Authorization stays an Adapter concern: every entry point takes an already-
+// loaded, already-authorized domain/mailbox (the REST handler checks the
+// caller's claims; the operator CLI is admin-by-construction). System mailboxes
+// (the GH #1056 noreply relay) are created only by the reconciler and are NOT
+// expressible here; the migration restore path keeps its own semantics too.
+package mailboxops
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"golang.org/x/crypto/bcrypt"
+
+	"github.com/dotnext-panel/dotnext/internal/mailaddr"
+	"github.com/dotnext-panel/dotnext/internal/dbops"
+	"github.com/dotnext-panel/dotnext/internal/ids"
+	"github.com/dotnext-panel/dotnext/internal/models"
+	"github.com/dotnext-panel/dotnext/internal/repository"
+	"github.com/dotnext-panel/dotnext/internal/ssokey"
+)
+
+// The single source for these constants — the CLI used to duplicate them with a
+// "keep in sync" comment.
+const (
+	DefaultQuotaBytes uint64 = 1 << 30          // 1 GiB
+	MinQuotaBytes     uint64 = 16 * 1024 * 1024 // 16 MiB floor
+	BcryptCost               = bcrypt.DefaultCost
+	// A caller-supplied password is an IMAP/SMTP/webmail credential the
+	// internet can try: at least PasswordMinChars characters (what both
+	// mailbox forms ask for), at most PasswordMaxBytes bytes (bcrypt hashes
+	// no more; a longer one used to fail the hash and answer 500).
+	PasswordMinChars = 8
+	PasswordMaxBytes = 72
+)
+
+// NotifyFunc is the best-effort agent notify (ADR-0013): its errors are
+// swallowed by the caller's implementation and never fail the operation.
+type NotifyFunc func(ctx context.Context, cmd string, params any)
+
+// CallFunc is the hard agent call used by Delete — its error aborts before the
+// row is removed so Stalwart and the DB never diverge.
+type CallFunc func(ctx context.Context, cmd string, params any) (json.RawMessage, error)
+
+// Deps carries the collaborators every operation needs.
+type Deps struct {
+	Mailboxes repository.MailboxRepository
+	// SSOKey seals the plaintext into password_enc for the webmail SSO flow.
+	// Nil → the row is stored/rotated with NO envelope (SSO unavailable until a
+	// rotate with a live key), never a stale one.
+	SSOKey *ssokey.Key
+	// Addresses clears the new mailbox's address from Stalwart's registry
+	// before the row is written (mailaddrowner.Releaser). The registry keeps
+	// every alias it has seen on the account that had it, and a mailbox at
+	// such an address signs in to that account. The create operations refuse
+	// when it is nil or fails.
+	Addresses AddressReleaser
+	// Users and Packages give Create the domain owner's package limit on
+	// email accounts. Without Users the limit is not applied; every
+	// production adapter (the API and the CLI) wires both.
+	Users    repository.UserRepository
+	Packages repository.PackageRepository
+}
+
+// emailAccountLimit is the domain owner's package limit on email accounts. 0
+// means none: no package, or a package that sets 0 (GH #282). A package that
+// is set but can't be loaded refuses the create rather than lifting the limit
+// (dbops.PackageLimit).
+func emailAccountLimit(ctx context.Context, d Deps, ownerID string) (uint32, error) {
+	if d.Users == nil {
+		return 0, nil
+	}
+	user, err := d.Users.FindByID(ctx, ownerID)
+	if err != nil {
+		return 0, fmt.Errorf("%w: load the domain's owner: %v", ErrQuotaUnavailable, err)
+	}
+	limit, err := dbops.PackageLimit(ctx, d.Packages, user, func(p *models.HostingPackage) uint32 { return p.MaxEmailAccounts })
+	if err != nil {
+		return 0, fmt.Errorf("%w: %v", ErrQuotaUnavailable, err)
+	}
+	return limit, nil
+}
+
+// AddressReleaser takes an address off every Stalwart account that still
+// holds it as an alias.
+type AddressReleaser interface {
+	ReleaseAddress(ctx context.Context, address string) error
+}
+
+// releaseAddress runs the Addresses gate for a create; it fails closed. It
+// first refuses an address the database would refuse (an alias, group or
+// shared resource holds it), so a create that cannot succeed leaves that
+// alias on its account in Stalwart's registry.
+func releaseAddress(ctx context.Context, d Deps, domainID, localPart, domainName string) error {
+	held, err := repository.MailboxAddressHeld(ctx, d.Mailboxes, domainID, localPart)
+	if err != nil {
+		return fmt.Errorf("%w: address check: %v", ErrInternal, err)
+	}
+	if held {
+		return ErrAddressInUse
+	}
+	address := localPart + "@" + domainName
+	if d.Addresses == nil {
+		return fmt.Errorf("%w: no mail server client to release %s", ErrMailServer, address)
+	}
+	if err := d.Addresses.ReleaseAddress(ctx, address); err != nil {
+		return fmt.Errorf("%w: %v", ErrMailServer, err)
+	}
+	return nil
+}
+
+var (
+	ErrEmailNotEnabled  = errors.New("mailboxops: email is not enabled on the domain")
+	ErrInvalidLocalPart = errors.New("mailboxops: invalid local part")
+	ErrMailboxExists    = errors.New("mailboxops: mailbox already exists")
+	ErrQuotaTooSmall    = errors.New("mailboxops: quota below the 16 MiB floor")
+	ErrWeakPassword     = errors.New("mailboxops: password must be at least 8 characters and at most 72 bytes")
+	ErrNotFound         = errors.New("mailboxops: mailbox not found")
+	ErrAgentUnavailable = errors.New("mailboxops: agent not configured")
+	ErrDeps             = errors.New("mailboxops: dependencies not wired")
+	ErrInternal         = errors.New("mailboxops: internal error")
+	// ErrAddressInUse: an alias, mail group or shared resource holds the
+	// address (migration 000306).
+	ErrAddressInUse = errors.New("mailboxops: the address already belongs to an alias, group or mailbox")
+	// ErrMailServer: the mail server could not be asked to release the
+	// address, so the mailbox was not created.
+	ErrMailServer = errors.New("mailboxops: the mail server could not be reached to set up the address")
+	// ErrOwnershipPending: the domain's owner has not proven the name yet
+	// (GH #1816 / ADR-0170), so it gets no mail principals.
+	ErrOwnershipPending = errors.New("mailboxops: domain ownership is not proven yet")
+	// ErrQuotaExceeded: the owner's hosting package allows no more email
+	// accounts.
+	ErrQuotaExceeded = errors.New("mailboxops: the hosting package allows no more email accounts")
+	// ErrQuotaUnavailable: the owner's package is set but could not be read,
+	// so the create is refused rather than let past the limit.
+	ErrQuotaUnavailable = errors.New("mailboxops: the hosting package's limits cannot be loaded")
+)
+
+// CreateInput is one interactive mailbox creation. Note the ABSENCE of a System
+// field — user-facing creates must never mint an infrastructure principal.
+type CreateInput struct {
+	Domain      *models.Domain // pre-loaded + authorized by the Adapter
+	LocalPart   string
+	Password    string // "" → generate a reveal-once secret
+	QuotaBytes  uint64 // 0 → DefaultQuotaBytes
+	DisplayName string
+	SendOnly    bool
+}
+
+// Create canonicalizes the address, enforces the EmailEnabled gate (send-only
+// accounts pass it where mail is hosted elsewhere) + the duplicate rule + the quota default/floor, generates/hashes/seals the password,
+// persists the row (with display_name + send_only), and fires the best-effort
+// agent notify. Returns the row and the generated password ("" when the caller
+// supplied one — the reveal-once contract).
+func Create(ctx context.Context, d Deps, in CreateInput, notify NotifyFunc) (*models.Mailbox, string, error) {
+	if d.Mailboxes == nil || in.Domain == nil {
+		return nil, "", fmt.Errorf("%w: mailboxes repo + domain required", ErrDeps)
+	}
+	if !in.Domain.Verified() {
+		return nil, "", ErrOwnershipPending
+	}
+	// A domain whose mail is hosted elsewhere gets no mailbox that receives,
+	// but a send-only one only submits mail, like the noreply@ every domain
+	// already has, so a site's SMTP login keeps working there.
+	if models.MailHostedElsewhere(in.Domain.EmailEnabled, in.Domain.MailProvider) && !in.SendOnly {
+		return nil, "", ErrEmailNotEnabled
+	}
+	canonLocal, _, err := mailaddr.Canonicalise(in.LocalPart + "@" + in.Domain.Name)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %v", ErrInvalidLocalPart, err)
+	}
+	// postmaster@ on a tenant domain is the server admin's (ADR-0110).
+	if err := mailaddr.CheckNotReservedOn(canonLocal, in.Domain.IsPanelPrimary); err != nil {
+		return nil, "", fmt.Errorf("%w: %w", ErrInvalidLocalPart, err)
+	}
+	exists, err := d.Mailboxes.ExistsByDomainAndLocalPart(ctx, in.Domain.ID, canonLocal)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: uniqueness check: %v", ErrInternal, err)
+	}
+	if exists {
+		return nil, "", ErrMailboxExists
+	}
+	// The package limit counts every account the owner has, send-only ones
+	// included. This is the early answer; the insert below re-checks it under
+	// a lock on the owner, so creates at the same time can't both take the
+	// last slot.
+	limit, err := emailAccountLimit(ctx, d, in.Domain.UserID)
+	if err != nil {
+		return nil, "", err
+	}
+	if limit > 0 {
+		n, err := d.Mailboxes.CountByOwner(ctx, in.Domain.UserID)
+		if err != nil {
+			return nil, "", fmt.Errorf("%w: count the owner's mailboxes: %v", ErrInternal, err)
+		}
+		if n >= int64(limit) {
+			return nil, "", fmt.Errorf("%w (%d of %d)", ErrQuotaExceeded, n, limit)
+		}
+	}
+
+	password := in.Password
+	generated := ""
+	if password == "" {
+		password = ids.NewSecret()
+		generated = password
+	} else if err := checkPassword(password); err != nil {
+		return nil, "", err
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), BcryptCost)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: hash: %v", ErrInternal, err)
+	}
+
+	quota := in.QuotaBytes
+	if quota == 0 {
+		quota = DefaultQuotaBytes
+	}
+	if quota < MinQuotaBytes {
+		return nil, "", ErrQuotaTooSmall
+	}
+
+	enc, err := sealIfKey(d.SSOKey, password)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: seal: %v", ErrInternal, err)
+	}
+
+	if err := releaseAddress(ctx, d, in.Domain.ID, canonLocal, in.Domain.Name); err != nil {
+		return nil, "", err
+	}
+	now := time.Now().UTC()
+	mb := &models.Mailbox{
+		ID:           ids.NewULID(),
+		DomainID:     in.Domain.ID,
+		LocalPart:    canonLocal,
+		DisplayName:  strings.TrimSpace(in.DisplayName),
+		PasswordHash: string(hash),
+		PasswordEnc:  enc,
+		QuotaBytes:   quota,
+		SendOnly:     in.SendOnly,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	insert := d.Mailboxes.Create
+	if limit > 0 {
+		insert = func(ctx context.Context, mb *models.Mailbox) error {
+			return d.Mailboxes.CreateWithinCap(ctx, mb, in.Domain.UserID, limit)
+		}
+	}
+	if err := insert(ctx, mb); err != nil {
+		if errors.Is(err, repository.ErrMailboxCapExceeded) {
+			return nil, "", fmt.Errorf("%w (%d)", ErrQuotaExceeded, limit)
+		}
+		if errors.Is(err, repository.ErrConflict) {
+			return nil, "", ErrMailboxExists
+		}
+		if errors.Is(err, mailaddr.ErrLocalReserved) {
+			return nil, "", fmt.Errorf("%w: %w", ErrInvalidLocalPart, err)
+		}
+		if errors.Is(err, repository.ErrAddressInUse) {
+			return nil, "", ErrAddressInUse
+		}
+		return nil, "", fmt.Errorf("%w: insert: %v", ErrInternal, err)
+	}
+
+	email := canonLocal + "@" + in.Domain.Name
+	if notify != nil {
+		notify(ctx, "mailbox.create", map[string]any{"id": mb.ID, "email": email, "display_name": mb.DisplayName})
+	}
+	// The BEFORE INSERT trigger already wrote email_cached in the DB; reflect it
+	// on the returned struct so the caller's response is correct without a re-read.
+	mb.EmailCached = email
+	return mb, generated, nil
+}
+
+// SystemCreateInput mints an INFRASTRUCTURE principal — the GH #1056 sendmail
+// relay the reconciler ensures per email-enabled domain. This is the one place
+// System=true is expressible, and it is deliberately separate from CreateInput
+// so a tenant-facing create can never reach it.
+type SystemCreateInput struct {
+	Domain      *models.Domain // pre-loaded by the reconciler
+	LocalPart   string         // already canonical (the reconciler controls it)
+	DisplayName string
+	QuotaBytes  uint64 // 0 → DefaultQuotaBytes
+}
+
+// CreateSystem mints the sendmail relay principal (System=true, SendOnly=true):
+// generate → hash → seal → persist, and return the plaintext once so the caller
+// can write it into the cred file. Unlike Create it applies NO EmailEnabled gate
+// and NO duplicate check — the reconciler owns idempotency (it calls this only
+// when the relay is absent). The SSO key is REQUIRED: the relay's webmail SSO
+// depends on the sealed envelope, so a nil key is a hard error rather than a
+// silently unsealed row.
+func CreateSystem(ctx context.Context, d Deps, in SystemCreateInput, notify NotifyFunc) (*models.Mailbox, string, error) {
+	if d.Mailboxes == nil || in.Domain == nil {
+		return nil, "", fmt.Errorf("%w: mailboxes repo + domain required", ErrDeps)
+	}
+	if d.SSOKey == nil {
+		return nil, "", fmt.Errorf("%w: SSO key required to seal the system relay", ErrDeps)
+	}
+	password := ids.NewSecret()
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), BcryptCost)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: hash: %v", ErrInternal, err)
+	}
+	enc, err := d.SSOKey.Seal([]byte(password))
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: seal: %v", ErrInternal, err)
+	}
+	quota := in.QuotaBytes
+	if quota == 0 {
+		quota = DefaultQuotaBytes
+	}
+	if err := releaseAddress(ctx, d, in.Domain.ID, in.LocalPart, in.Domain.Name); err != nil {
+		return nil, "", err
+	}
+	now := time.Now().UTC()
+	mb := &models.Mailbox{
+		ID:           ids.NewULID(),
+		DomainID:     in.Domain.ID,
+		LocalPart:    in.LocalPart,
+		DisplayName:  in.DisplayName,
+		System:       true, // GH #1056: hide the JAB-230 relay from the mailbox lists
+		PasswordHash: string(hash),
+		PasswordEnc:  enc,
+		QuotaBytes:   quota,
+		SendOnly:     true,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	if err := d.Mailboxes.Create(ctx, mb); err != nil {
+		if errors.Is(err, repository.ErrAddressInUse) {
+			return nil, "", ErrAddressInUse
+		}
+		return nil, "", fmt.Errorf("%w: insert: %v", ErrInternal, err)
+	}
+	email := in.LocalPart + "@" + in.Domain.Name
+	if notify != nil {
+		notify(ctx, "mailbox.create", map[string]any{"id": mb.ID, "email": email})
+	}
+	mb.EmailCached = email
+	return mb, password, nil
+}
+
+// RestoreCreateInput persists a migrated mailbox from an ALREADY-computed bcrypt
+// hash (the tag-stripped source hash, or a fresh temp hash the caller generated
+// when the source could not be preserved). There is no plaintext, so nothing is
+// sealed and password_enc stays NULL until the tenant rotates.
+type RestoreCreateInput struct {
+	DomainID     string
+	DomainName   string // the domain's name, for the registry release
+	LocalPart    string // already canonical
+	PasswordHash string // pre-computed; NEVER sealed
+	QuotaBytes   uint64 // 0 → DefaultQuotaBytes
+	// SendOnly: the caller decides it from the domain (a migrated account on
+	// a domain whose mail is hosted elsewhere can only send).
+	SendOnly bool
+}
+
+// CreateForRestore persists a migrated mailbox row. It exists so the migration
+// stops hand-assembling the row: it applies NO EmailEnabled gate (the migration
+// provisions the domain it imports into), NO duplicate check (the caller already
+// resolved existence), and fires NO agent notify (the migration batches Stalwart
+// registration separately). password_enc is left NULL by construction.
+func CreateForRestore(ctx context.Context, d Deps, in RestoreCreateInput) (*models.Mailbox, error) {
+	if d.Mailboxes == nil {
+		return nil, fmt.Errorf("%w: mailboxes repo required", ErrDeps)
+	}
+	// A source account at the directory's address would share its Stalwart
+	// principal with the directory host (GH #1637).
+	if err := mailaddr.CheckNotReserved(in.LocalPart); err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrInvalidLocalPart, err)
+	}
+	quota := in.QuotaBytes
+	if quota == 0 {
+		quota = DefaultQuotaBytes
+	}
+	if in.DomainName == "" {
+		return nil, fmt.Errorf("%w: domain name required", ErrDeps)
+	}
+	if err := releaseAddress(ctx, d, in.DomainID, in.LocalPart, in.DomainName); err != nil {
+		return nil, err
+	}
+	now := time.Now().UTC()
+	mb := &models.Mailbox{
+		ID:           ids.NewULID(),
+		DomainID:     in.DomainID,
+		LocalPart:    in.LocalPart,
+		PasswordHash: in.PasswordHash,
+		QuotaBytes:   quota,
+		SendOnly:     in.SendOnly,
+		CreatedAt:    now,
+		UpdatedAt:    now,
+	}
+	if err := d.Mailboxes.Create(ctx, mb); err != nil {
+		// The database refuses postmaster@ on a tenant domain (ADR-0110).
+		if errors.Is(err, mailaddr.ErrLocalReserved) {
+			return nil, fmt.Errorf("%w: %w", ErrInvalidLocalPart, err)
+		}
+		if errors.Is(err, repository.ErrAddressInUse) {
+			return nil, ErrAddressInUse
+		}
+		return nil, fmt.Errorf("%w: insert: %v", ErrInternal, err)
+	}
+	return mb, nil
+}
+
+// RotatePassword rotates a mailbox's password. Empty newPassword → generate one
+// and return it once. The hash and the sealed envelope are updated ATOMICALLY:
+// with a live SSO key the envelope is re-sealed to the new password; WITHOUT a
+// key it is CLEARED (password_enc = NULL), never left stale — a stale envelope
+// makes the webmail SSO mint decrypt to the OLD password Stalwart no longer
+// accepts (this closes a live bug where both adapters called the hash-only
+// UpdatePasswordHash, leaving the old envelope behind).
+func RotatePassword(ctx context.Context, d Deps, email, newPassword string, notify NotifyFunc) (string, error) {
+	if d.Mailboxes == nil {
+		return "", fmt.Errorf("%w: mailboxes repo required", ErrDeps)
+	}
+	if newPassword != "" {
+		if err := checkPassword(newPassword); err != nil {
+			return "", err
+		}
+	}
+	mb, err := d.Mailboxes.FindByEmail(ctx, email)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return "", ErrNotFound
+		}
+		return "", fmt.Errorf("%w: lookup: %v", ErrInternal, err)
+	}
+	generated := ""
+	if newPassword == "" {
+		newPassword = ids.NewSecret()
+		generated = newPassword
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(newPassword), BcryptCost)
+	if err != nil {
+		return "", fmt.Errorf("%w: hash: %v", ErrInternal, err)
+	}
+	enc, err := sealIfKey(d.SSOKey, newPassword)
+	if err != nil {
+		return "", fmt.Errorf("%w: seal: %v", ErrInternal, err)
+	}
+	// enc is nil when no key → password_enc is set to NULL (never left stale).
+	if err := d.Mailboxes.UpdatePasswordHashAndEnc(ctx, mb.ID, string(hash), enc); err != nil {
+		return "", fmt.Errorf("%w: persist: %v", ErrInternal, err)
+	}
+	if notify != nil {
+		notify(ctx, "mailbox.set_password", map[string]any{"id": mb.ID, "email": email})
+	}
+	return generated, nil
+}
+
+// SetQuota updates a mailbox's quota (floor: MinQuotaBytes).
+func SetQuota(ctx context.Context, d Deps, email string, quotaBytes uint64, notify NotifyFunc) (*models.Mailbox, error) {
+	if d.Mailboxes == nil {
+		return nil, fmt.Errorf("%w: mailboxes repo required", ErrDeps)
+	}
+	if quotaBytes < MinQuotaBytes {
+		return nil, ErrQuotaTooSmall
+	}
+	mb, err := d.Mailboxes.FindByEmail(ctx, email)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, fmt.Errorf("%w: lookup: %v", ErrInternal, err)
+	}
+	if err := d.Mailboxes.UpdateQuota(ctx, mb.ID, quotaBytes); err != nil {
+		return nil, fmt.Errorf("%w: update quota: %v", ErrInternal, err)
+	}
+	if notify != nil {
+		notify(ctx, "mailbox.set_quota", map[string]any{"id": mb.ID, "email": email, "quota_bytes": quotaBytes})
+	}
+	mb.QuotaBytes = quotaBytes
+	mb.UpdatedAt = time.Now().UTC()
+	return mb, nil
+}
+
+// Delete destroys the Stalwart account FIRST (a hard dependency) then removes
+// the row — a failed destroy aborts before the row delete so the DB never
+// tombstones a mailbox whose Stalwart side is still live.
+func Delete(ctx context.Context, mailboxes repository.MailboxRepository, call CallFunc, email string) error {
+	if mailboxes == nil {
+		return fmt.Errorf("%w: mailboxes repo required", ErrDeps)
+	}
+	mb, err := mailboxes.FindByEmail(ctx, email)
+	if err != nil {
+		if errors.Is(err, repository.ErrNotFound) {
+			return ErrNotFound
+		}
+		return fmt.Errorf("%w: lookup: %v", ErrInternal, err)
+	}
+	if call == nil {
+		return ErrAgentUnavailable
+	}
+	if _, err := call(ctx, "mailbox.delete", map[string]any{"id": mb.ID, "email": email}); err != nil {
+		return fmt.Errorf("%w: agent mailbox.delete: %v", ErrInternal, err)
+	}
+	if err := mailboxes.Delete(ctx, mb.ID); err != nil {
+		return fmt.Errorf("%w: delete row: %v", ErrInternal, err)
+	}
+	return nil
+}
+
+func sealIfKey(key *ssokey.Key, password string) ([]byte, error) {
+	if key == nil {
+		return nil, nil
+	}
+	return key.Seal([]byte(password))
+}
+
+// checkPassword bounds a caller-supplied password (see PasswordMinChars).
+// Characters, not bytes, set the floor, so a non-ASCII password is not
+// rejected for being short in characters but long in bytes; the ceiling is
+// bytes, because that is what bcrypt limits.
+func checkPassword(p string) error {
+	if utf8.RuneCountInString(p) < PasswordMinChars || len(p) > PasswordMaxBytes {
+		return ErrWeakPassword
+	}
+	return nil
+}

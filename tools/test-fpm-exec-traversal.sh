@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+# TDD reproducer for the per-user FPM crash-loop caused by an
+# unreadable /etc/dotnext parent directory.
+#
+# Bug (observed live on mx.dotnext-panel.local / 192.168.100.150):
+#   /etc/dotnext was mode 0750 root:dotnext. dotnext-fpm@<user>.service
+#   runs ExecStart as User=<hosting-user> (NOT root, NOT group dotnext).
+#   fpm-exec does `cat /etc/dotnext/user-phpver/<user>` AFTER the
+#   privilege drop, so it cannot traverse the 0750 parent -> "Permission
+#   denied" -> `set -e` exit 1 -> systemd restart loop (observed restart
+#   counter 595) -> every hosted PHP site permanently 502.
+#
+#   The dir is *created* 0750 (install.sh) and only loosened to 0755 as
+#   a side-effect buried inside install_powerdns + the sso-key step. Any
+#   `dotnext update` whose provision path does not re-run those two
+#   functions leaves it 0750 and breaks all per-user PHP.
+#
+# Contracts under test (all must hold for the bug to stay fixed):
+#   C1 install.sh creates /etc/dotnext with mode 0755, never 0750.
+#   C2 provision_new_software (runs on every `dotnext update`) calls an
+#      idempotent ensure_* that re-asserts /etc/dotnext is 0755,
+#      independent of install_powerdns / sso-key running.
+#   C3 fpm-exec never reads anything under /etc/dotnext (it must be
+#      structurally immune to the parent-perm regression).
+#   C4 fpm-exec reads the resolved PHP version from the per-user runtime
+#      dir /run/php/dotnext-<user>/phpver instead.
+#   C5 fpm-pre-start (root, via "+" ExecStartPre) writes that runtime
+#      phpver file so the decoupling is real, not a dangling read.
+#
+# Sandboxed/static only — no root, no real systemd. Mirrors the style
+# of tools/test-apparmor-gate.sh.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+INSTALL_SH="$REPO_ROOT/install.sh"
+FPM_EXEC="$REPO_ROOT/infrastructure/systemd/fpm-exec"
+FPM_PRE="$REPO_ROOT/infrastructure/systemd/fpm-pre-start"
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+pass() { echo "PASS: $*"; }
+
+[[ -f "$INSTALL_SH" ]] || fail "install.sh not found at $INSTALL_SH"
+[[ -f "$FPM_EXEC"   ]] || fail "fpm-exec not found at $FPM_EXEC"
+[[ -f "$FPM_PRE"    ]] || fail "fpm-pre-start not found at $FPM_PRE"
+
+# ---- C1: /etc/dotnext is created 0755, never 0750 -------------
+if grep -Eq 'install -d -m 0750 -o root -g "\$SERVICE_USER" /etc/dotnext( |$)' "$INSTALL_SH"; then
+  fail "C1: install.sh still creates /etc/dotnext with -m 0750 (breaks non-dotnext traversal)"
+fi
+grep -Eq 'install -d -m 0755 -o root -g "\$SERVICE_USER" /etc/dotnext( |$)' "$INSTALL_SH" \
+  || fail "C1: install.sh has no 'install -d -m 0755 ... /etc/dotnext' creation line"
+pass "C1: /etc/dotnext created 0755"
+
+# ---- C2: provision_new_software heals the dir mode every update ----
+grep -Eq '^ensure_dotnext_panel_dir_traversable\(\)' "$INSTALL_SH" \
+  || fail "C2: ensure_dotnext_panel_dir_traversable() not defined"
+# It must actually assert 0755 on the dir. NB: capture awk output to a
+# var first — `awk | grep -q` under `set -o pipefail` makes grep close
+# the pipe early, SIGPIPE-kills awk (exit 141), and pipefail then fails
+# the pipeline even on a match (feedback_sigpipe_silent_exit).
+ensure_block="$(awk '/^ensure_dotnext_panel_dir_traversable\(\)/,/^}/' "$INSTALL_SH")"
+grep -Eq 'chmod 0755 /etc/dotnext( |$|")' <<<"$ensure_block" \
+  || fail "C2: ensure_dotnext_panel_dir_traversable() does not chmod 0755 /etc/dotnext"
+# And provision_new_software must call it.
+provision_block="$(awk '/^provision_new_software\(\)/,/^}/' "$INSTALL_SH")"
+grep -Eq 'ensure_dotnext_panel_dir_traversable' <<<"$provision_block" \
+  || fail "C2: provision_new_software does not call ensure_dotnext_panel_dir_traversable"
+pass "C2: provision_new_software heals /etc/dotnext mode every update"
+
+# ---- C3: fpm-exec never READS the phpver pin out of
+#      /etc/dotnext/user-phpver as the unprivileged user.
+#      (Passing /etc/dotnext/fpm/<user>.conf to php-fpm via
+#      --fpm-config is legitimate and unavoidable; that file is 0644
+#      and the parent is 0755 per C1/C2, so php-fpm reads it fine. The
+#      bug was the *phpver cat*, which must be gone.) -----------------
+# Check executable code only — comments may legitimately name the old
+# path to explain the fix. Strip comment lines first (capture to var:
+# no pipe under pipefail, see C2 note).
+fpm_exec_code="$(grep -vE '^[[:space:]]*#' "$FPM_EXEC")"
+grep -Eq 'cat[^|]*/etc/dotnext/user-phpver|cat[^|]*user-phpver/\$\{?user' <<<"$fpm_exec_code" \
+  && fail "C3: fpm-exec code still cats /etc/dotnext/user-phpver/<user> (the 0750 crash-loop read)" || true
+grep -q '/etc/dotnext/user-phpver' <<<"$fpm_exec_code" \
+  && fail "C3: fpm-exec code still references /etc/dotnext/user-phpver" || true
+pass "C3: fpm-exec code no longer reads the phpver pin from /etc/dotnext"
+
+# ---- C4: fpm-exec reads ver from the per-user runtime dir ----------
+grep -Eq '/run/php/dotnext-\$\{?user\}?/phpver' "$FPM_EXEC" \
+  || fail "C4: fpm-exec does not read /run/php/dotnext-<user>/phpver"
+pass "C4: fpm-exec reads ver from /run/php/dotnext-<user>/phpver"
+
+# ---- C5: fpm-pre-start writes that runtime phpver file -------------
+# fpm-pre-start may write the literal path or via its $userrundir var
+# (userrundir="/run/php/dotnext-${user}"). Accept either, but require
+# both that the runtime dir is that path AND a phpver file is written
+# into it, AND that pre-start runs as root (ExecStartPre "+" — it must
+# be able to read the protected pin to publish it).
+grep -Eq 'userrundir="/run/php/dotnext-\$\{?user\}?"' "$FPM_PRE" \
+  || fail "C5: fpm-pre-start userrundir is not /run/php/dotnext-<user>"
+grep -Eq '(/run/php/dotnext-\$\{?user\}?/phpver|\$\{?userrundir\}?/phpver)' "$FPM_PRE" \
+  || fail "C5: fpm-pre-start does not write the phpver file into the user runtime dir"
+grep -q 'printf .* "\$ver" > "\$userrundir/phpver"' "$FPM_PRE" \
+  || fail "C5: fpm-pre-start does not write the validated \$ver into \$userrundir/phpver"
+pass "C5: fpm-pre-start publishes /run/php/dotnext-<user>/phpver"
+
+# ---- Behavioral sandbox: prove the decoupled read works even when
+#      /etc/dotnext is totally unreadable (0000) ----------------
+SBX="$(mktemp -d)"
+trap 'chmod -R u+rwx "$SBX" 2>/dev/null || true; rm -rf "$SBX"' EXIT
+mkdir -p "$SBX/etc/dotnext/user-phpver" "$SBX/run/php/dotnext-bob"
+echo "8.5" > "$SBX/etc/dotnext/user-phpver/bob"
+# Simulate fpm-pre-start (root): resolve ver from the protected file
+# (root can read it) and publish to the user-runtime dir.
+ver_root="$(cat "$SBX/etc/dotnext/user-phpver/bob")"
+printf '%s' "$ver_root" > "$SBX/run/php/dotnext-bob/phpver"
+# Now make the whole /etc/dotnext tree unreadable, mimicking the
+# 0750-vs-non-dotnext-user regression in its worst form.
+chmod 0000 "$SBX/etc/dotnext"
+# Simulate fpm-exec (dropped to the hosting user): it must resolve the
+# version WITHOUT reading anything under /etc/dotnext.
+ver_exec="$(cat "$SBX/run/php/dotnext-bob/phpver")"
+[[ "$ver_exec" == "8.5" ]] \
+  || fail "behavioral: decoupled fpm-exec read resolved '$ver_exec', expected '8.5'"
+if cat "$SBX/etc/dotnext/user-phpver/bob" >/dev/null 2>&1; then
+  fail "behavioral: sandbox setup wrong — /etc/dotnext still readable"
+fi
+pass "behavioral: fpm-exec resolves PHP version with /etc/dotnext at mode 0000"
+
+echo "ALL PASS: fpm-exec is decoupled from /etc/dotnext traversal"

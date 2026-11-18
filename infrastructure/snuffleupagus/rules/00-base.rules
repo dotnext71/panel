@@ -1,0 +1,62 @@
+# DotNext PHP Defense -- base rules (M41, ADR-0088).
+#
+# Snuffleupagus v0.14 grammar. Every .drop() ban is converted to
+# .drop().simulation() by the renderer when mode=simulation; in enforce
+# the .drop() runs as-is.
+#
+# ASCII-only, comments included: v0.13 drops every rule after the first
+# non-ASCII byte. TestSnuffleupagusBundle_IsASCII enforces it.
+
+# Log to syslog so the agent's journalctl --identifier snuffleupagus
+# tail picks every incident up.
+sp.log_media("syslog");
+
+# Harden the PRNG (mt_rand seeding).
+sp.harden_random.enable();
+
+# unserialize() POP-chain protection. HMAC-pins serialized session state.
+sp.unserialize_hmac.enable();
+
+# Cookie hardening: SameSite=lax on the session cookie.
+sp.cookie.name("PHPSESSID").samesite("lax");
+
+# XXE protection: disable libxml entity expansion when ext/xml is loaded.
+@condition extension_loaded("xml");
+sp.xxe_protection.enable();
+@end_condition;
+
+# --- Function-execution lockdown ---
+# OS command exec.
+sp.disable_function.function("system").drop();
+sp.disable_function.function("exec").drop();
+sp.disable_function.function("shell_exec").drop();
+sp.disable_function.function("passthru").drop();
+sp.disable_function.function("popen").drop();
+sp.disable_function.function("proc_open").drop();
+sp.disable_function.function("pcntl_exec").drop();
+
+# eval-by-string vector.
+sp.disable_function.function("assert").drop();
+
+# Info-leak builtins.
+sp.disable_function.function("show_source").drop();
+sp.disable_function.function("highlight_file").drop();
+sp.disable_function.function("phpinfo").drop();
+
+# Runtime extension load: rule REMOVED (GH #897). Hooking dl() makes
+# Snuffleupagus defer destruction of discarded temporaries to script
+# shutdown (verified on PHP 8.4/8.5: a `new A;` statement's __destruct
+# stops firing at statement end), which silently breaks RAII patterns --
+# concretely, every Laravel Route::resource() registration (InvoiceShelf
+# lost all its CRUD API routes). Security loss is minimal: PHP-FPM's
+# SAPI hard-disables dl() natively (the serving path never had it), and
+# CLI abuse requires an attacker who already executes arbitrary PHP.
+
+# --- End of the loaded base rules ---
+# Every rule above was loaded on boxes in simulation/enforce mode. The
+# rules that used to follow (putenv, .php writes, eval_blacklist, uploads,
+# mail, curl, extract, include/require, ini_set, call_user_func) and the
+# CMS overlays were never loaded from 2026-07-02 on: a non-ASCII byte in a
+# comment stopped the v0.13 parser at line 49. Loaded as written, they
+# break WordPress, Drupal, phpBB and Laravel apps. They wait in pending/
+# (not rendered) until each passes a soak; see pending/README.md.

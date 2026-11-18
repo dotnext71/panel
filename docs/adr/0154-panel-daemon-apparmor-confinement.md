@@ -1,0 +1,53 @@
+# ADR-0154: Panel daemon AppArmor confinement via aa-exec
+
+## Status
+Accepted (2026-07-04)
+
+## Context
+The `dotnext-panel` AppArmor profile is deliberately **name-only** (not attached
+by binary path) so it does not confine direct operator CLI invocations
+(`dotnext update` / `repair` / `apparmor flip-mature`), which share the same
+binary via the `/usr/local/bin/dotnext` symlink. The profile's header comment
+stated the daemon would pick the profile up via a systemd
+`AppArmorProfile=dotnext-panel` directive in the unit.
+
+That directive was **never wired into the unit**, and on Debian systemd's
+`AppArmorProfile=` silently no-ops regardless. Result: the profile loaded (and
+showed `enforce` in the Security UI) but attached to no process — the panel
+daemon ran **unconfined**. Verified on the test VM: the daemon's
+`/proc/<pid>/attr/current` was `unconfined`.
+
+## Decision
+Confine the daemon by wrapping its `ExecStart` in `aa-exec -p dotnext-panel`
+(the mechanism already used for the Kratos migrate step; GH #705). The wrapper
+probes that the profile is applicable and falls back to a plain exec otherwise,
+so a kernel that skips the profile, a container, or a missing `aa-exec` can
+never block daemon startup.
+
+CLI invocations are unaffected — they run outside this unit, so they stay
+unconfined by design (the name-only profile is never path-attached).
+
+## Consequences
+- The panel daemon is now genuinely MAC-confined (files/caps/network scoped to
+  the profile) instead of relying on a loaded-but-unattached profile.
+- Verified on the VM both ways: profile loaded -> daemon label
+  `dotnext-panel`, panel serves; profile absent -> plain fallback, panel serves.
+- **Follow-up (soak-gated):** the profile still carries broad CLI-era powers
+  (chown / exec / broad fs) the daemon no longer needs. Tightening it must ship
+  in complain, soak 7 days on a live host to surface would-denies, then flip
+  enforce per the standard dotnext AppArmor lifecycle — not shipped blind.
+
+## Update 2026-07-05 — REVERTED (production 502)
+
+`dotnext update` on mx applied the aa-exec wrapper and the panel crash-looped
+(502): the confined daemon could not `connect()` to `/run/mysqld/mysqld.sock`
+(`permission denied`), dying on the startup DB ping. The `dotnext-panel` profile
+is **incomplete** — it was never validated against the panel's real unix-socket
+set (mysqld, and almost certainly redis/kratos/agent/pdns), because the daemon
+had always run unconfined. The `.86` check that "proved" it was insufficient: it
+did not exercise a confined daemon against a live MariaDB.
+
+Decision reversed: the daemon runs plain/unconfined again (ExecStart back to
+`$BIN serve`). Daemon confinement is a real goal but requires the full socket
+allow-set in the profile **plus** a complain-mode soak on a live host before
+enforce — not a single-box smoke test. Tracking as a proper follow-up.

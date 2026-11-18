@@ -1,0 +1,87 @@
+[Unit]
+Description=dotNext Mail (Stalwart SMTP + IMAP + JMAP)
+Documentation=https://stalw.art/
+After=network-online.target mariadb.service
+Wants=network-online.target
+PartOf=dotnext.slice
+
+[Service]
+Type=simple
+User=dotnext-mail
+Group=dotnext-mail
+# JAB-357: NO broad `dotnext` supplementary group. That group owns the root
+# Agent socket (/run/dotnext/agent.sock, 0660 root:dotnext) + panel secrets under
+# /etc/dotnext, so a mail-server compromise must not hold it — the agent's
+# SO_PEERCRED gate already rejects non-panel UIDs, and this drops the FS-layer
+# reach too (defense in depth). Stalwart needs no supplementary group:
+#   - /etc/dotnext/stalwart-admin.token is 0640 dotnext:dotnext-mail, read
+#     via dotnext-mail's own PRIMARY group.
+#   - DKIM signatures are provisioned into Stalwart's REGISTRY by the root agent
+#     (createDkimSignature); Stalwart signs from the registry and never reads
+#     the on-disk /etc/dotnext/dkim/*.key files.
+Slice=dotnext.slice
+
+# v0.16 config is a small JSON file describing only the datastore
+# (ADR-0045). All other settings (SqlDirectory, listeners, TLS, DKIM
+# signatures) live as JMAP objects in Stalwart's registry, provisioned
+# via `stalwart-cli apply` at bootstrap time.
+EnvironmentFile=-/etc/dotnext/stalwart.env
+
+# Redirect Stalwart's temp dir into its writable data volume. Stalwart unpacks
+# downloaded application bundles — the WebAdmin SPA served at /admin (opt-in via
+# Server Settings → Stalwart WebAdmin), plus periodically-refreshed resources —
+# into the system temp dir by default. Under ProtectSystem=strict that default
+# path is read-only to the sandbox, so the unpack failed with "Permission denied
+# (os error 13) — Failed to unpack application bundle" and /admin returned 404
+# (no AppArmor denial: it's the mount-namespace, not AA). Pointing TMPDIR at a
+# pre-created dir inside ReadWritePaths lets the unpack land. Verified on .86.
+Environment=TMPDIR=/var/lib/stalwart/tmp
+ExecStartPre=/usr/bin/mkdir -p /var/lib/stalwart/tmp
+ExecStart=/usr/local/bin/stalwart --config=/etc/stalwart/config.json
+
+Restart=on-failure
+RestartSec=5s
+# WatchdogSec intentionally omitted: Stalwart v0.16 does not send
+# sd_notify WATCHDOG=1 heartbeats, so systemd kills it on every
+# WatchdogSec interval (confirmed on fresh VM install 2026-04-21:
+# restart counter climbed monotonically with "Failed with result
+# 'watchdog'" entries every ~30s). Liveness is covered by process-
+# level Restart=on-failure + the panel-agent's mailbox.usage probe.
+
+# Security hardening (matches dotnext-kratos.service shape).
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/stalwart /etc/stalwart /etc/dotnext
+
+# Mail event logs (Stalwart Log file tracers): the delivery-log viewer
+# (GH #239, queue.message-queued events) and the CrowdSec mail brute-force
+# tap (ADR-0115). LogsDirectory makes systemd create /var/log/stalwart
+# (owned by User=, mode below) BEFORE ExecStart and mount it read-write
+# inside the ProtectSystem=strict sandbox. Using LogsDirectory rather than
+# a ReadWritePaths entry avoids the "dir missing -> namespace setup fails
+# -> mail server won't start" trap, and fixes the original breakage where
+# the directory was absent AND excluded from ReadWritePaths, so every
+# Stalwart file tracer silently wrote nothing (Mail > Logs was always
+# empty; CrowdSec saw no mail-auth events).
+LogsDirectory=stalwart
+LogsDirectoryMode=0750
+
+# Stalwart binds to ports 25, 465, 587, 993 (external mail protocols) and
+# 8446 (loopback JMAP). Only the loopback binding requires no capability;
+# binding to the mail ports as non-root needs CAP_NET_BIND_SERVICE.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+# install.sh enables + starts this unit as part of the v0.16 bootstrap
+# flow (ADR-0045): it needs a running /jmap endpoint to run
+# `stalwart-cli apply` against, which seeds the SqlDirectory + listeners.
+# On a host with no email-enabled domains the unit still runs idle —
+# Stalwart rejects inbound mail for domains that have no registry Domain
+# object, which domain.email_enable creates via JMAP on first enable.
+WantedBy=multi-user.target
