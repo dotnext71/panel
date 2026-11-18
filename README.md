@@ -618,7 +618,9 @@ Local documentation lives under [`docs/`](docs/):
 - [Runbooks](docs/runbooks/) — operational guides (SSL, mail, backups,
   secondary nameserver, DNS, applications)
 - [Known Issues](docs/KNOWN_ISSUES.md) — caveats + workarounds
+- [Domains & subdomains](docs/DOMAINS.md) — every hostname the panel uses,
+  which ones need to be bought, and what degrades without them
 - [Contributing](docs/CONTRIBUTING.md) — feature development workflow
-- Translations — Weblate portal (not published yet); English strings in `frontend/src/locales/en/`;
-  is the source catalog (`panel-ui/src/locales/en/common.json`)
+- Translations — Weblate portal not published yet; `frontend/src/locales/en/common.json`
+  is the source catalog
 - [Environment](docs/ENV.md) — full env-var reference

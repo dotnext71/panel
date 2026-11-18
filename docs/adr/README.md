@@ -174,7 +174,7 @@ This directory contains Architecture Decision Records (ADRs) documenting signifi
 | [0179](0179-stalwart-1-0-migration.md) | Moving hosts from Stalwart 0.16 to 1.0 (GH #2338) | Accepted |
 | [0180](0180-root-owned-panel-checkout.md) | The panel checkout is root-owned | Proposed |
 | [0181](0181-scanner-drop-folders.md) | Scanner drop folders for shared Files resources (GH #2503) | Proposed |
-| [0182](0182-product-rename-jabali-to-dotnext.md) | Product rename: every first-party Jabali token becomes DotNext (MIT licence, new repo URL) | Accepted |
+| [0182](0182-product-identity.md) | Product identity: dotNext everywhere, no legacy brand tokens (MIT licence, new repo URL) | Accepted |
 <!-- 0133-0140: numbers reserved during planning, no ADR file was ever written (JAB-161). -->
 <!-- /AUTO-GENERATED -->
 

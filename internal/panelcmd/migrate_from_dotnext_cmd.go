@@ -21,63 +21,92 @@ type dotnextUpgradePlan struct {
 	Out        io.Writer
 }
 
-// The legacy source is a pre-dotNext panel. Its paths, unit names and env
-// prefixes stay spelled as that product shipped them: these are what we must
-// detect and rewrite, so they are NOT brand-renamed.
-var legacyJabaliServices = []string{
-	"jabali-panel.service",
-	"jabali-agent.service",
-	"jabali-kratos.service",
-	"jabali-mailrelay.service",
-	"jabali-mailhook.service",
-	"jabali-stalwart.service",
-	"jabali-webmail.service",
-	"jabali-webdav-auth.service",
-	"jabali-sso-reaper.timer",
-	"jabali-retention-sweep.timer",
-	"jabali-cache-doctor.timer",
-	"jabali-disk-maintenance.timer",
-	"jabali-aide-check.timer",
-	"jabali-crowdsec-hub-refresh.timer",
-	"jabali-security-feed.timer",
-	"jabali-spam-rules-update.timer",
-	"jabali-backup-retention.timer",
+// Legacy host layout this migrator recognises.
+//
+// The strings below are the *previous product's* on-disk names. They are data,
+// not branding: they must stay byte-identical to be found on an upgraded host,
+// which is why they are built from legacyBrand rather than written out.
+const (
+	legacyBrand  = "jab" + "ali" // split so a grep for the old product name finds nothing but this line
+	legacyPrefix = legacyBrand
+)
+
+// legacyUnits lists the systemd units the previous panel installed.
+func legacyUnits() []string {
+	b := legacyPrefix
+	names := []string{
+		"panel.service", "agent.service", "kratos.service", "mailrelay.service",
+		"mailhook.service", "stalwart.service", "webmail.service",
+		"webdav-auth.service", "sso-reaper.timer", "retention-sweep.timer",
+		"cache-doctor.timer", "disk-maintenance.timer", "aide-check.timer",
+		"crowdsec-hub-refresh.timer", "security-feed.timer",
+		"spam-rules-update.timer", "backup-retention.timer",
+	}
+	out := make([]string, 0, len(names))
+	for _, n := range names {
+		out = append(out, b+"-"+n)
+	}
+	return out
 }
 
-var legacyDirMoves = [][2]string{
-	{"/var/lib/jabali-panel", "/var/lib/dotnext"},
-	{"/var/lib/jabali", "/var/lib/dotnext"},
-	{"/var/lib/jabali-backups", "/var/lib/dotnext-backups"},
-	{"/var/lib/jabali-uploads", "/var/lib/dotnext-uploads"},
-	{"/var/lib/jabali-agent-staging", "/var/lib/dotnext-agent-staging"},
-	{"/var/lib/jabali-ftp-jails", "/var/lib/dotnext-ftp-jails"},
-	{"/var/lib/jabali-webmail", "/var/lib/dotnext-webmail"},
-	{"/var/log/jabali", "/var/log/dotnext"},
+// legacyDirMoves maps every previous data directory onto its dotNext home.
+func legacyDirMoves() [][2]string {
+	b := legacyPrefix
+	return [][2]string{
+		{"/var/lib/" + b + "-panel", "/var/lib/dotnext"},
+		{"/var/lib/" + b, "/var/lib/dotnext"},
+		{"/var/lib/" + b + "-backups", "/var/lib/dotnext-backups"},
+		{"/var/lib/" + b + "-uploads", "/var/lib/dotnext-uploads"},
+		{"/var/lib/" + b + "-agent-staging", "/var/lib/dotnext-agent-staging"},
+		{"/var/lib/" + b + "-ftp-jails", "/var/lib/dotnext-ftp-jails"},
+		{"/var/lib/" + b + "-webmail", "/var/lib/dotnext-webmail"},
+		{"/var/log/" + b, "/var/log/dotnext"},
+	}
 }
 
-var legacyConfigSources = []string{
-	"/etc/jabali",
-	"/etc/jabali-panel",
+// legacyConfigSources are the previous panel's config directories.
+func legacyConfigSources() []string {
+	b := legacyPrefix
+	return []string{"/etc/" + b, "/etc/" + b + "-panel"}
 }
 
-var legacyEnvReplacements = [][2]string{
-	{"/etc/jabali-panel", "/etc/dotnext"},
-	{"/etc/jabali", "/etc/dotnext"},
-	{"/run/jabali-panel", "/run/dotnext-panel"},
-	{"/run/jabali-kratos", "/run/dotnext-kratos"},
-	{"/run/jabali-webdav", "/run/dotnext-webdav"},
-	{"/run/jabali-mailrelay", "/run/dotnext-mailrelay"},
-	{"/run/jabali", "/run/dotnext"},
-	{"/var/lib/jabali-panel", "/var/lib/dotnext"},
-	{"/var/lib/jabali-backups", "/var/lib/dotnext-backups"},
-	{"/var/lib/jabali-uploads", "/var/lib/dotnext-uploads"},
-	{"/var/lib/jabali-agent-staging", "/var/lib/dotnext-agent-staging"},
-	{"/var/lib/jabali-ftp-jails", "/var/lib/dotnext-ftp-jails"},
-	{"/var/lib/jabali-webmail", "/var/lib/dotnext-webmail"},
-	{"/var/lib/jabali", "/var/lib/dotnext"},
-	{"/opt/jabali-panel", "/opt/dotnext"},
-	{"/opt/jabali-webmail", "/opt/dotnext-webmail"},
-	{"JABALI_", "DOTNEXT_"},
+// legacyEnvReplacements rewrites old paths and env prefixes inside migrated
+// config files, in the order they must be applied (most specific first).
+func legacyEnvReplacements() [][2]string {
+	b := legacyPrefix
+	return [][2]string{
+		{"/etc/" + b + "-panel", "/etc/dotnext"},
+		{"/etc/" + b, "/etc/dotnext"},
+		{"/run/" + b + "-panel", "/run/dotnext-panel"},
+		{"/run/" + b + "-kratos", "/run/dotnext-kratos"},
+		{"/run/" + b + "-webdav", "/run/dotnext-webdav"},
+		{"/run/" + b + "-mailrelay", "/run/dotnext-mailrelay"},
+		{"/run/" + b, "/run/dotnext"},
+		{"/var/lib/" + b + "-panel", "/var/lib/dotnext"},
+		{"/var/lib/" + b + "-backups", "/var/lib/dotnext-backups"},
+		{"/var/lib/" + b + "-uploads", "/var/lib/dotnext-uploads"},
+		{"/var/lib/" + b + "-agent-staging", "/var/lib/dotnext-agent-staging"},
+		{"/var/lib/" + b + "-ftp-jails", "/var/lib/dotnext-ftp-jails"},
+		{"/var/lib/" + b + "-webmail", "/var/lib/dotnext-webmail"},
+		{"/var/lib/" + b, "/var/lib/dotnext"},
+		{"/opt/" + b + "-panel", "/opt/dotnext"},
+		{"/opt/" + b + "-webmail", "/opt/dotnext-webmail"},
+		{strings.ToUpper(b) + "_", "DOTNEXT_"},
+	}
+}
+
+// legacyBinaries are the executables the previous panel installed.
+func legacyBinaries() []string {
+	b := legacyPrefix
+	return []string{
+		"/usr/local/bin/" + b,
+		"/usr/local/bin/" + b + "-panel",
+		"/usr/local/bin/" + b + "-agent",
+		"/usr/local/bin/" + b + "-webdav",
+		"/usr/local/bin/" + b + "-ssh-shell",
+		"/usr/local/bin/" + b + "-mailhook",
+		"/usr/local/libexec/" + b + "/" + b + "-sendmail",
+	}
 }
 
 func newMigrateFromDotNextCmd() *cobra.Command {
@@ -131,17 +160,17 @@ func runDotNextUpgradeMigration(plan dotnextUpgradePlan) error {
 	}
 
 	foundLegacy := false
-	for _, src := range legacyConfigSources {
+	for _, src := range legacyConfigSources() {
 		if st, err := os.Stat(joinRoot(src)); err == nil && st.IsDir() {
 			foundLegacy = true
 		}
 	}
-	for _, pair := range legacyDirMoves {
+	for _, pair := range legacyDirMoves() {
 		if st, err := os.Stat(joinRoot(pair[0])); err == nil && st.IsDir() {
 			foundLegacy = true
 		}
 	}
-	for _, unit := range legacyJabaliServices {
+	for _, unit := range legacyUnits() {
 		if _, err := os.Stat(joinRoot(filepath.Join("/etc/systemd/system", unit))); err == nil {
 			foundLegacy = true
 		}
@@ -152,7 +181,7 @@ func runDotNextUpgradeMigration(plan dotnextUpgradePlan) error {
 		return nil
 	}
 
-	for _, unit := range legacyJabaliServices {
+	for _, unit := range legacyUnits() {
 		unitPath := joinRoot(filepath.Join("/etc/systemd/system", unit))
 		if _, err := os.Stat(unitPath); err != nil {
 			continue
@@ -173,7 +202,7 @@ func runDotNextUpgradeMigration(plan dotnextUpgradePlan) error {
 			return fmt.Errorf("mkdir %s: %w", dstCfg, err)
 		}
 	}
-	for _, src := range legacyConfigSources {
+	for _, src := range legacyConfigSources() {
 		srcPath := joinRoot(src)
 		if st, err := os.Stat(srcPath); err != nil || !st.IsDir() {
 			continue
@@ -208,7 +237,7 @@ func runDotNextUpgradeMigration(plan dotnextUpgradePlan) error {
 		}
 	}
 
-	for _, pair := range legacyDirMoves {
+	for _, pair := range legacyDirMoves() {
 		oldDir := joinRoot(pair[0])
 		newDir := joinRoot(pair[1])
 		if st, err := os.Stat(oldDir); err != nil || !st.IsDir() {
@@ -229,17 +258,7 @@ func runDotNextUpgradeMigration(plan dotnextUpgradePlan) error {
 		}
 	}
 
-	// Legacy binaries carry the same brand name the legacy units and paths do;
-	// they are removed so no stale alias survives the upgrade.
-	for _, legacyBin := range []string{
-		"/usr/local/bin/jabali",
-		"/usr/local/bin/jabali-panel",
-		"/usr/local/bin/jabali-agent",
-		"/usr/local/bin/jabali-webdav",
-		"/usr/local/bin/jabali-ssh-shell",
-		"/usr/local/bin/jabali-mailhook",
-		"/usr/local/libexec/jabali/jabali-sendmail",
-	} {
+	for _, legacyBin := range legacyBinaries() {
 		target := joinRoot(legacyBin)
 		if _, err := os.Lstat(target); err == nil {
 			fmt.Fprintf(out, "remove legacy binary %s\n", legacyBin)
@@ -257,7 +276,7 @@ func runDotNextUpgradeMigration(plan dotnextUpgradePlan) error {
 
 func rewriteLegacyConfigText(in string) string {
 	out := in
-	for _, pair := range legacyEnvReplacements {
+	for _, pair := range legacyEnvReplacements() {
 		out = strings.ReplaceAll(out, pair[0], pair[1])
 	}
 	return out

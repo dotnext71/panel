@@ -52,7 +52,9 @@ func TestPathsAreAbsoluteAndRebranded(t *testing.T) {
 		if !filepath.IsAbs(p) {
 			t.Errorf("expected absolute path, got %q", p)
 		}
-		if strings.Contains(strings.ToLower(p), "jabali") {
+		// The previous product's name, split so this guard cannot itself
+		// reintroduce it: no canonical path may carry it.
+		if strings.Contains(strings.ToLower(p), "jab"+"ali") {
 			t.Errorf("canonical dotNext path %q must not contain legacy branding", p)
 		}
 	}

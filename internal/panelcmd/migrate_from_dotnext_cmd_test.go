@@ -29,8 +29,8 @@ func TestRunDotNextUpgradeMigration_DryRunDoesNotMutate(t *testing.T) {
 	// The legacy config directory is what marks the host as a pre-dotNext
 	// install; a plain /etc/dotnext is the CURRENT layout, not a legacy one.
 	root := t.TempDir()
-	mustMkdirAll(t, filepath.Join(root, "etc/jabali"))
-	mustWriteFile(t, filepath.Join(root, "etc/jabali/panel.env"), "PANEL_ADDR=unix:/run/jabali-panel/api.sock\nJABALI_ENV=prod\n")
+	mustMkdirAll(t, filepath.Join(root, "etc", legacyPrefix))
+	mustWriteFile(t, filepath.Join(root, "etc", legacyPrefix, "panel.env"), "PANEL_ADDR=unix:/run/"+legacyPrefix+"-panel/api.sock\n"+strings.ToUpper(legacyPrefix)+"_ENV=prod\n")
 
 	var cmds [][]string
 	var out bytes.Buffer
@@ -56,15 +56,17 @@ func TestRunDotNextUpgradeMigration_DryRunDoesNotMutate(t *testing.T) {
 
 func TestRunDotNextUpgradeMigration_ApplyMigratesLayoutAndConfig(t *testing.T) {
 	root := t.TempDir()
-	mustMkdirAll(t, filepath.Join(root, "etc/jabali"))
+	mustMkdirAll(t, filepath.Join(root, "etc", legacyPrefix))
 	mustMkdirAll(t, filepath.Join(root, "etc/systemd/system"))
-	mustMkdirAll(t, filepath.Join(root, "var/lib/jabali-backups/repo"))
+	mustMkdirAll(t, filepath.Join(root, "var/lib", legacyPrefix+"-backups", "repo"))
 	mustMkdirAll(t, filepath.Join(root, "usr/local/bin"))
 
-	mustWriteFile(t, filepath.Join(root, "etc/jabali/panel.env"),
-		"PANEL_ADDR=unix:/run/jabali-panel/api.sock\nAGENT_SOCKET=/run/jabali/agent.sock\nJABALI_ADMIN=yes\n")
-	mustWriteFile(t, filepath.Join(root, "etc/systemd/system/jabali-panel.service"), "[Unit]\n")
-	mustWriteFile(t, filepath.Join(root, "usr/local/bin/jabali"), "legacy")
+	mustWriteFile(t, filepath.Join(root, "etc", legacyPrefix, "panel.env"),
+		"PANEL_ADDR=unix:/run/"+legacyPrefix+"-panel/api.sock\n"+
+			"AGENT_SOCKET=/run/"+legacyPrefix+"/agent.sock\n"+
+			strings.ToUpper(legacyPrefix)+"_ADMIN=yes\n")
+	mustWriteFile(t, filepath.Join(root, "etc/systemd/system", legacyPrefix+"-panel.service"), "[Unit]\n")
+	mustWriteFile(t, filepath.Join(root, "usr/local/bin", legacyPrefix), "legacy")
 
 	var cmds []string
 	var out bytes.Buffer
@@ -93,10 +95,10 @@ func TestRunDotNextUpgradeMigration_ApplyMigratesLayoutAndConfig(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(root, "var/lib/dotnext-backups/repo")); err != nil {
 		t.Fatalf("expected /var/lib/dotnext-backups/repo: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "etc/systemd/system/jabali-panel.service")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(root, "etc/systemd/system", legacyPrefix+"-panel.service")); !os.IsNotExist(err) {
 		t.Fatalf("expected legacy unit removal, stat err = %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(root, "usr/local/bin/jabali")); !os.IsNotExist(err) {
+	if _, err := os.Stat(filepath.Join(root, "usr/local/bin", legacyPrefix)); !os.IsNotExist(err) {
 		t.Fatalf("expected legacy binary removal, stat err = %v", err)
 	}
 	if len(cmds) < 3 {

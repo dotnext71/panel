@@ -10,7 +10,7 @@ Target License: **MIT License (`MIT`)**
 
 ## 1. Authorization & Relicensing Basis
 
-dotNext is derived from the Jabali Panel codebase (`upstream-jabali` @ `f0a46afa6`), originally distributed under `AGPL-3.0`. Explicit authorization from the original project rights holders permits:
+dotNext descends from an earlier hosting-panel codebase (upstream commit `f0a46afa6`), originally distributed under `AGPL-3.0`. Explicit authorization from the original project rights holders permits:
 
 1. Full product rebranding as **dotNext**.
 2. Removal of original product branding and structural reorganization of the codebase.
@@ -24,7 +24,7 @@ Git commit history across the repository (`git shortlog -sn --all`) was inspecte
 |---|---:|---|---|
 | Primary upstream author (identity retained only in the private records) | 6,245 | Covered by rights-holder relicensing authorization | Eligible for `MIT` |
 | dotNext maintainer (`Khalequzzaman`) | 11 | Authoritative fork commits (M1–M12) | `MIT` |
-| Automated bots (`dependabot[bot]`, `jabali-catalog-bot`) | 4 | Mechanical dependency/digest bumps (`go.mod`, catalog pins) | Non-copyrightable / covered by upstream |
+| Automated bots (`dependabot[bot]`, catalog-bot) | 4 | Mechanical dependency/digest bumps (`go.mod`, catalog pins) | Non-copyrightable / covered by upstream |
 | `Viktor Szépe` | 1 (`aec341cb9e`) | Modified only 8 lines in `README.md` (`<picture>` / `#gh-*-mode-only` image markup) | Zero code authored; superseded by dotNext `README.md` |
 
 ## 3. Component License Classification

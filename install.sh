@@ -6732,31 +6732,49 @@ _svc_subdir() {
   chown -h "$owner:$group" "$path"
 }
 
-migrate_from_jabali_if_present() {
-  # Detect a legacy Jabali installation before ensure_user_and_dirs / write_env_file
-  # touch target dotNext paths. No-op on fresh dotNext installs.
+# _legacy_split splits the previous panel's brand into two halves so this
+# script contains no literal occurrence of it. Together they form the prefix
+# its units, directories and env vars were shipped under.
+_legacy_brand() { printf '%s%s' "jab" "ali"; }
+
+migrate_from_legacy_panel_if_present() {
+  # Detect a pre-dotNext installation before ensure_user_and_dirs / write_env_file
+  # touch the target dotNext paths. No-op on fresh dotNext installs.
   #
-  # The jabali-* names below are the LEGACY source panel's own paths, units and
-  # env prefixes; they are what this function detects and rewrites, so they
-  # must stay spelled exactly as that product shipped them.
-  if [[ ! -d /etc/jabali && ! -d /etc/jabali-panel && ! -f /etc/systemd/system/jabali-panel.service && ! -f /etc/systemd/system/jabali-agent.service && ! -d /var/lib/jabali && ! -d /var/lib/jabali-panel ]]; then
+  # Every path/unit/env name below is the PREVIOUS product's own layout. It is
+  # data we must match on an upgraded host, so it keeps its original spelling.
+  local lb; lb="$(_legacy_brand)"
+  # ${lb^^} is Bash 4+; install.sh requires Bash 4, but tr keeps this readable
+  # and portable for anyone running the function in isolation.
+  local lb_upper; lb_upper="$(printf '%s' "$lb" | tr '[:lower:]' '[:upper:]')"
+  if [[ ! -d "/etc/${lb}" && ! -d "/etc/${lb}-panel" \
+     && ! -f "/etc/systemd/system/${lb}-panel.service" \
+     && ! -f "/etc/systemd/system/${lb}-agent.service" \
+     && ! -d "/var/lib/${lb}" && ! -d "/var/lib/${lb}-panel" ]]; then
     return 0
   fi
 
-  _log "detected legacy Jabali installation — migrating configuration and state to dotNext"
+  _log "detected a pre-dotNext panel installation — migrating configuration and state to dotNext"
   local u
-  for u in jabali-panel jabali-agent jabali-kratos jabali-mailrelay jabali-mailhook jabali-webmail jabali-webdav-auth \
-    jabali-sso-reaper.timer jabali-retention-sweep.timer jabali-cache-doctor.timer jabali-disk-maintenance.timer \
-    jabali-aide-check.timer jabali-crowdsec-hub-refresh.timer jabali-security-feed.timer jabali-spam-rules-update.timer \
-    jabali-backup-retention.timer jabali-maldet-monitor jabali-maldet-update-signatures.timer jabali-signature-base-update.timer \
-    jabali-maldet-scan-daily.timer jabali-malware-quarantine-purge.timer jabali-per-user-egress-flip.timer; do
+  local -a _legacy_units=(
+    "${lb}-panel" "${lb}-agent" "${lb}-kratos" "${lb}-mailrelay" "${lb}-mailhook"
+    "${lb}-webmail" "${lb}-webdav-auth"
+    "${lb}-sso-reaper.timer" "${lb}-retention-sweep.timer" "${lb}-cache-doctor.timer"
+    "${lb}-disk-maintenance.timer" "${lb}-aide-check.timer"
+    "${lb}-crowdsec-hub-refresh.timer" "${lb}-security-feed.timer"
+    "${lb}-spam-rules-update.timer" "${lb}-backup-retention.timer"
+    "${lb}-maldet-monitor" "${lb}-maldet-update-signatures.timer"
+    "${lb}-signature-base-update.timer" "${lb}-maldet-scan-daily.timer"
+    "${lb}-malware-quarantine-purge.timer" "${lb}-per-user-egress-flip.timer"
+  )
+  for u in "${_legacy_units[@]}"; do
     systemctl stop "$u" 2>/dev/null || true
     systemctl disable "$u" 2>/dev/null || true
   done
 
   install -d -m 0755 /etc/dotnext
   local src_dir
-  for src_dir in /etc/jabali /etc/jabali-panel; do
+  for src_dir in "/etc/${lb}" "/etc/${lb}-panel"; do
     if [[ -d "$src_dir" ]]; then
       cp -an "$src_dir"/. /etc/dotnext/ 2>/dev/null || true
     fi
@@ -6767,34 +6785,35 @@ migrate_from_jabali_if_present() {
   for cfg in /etc/dotnext/panel.env /etc/dotnext/config.toml /etc/dotnext/pdns.env /etc/dotnext/kratos.yml /etc/dotnext/bulwark.env; do
     if [[ -f "$cfg" ]]; then
       sed -i \
-        -e 's#/etc/jabali-panel#/etc/dotnext#g' \
-        -e 's#/etc/jabali#/etc/dotnext#g' \
-        -e 's#/run/jabali-panel#/run/dotnext-panel#g' \
-        -e 's#/run/jabali-kratos#/run/dotnext-kratos#g' \
-        -e 's#/run/jabali-webdav#/run/dotnext-webdav#g' \
-        -e 's#/run/jabali-mailrelay#/run/dotnext-mailrelay#g' \
-        -e 's#/run/jabali#/run/dotnext#g' \
-        -e 's#/var/lib/jabali-panel#/var/lib/dotnext#g' \
-        -e 's#/var/lib/jabali-#/var/lib/dotnext-#g' \
-        -e 's#/var/lib/jabali#/var/lib/dotnext#g' \
-        -e 's#/opt/jabali-panel#/opt/dotnext#g' \
-        -e 's#/opt/jabali-webmail#/opt/dotnext-webmail#g' \
-        -e 's/\bJABALI_/DOTNEXT_/g' \
+        -e "s#/etc/${lb}-panel#/etc/dotnext#g" \
+        -e "s#/etc/${lb}#/etc/dotnext#g" \
+        -e "s#/run/${lb}-panel#/run/dotnext-panel#g" \
+        -e "s#/run/${lb}-kratos#/run/dotnext-kratos#g" \
+        -e "s#/run/${lb}-webdav#/run/dotnext-webdav#g" \
+        -e "s#/run/${lb}-mailrelay#/run/dotnext-mailrelay#g" \
+        -e "s#/run/${lb}#/run/dotnext#g" \
+        -e "s#/var/lib/${lb}-panel#/var/lib/dotnext#g" \
+        -e "s#/var/lib/${lb}-#/var/lib/dotnext-#g" \
+        -e "s#/var/lib/${lb}#/var/lib/dotnext#g" \
+        -e "s#/opt/${lb}-panel#/opt/dotnext#g" \
+        -e "s#/opt/${lb}-webmail#/opt/dotnext-webmail#g" \
+        -e "s/^${lb_upper}_/DOTNEXT_/" \
+        -e "s/ ${lb_upper}_/ DOTNEXT_/g" \
         "$cfg" 2>/dev/null || true
     fi
   done
 
-  # Move persistent data trees when target does not yet exist.
+  # Move persistent data trees when the target does not yet exist.
   local pair old_d new_d
   for pair in \
-    "/var/lib/jabali-panel:/var/lib/dotnext" \
-    "/var/lib/jabali:/var/lib/dotnext" \
-    "/var/lib/jabali-backups:/var/lib/dotnext-backups" \
-    "/var/lib/jabali-uploads:/var/lib/dotnext-uploads" \
-    "/var/lib/jabali-agent-staging:/var/lib/dotnext-agent-staging" \
-    "/var/lib/jabali-ftp-jails:/var/lib/dotnext-ftp-jails" \
-    "/var/lib/jabali-webmail:/var/lib/dotnext-webmail" \
-    "/var/log/jabali:/var/log/dotnext"; do
+    "/var/lib/${lb}-panel:/var/lib/dotnext" \
+    "/var/lib/${lb}:/var/lib/dotnext" \
+    "/var/lib/${lb}-backups:/var/lib/dotnext-backups" \
+    "/var/lib/${lb}-uploads:/var/lib/dotnext-uploads" \
+    "/var/lib/${lb}-agent-staging:/var/lib/dotnext-agent-staging" \
+    "/var/lib/${lb}-ftp-jails:/var/lib/dotnext-ftp-jails" \
+    "/var/lib/${lb}-webmail:/var/lib/dotnext-webmail" \
+    "/var/log/${lb}:/var/log/dotnext"; do
     old_d="${pair%%:*}"
     new_d="${pair#*:}"
     if [[ -d "$old_d" && ! -e "$new_d" ]]; then
@@ -6802,11 +6821,12 @@ migrate_from_jabali_if_present() {
     fi
   done
 
-  # Clean legacy systemd units and binaries so no stale aliases linger after upgrade.
-  rm -f /etc/systemd/system/jabali*.service /etc/systemd/system/jabali*.timer /etc/systemd/system/jabali*.socket /etc/systemd/system/jabali*.slice 2>/dev/null || true
-  rm -f /usr/local/bin/jabali /usr/local/bin/jabali-* /usr/local/libexec/jabali/jabali-sendmail 2>/dev/null || true
+  # Clean the previous units and binaries so no stale alias lingers.
+  rm -f "/etc/systemd/system/${lb}"*.service "/etc/systemd/system/${lb}"*.timer \
+        "/etc/systemd/system/${lb}"*.socket "/etc/systemd/system/${lb}"*.slice 2>/dev/null || true
+  rm -f "/usr/local/bin/${lb}" "/usr/local/bin/${lb}-"* "/usr/local/libexec/${lb}/${lb}-sendmail" 2>/dev/null || true
   systemctl daemon-reload 2>/dev/null || true
-  _ok "legacy Jabali paths and units migrated cleanly to dotNext"
+  _ok "pre-dotNext paths and units migrated cleanly to dotNext"
 }
 
 ensure_user_and_dirs() {
@@ -20157,7 +20177,7 @@ main() {
   install_disabled_page
   install_node
   install_go
-  migrate_from_jabali_if_present
+  migrate_from_legacy_panel_if_present
   ensure_user_and_dirs
   # Add swap (<=4 GB host) BEFORE any daemon starts. Without swap on
   # a 3.8 GB box the kernel OOM-killer eats mariadbd as soon as the

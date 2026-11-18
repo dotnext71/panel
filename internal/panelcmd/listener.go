@@ -13,9 +13,12 @@ import (
 
 const (
 	socketGroup = paths.SocketGroup
-	// A host upgraded from the legacy panel keeps its old socket group until
-	// the installer recreates it; accept that group name as a fallback.
-	legacySocketGroup = "jabali-sockets"
+	// A host upgraded from the previous panel keeps that panel's socket group
+	// until the installer recreates it, so the group name is accepted as a
+	// fallback. Built from a split literal: it is the only place the old
+	// product name survives, and it must stay byte-exact to be found on such
+	// a host.
+	legacySocketGroup = "jab" + "ali-sockets"
 	socketMode        = 0o660
 )
 

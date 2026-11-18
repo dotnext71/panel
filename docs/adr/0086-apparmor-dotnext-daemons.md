@@ -315,7 +315,8 @@ keeps `dotnext-fpm-app` in complain (so tenant PHP can run `df`, `ls` and the
 like) could not enforce the shim.
 
 Decision: `dotnext-sendmail` moves, unchanged and with the same `abi <abi/3.0>`
-pin, into `install/apparmor/usr.local.libexec.dotnext.jabali-sendmail`. The
+pin, into the `dotnext-sendmail` AppArmor profile (now
+`infrastructure/apparmor/usr.local.libexec.dotnext.dotnext-sendmail`). The
 parent keeps `Px -> dotnext-sendmail`; named profiles are global, so the
 transition doesn't depend on which file defines the target. The agent's
 allowlist adds `dotnext-sendmail`, so Security → AppArmor switches it on its

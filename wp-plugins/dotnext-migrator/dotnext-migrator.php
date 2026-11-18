@@ -6,7 +6,7 @@
  * Version:           0.1.2
  * Requires at least: 5.6
  * Requires PHP:      7.4
- * Author:            dotNext Panel (derived from the Jabali Panel codebase)
+ * Author:            dotNext Panel (derived from an earlier hosting panel codebase)
  * License:           GPL-2.0-or-later
  * Text Domain:       dotnext-migrator
  *
