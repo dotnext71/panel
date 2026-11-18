@@ -620,6 +620,8 @@ Local documentation lives under [`docs/`](docs/):
 - [Known Issues](docs/KNOWN_ISSUES.md) — caveats + workarounds
 - [Domains & subdomains](docs/DOMAINS.md) — every hostname the panel uses,
   which ones need to be bought, and what degrades without them
+- [Security review](docs/security/SECURITY_REVIEW_2026-11-18.md) — trust
+  boundaries, what is enforced where, and the open hardening items
 - [Contributing](docs/CONTRIBUTING.md) — feature development workflow
 - Translations — Weblate portal not published yet; `frontend/src/locales/en/common.json`
   is the source catalog
