@@ -2,7 +2,7 @@
 
 **Date**: 2026-05-16
 **Status**: accepted
-**Deciders**: shuki (requested + scope confirmed), Claude (design)
+**Deciders**: dotNext maintainers
 **Related**: ADR-0050 (unix-socket group model), ADR-0067 (M13 SSH sandbox), M14 (notifications)
 
 ## Context

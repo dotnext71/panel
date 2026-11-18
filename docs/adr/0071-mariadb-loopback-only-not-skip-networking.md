@@ -2,7 +2,7 @@
 
 - **Date:** 2026-04-27
 - **Status:** Accepted (amends ADR-0050 M25.1)
-- **Deciders:** shuki
+- **Deciders:** dotNext maintainers
 
 ## Context
 

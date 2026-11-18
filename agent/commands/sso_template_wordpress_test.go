@@ -172,12 +172,12 @@ func TestRenderWordPressSSOTemplate_RejectsInvalidAdminUsername(t *testing.T) {
 func TestRenderWordPressSSOTemplate_AcceptsRealisticUsernames(t *testing.T) {
 	cases := []string{
 		"admin",
-		"a",                 // single char
-		"shuki.vaknin",      // dot
-		"alice_bob",         // underscore
-		"user-1",            // dash
+		"a",            // single char
+		"alice.vaknin", // dot
+		"alice_bob",    // underscore
+		"user-1",       // dash
 		"someone@example.com",
-		"user with space",   // internal space
+		"user with space",       // internal space
 		strings.Repeat("a", 60), // max length
 	}
 	for _, u := range cases {

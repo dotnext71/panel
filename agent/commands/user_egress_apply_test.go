@@ -174,8 +174,8 @@ func TestExtractUsernameFromCounter_ShapeRequired(t *testing.T) {
 func TestSlicePathFor_M18Format(t *testing.T) {
 	requireHostMutationAllowed(t)
 	require.Equal(t,
-		"dotnext.slice/dotnext-user.slice/dotnext-user-shukivaknin.slice",
-		SlicePathFor("shukivaknin"))
+		"dotnext.slice/dotnext-user.slice/dotnext-user-alice.slice",
+		SlicePathFor("alice"))
 }
 
 func TestPortStrings(t *testing.T) {

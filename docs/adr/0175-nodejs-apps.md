@@ -2,7 +2,7 @@
 
 **Date**: 2026-10-20
 **Status**: Accepted (2026-10-22)
-**Deciders**: shuki + Claude
+**Deciders**: dotNext maintainers
 **Related**: ADR-0131 (Python Application Manager), ADR-0084 (per-user
 egress firewall), M18 (per-user cgroup slices), the Docker-app subsystem.
 

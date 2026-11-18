@@ -2,7 +2,7 @@
 
 **Date**: 2026-05-17
 **Status**: accepted
-**Deciders**: shuki (reported the 403), Claude (`/diagnose`)
+**Deciders**: dotNext maintainers
 **Related**: ADR-0060 (AppSec geoblock), ADR-0063 (per-scenario remediation override), ADR-0050 (unix-socket model), M46 (DB admin ops)
 
 ## Context

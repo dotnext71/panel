@@ -131,6 +131,6 @@ Nothing yet.
 - Multisite-aware namespacing.
 - Fail-safe: WordPress keeps running normally whenever Redis is unavailable.
 
-[Unreleased]: https://github.com/shukiv/dotnext-panel/blob/main/wp-plugins/dotnext-cache
-[1.0.1]: https://github.com/shukiv/dotnext-panel/issues/609
-[1.0.0]: https://github.com/shukiv/dotnext-panel/blob/main/wp-plugins/dotnext-cache
+[Unreleased]: https://github.com/dotnext71/panel/blob/main/wp-plugins/dotnext-cache
+[1.0.1]: https://github.com/dotnext71/panel/issues
+[1.0.0]: https://github.com/dotnext71/panel/blob/main/wp-plugins/dotnext-cache

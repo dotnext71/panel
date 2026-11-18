@@ -13,7 +13,7 @@
 - **Major security vulnerabilities found** in input validation (XSS, missing sanitization)
 - **One functional bug:** Cron creation returns HTTP 502 from UI
 - **All navigation works** - both admin and user panels load correctly
-- **Full report:** `/home/shuki/projects/dotnext-comprehensive-qa-report.md`
+- **Full report:** kept outside the repository (the QA box’s project directory), not committed.
 
 ---
 
@@ -208,7 +208,7 @@ curl -X POST https://mx.dotnext-panel.local:8443/api/v1/domains \
 
 ## Files Referenced
 
-- Full report: `/home/shuki/projects/dotnext-comprehensive-qa-report.md`
+- Full report: kept outside the repository, not committed.
 - Screenshots: `/tmp/admin-*.png`, `/tmp/user-crud-*.png`
 - Test scripts: `/tmp/qa-*.js`
 - Source code: `/opt/dotnext-panel/`

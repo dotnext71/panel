@@ -13,7 +13,7 @@ name: DotNext Sounder
 version: "0.5.17"
 icon: icon.svg
 
-image_channel: ghcr.io/shukiv/dotnext-sounder:0.5.17@` + testDigest + `
+image_channel: ghcr.io/alicev/dotnext-sounder:0.5.17@` + testDigest + `
 volume_owner: "10001:10001"
 update_mode: manual
 `
@@ -94,7 +94,7 @@ func TestRewriteAppYaml(t *testing.T) {
 	if !strings.Contains(out, `version: "0.5.22"`) {
 		t.Error("version line not rewritten")
 	}
-	if !strings.Contains(out, "image_channel: ghcr.io/shukiv/dotnext-sounder:0.5.22@"+newDigest) {
+	if !strings.Contains(out, "image_channel: ghcr.io/alicev/dotnext-sounder:0.5.22@"+newDigest) {
 		t.Error("image_channel not rewritten")
 	}
 	// Everything except the two rewritten values must be byte-identical —

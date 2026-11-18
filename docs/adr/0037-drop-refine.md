@@ -2,7 +2,7 @@
 
 **Date**: 2026-04-20 (proposed), 2026-04-21 (accepted)
 **Status**: accepted — all five waves (A–E) shipped on `m21/drop-refine` 2026-04-21. Zero `@refinedev/*` imports remain under `src/`, `tests/`, or `package.json`; production bundle dropped from ~2.2 MB to ~1.6 MB (gzip: 700 → 507 kB). See the "Outcome" section below.
-**Deciders**: shuki + Claude
+**Deciders**: dotNext maintainers
 **Related**: ADR-0034 (M20 Kratos identity — supersedes Refine's `authProvider` role), ADR-0036 (M16 Hydra — unaffected by this change), memory `project_plan_panel_ui_migration` (parked 2026-04-17, pre-Kratos)
 
 ## Context

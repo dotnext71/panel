@@ -172,7 +172,7 @@ if err != nil {
 - Table-driven tests where the input varies.
 - Prefer narrow interfaces that fakes can implement with 3–5 methods (see `eventsources.SSLCertLister`) over implementing the full repo interface in tests.
 - Integration tests use miniredis for Redis, sqlmock for DB. No real services in CI.
-- TMPDIR on this box is small — set `TMPDIR=/home/shuki/tmp-go` when running large test matrices.
+- Some dev boxes ship a small `/tmp`. When running large test matrices, point `TMPDIR` at a roomier path, e.g. `TMPDIR=$HOME/tmp-go make test`.
 
 ---
 

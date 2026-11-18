@@ -2,7 +2,7 @@
 
 **Date**: 2026-05-16
 **Status**: accepted
-**Deciders**: shuki (architecture review), Claude (design)
+**Deciders**: dotNext maintainers
 **Related**: amends ADR-0083 (shared-ops packages); relates to ADR-0004
 (reconciler-driven convergence), ADR-0029 (M8 cron via systemd-user timers)
 

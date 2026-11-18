@@ -14,11 +14,11 @@ CONVENTIONS.md; they're the quick way to avoid reopening a closed regression.
 <!-- cbm:start -->
 # codebase-memory-mcp — Code Intelligence
 
-This project is indexed by **codebase-memory-mcp** as project ID `home-shuki-projects-dotnext2` (9,272 nodes / 25,192 edges at last full index). Use its MCP tools for code discovery, impact analysis, and navigation instead of grep/find/Read when looking up code structure.
+This project is indexed by **codebase-memory-mcp**. Use its MCP tools for code discovery, impact analysis, and navigation instead of grep/find/Read when looking up code structure. The project id is derived from the indexed checkout path — run `index_repository` on this checkout once and use the id it reports as `project` on every call.
 
 ## Shared index across worktrees
 
-Every worktree under `/home/shuki/projects/dotnext2*` (main, wt-a, wt-b, wt-c) uses the **same** project ID `home-shuki-projects-dotnext2`. Pass that literal string as `project` to every `mcp__codebase-memory-mcp__*` call, regardless of which worktree the session is in. The graph reflects `main` (or the last branch that was full-indexed); it will NOT reflect uncommitted edits in wt-a/b/c. Re-run `index_repository` only when a worktree's branch has substantive diff from main AND you need graph queries against that diff.
+Every worktree of this repository uses the **same** project ID. Pass that literal string as `project` to every `mcp__codebase-memory-mcp__*` call, whichever worktree the session is in (the id is derived from the indexed checkout path — run `index_repository` on this checkout and use the id it reports). The graph reflects `main` (or the last branch that was full-indexed); it will NOT reflect uncommitted edits in wt-a/b/c. Re-run `index_repository` only when a worktree's branch has substantive diff from main AND you need graph queries against that diff.
 
 ## Always Do
 
@@ -28,7 +28,7 @@ Every worktree under `/home/shuki/projects/dotnext2*` (main, wt-a, wt-b, wt-c) u
 
 ## Never Do
 
-- NEVER grep the codebase for a symbol name when `search_graph({project: "home-shuki-projects-dotnext2", query: "…"})` would answer.
+- NEVER grep the codebase for a symbol name when `search_graph({project: "<cbm project id>", query: "…"})` would answer.
 - NEVER assume a file is isolated. Every edit has upstream callers. Use `query_graph` (Cypher) for "who calls X" when unsure.
 - NEVER commit without running `detect_changes` if the edit crossed package boundaries.
 
@@ -49,7 +49,7 @@ Every worktree under `/home/shuki/projects/dotnext2*` (main, wt-a, wt-b, wt-c) u
 
 ## Reindex cadence
 
-Full reindex on main after merging substantive structural changes (new package, deleted file, renamed type). The index does NOT auto-refresh — call `index_repository({repo_path: "/home/shuki/projects/dotnext2"})` explicitly.
+Full reindex on main after merging substantive structural changes (new package, deleted file, renamed type). The index does NOT auto-refresh — call `index_repository({repo_path: "<absolute path of this checkout>"})` explicitly.
 
 <!-- cbm:end -->
 
@@ -102,9 +102,9 @@ mcp__shadcn-ui__get_component → shadcn component source + usage
 
 Any agent launched via the `Agent` tool in this repository MUST:
 
-1. **Before first edit** to any `.go`, `.tsx`, `.ts` or migration file — call `mcp__codebase-memory-mcp__search_graph` and `mcp__codebase-memory-mcp__trace_path` on the target symbol (project=`home-shuki-projects-dotnext2`; if the index has not been built on this machine yet, index the current checkout first, see the note below) and include the blast radius (direct callers + call chain depth) in its reasoning. If the target is a widely-called function (>10 callers, or touched by an HTTP route), stop and report to the dispatcher BEFORE editing.
+1. **Before first edit** to any `.go`, `.tsx`, `.ts` or migration file — call `mcp__codebase-memory-mcp__search_graph` and `mcp__codebase-memory-mcp__trace_path` on the target symbol (project=<the id from step 1>; if the index has not been built on this machine yet, index the current checkout first, see the note below) and include the blast radius (direct callers + call chain depth) in its reasoning. If the target is a widely-called function (>10 callers, or touched by an HTTP route), stop and report to the dispatcher BEFORE editing.
 
-2. **Before committing** — call `mcp__codebase-memory-mcp__detect_changes` (project=`home-shuki-projects-dotnext2`) and verify affected symbols match the intended scope. If the change set includes unexpected symbols, pause and report.
+2. **Before committing** — call `mcp__codebase-memory-mcp__detect_changes` (project=<the id from step 1>) and verify affected symbols match the intended scope. If the change set includes unexpected symbols, pause and report.
 
 3. **For unfamiliar code exploration** (any "how does X work?" type question) — prefer `mcp__codebase-memory-mcp__search_graph` / `query_graph` / `get_code_snippet` over `Grep`/`Read`. Text search is the fallback, not the default.
 

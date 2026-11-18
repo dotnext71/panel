@@ -2,7 +2,7 @@
 
 **Date**: 2026-04-26
 **Status**: accepted
-**Deciders**: shuki (operator) + assistant
+**Deciders**: dotNext maintainers
 **Related**: ADR-0032 (M18 resource limits, cgroup v2 hierarchy), ADR-0065 (server-status aggregator)
 
 ## Context

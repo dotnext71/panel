@@ -2,7 +2,7 @@
 
 **Status:** Accepted
 **Date:** 2026-04-26
-**Deciders:** Shuki (operator/architect)
+**Deciders:** dotNext maintainers
 **Supersedes:** —
 **Related:** M12 SFTP, 7480fff (SFTP chroot)
 

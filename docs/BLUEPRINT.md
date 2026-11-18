@@ -275,7 +275,7 @@ binary install, panel-agent binary + systemd socket activation, PowerDNS MySQL b
 setup (merges local-address + local-ipv6 into pdns.conf), nginx reload, idempotency
 guards (checks for existing config files before overwriting).
 
-- **Files:** `/home/shuki/projects/dotnext2/install.sh` (single entry point)
+- **Files:** `install.sh` at the repository root (single entry point)
 - **Evidence:** Commits `f8b02a5`, `98e9bb6`, `4a8487c`, `7490b4f`, `113f639`, `177bc3a`
 
 ### 4.9 Database schema (GORM migrations)
@@ -1269,7 +1269,7 @@ See ADRs for architectural security decisions:
 - Concurrency group `ci-${{ github.ref }}` with `cancel-in-progress: true`
   auto-cancels stale runs on rapid pushes so the runner queue stays shallow.
 - **Branch protection on `main`** (loose): PR merges blocked until all 3 CI
-  checks green, direct-push whitelisted for `shukivaknin` only, force-push
+  checks green, direct push restricted to branch maintainers, force-push
   disabled, admin merge override enabled as escape hatch for genuinely-broken
   CI. Configured via `POST /repos/:owner/:repo/branch_protections`.
 - Pre-commit hook `/.claude/hooks/block-agent-commit-main.sh` blocks direct

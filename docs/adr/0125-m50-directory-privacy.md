@@ -2,7 +2,7 @@
 
 **Date**: 2026-05-30
 **Status**: Accepted
-**Deciders**: shuki + Claude
+**Deciders**: dotNext maintainers
 **Related**: ADR-0002 (DB is source of truth), ADR-0004 (reconciler-driven convergence), ADR-0009 (nginx file-per-vhost), ADR-0021 (M7 reveal-once password lifecycle)
 
 > Written retroactively (2026-06-14) to document a shipped feature that

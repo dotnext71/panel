@@ -30,7 +30,7 @@ Three design questions had real forks; the operator chose:
 
 5. **`autoupdate_apply` is self-gating.** It renders desired file contents, writes only files whose bytes changed, `daemon-reload`s only on change, and flips a timer's enable state only on `is-enabled` drift — so the per-tick reconcile is a cheap no-op once converged (per `feedback_per_tick_idempotent_loops`). Times are re-validated `HH:MM` at the agent boundary and rendered through fixed templates; no value is shell-interpolated into a unit file.
 
-6. **Changelog from the public GitHub mirror, cached.** `services/changelog.go` fetches `api.github.com/repos/shukiv/dotnext-panel/releases` (a fixed constant URL — no user input, no SSRF surface), caches 6h, and serves the last-good cache on any fetch error. Until the first release is cut the API returns `[]` and the UI shows an empty state.
+6. **Changelog from the public GitHub mirror, cached.** `services/changelog.go` fetches `api.github.com/repos/dotnext71/panel/releases` (a fixed constant URL — no user input, no SSRF surface), caches 6h, and serves the last-good cache on any fetch error. Until the first release is cut the API returns `[]` and the UI shows an empty state.
 
 7. **UI rebuild, keeping the M29 cards.** The page gains 3 stat cards, a security column + "security only" filter on the packages table, an Automatic Updates card (two switches + TimePickers), a Recent History table, and a Changelog timeline — while the M29 DotNext/Apt check+run+poll cards are preserved verbatim.
 

@@ -18,18 +18,18 @@ import (
 
 // wordpressInstallReq is the input shape for wordpress.install.
 type wordpressInstallReq struct {
-	OSUser       string `json:"os_user"`     // domain owner (e.g. "shuki")
-	Docroot      string `json:"docroot"`     // /home/shuki/domains/example.com/public_html
-	DBName       string `json:"db_name"`     // already-provisioned
-	DBUser       string `json:"db_user"`     // already-provisioned
-	DBPassword   string `json:"db_password"` // plaintext, single-use
-	DBHost       string `json:"db_host"`     // "localhost" (unix socket) or "127.0.0.1"
-	SiteURL      string `json:"site_url"`    // https://example.com
-	SiteTitle    string `json:"site_title"`
-	AdminUser    string `json:"admin_user"`
-	AdminPass    string `json:"admin_pass"`
-	AdminEmail   string `json:"admin_email"`
-	Locale       string `json:"locale"`
+	OSUser     string `json:"os_user"`     // domain owner (e.g. "alice")
+	Docroot    string `json:"docroot"`     // /home/alice/domains/example.com/public_html
+	DBName     string `json:"db_name"`     // already-provisioned
+	DBUser     string `json:"db_user"`     // already-provisioned
+	DBPassword string `json:"db_password"` // plaintext, single-use
+	DBHost     string `json:"db_host"`     // "localhost" (unix socket) or "127.0.0.1"
+	SiteURL    string `json:"site_url"`    // https://example.com
+	SiteTitle  string `json:"site_title"`
+	AdminUser  string `json:"admin_user"`
+	AdminPass  string `json:"admin_pass"`
+	AdminEmail string `json:"admin_email"`
+	Locale     string `json:"locale"`
 	// Version is the WordPress core release to install: "latest" (default,
 	// resolved by wp-cli at install time) or a concrete version like "6.7.1"
 	// (JAB-180). Validated below; integrity is enforced by verify-checksums

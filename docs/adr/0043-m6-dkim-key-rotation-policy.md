@@ -2,7 +2,7 @@
 
 **Date**: 2026-04-21
 **Status**: accepted
-**Deciders**: shuki + Claude
+**Deciders**: dotNext maintainers
 **Related**: ADR-0002 (DB is truth), ADR-0041 (Stalwart auto-DNS disabled), ADR-0042 (`domains.dkim_public_key` column), plan §1 decision 4
 
 ## Context

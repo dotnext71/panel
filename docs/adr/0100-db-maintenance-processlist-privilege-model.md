@@ -2,7 +2,7 @@
 
 **Date**: 2026-05-16
 **Status**: accepted
-**Deciders**: shuki (requested), Claude (design)
+**Deciders**: dotNext maintainers
 **Related**: ADR-0019 (per-database grants only), ADR-0050 (unix-socket model), ADR-0097 (root pw alongside socket), M46
 
 ## Context

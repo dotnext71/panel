@@ -13,8 +13,8 @@ func TestStripWPCacheBlock_ClonePath(t *testing.T) {
 		"define( 'DB_NAME', 'wp_src' );\n" +
 		"define( 'DB_USER', 'u' );\n" +
 		wpConfigBeginMarker + "\n" +
-		"if ( ! defined( 'DOTNEXT_CACHE_PREFIX' ) )   define( 'DOTNEXT_CACHE_PREFIX', 'shuki:src123' );\n" +
-		"if ( ! defined( 'DOTNEXT_CACHE_USER' ) )     define( 'DOTNEXT_CACHE_USER', 'wp_shuki' );\n" +
+		"if ( ! defined( 'DOTNEXT_CACHE_PREFIX' ) )   define( 'DOTNEXT_CACHE_PREFIX', 'alice:src123' );\n" +
+		"if ( ! defined( 'DOTNEXT_CACHE_USER' ) )     define( 'DOTNEXT_CACHE_USER', 'wp_alice' );\n" +
 		wpConfigEndMarker + "\n" +
 		"/* That's all, stop editing! */\n"
 

@@ -20,7 +20,7 @@ const auditRow = {
   id: "a1",
   ts: "2026-10-11T10:00:00Z",
   actor_kind: "user",
-  actor_name: "shuki",
+  actor_name: "alice",
   action: "POST /api/v1/domains",
   target_type: "domain",
   target_id: "01DOMAIN",
@@ -206,7 +206,7 @@ describe("admin Dashboard (GH #1249 Option 7)", () => {
 
   it("fetches only the Activity rows on landing", async () => {
     renderDash();
-    expect(await screen.findByText("shuki")).toBeInTheDocument();
+    expect(await screen.findByText("alice")).toBeInTheDocument();
     expect(screen.getByText("Create domain")).toBeInTheDocument();
     for (const prefix of ["/users", "/domains", "/databases", "/packages", "/admin/backup-runs"]) {
       expect(requested(prefix)).toBe(false);
@@ -215,7 +215,7 @@ describe("admin Dashboard (GH #1249 Option 7)", () => {
 
   it("loads a tab's list on first click and unmounts the pane it leaves", async () => {
     renderDash();
-    await screen.findByText("shuki");
+    await screen.findByText("alice");
 
     fireEvent.click(screen.getByRole("tab", { name: /Backups/ }));
     expect(await screen.findByText("1 failed")).toBeInTheDocument();
@@ -225,7 +225,7 @@ describe("admin Dashboard (GH #1249 Option 7)", () => {
     expect(rows).toHaveLength(2);
     expect(rows[0]).toHaveTextContent("Database Restore");
     expect(rows[1]).toHaveTextContent("1 failed");
-    expect(screen.queryByText("shuki")).not.toBeInTheDocument();
+    expect(screen.queryByText("alice")).not.toBeInTheDocument();
 
     fireEvent.click(screen.getByRole("tab", { name: /Domains \/ Users \/ Databases/ }));
     expect(await screen.findByText("shop_wp")).toBeInTheDocument();
@@ -248,10 +248,10 @@ describe("admin Dashboard (GH #1249 Option 7)", () => {
 
   it("opens the Alerts tab from the host card's health tag", async () => {
     renderDash();
-    await screen.findByText("shuki");
+    await screen.findByText("alice");
     fireEvent.click(screen.getByText("1 critical"));
     expect(await screen.findByText("crowdsec.service has failed")).toBeInTheDocument();
-    expect(screen.queryByText("shuki")).not.toBeInTheDocument();
+    expect(screen.queryByText("alice")).not.toBeInTheDocument();
   });
 
   it("opens the tab named in ?tab=, and Activity for an unknown one", async () => {
@@ -261,7 +261,7 @@ describe("admin Dashboard (GH #1249 Option 7)", () => {
     unmount();
 
     renderDash("/admin/dashboard?tab=nonsense");
-    expect(await screen.findByText("shuki")).toBeInTheDocument();
+    expect(await screen.findByText("alice")).toBeInTheDocument();
   });
 
   it("counts the rail's running units against the units meant to run", () => {

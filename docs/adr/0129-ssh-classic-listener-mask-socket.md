@@ -2,7 +2,7 @@
 
 **Date**: 2026-06-15
 **Status**: Accepted
-**Deciders**: shuki + Claude
+**Deciders**: dotNext maintainers
 **Related**: ADR-0028 (M12 SFTP, sshd drop-in + reload), ADR-0067 (SSH shell sandbox), ADR-0127 (SSH sandbox userns). Fixes GH #133.
 
 ## Context

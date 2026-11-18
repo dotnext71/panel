@@ -26,17 +26,17 @@ func TestCronAgentParamsWireShape(t *testing.T) {
 	}{
 		{
 			name:    "cron.remove",
-			payload: cronRemoveAgentParams{UserID: "u", Username: "shuki", JobID: "j"},
+			payload: cronRemoveAgentParams{UserID: "u", Username: "alice", JobID: "j"},
 			want:    []string{"job_id", "user_id", "username"},
 		},
 		{
 			name:    "cron.run_now",
-			payload: cronRunNowAgentParams{UserID: "u", Username: "shuki", JobID: "j", Command: "php /home/u/public_html/wp-cron.php", OwnedDocroots: []string{"/home/u/public_html"}},
+			payload: cronRunNowAgentParams{UserID: "u", Username: "alice", JobID: "j", Command: "php /home/u/public_html/wp-cron.php", OwnedDocroots: []string{"/home/u/public_html"}},
 			want:    []string{"command", "job_id", "owned_docroots", "owned_domains", "user_id", "username"},
 		},
 		{
 			name:    "cron.run_now_with_wait",
-			payload: cronRunNowAgentParams{UserID: "u", Username: "shuki", JobID: "j", Command: "php /home/u/public_html/wp-cron.php", WaitSeconds: 20},
+			payload: cronRunNowAgentParams{UserID: "u", Username: "alice", JobID: "j", Command: "php /home/u/public_html/wp-cron.php", WaitSeconds: 20},
 			want:    []string{"command", "job_id", "owned_docroots", "owned_domains", "user_id", "username", "wait_seconds"},
 		},
 		{
@@ -51,12 +51,12 @@ func TestCronAgentParamsWireShape(t *testing.T) {
 		},
 		{
 			name:    "cron.tail_log_with_lines",
-			payload: cronTailLogAgentParams{UserID: "u", Username: "shuki", JobID: "j", Lines: 100},
+			payload: cronTailLogAgentParams{UserID: "u", Username: "alice", JobID: "j", Lines: 100},
 			want:    []string{"job_id", "lines", "user_id", "username"},
 		},
 		{
 			name:    "cron.tail_log_omits_zero_lines",
-			payload: cronTailLogAgentParams{UserID: "u", Username: "shuki", JobID: "j"},
+			payload: cronTailLogAgentParams{UserID: "u", Username: "alice", JobID: "j"},
 			want:    []string{"job_id", "user_id", "username"},
 		},
 	}

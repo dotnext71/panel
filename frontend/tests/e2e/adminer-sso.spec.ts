@@ -40,7 +40,7 @@ describe("adminer SSO (M37 Phase 4)", () => {
             {
               id: "01J0DBMARIA0000000000000000",
               user_id: admin.id,
-              name: "shukivaknin_wp",
+              name: "alice_wp",
               engine: "mariadb",
               charset: "utf8mb4",
               size_bytes: 1024,
@@ -50,7 +50,7 @@ describe("adminer SSO (M37 Phase 4)", () => {
             {
               id: "01J0DBPGSQL0000000000000000",
               user_id: admin.id,
-              name: "shukivaknin_app",
+              name: "alice_app",
               engine: "postgres",
               charset: "UTF8",
               size_bytes: 0,
@@ -79,19 +79,19 @@ describe("adminer SSO (M37 Phase 4)", () => {
           // resolves in CI. The asserts below only care about the path
           // + query string; the host part is irrelevant.
           redirect_url:
-            "http://127.0.0.1:4173/dotnext-adminer/?token=t0kenABC&db=shukivaknin_app&engine=postgres",
+            "http://127.0.0.1:4173/dotnext-adminer/?token=t0kenABC&db=alice_app&engine=postgres",
         }),
       });
     });
 
     await page.goto("/dotnext-panel/databases");
-    await expect(page.getByRole("cell", { name: "shukivaknin_app" })).toBeVisible();
+    await expect(page.getByRole("cell", { name: "alice_app" })).toBeVisible();
 
     // Click "Open in Adminer" on the postgres row, then capture the
     // new tab. window.open is fired synchronously so Playwright sees
     // it via context.waitForEvent('page').
     const newTabPromise = context.waitForEvent("page");
-    const pgRow = page.getByRole("row", { name: /shukivaknin_app/ });
+    const pgRow = page.getByRole("row", { name: /alice_app/ });
     await pgRow.getByRole("button", { name: /Open in Adminer/i }).click();
     const newTab = await newTabPromise;
 
@@ -100,7 +100,7 @@ describe("adminer SSO (M37 Phase 4)", () => {
     await newTab.waitForURL(/\/dotnext-adminer\/\?/);
     const url = newTab.url();
     expect(url).toContain("token=t0kenABC");
-    expect(url).toContain("db=shukivaknin_app");
+    expect(url).toContain("db=alice_app");
     expect(url).toContain("engine=postgres");
 
     expect(mintBody).not.toBeNull();

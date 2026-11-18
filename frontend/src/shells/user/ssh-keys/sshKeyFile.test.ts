@@ -6,10 +6,10 @@ const KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEtZ4mO5QdupIvjCNJyOr7P2DZxYyXU
 
 describe("parsePublicKeyFile", () => {
   it("takes the key line and names it from the key's comment", () => {
-    expect(parsePublicKeyFile(`${KEY} shuki@laptop\n`, "id_ed25519.pub")).toEqual({
+    expect(parsePublicKeyFile(`${KEY} alice@laptop\n`, "id_ed25519.pub")).toEqual({
       ok: true,
-      publicKey: `${KEY} shuki@laptop`,
-      suggestedName: "shuki@laptop",
+      publicKey: `${KEY} alice@laptop`,
+      suggestedName: "alice@laptop",
     });
   });
 

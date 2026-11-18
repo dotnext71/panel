@@ -2,7 +2,7 @@
 
 **Date**: 2026-06-14
 **Status**: accepted
-**Deciders**: shukiv
+**Deciders**: dotNext maintainers
 **Relates to**: ADR-0102 (panel-API AppSec allowlist), ADR-0060/0063 (CrowdSec)
 
 ## Context

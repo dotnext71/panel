@@ -117,5 +117,5 @@ For a **distro-tracked package** (nginx, MariaDB, certbot):
    `apt-get upgrade` / `unattended-upgrades`.
 2. When the distro bumps a major (e.g. MariaDB 11.4 → 11.8) and breaks
    anything, file a memory note in
-   `~/.claude/projects/-home-shuki-projects-dotnext2/memory/` so the next
+   the local Claude Code memory directory for this checkout (`~/.claude/projects/<path-encoded-checkout>/memory/`) so the next
    migration round picks it up.

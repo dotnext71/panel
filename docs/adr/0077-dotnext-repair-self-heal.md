@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-28
 **Status:** Accepted
-**Deciders:** shuki (operator/architect)
+**Deciders:** dotNext maintainers
 **Related:** ADR-0010 (install via `curl|bash`), `dotnext update` (`panel-api/cmd/server/update.go`)
 
 ## Context

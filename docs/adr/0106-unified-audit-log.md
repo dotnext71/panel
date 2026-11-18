@@ -2,7 +2,7 @@
 
 **Date**: 2026-05-17
 **Status**: accepted
-**Deciders**: shuki (requested), Claude (design)
+**Deciders**: dotNext maintainers
 **Implementation**: backend SHIPPED + merged to gitea `main`
 (Steps 0–5 + 7: schema/migration 000138, `internal/audit` recorder +
 single-writer chain consumer, recorder middleware, token/M46 db-admin

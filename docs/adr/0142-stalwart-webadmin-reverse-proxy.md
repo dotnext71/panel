@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-21
 **Status:** Accepted — live-verified on 10.0.3.14 (dotnext-panel.local) 2026-06-22
-**Owner:** shuki
+**Owner:** dotNext maintainers
 **Issue:** GH #243
 **Companion plan:** [`plans/stalwart-webadmin-toggle-243.md`](../../plans/stalwart-webadmin-toggle-243.md)
 

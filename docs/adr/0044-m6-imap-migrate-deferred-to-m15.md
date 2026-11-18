@@ -2,7 +2,7 @@
 
 **Date**: 2026-04-21
 **Status**: accepted
-**Deciders**: shuki + Claude
+**Deciders**: dotNext maintainers
 **Related**: ADR-0041 (Bulwark webmail), plan §1 decision 5, M15 (migration importers, planned)
 
 ## Context

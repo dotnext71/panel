@@ -11,11 +11,11 @@ func TestDecodeListFailsClosed(t *testing.T) {
 	if _, err := DecodeList([]byte(`{"error":"boom"`)); err == nil {
 		t.Fatal("DecodeList(malformed) = nil error, want a decode error")
 	}
-	got, err := DecodeList([]byte(`{"path":"/home/shuki","entries":[{"name":"a.txt","size":3}]}`))
+	got, err := DecodeList([]byte(`{"path":"/home/alice","entries":[{"name":"a.txt","size":3}]}`))
 	if err != nil {
 		t.Fatalf("DecodeList(valid): %v", err)
 	}
-	if got.Path != "/home/shuki" || len(got.Entries) != 1 || got.Entries[0].Name != "a.txt" {
+	if got.Path != "/home/alice" || len(got.Entries) != 1 || got.Entries[0].Name != "a.txt" {
 		t.Fatalf("DecodeList decoded wrong: %+v", got)
 	}
 }
@@ -97,11 +97,11 @@ func TestDecodeStat(t *testing.T) {
 	if _, err := DecodeStat([]byte(`null`)); !errors.Is(err, ErrNoStatMode) {
 		t.Fatalf("DecodeStat(null) = %v, want ErrNoStatMode", err)
 	}
-	got, err := DecodeStat([]byte(`{"path":"/home/shuki/f.txt","size":7,"mode":"-rw-r--r--","is_dir":false,"mod_time":"2026-01-02T03:04:05Z","is_symlink":true}`))
+	got, err := DecodeStat([]byte(`{"path":"/home/alice/f.txt","size":7,"mode":"-rw-r--r--","is_dir":false,"mod_time":"2026-01-02T03:04:05Z","is_symlink":true}`))
 	if err != nil {
 		t.Fatalf("DecodeStat(valid): %v", err)
 	}
-	if got.Path != "/home/shuki/f.txt" || got.Size != 7 || got.Mode != "-rw-r--r--" ||
+	if got.Path != "/home/alice/f.txt" || got.Size != 7 || got.Mode != "-rw-r--r--" ||
 		got.IsDir || got.ModTime != "2026-01-02T03:04:05Z" || !got.IsSymlink {
 		t.Fatalf("DecodeStat decoded wrong: %+v", got)
 	}
@@ -124,18 +124,18 @@ func TestDecodeDu(t *testing.T) {
 	// Regression against a zero-value guard: a du of an EMPTY directory is a real
 	// success — total 0, no entries — and must decode cleanly. Guarding on total
 	// or entries instead of path would false-fail this.
-	empty, err := DecodeDu([]byte(`{"path":"/home/shuki/empty","total":0,"entries":[]}`))
+	empty, err := DecodeDu([]byte(`{"path":"/home/alice/empty","total":0,"entries":[]}`))
 	if err != nil {
 		t.Fatalf("DecodeDu(empty dir) = %v, want nil (0 bytes is a valid du)", err)
 	}
-	if empty.Path != "/home/shuki/empty" || empty.Total != 0 || len(empty.Entries) != 0 {
+	if empty.Path != "/home/alice/empty" || empty.Total != 0 || len(empty.Entries) != 0 {
 		t.Fatalf("DecodeDu(empty dir) decoded wrong: %+v", empty)
 	}
-	got, err := DecodeDu([]byte(`{"path":"/home/shuki","total":4096,"entries":[{"name":"a","is_dir":true,"size":4096,"has_subdirs":true}]}`))
+	got, err := DecodeDu([]byte(`{"path":"/home/alice","total":4096,"entries":[{"name":"a","is_dir":true,"size":4096,"has_subdirs":true}]}`))
 	if err != nil {
 		t.Fatalf("DecodeDu(valid): %v", err)
 	}
-	if got.Path != "/home/shuki" || got.Total != 4096 || len(got.Entries) != 1 ||
+	if got.Path != "/home/alice" || got.Total != 4096 || len(got.Entries) != 1 ||
 		got.Entries[0].Name != "a" || !got.Entries[0].IsDir || got.Entries[0].Size != 4096 || !got.Entries[0].HasSubdirs {
 		t.Fatalf("DecodeDu decoded wrong: %+v", got)
 	}
@@ -157,11 +157,11 @@ func TestDecodeExtract(t *testing.T) {
 	if def.Dest != "" || def.Extracted != 0 || def.Skipped != 0 {
 		t.Fatalf("DecodeExtract(default-dest) decoded wrong: %+v", def)
 	}
-	got, err := DecodeExtract([]byte(`{"dest":"/home/shuki/out","extracted":3,"skipped":1}`))
+	got, err := DecodeExtract([]byte(`{"dest":"/home/alice/out","extracted":3,"skipped":1}`))
 	if err != nil {
 		t.Fatalf("DecodeExtract(valid): %v", err)
 	}
-	if got.Dest != "/home/shuki/out" || got.Extracted != 3 || got.Skipped != 1 {
+	if got.Dest != "/home/alice/out" || got.Extracted != 3 || got.Skipped != 1 {
 		t.Fatalf("DecodeExtract decoded wrong: %+v", got)
 	}
 }

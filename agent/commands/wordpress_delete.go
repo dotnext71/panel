@@ -13,8 +13,8 @@ import (
 // wordpressDeleteReq is the input shape for wordpress.delete.
 type wordpressDeleteReq struct {
 	AppType string `json:"app_type"` // present, ignored
-	OSUser  string `json:"os_user"`  // domain owner (e.g. "shuki")
-	Docroot string `json:"docroot"`  // /home/shuki/domains/example.com/public_html
+	OSUser  string `json:"os_user"`  // domain owner (e.g. "alice")
+	Docroot string `json:"docroot"`  // /home/alice/domains/example.com/public_html
 	// Subdirectory pins the install root under the docroot for subdir
 	// installs (example.com/blog). Empty = the install owns the docroot.
 	// Without this the deleter rm'd docroot/wp-admin etc., never

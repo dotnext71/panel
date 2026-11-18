@@ -1,7 +1,7 @@
 # ADR-0083 — Shared ops packages for REST + CLI code reuse (M44)
 
 **Status:** Accepted — 2026-04-29
-**Deciders:** shuki (plan + review), ADR target noted in M44 plan and BLUEPRINT.md
+**Deciders:** dotNext maintainers
 **Related:** ADR-0003 (one write path — CLI is thin HTTP client for user-facing ops), ADR-0001 (privileged ops via Go agent)
 
 ## Context

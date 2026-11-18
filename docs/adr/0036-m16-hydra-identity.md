@@ -2,7 +2,7 @@
 
 **Date**: 2026-04-20 (original); amended 2026-04-20 to record MariaDB→SQLite pivot for Hydra's state
 **Status**: superseded by ADR-0038 (2026-04-21) — M16 rolled back due to PKCE incompatibility with WordPress plugin; replaced by M22 magic-link
-**Deciders**: shuki + Claude
+**Deciders**: dotNext maintainers
 **Related**: ADR-0034 (M20 Kratos identity), ADR-0033 (applications framework), M7/ADR-0021 (phpMyAdmin SSO — explicitly *not* migrated), [ory/hydra#3387](https://github.com/ory/hydra/issues/3387)
 
 ## Amendment 2026-04-20 — Hydra persistence moved from MariaDB to SQLite

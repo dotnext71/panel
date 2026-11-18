@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-18
 **Status:** Accepted
-**Deciders:** Shuki
+**Deciders:** dotNext maintainers
 
 ## Context
 

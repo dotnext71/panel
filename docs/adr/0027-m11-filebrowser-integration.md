@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-18
 **Status:** Superseded by ADR-0030 (2026-04-19)
-**Deciders:** Shuki
+**Deciders:** dotNext maintainers
 
 ## Context
 

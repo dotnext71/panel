@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-19
 **Status:** Accepted (steps 1–5 + 8 shipped; steps 6–7 deferred behind a host-deploy gate)
-**Deciders:** Shuki
+**Deciders:** dotNext maintainers
 
 ## Context
 

@@ -32,7 +32,7 @@ func TestQuotaMountFor_HomeOnOwnMount(t *testing.T) {
 		"/dev/sda2 /home ext4 rw,relatime,usrquota 0 0",
 		"/dev/sda3 /var ext4 rw,relatime 0 0",
 	})
-	got, err := quotaMountForWithMounts("/home/shuki/public_html", mp)
+	got, err := quotaMountForWithMounts("/home/alice/public_html", mp)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -45,7 +45,7 @@ func TestQuotaMountFor_HomeOnRoot(t *testing.T) {
 	mp := writeMounts(t, []string{
 		"/dev/sda1 / ext4 rw,relatime 0 0",
 	})
-	got, err := quotaMountForWithMounts("/home/shuki", mp)
+	got, err := quotaMountForWithMounts("/home/alice", mp)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
@@ -60,7 +60,7 @@ func TestQuotaMountFor_NoRootEntry(t *testing.T) {
 	mp := writeMounts(t, []string{
 		"/dev/sda1 /boot ext4 rw 0 0",
 	})
-	_, err := quotaMountForWithMounts("/home/shuki", mp)
+	_, err := quotaMountForWithMounts("/home/alice", mp)
 	if err == nil {
 		t.Fatal("expected error, got nil")
 	}
@@ -79,7 +79,7 @@ func TestQuotaMountFor_PathEqualsMount(t *testing.T) {
 	mp := writeMounts(t, []string{
 		"/dev/sda1 / ext4 rw 0 0",
 		"/dev/sda2 /home ext4 rw,usrquota 0 0",
-		"/dev/sda3 /home/shuki/deep-mount xfs rw 0 0",
+		"/dev/sda3 /home/alice/deep-mount xfs rw 0 0",
 	})
 	got, err := quotaMountForWithMounts("/home", mp)
 	if err != nil {
@@ -91,19 +91,19 @@ func TestQuotaMountFor_PathEqualsMount(t *testing.T) {
 }
 
 func TestQuotaMountFor_NestedMountWins(t *testing.T) {
-	// If /home has its own mount AND /home/shuki has a nested mount,
-	// a path inside /home/shuki must land on the deeper mount because
+	// If /home has its own mount AND /home/alice has a nested mount,
+	// a path inside /home/alice must land on the deeper mount because
 	// that's where setquota's quota table lives.
 	mp := writeMounts(t, []string{
 		"/dev/sda1 / ext4 rw 0 0",
 		"/dev/sda2 /home ext4 rw,usrquota 0 0",
-		"/dev/sda3 /home/shuki xfs rw,usrquota 0 0",
+		"/dev/sda3 /home/alice xfs rw,usrquota 0 0",
 	})
-	got, err := quotaMountForWithMounts("/home/shuki/public_html", mp)
+	got, err := quotaMountForWithMounts("/home/alice/public_html", mp)
 	if err != nil {
 		t.Fatalf("err: %v", err)
 	}
-	if got != "/home/shuki" {
-		t.Errorf("got %q, want /home/shuki — nested mount must win", got)
+	if got != "/home/alice" {
+		t.Errorf("got %q, want /home/alice — nested mount must win", got)
 	}
 }

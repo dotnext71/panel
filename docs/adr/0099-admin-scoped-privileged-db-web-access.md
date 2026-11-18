@@ -2,7 +2,7 @@
 
 **Date**: 2026-05-16
 **Status**: accepted
-**Deciders**: shuki (requested + chose admin all-DBs SSO), Claude (design)
+**Deciders**: dotNext maintainers
 **Related**: ADR-0020/0022 (phpMyAdmin SSO), ADR-0096 (root web terminal — comparable risk framing), M7, M46
 
 ## Context

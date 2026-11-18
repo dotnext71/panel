@@ -28,10 +28,10 @@
 #
 # Overrides:
 #   DOTNEXT_RELEASE_CHANNEL        stable (default) or development
-#   DOTNEXT_RELEASE_REPO           default https://github.com/shukiv/dotnext-panel
+#   DOTNEXT_RELEASE_REPO           default https://github.com/dotnext71/panel
 #                                 (the stable channel's tag and assets)
 #   DOTNEXT_RELEASE_DOWNLOAD_BASE  default
-#       https://github.com/shukiv/dotnext-panel/releases/latest/download
+#       https://github.com/dotnext71/panel/releases/latest/download
 #   DOTNEXT_RELEASE_API_BASE       GitHub fallback repo API (development only,
 #                                 used only if the fixed-name latest asset
 #                                 isn't attached yet)
@@ -40,9 +40,9 @@
 set -euo pipefail
 
 CHANNEL="${DOTNEXT_RELEASE_CHANNEL:-stable}"
-REPO_WEB="${DOTNEXT_RELEASE_REPO:-https://github.com/shukiv/dotnext-panel}"
-DL_BASE="${DOTNEXT_RELEASE_DOWNLOAD_BASE:-https://github.com/shukiv/dotnext-panel/releases/latest/download}"
-API_BASE="${DOTNEXT_RELEASE_API_BASE:-https://api.github.com/repos/shukiv/dotnext-panel}"
+REPO_WEB="${DOTNEXT_RELEASE_REPO:-https://github.com/dotnext71/panel}"
+DL_BASE="${DOTNEXT_RELEASE_DOWNLOAD_BASE:-https://github.com/dotnext71/panel/releases/latest/download}"
+API_BASE="${DOTNEXT_RELEASE_API_BASE:-https://api.github.com/repos/dotnext71/panel}"
 
 die() { printf '\033[1;31m[bootstrap] %s\033[0m\n' "$*" >&2; exit 1; }
 log() { printf '\033[1;34m[bootstrap]\033[0m %s\n' "$*"; }

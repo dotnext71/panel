@@ -2,7 +2,7 @@
 
 **Date:** 2026-04-28
 **Status:** Accepted
-**Deciders:** shuki (operator/architect)
+**Deciders:** dotNext maintainers
 **Related:** ADR-0049 (M24 IP Manager), ADR-0056 (M14 dispatcher),
 ADR-0047 (pdns-recursor on loopback), old dotnext-panel issue #64
 

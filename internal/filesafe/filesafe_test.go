@@ -9,25 +9,25 @@ import (
 // TestNewScope validates scope creation and normalization.
 func TestNewScope(t *testing.T) {
 	cases := []struct {
-		name      string
-		userID    string
-		username  string
-		docroots  []string
-		wantErr   bool
-		errCode   string
+		name     string
+		userID   string
+		username string
+		docroots []string
+		wantErr  bool
+		errCode  string
 	}{
 		{
 			name:     "valid single docroot",
 			userID:   "u123",
-			username: "shuki",
+			username: "alice",
 			docroots: []string{"/var/www"},
 			wantErr:  false,
 		},
 		{
 			name:     "valid multiple docroots",
 			userID:   "u123",
-			username: "shuki",
-			docroots: []string{"/var/www", "/home/shuki"},
+			username: "alice",
+			docroots: []string{"/var/www", "/home/alice"},
 			wantErr:  false,
 		},
 		{
@@ -41,7 +41,7 @@ func TestNewScope(t *testing.T) {
 		{
 			name:     "empty docroots",
 			userID:   "u123",
-			username: "shuki",
+			username: "alice",
 			docroots: []string{},
 			wantErr:  true,
 			errCode:  ErrCodeEmpty,
@@ -49,7 +49,7 @@ func TestNewScope(t *testing.T) {
 		{
 			name:     "relative docroot",
 			userID:   "u123",
-			username: "shuki",
+			username: "alice",
 			docroots: []string{"relative/path"},
 			wantErr:  true,
 			errCode:  ErrCodeNotAbsolute,
@@ -85,30 +85,30 @@ func TestNewScope(t *testing.T) {
 
 // TestClean validates path cleaning and scope enforcement.
 func TestClean(t *testing.T) {
-	scope, _ := NewScope("u123", "shuki", []string{"/home/shuki", "/var/www"})
+	scope, _ := NewScope("u123", "alice", []string{"/home/alice", "/var/www"})
 
 	cases := []struct {
-		name      string
-		path      string
-		wantErr   bool
-		errCode   string
-		wantPath  string
+		name     string
+		path     string
+		wantErr  bool
+		errCode  string
+		wantPath string
 	}{
 		{
 			name:     "absolute path in scope",
-			path:     "/home/shuki/file.txt",
+			path:     "/home/alice/file.txt",
 			wantErr:  false,
-			wantPath: "/home/shuki/file.txt",
+			wantPath: "/home/alice/file.txt",
 		},
 		{
 			name:     "path with . components",
-			path:     "/home/shuki/./file.txt",
+			path:     "/home/alice/./file.txt",
 			wantErr:  false,
-			wantPath: "/home/shuki/file.txt",
+			wantPath: "/home/alice/file.txt",
 		},
 		{
 			name:    "path with .. at docroot boundary (unsafe)",
-			path:    "/home/shuki/subdir/../file.txt",
+			path:    "/home/alice/subdir/../file.txt",
 			wantErr: true,
 			errCode: ErrCodeTraversal,
 		},
@@ -120,19 +120,19 @@ func TestClean(t *testing.T) {
 		},
 		{
 			name:    "path with null byte",
-			path:    "/home/shuki/file\x00.txt",
+			path:    "/home/alice/file\x00.txt",
 			wantErr: true,
 			errCode: ErrCodeContainsNull,
 		},
 		{
 			name:    "path with control character",
-			path:    "/home/shuki/file\x01.txt",
+			path:    "/home/alice/file\x01.txt",
 			wantErr: true,
 			errCode: ErrCodeContainsControl,
 		},
 		{
 			name:    "path with .. traversal",
-			path:    "/home/shuki/../../../etc/passwd",
+			path:    "/home/alice/../../../etc/passwd",
 			wantErr: true,
 			errCode: ErrCodeTraversal,
 		},
@@ -144,15 +144,15 @@ func TestClean(t *testing.T) {
 		},
 		{
 			name:    "relative path",
-			path:    "home/shuki/file.txt",
+			path:    "home/alice/file.txt",
 			wantErr: true,
 			errCode: ErrCodeNotAbsolute,
 		},
 		{
 			name:     "exact docroot",
-			path:     "/home/shuki",
+			path:     "/home/alice",
 			wantErr:  false,
-			wantPath: "/home/shuki",
+			wantPath: "/home/alice",
 		},
 		{
 			name:     "nested in second docroot",
@@ -188,7 +188,7 @@ func TestClean(t *testing.T) {
 
 // TestBoundaryConditions tests the word-boundary check for docroot containment.
 func TestBoundaryConditions(t *testing.T) {
-	scope, _ := NewScope("u123", "shuki", []string{"/home/shuki"})
+	scope, _ := NewScope("u123", "alice", []string{"/home/alice"})
 
 	cases := []struct {
 		name    string
@@ -197,22 +197,22 @@ func TestBoundaryConditions(t *testing.T) {
 	}{
 		{
 			name:    "exact match",
-			path:    "/home/shuki",
+			path:    "/home/alice",
 			wantErr: false,
 		},
 		{
 			name:    "proper subdirectory",
-			path:    "/home/shuki/subdir",
+			path:    "/home/alice/subdir",
 			wantErr: false,
 		},
 		{
 			name:    "almost-match (no slash boundary)",
-			path:    "/home/shukiforensics",
+			path:    "/home/aliceforensics",
 			wantErr: true, // Should not match because no / boundary
 		},
 		{
 			name:    "sibling with same prefix",
-			path:    "/home/shukix/file",
+			path:    "/home/alicex/file",
 			wantErr: true,
 		},
 	}
@@ -256,7 +256,7 @@ func TestResolve(t *testing.T) {
 	escapeLinkPath := filepath.Join(docroot, "escape_link.txt")
 	os.Symlink(external, escapeLinkPath)
 
-	scope, _ := NewScope("u123", "shuki", []string{docroot})
+	scope, _ := NewScope("u123", "alice", []string{docroot})
 
 	cases := []struct {
 		name    string
@@ -321,7 +321,7 @@ func TestOpen(t *testing.T) {
 	symFile := filepath.Join(docroot, "link.txt")
 	os.Symlink(regularFile, symFile)
 
-	scope, _ := NewScope("u123", "shuki", []string{docroot})
+	scope, _ := NewScope("u123", "alice", []string{docroot})
 
 	// Test opening regular file
 	f, err := scope.Open(regularFile, os.O_RDONLY, 0)
@@ -358,7 +358,7 @@ func TestChownToUser(t *testing.T) {
 	symFile := filepath.Join(docroot, "link.txt")
 	os.Symlink(regularFile, symFile)
 
-	scope, _ := NewScope("u123", "shuki", []string{docroot})
+	scope, _ := NewScope("u123", "alice", []string{docroot})
 
 	// Attempt to chown a symlink should fail
 	err := scope.ChownToUser(symFile, os.Getuid(), os.Getgid())
@@ -383,36 +383,36 @@ func TestChownToUser(t *testing.T) {
 
 // TestPathTraversalVectors tests various path traversal attack vectors.
 func TestPathTraversalVectors(t *testing.T) {
-	scope, _ := NewScope("u123", "shuki", []string{"/home/shuki"})
+	scope, _ := NewScope("u123", "alice", []string{"/home/alice"})
 
 	cases := []struct {
-		name  string
-		path  string
-		want  bool // true = should succeed, false = should fail
+		name string
+		path string
+		want bool // true = should succeed, false = should fail
 	}{
 		{
 			name: "simple traversal with ..",
-			path: "/home/shuki/../../etc/passwd",
+			path: "/home/alice/../../etc/passwd",
 			want: false,
 		},
 		{
 			name: "unicode encoding attempt (should reject raw ..)",
-			path: "/home/shuki/\x2e\x2e/etc/passwd",
+			path: "/home/alice/\x2e\x2e/etc/passwd",
 			want: false,
 		},
 		{
 			name: "double encoding %252e%252e",
-			path: "/home/shuki/%252e%252e/etc/passwd",
+			path: "/home/alice/%252e%252e/etc/passwd",
 			want: true, // URL encoding is not decoded by filepath.Clean
 		},
 		{
 			name: "backtracking at boundary",
-			path: "/home/shuki/../../../outside",
+			path: "/home/alice/../../../outside",
 			want: false,
 		},
 		{
 			name: "relative with ..",
-			path: "shuki/../../etc/passwd",
+			path: "alice/../../etc/passwd",
 			want: false, // Should fail on not absolute before traversal check
 		},
 	}
@@ -430,7 +430,7 @@ func TestPathTraversalVectors(t *testing.T) {
 
 // TestControlCharacterRejection tests rejection of various control characters.
 func TestControlCharacterRejection(t *testing.T) {
-	scope, _ := NewScope("u123", "shuki", []string{"/home/shuki"})
+	scope, _ := NewScope("u123", "alice", []string{"/home/alice"})
 
 	cases := []struct {
 		name  string
@@ -439,27 +439,27 @@ func TestControlCharacterRejection(t *testing.T) {
 	}{
 		{
 			name:  "null byte",
-			path:  "/home/shuki/file\x00.txt",
+			path:  "/home/alice/file\x00.txt",
 			valid: false,
 		},
 		{
 			name:  "bell character",
-			path:  "/home/shuki/file\x07.txt",
+			path:  "/home/alice/file\x07.txt",
 			valid: false,
 		},
 		{
 			name:  "form feed",
-			path:  "/home/shuki/file\x0c.txt",
+			path:  "/home/alice/file\x0c.txt",
 			valid: false,
 		},
 		{
 			name:  "escape character",
-			path:  "/home/shuki/file\x1b.txt",
+			path:  "/home/alice/file\x1b.txt",
 			valid: false,
 		},
 		{
 			name:  "normal path",
-			path:  "/home/shuki/file.txt",
+			path:  "/home/alice/file.txt",
 			valid: true,
 		},
 	}
@@ -479,10 +479,10 @@ func TestControlCharacterRejection(t *testing.T) {
 
 // TestLongPathRejection tests rejection of paths exceeding 4096 bytes.
 func TestLongPathRejection(t *testing.T) {
-	scope, _ := NewScope("u123", "shuki", []string{"/home/shuki"})
+	scope, _ := NewScope("u123", "alice", []string{"/home/alice"})
 
 	// Create a path longer than 4096 bytes
-	longPath := "/home/shuki/" + string(make([]byte, 4100))
+	longPath := "/home/alice/" + string(make([]byte, 4100))
 	for i := range longPath[12:] {
 		longPath = longPath[:12+i] + "a" + longPath[12+i+1:]
 	}
@@ -500,7 +500,7 @@ func TestLongPathRejection(t *testing.T) {
 
 // TestMultipleDocroots tests path validation across multiple docroots.
 func TestMultipleDocroots(t *testing.T) {
-	scope, _ := NewScope("u123", "shuki", []string{"/home/shuki", "/var/www", "/opt/app"})
+	scope, _ := NewScope("u123", "alice", []string{"/home/alice", "/var/www", "/opt/app"})
 
 	cases := []struct {
 		name    string
@@ -509,7 +509,7 @@ func TestMultipleDocroots(t *testing.T) {
 	}{
 		{
 			name:    "path in first docroot",
-			path:    "/home/shuki/file.txt",
+			path:    "/home/alice/file.txt",
 			wantErr: false,
 		},
 		{

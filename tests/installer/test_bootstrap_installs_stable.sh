@@ -125,7 +125,7 @@ EOF
   chmod +x "$b/bin/dotnext-installer"
   : >"$b/install.sh"
   printf 'short_sha=%s\nfull_sha=%s\n' "$short" "$1" >"$b/MANIFEST"
-  d="$web/github.com/dotnext-panel/dotnext/releases/download/release-$short"
+  d="$web/github.com/dotnext71/panel/releases/download/release-$short"
   mkdir -p "$d"
   # Owned by root, as a release is: root in the user namespace can't chown to
   # an unmapped uid.
@@ -135,11 +135,11 @@ EOF
 rm -rf "$web"
 make_release "$stable" 111111111
 make_release "$latest" 333333333
-latest_dir="$web/github.com/dotnext-panel/dotnext/releases/latest/download"
+latest_dir="$web/github.com/dotnext71/panel/releases/latest/download"
 mkdir -p "$latest_dir"
-cp "$web/github.com/dotnext-panel/dotnext/releases/download/release-333333333/dotnext-release-333333333.tar.gz" "$latest_dir/dotnext-release.tar.gz"
-cp "$web/github.com/dotnext-panel/dotnext/releases/download/release-333333333/dotnext-release-333333333.tar.gz.sha256" "$latest_dir/dotnext-release.tar.gz.sha256"
-refs_dir="$web/github.com/shukiv"
+cp "$web/github.com/dotnext71/panel/releases/download/release-333333333/dotnext-release-333333333.tar.gz" "$latest_dir/dotnext-release.tar.gz"
+cp "$web/github.com/dotnext71/panel/releases/download/release-333333333/dotnext-release-333333333.tar.gz.sha256" "$latest_dir/dotnext-release.tar.gz.sha256"
+refs_dir="$web/github.com/dotnext71"
 refs_file "$tmp/refs-stable" "$latest refs/heads/main" "$stable refs/tags/stable"
 refs_file "$tmp/refs-none" "$latest refs/heads/main"
 
@@ -194,9 +194,9 @@ expect "an unknown channel is refused" \
   "$(run_bootstrap "$tmp/refs-stable" DOTNEXT_RELEASE_CHANNEL=beta)" refused
 
 # The stable release's tarball built from another commit: refused.
-cp "$web/github.com/dotnext-panel/dotnext/releases/download/release-333333333/dotnext-release-333333333.tar.gz" \
-   "$web/github.com/dotnext-panel/dotnext/releases/download/release-111111111/dotnext-release-111111111.tar.gz"
-(cd "$web/github.com/dotnext-panel/dotnext/releases/download/release-111111111" \
+cp "$web/github.com/dotnext71/panel/releases/download/release-333333333/dotnext-release-333333333.tar.gz" \
+   "$web/github.com/dotnext71/panel/releases/download/release-111111111/dotnext-release-111111111.tar.gz"
+(cd "$web/github.com/dotnext71/panel/releases/download/release-111111111" \
   && sha256sum dotnext-release-111111111.tar.gz >dotnext-release-111111111.tar.gz.sha256)
 expect "a stable tarball whose MANIFEST names another commit is refused" \
   "$(run_bootstrap "$tmp/refs-stable")" refused

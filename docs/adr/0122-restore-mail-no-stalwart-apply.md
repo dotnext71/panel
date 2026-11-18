@@ -3,7 +3,7 @@
 **Date**: 2026-06-14
 **Status**: accepted
 **Supersedes**: ADR-0121
-**Deciders**: shukiv
+**Deciders**: dotNext maintainers
 
 ## Context
 

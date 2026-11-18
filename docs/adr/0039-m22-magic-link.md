@@ -4,7 +4,7 @@
 
 **Date**: 2026-04-21
 
-**Deciders**: shuki
+**Deciders**: dotNext maintainers
 
 **Related**:
 - [ADR-0036: OIDC for WordPress Admin Access (M16)](./0036-m16-hydra-identity.md) — superseded by this ADR

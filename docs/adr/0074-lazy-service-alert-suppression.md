@@ -2,7 +2,7 @@
 
 **Date**: 2026-04-26
 **Status**: accepted
-**Deciders**: shuki (operator) + assistant
+**Deciders**: dotNext maintainers
 **Supersedes part of**: ADR-0065 §5 (alert synthesis rule for service state)
 
 ## Context

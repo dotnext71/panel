@@ -10,7 +10,7 @@
 
 **Date:** 2026-04-17
 **Status:** Accepted (partially superseded by ADR-0022)
-**Deciders:** Shuki
+**Deciders:** dotNext maintainers
 
 ## Context
 

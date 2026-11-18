@@ -14,7 +14,7 @@ import (
 
 // wordpressCloneReq is the input shape for wordpress.clone.
 type wordpressCloneReq struct {
-	OSUser          string `json:"os_user"`          // domain owner (e.g. "shuki")
+	OSUser          string `json:"os_user"`          // domain owner (e.g. "alice")
 	SrcDocroot      string `json:"src_docroot"`      // source docroot
 	DstDocroot      string `json:"dst_docroot"`      // destination docroot
 	SrcDBName       string `json:"src_db_name"`      // source database name

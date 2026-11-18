@@ -2,7 +2,7 @@
 
 **Date**: 2026-04-26
 **Status**: accepted
-**Deciders**: shukiv
+**Deciders**: dotNext maintainers
 **Supersedes**: amends ADR-0066 (panel cert SAN)
 
 ## Context

@@ -8,7 +8,7 @@ import (
 )
 
 func TestValidateCommand(t *testing.T) {
-	ownedDocroots := []string{"/home/shuki/example.com/public_html"}
+	ownedDocroots := []string{"/home/alice/example.com/public_html"}
 
 	tests := []struct {
 		name     string
@@ -20,35 +20,35 @@ func TestValidateCommand(t *testing.T) {
 		// Happy paths
 		{
 			name:     "wp_cron_with_path_flag",
-			raw:      "wp cron event run --path=/home/shuki/example.com/public_html",
+			raw:      "wp cron event run --path=/home/alice/example.com/public_html",
 			docroots: ownedDocroots,
 			wantErr:  "",
 			desc:     "Standard wp cron with --path= form",
 		},
 		{
 			name:     "wp_cron_with_path_two_token",
-			raw:      "wp cron event run --path /home/shuki/example.com/public_html",
+			raw:      "wp cron event run --path /home/alice/example.com/public_html",
 			docroots: ownedDocroots,
 			wantErr:  "",
 			desc:     "wp cron with separate --path arg",
 		},
 		{
 			name:     "wp_cron_with_extra_args",
-			raw:      "wp cron event run --path=/home/shuki/example.com/public_html --due-now",
+			raw:      "wp cron event run --path=/home/alice/example.com/public_html --due-now",
 			docroots: ownedDocroots,
 			wantErr:  "",
 			desc:     "wp with additional arguments",
 		},
 		{
 			name:     "php_absolute_path",
-			raw:      "php /home/shuki/example.com/public_html/tools/cleanup.php",
+			raw:      "php /home/alice/example.com/public_html/tools/cleanup.php",
 			docroots: ownedDocroots,
 			wantErr:  "",
 			desc:     "PHP script with absolute path",
 		},
 		{
 			name:     "php_with_args",
-			raw:      "php /home/shuki/example.com/public_html/tools/cleanup.php --verbose --days=30",
+			raw:      "php /home/alice/example.com/public_html/tools/cleanup.php --verbose --days=30",
 			docroots: ownedDocroots,
 			wantErr:  "",
 			desc:     "PHP script with additional arguments",
@@ -73,7 +73,7 @@ func TestValidateCommand(t *testing.T) {
 		// Rejection: too long
 		{
 			name:     "exceeds_1024",
-			raw:      "wp cron event run --path=/home/shuki/example.com/public_html " + string(make([]byte, 1024)),
+			raw:      "wp cron event run --path=/home/alice/example.com/public_html " + string(make([]byte, 1024)),
 			docroots: ownedDocroots,
 			wantErr:  ErrCodeTooLong,
 			desc:     "Command exceeds 1024 bytes",
@@ -97,14 +97,14 @@ func TestValidateCommand(t *testing.T) {
 		},
 		{
 			name:     "sudo_binary",
-			raw:      "sudo wp cron event run --path=/home/shuki/example.com/public_html",
+			raw:      "sudo wp cron event run --path=/home/alice/example.com/public_html",
 			docroots: ownedDocroots,
 			wantErr:  ErrCodeBinaryNotAllowed,
 			desc:     "Rejected binary: sudo",
 		},
 		{
 			name:     "full_path_wp",
-			raw:      "/usr/bin/wp cron event run --path=/home/shuki/example.com/public_html",
+			raw:      "/usr/bin/wp cron event run --path=/home/alice/example.com/public_html",
 			docroots: ownedDocroots,
 			wantErr:  ErrCodeBinaryNotAllowed,
 			desc:     "Full path to wp binary (not allowed)",
@@ -176,21 +176,21 @@ func TestValidateCommand(t *testing.T) {
 		},
 		{
 			name:     "brace_expansion",
-			raw:      "wp cron event run --path=/home/{shuki,other}/example.com",
+			raw:      "wp cron event run --path=/home/{alice,other}/example.com",
 			docroots: ownedDocroots,
 			wantErr:  ErrCodeMetacharReject,
 			desc:     "Brace expansion",
 		},
 		{
 			name:     "glob_star_unquoted",
-			raw:      "wp cron event run --path=/home/shuki/*.php",
+			raw:      "wp cron event run --path=/home/alice/*.php",
 			docroots: ownedDocroots,
 			wantErr:  ErrCodeMetacharReject,
 			desc:     "Unquoted glob star",
 		},
 		{
 			name:     "glob_question_unquoted",
-			raw:      "wp cron event run --path=/home/shuki/?.php",
+			raw:      "wp cron event run --path=/home/alice/?.php",
 			docroots: ownedDocroots,
 			wantErr:  ErrCodeMetacharReject,
 			desc:     "Unquoted glob question mark",
@@ -199,14 +199,14 @@ func TestValidateCommand(t *testing.T) {
 		// Rejection: path traversal
 		{
 			name:     "path_traversal_dotdot",
-			raw:      "wp cron event run --path=/home/shuki/../other/example.com/public_html",
+			raw:      "wp cron event run --path=/home/alice/../other/example.com/public_html",
 			docroots: ownedDocroots,
 			wantErr:  ErrCodeBadPathArg,
 			desc:     "Path traversal via ..",
 		},
 		{
 			name:     "php_path_traversal",
-			raw:      "php /home/shuki/../etc/passwd.php",
+			raw:      "php /home/alice/../etc/passwd.php",
 			docroots: ownedDocroots,
 			wantErr:  ErrCodeBadPathArg,
 			desc:     "PHP path traversal",
@@ -222,7 +222,7 @@ func TestValidateCommand(t *testing.T) {
 		},
 		{
 			name:     "prefix_attack",
-			raw:      "wp cron event run --path=/home/shukimalicious/example.com/public_html",
+			raw:      "wp cron event run --path=/home/alicesmith/example.com/public_html",
 			docroots: ownedDocroots,
 			wantErr:  ErrCodeBadPathArg,
 			desc:     "Prefix match attack (missing / boundary)",
@@ -252,7 +252,7 @@ func TestValidateCommand(t *testing.T) {
 		},
 		{
 			name:     "php_not_ending_php",
-			raw:      "php /home/shuki/example.com/public_html/tools/cleanup.txt",
+			raw:      "php /home/alice/example.com/public_html/tools/cleanup.txt",
 			docroots: ownedDocroots,
 			wantErr:  ErrCodeBadPathArg,
 			desc:     "php path not ending in .php",
@@ -261,7 +261,7 @@ func TestValidateCommand(t *testing.T) {
 		// Versioned PHP interpreter (GH #299): same arg rules as bare php.
 		{
 			name:     "php_versioned_script",
-			raw:      "php8.5 /home/shuki/example.com/public_html/cron.php",
+			raw:      "php8.5 /home/alice/example.com/public_html/cron.php",
 			docroots: ownedDocroots,
 			wantErr:  "",
 			desc:     "Versioned php8.5 with an absolute .php script is allowed",
@@ -282,14 +282,14 @@ func TestValidateCommand(t *testing.T) {
 		},
 		{
 			name:     "php_fake_version_rejected",
-			raw:      "php8 /home/shuki/example.com/public_html/cron.php",
+			raw:      "php8 /home/alice/example.com/public_html/cron.php",
 			docroots: ownedDocroots,
 			wantErr:  ErrCodeBinaryNotAllowed,
 			desc:     "php<major> without a minor is not a versioned interpreter",
 		},
 		{
 			name:     "php_bogus_suffix_rejected",
-			raw:      "phpmyadmin /home/shuki/example.com/public_html/cron.php",
+			raw:      "phpmyadmin /home/alice/example.com/public_html/cron.php",
 			docroots: ownedDocroots,
 			wantErr:  ErrCodeBinaryNotAllowed,
 			desc:     "A non-php binary is still rejected",
@@ -299,14 +299,14 @@ func TestValidateCommand(t *testing.T) {
 		// system wp-cli, and the rest of the line must pass the wp rules.
 		{
 			name:     "php_versioned_wp_cli",
-			raw:      "php7.4 /usr/local/bin/wp --skip-plugins --skip-themes --path=/home/shuki/example.com/public_html cron event run --due-now",
+			raw:      "php7.4 /usr/local/bin/wp --skip-plugins --skip-themes --path=/home/alice/example.com/public_html cron event run --due-now",
 			docroots: ownedDocroots,
 			wantErr:  "",
 			desc:     "php7.4 running the system wp-cli with an owned --path is allowed",
 		},
 		{
 			name:     "php_bare_wp_cli_two_token_path",
-			raw:      "php /usr/local/bin/wp cron event run --path /home/shuki/example.com/public_html",
+			raw:      "php /usr/local/bin/wp cron event run --path /home/alice/example.com/public_html",
 			docroots: ownedDocroots,
 			wantErr:  "",
 			desc:     "bare php running wp-cli with the two-token --path form is allowed",
@@ -327,28 +327,28 @@ func TestValidateCommand(t *testing.T) {
 		},
 		{
 			name:     "php_versioned_wp_path_before_script_ignored",
-			raw:      "php7.4 --path=/home/shuki/example.com/public_html /usr/local/bin/wp cron event run",
+			raw:      "php7.4 --path=/home/alice/example.com/public_html /usr/local/bin/wp cron event run",
 			docroots: ownedDocroots,
 			wantErr:  ErrCodeBadPathArg,
 			desc:     "a --path given to php, not to wp-cli, does not count",
 		},
 		{
 			name:     "php_versioned_other_wp_binary_rejected",
-			raw:      "php7.4 /home/shuki/example.com/public_html/wp cron event run --path=/home/shuki/example.com/public_html",
+			raw:      "php7.4 /home/alice/example.com/public_html/wp cron event run --path=/home/alice/example.com/public_html",
 			docroots: ownedDocroots,
 			wantErr:  ErrCodeBadPathArg,
 			desc:     "only the system wp-cli path counts; any other non-.php file is still rejected",
 		},
 		{
 			name:     "php_versioned_bare_wp_rejected",
-			raw:      "php7.4 wp cron event run --path=/home/shuki/example.com/public_html",
+			raw:      "php7.4 wp cron event run --path=/home/alice/example.com/public_html",
 			docroots: ownedDocroots,
 			wantErr:  ErrCodeBadPathArg,
 			desc:     "php7.4 wp (not the absolute wp-cli path) is rejected",
 		},
 		{
 			name:     "php_versioned_wp_cli_inline_code_rejected",
-			raw:      "php7.4 -r 'echo 1;' /usr/local/bin/wp --path=/home/shuki/example.com/public_html",
+			raw:      "php7.4 -r 'echo 1;' /usr/local/bin/wp --path=/home/alice/example.com/public_html",
 			docroots: ownedDocroots,
 			wantErr:  ErrCodeBinaryNotAllowed,
 			desc:     "inline-code flags stay rejected in the wp-cli form",
@@ -661,7 +661,7 @@ func TestHasUnquotedMetachar(t *testing.T) {
 }
 
 func TestValidatePathArg(t *testing.T) {
-	ownedDocroots := []string{"/home/shuki/example.com/public_html"}
+	ownedDocroots := []string{"/home/alice/example.com/public_html"}
 
 	tests := []struct {
 		name     string
@@ -672,21 +672,21 @@ func TestValidatePathArg(t *testing.T) {
 	}{
 		{
 			name:     "exact_match",
-			path:     "/home/shuki/example.com/public_html",
+			path:     "/home/alice/example.com/public_html",
 			docroots: ownedDocroots,
 			wantErr:  "",
 			desc:     "Path equals docroot exactly",
 		},
 		{
 			name:     "inside_docroot",
-			path:     "/home/shuki/example.com/public_html/wp-admin",
+			path:     "/home/alice/example.com/public_html/wp-admin",
 			docroots: ownedDocroots,
 			wantErr:  "",
 			desc:     "Path inside docroot",
 		},
 		{
 			name:     "has_dotdot",
-			path:     "/home/shuki/../other/example.com/public_html",
+			path:     "/home/alice/../other/example.com/public_html",
 			docroots: ownedDocroots,
 			wantErr:  ErrCodeBadPathArg,
 			desc:     "Path contains .. (caught before EvalSymlinks)",
@@ -700,7 +700,7 @@ func TestValidatePathArg(t *testing.T) {
 		},
 		{
 			name:     "prefix_attack",
-			path:     "/home/shukimalicious/example.com/public_html",
+			path:     "/home/alicesmith/example.com/public_html",
 			docroots: ownedDocroots,
 			wantErr:  ErrCodeBadPathArg,
 			desc:     "Prefix attack (missing / boundary)",
@@ -725,8 +725,8 @@ func TestValidatePathArg(t *testing.T) {
 
 // Benchmark for ValidateCommand
 func BenchmarkValidateCommand(b *testing.B) {
-	ownedDocroots := []string{"/home/shuki/example.com/public_html"}
-	cmd := "wp cron event run --path=/home/shuki/example.com/public_html --due-now"
+	ownedDocroots := []string{"/home/alice/example.com/public_html"}
+	cmd := "wp cron event run --path=/home/alice/example.com/public_html --due-now"
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -747,16 +747,16 @@ func BenchmarkValidateSchedule(b *testing.B) {
 // GH #1838: a php line that names some other "wp" says how to run wp-cli on a
 // chosen PHP version, instead of only failing the .php rule.
 func TestValidateCommand_WPCLIHint(t *testing.T) {
-	docroots := []string{"/home/shuki/example.com/public_html"}
+	docroots := []string{"/home/alice/example.com/public_html"}
 	for _, raw := range []string{
-		"php7.4 wp cron event run --path=/home/shuki/example.com/public_html",
-		"php7.4 /usr/bin/wp cron event run --path=/home/shuki/example.com/public_html",
+		"php7.4 wp cron event run --path=/home/alice/example.com/public_html",
+		"php7.4 /usr/bin/wp cron event run --path=/home/alice/example.com/public_html",
 	} {
 		_, err := ValidateCommand(raw, docroots, "")
 		require.Error(t, err, raw)
 		assert.Contains(t, err.Error(), "php<X.Y> "+WPCLIPath, raw)
 	}
-	_, err := ValidateCommand("php7.4 /home/shuki/example.com/public_html/run.sh", docroots, "")
+	_, err := ValidateCommand("php7.4 /home/alice/example.com/public_html/run.sh", docroots, "")
 	require.Error(t, err)
 	assert.NotContains(t, err.Error(), WPCLIPath, "no wp-cli hint for an unrelated file")
 }

@@ -9,11 +9,11 @@ import (
 )
 
 // Real lines captured from Stalwart 0.16.6 (mx) Log tracer, ansi=false.
-const sampleQueued = `2026-06-19T22:11:43Z INFO Queued message for delivery (queue.message-queued) listenerId = "smtp", localPort = 25, remoteIp = 127.0.0.1, remotePort = 47258, queueId = 313790779361329152, from = "probe7@dotnext.site", to = ["shuki@dotnext.site"], size = 1662, nextRetry = 2026-06-19T22:11:43Z, nextDsn = 2026-06-20T22:11:43Z, expires = 2026-06-22T22:11:43Z`
+const sampleQueued = `2026-06-19T22:11:43Z INFO Queued message for delivery (queue.message-queued) listenerId = "smtp", localPort = 25, remoteIp = 127.0.0.1, remotePort = 47258, queueId = 313790779361329152, from = "probe7@dotnext.site", to = ["alice@dotnext.site"], size = 1662, nextRetry = 2026-06-19T22:11:43Z, nextDsn = 2026-06-20T22:11:43Z, expires = 2026-06-22T22:11:43Z`
 
 const sampleMultiRcpt = `2026-06-19T23:00:00Z INFO Queued message for delivery (queue.message-queued) queueId = 9, from = "bob@otherdom.test", to = ["a@dotnext.site", "b@dotnext.site"], size = 4096, nextRetry = 2026-06-19T23:00:00Z`
 
-const sampleCompleted = `2026-06-19T22:11:43Z INFO Delivery completed (delivery.completed) queueId = 313790779361329152, queueName = "local", from = "probe7@dotnext.site", to = ["shuki@dotnext.site"], size = 1662, total = 1, elapsed = 0ms`
+const sampleCompleted = `2026-06-19T22:11:43Z INFO Delivery completed (delivery.completed) queueId = 313790779361329152, queueName = "local", from = "probe7@dotnext.site", to = ["alice@dotnext.site"], size = 1662, total = 1, elapsed = 0ms`
 
 // sampleAuthQueued is a tenant SEND — an authenticated submission, which fires
 // queue.authenticated-message-queued (verified against Stalwart 0.16.15), not
@@ -31,13 +31,13 @@ func TestParseMailLogLine_Queued(t *testing.T) {
 	if pl.entry.From != "probe7@dotnext.site" {
 		t.Errorf("from = %q", pl.entry.From)
 	}
-	if pl.entry.To != "shuki@dotnext.site" {
+	if pl.entry.To != "alice@dotnext.site" {
 		t.Errorf("to = %q", pl.entry.To)
 	}
 	if pl.entry.Size != 1662 {
 		t.Errorf("size = %d", pl.entry.Size)
 	}
-	if len(pl.recipients) != 1 || pl.recipients[0] != "shuki@dotnext.site" {
+	if len(pl.recipients) != 1 || pl.recipients[0] != "alice@dotnext.site" {
 		t.Errorf("recipients = %v", pl.recipients)
 	}
 }
@@ -193,7 +193,7 @@ func TestMailLogsHandler_FiltersAndPaginates(t *testing.T) {
 	}
 
 	// Recipient substring filter.
-	resp = callMailLogs(t, map[string]any{"recipient_prefix": "shuki", "limit": 50})
+	resp = callMailLogs(t, map[string]any{"recipient_prefix": "alice", "limit": 50})
 	if resp.Total != 1 {
 		t.Errorf("recipient filter total = %d, want 1", resp.Total)
 	}

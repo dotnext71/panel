@@ -2,7 +2,7 @@
 
 **Date**: 2026-04-19
 **Status**: accepted
-**Deciders**: shuki + Claude
+**Deciders**: dotNext maintainers
 **Related**: ADR-0025 (per-user systemd slices), ADR-0023 (M9 PHP-FPM pool manager)
 
 ## Context

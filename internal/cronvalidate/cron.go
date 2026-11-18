@@ -666,7 +666,7 @@ func validatePathArg(pathStr string, ownedDocroots []string) error {
 		docroot = filepath.Clean(docroot)
 
 		// Check if realPath is docroot itself or a descendant
-		// We must ensure word-boundary: /home/shuki/x should NOT match /home/shukimalicious/x
+		// We must ensure a word boundary: /home/alice/x should NOT match /home/alicebob/x
 		if realPath == docroot {
 			found = true
 			break

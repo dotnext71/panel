@@ -10,15 +10,15 @@ import (
 // if input contains any unquoted metacharacters from forbiddenMetachars set.
 func FuzzValidateCommand(f *testing.F) {
 	// Seed with representative happy paths
-	f.Add("wp cron event run --path=/home/shuki/a/public_html")
-	f.Add("wp cron event run --path /home/shuki/a/public_html")
-	f.Add("php /home/shuki/a/public_html/cleanup.php")
-	f.Add("php /home/shuki/a/public_html/cleanup.php --verbose")
-	f.Add("wp cron test-event --path=/home/shuki/example.com/public_html --debug")
+	f.Add("wp cron event run --path=/home/alice/a/public_html")
+	f.Add("wp cron event run --path /home/alice/a/public_html")
+	f.Add("php /home/alice/a/public_html/cleanup.php")
+	f.Add("php /home/alice/a/public_html/cleanup.php --verbose")
+	f.Add("wp cron test-event --path=/home/alice/example.com/public_html --debug")
 
 	ownedDocroots := []string{
-		"/home/shuki/a/public_html",
-		"/home/shuki/example.com/public_html",
+		"/home/alice/a/public_html",
+		"/home/alice/example.com/public_html",
 		"/home/user/site/html",
 	}
 

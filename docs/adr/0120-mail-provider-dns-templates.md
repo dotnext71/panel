@@ -2,7 +2,7 @@
 
 **Status:** Proposed
 **Date:** 2026-06-13
-**Deciders:** Shuki (operator/architect)
+**Deciders:** dotNext maintainers
 **Related:** GH#181, ADR-0070 (auto-SAN skip), M6 email (000054), GH#132
 (mail-cert autodiscover SAN 404), GH#134 (full mail record set)
 

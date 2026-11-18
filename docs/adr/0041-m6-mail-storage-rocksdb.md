@@ -2,7 +2,7 @@
 
 **Date**: 2026-04-21
 **Status**: accepted (amended 2026-04-21 by ADR-0045 — on-disk config moved from TOML to `config.json` + `stalwart-cli apply` plan)
-**Deciders**: shuki + Claude
+**Deciders**: dotNext maintainers
 **Related**: ADR-0002 (DB as source of truth), ADR-0008 (sibling repos out of scope — amended here for Bulwark), ADR-0042, ADR-0043, ADR-0044, ADR-0045
 
 ## Context

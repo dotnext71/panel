@@ -2,7 +2,7 @@
 
 **Date**: 2026-05-16
 **Status**: accepted
-**Deciders**: shuki (requested + chose Option A), Claude (design)
+**Deciders**: dotNext maintainers
 **Related**: ADR-0050 (unix-socket model), ADR-0071 (MariaDB loopback-only), M7 (databases), M46
 
 ## Context

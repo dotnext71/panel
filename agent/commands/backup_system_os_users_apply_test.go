@@ -8,12 +8,12 @@ import (
 // GH #331: the os_users merge parsers are the safety boundary — a malformed
 // line must warn, never crash or half-apply.
 func TestParsePasswdLine(t *testing.T) {
-	e, err := parsePasswdLine("shukivaknin:x:1000:1000:Shuki:/home/shukivaknin:/bin/bash")
+	e, err := parsePasswdLine("alice:x:1000:1000:Alice Example:/home/alice:/bin/bash")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if e.Name != "shukivaknin" || e.UID != 1000 || e.GID != 1000 ||
-		e.Home != "/home/shukivaknin" || e.Shell != "/bin/bash" {
+	if e.Name != "alice" || e.UID != 1000 || e.GID != 1000 ||
+		e.Home != "/home/alice" || e.Shell != "/bin/bash" {
 		t.Errorf("parsed wrong: %+v", e)
 	}
 	for _, bad := range []string{"", "a:b", "u:x:notnum:1::/h:/s", "u:x:1:notnum::/h:/s"} {
@@ -24,14 +24,14 @@ func TestParsePasswdLine(t *testing.T) {
 }
 
 func TestParseGroupLine(t *testing.T) {
-	name, gid, members, err := parseGroupLine("dotnext-sftp:x:986:shukivaknin, demolab_ftp")
+	name, gid, members, err := parseGroupLine("dotnext-sftp:x:986:alice, demolab_ftp")
 	if err != nil {
 		t.Fatal(err)
 	}
 	if name != "dotnext-sftp" || gid != 986 {
 		t.Errorf("got %s/%d", name, gid)
 	}
-	if strings.Join(members, "|") != "shukivaknin|demolab_ftp" {
+	if strings.Join(members, "|") != "alice|demolab_ftp" {
 		t.Errorf("members: %v", members)
 	}
 	if _, _, m, err := parseGroupLine("g:x:1:"); err != nil || len(m) != 0 {

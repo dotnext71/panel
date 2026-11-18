@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-05
 **Status:** Proposed (queued behind blueprint review)
-**Owner:** shuki
+**Owner:** dotNext maintainers
 **Companion plan:** [`plans/m48-docker-app-marketplace.md`](../../plans/m48-docker-app-marketplace.md)
 
 ---

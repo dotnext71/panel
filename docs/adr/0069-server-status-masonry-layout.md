@@ -2,7 +2,7 @@
 
 **Date**: 2026-04-26
 **Status**: accepted
-**Deciders**: shuki (operator) + assistant
+**Deciders**: dotNext maintainers
 **Related**: ADR-0065 (server-status backend), ADR-0046 (M23 responsive)
 
 ## Context

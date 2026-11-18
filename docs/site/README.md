@@ -54,7 +54,7 @@ The site (dotnext-panel.com) stores doc HTML inline in `src/i18n/ui.ts` (7 langu
 
 ### Option A — extend the existing sync pipeline
 
-1. Drop these files into `/home/shuki/projects/dotnext/docs/` (or repoint sync-docs.mjs at this directory).
+1. Drop these files into `<repo-root>/docs/` (or repoint sync-docs.mjs at this directory).
 2. Extend `MAPPINGS` in `~/projects/dotnext-panel.com/scripts/sync-docs.mjs` to cover the new pages.
 3. Run `node scripts/sync-docs.mjs` — updates the `en` `docsHtml.*` keys.
 4. Translate the new content into other locales as needed.
@@ -73,7 +73,7 @@ pandoc -f markdown -t html5 --no-highlight --wrap=none site/<page>.md
 ## Conventions
 
 - Each page is self-contained: it doesn't assume the reader has read another doc, except where it explicitly links one.
-- Domain language matches `/home/shuki/projects/dotnext2/CONTEXT.md`: **Agent**, **Reconciler**, **Privileged DB Admin Action**, **Cron Job**, **Cron Job Intake**, **SSO Token**, **Shadow Account**, **SSO Token Resolution**.
+- Domain language matches `<repo-root>/CONTEXT.md`: **Agent**, **Reconciler**, **Privileged DB Admin Action**, **Cron Job**, **Cron Job Intake**, **SSO Token**, **Shadow Account**, **SSO Token Resolution**.
 - All "this is intentionally not here" notes for old-panel features live in `removed-features.md` so user docs stay focused on what's shipped.
 - No internal codes in the published pages: no milestones (M43), JAB- tickets, ADR numbers, or GitHub issue and PR numbers. Say what the feature does and where it is instead. dotnext-panel.com removes them when it merges a page, so a code added here comes back on the website with the next merge. `TestDocsSiteHasNoInternalCodes` (`internal/panelcmd`) fails on one. Product names such as M365 are fine.
 - File paths, systemd unit names, and CLI verbs are quoted exact and verified against the current code.

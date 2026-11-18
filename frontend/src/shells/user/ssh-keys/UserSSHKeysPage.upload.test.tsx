@@ -52,15 +52,15 @@ function upload(text: string, name: string) {
 describe("Add SSH key: upload a key file (GH #2425)", () => {
   it("fills the key and the name from a .pub file", async () => {
     await openAddDrawer();
-    upload(`${KEY} shuki@laptop\n`, "id_ed25519.pub");
+    upload(`${KEY} alice@laptop\n`, "id_ed25519.pub");
 
     const keyBox = screen.getByPlaceholderText("ssh-ed25519 AAAA... user@host") as HTMLTextAreaElement;
-    await waitFor(() => expect(keyBox.value).toBe(`${KEY} shuki@laptop`));
-    expect((screen.getByPlaceholderText("e.g., My Laptop") as HTMLInputElement).value).toBe("shuki@laptop");
+    await waitFor(() => expect(keyBox.value).toBe(`${KEY} alice@laptop`));
+    expect((screen.getByPlaceholderText("e.g., My Laptop") as HTMLInputElement).value).toBe("alice@laptop");
 
     fireEvent.click(screen.getAllByRole("button", { name: "Add Key" }).at(-1)!);
     await waitFor(() =>
-      expect(mocked.createSSHKey).toHaveBeenCalledWith({ name: "shuki@laptop", public_key: `${KEY} shuki@laptop` }),
+      expect(mocked.createSSHKey).toHaveBeenCalledWith({ name: "alice@laptop", public_key: `${KEY} alice@laptop` }),
     );
   });
 

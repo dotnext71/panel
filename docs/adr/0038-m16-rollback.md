@@ -2,7 +2,7 @@
 
 **Date**: 2026-04-21
 **Status**: accepted
-**Deciders**: shuki + Claude
+**Deciders**: dotNext maintainers
 **Related**: ADR-0036 (M16 — now superseded), ADR-0034 (M20 Kratos identity), ADR-0039 (M22 magic-link design), [plans/m16-rollback-and-m22-magic-link.md](../../plans/m16-rollback-and-m22-magic-link.md)
 
 ## Context

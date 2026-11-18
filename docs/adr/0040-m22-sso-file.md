@@ -4,7 +4,7 @@
 
 **Date**: 2026-04-21
 
-**Deciders**: shuki
+**Deciders**: dotNext maintainers
 
 **Related**:
 - [ADR-0036: M16 Hydra Identity](./0036-m16-hydra-identity.md) — first attempt at panel→WP admin SSO, rolled back
@@ -32,7 +32,7 @@ We replace the M22 magic-link mechanism (kept the public mint endpoint and the w
 
 1. **Capability mechanism.** The capability token is a 256-bit random nonce (43 base64url characters from `crypto/rand`) embedded in the filename `dotnext-sso-<nonce>.php`. The filename **is** the access token. There is no HMAC, no server-side signing key, no database row containing the token, no key material to rotate. Brute force is computationally infeasible (`2^256` ≈ 10^77). The wire contract `{url, expires_in}` returned by `POST /api/v1/applications/:id/magic-link` is preserved — only the `url` shape changes.
 
-2. **File location and permissions.** The file lives in the WordPress webroot at `<install_path>/dotnext-sso-<nonce>.php` where `<install_path>` is the install row's web-served directory (e.g. `/home/shukivaknin/domains/123123.com/public_html/`). nginx serves the file via the existing PHP location block — no special routing required. File mode is `0440 owner:www-data` so PHP-FPM (group `www-data`) can read but the install owner cannot accidentally edit. Atomic write: write to `.<filename>.tmp` with `O_CREAT|O_EXCL|O_WRONLY`, fsync, rename, chown, chmod. **If chown fails, the file is removed before returning** (no partial-state file readable by the wrong user).
+2. **File location and permissions.** The file lives in the WordPress webroot at `<install_path>/dotnext-sso-<nonce>.php` where `<install_path>` is the install row's web-served directory (e.g. `/home/alice/domains/123123.com/public_html/`). nginx serves the file via the existing PHP location block — no special routing required. File mode is `0440 owner:www-data` so PHP-FPM (group `www-data`) can read but the install owner cannot accidentally edit. Atomic write: write to `.<filename>.tmp` with `O_CREAT|O_EXCL|O_WRONLY`, fsync, rename, chown, chmod. **If chown fails, the file is removed before returning** (no partial-state file readable by the wrong user).
 
 3. **PHP template (file content).** The file is self-contained — only `wp-load.php` is included. The execution sequence (top to bottom):
    1. **Speculative-fetch / non-GET guard**: short-circuit on **any non-empty `Sec-Purpose`** (covers `prefetch`, `prerender`, `prefetch;prerender`, and any future speculation types per the Fetch Metadata spec), `Purpose: prefetch`, `X-Moz: prefetch`, `X-Purpose: preview`, or any non-`GET` method → return 204 without entering single-use state. **2026-04-21 incident**: the initial implementation used `Sec-Purpose === 'prefetch'` which missed Chrome's `Sec-Purpose: prefetch;prerender` — a prerender silently consumed the SSO file before the user's real click arrived, which then 404'd. Changed to `$secPurpose !== ''` (forward-compatible with future speculation values).

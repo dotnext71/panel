@@ -2,7 +2,7 @@
 
 **Date**: 2026-06-15
 **Status**: Accepted
-**Deciders**: shuki + Claude
+**Deciders**: dotNext maintainers
 **Related**: ADR-0015 (legacy JWT `impersonated_by`, removed), ADR-0034 (M20 Kratos is the only auth source), ADR-0106 (M49 unified audit). Fixes GH #183.
 
 ## Context

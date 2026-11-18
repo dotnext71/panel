@@ -62,7 +62,7 @@ func fakeAgentResponse(fileName string, expiresAt int64) json.RawMessage {
 
 func seedReadyWPInstall(t *testing.T, wpRepo *mockWordPressInstallRepo, domainRepo *mockDomainRepo, userRepo *mockUserRepo, ownerUserID, installID, domainID, domainName, docRoot, subdirectory string) {
 	t.Helper()
-	uname := "shuki"
+	uname := "alice"
 	userRepo.users = map[string]*models.User{
 		ownerUserID: {ID: ownerUserID, Username: &uname},
 	}
@@ -88,7 +88,7 @@ func TestMagicLinkMint_HappyPath_RootInstall(t *testing.T) {
 	const domainID = "01ARZ3NDEKTSV4RRFFQ69G5DOM"
 
 	r, wpRepo, dRepo, uRepo, agent := magicLinkRouter(t, owner, false)
-	seedReadyWPInstall(t, wpRepo, dRepo, uRepo, owner, installID, domainID, "example.com", "/home/shuki/domains/example.com/public_html", "")
+	seedReadyWPInstall(t, wpRepo, dRepo, uRepo, owner, installID, domainID, "example.com", "/home/alice/domains/example.com/public_html", "")
 
 	const fakeFile = "dotnext-sso-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.php"
 	agent.callFn = func(ctx context.Context, command string, params any) (json.RawMessage, error) {
@@ -96,11 +96,11 @@ func TestMagicLinkMint_HappyPath_RootInstall(t *testing.T) {
 			t.Errorf("agent.Call command = %q, want wordpress.create_sso_file", command)
 		}
 		p := params.(map[string]any)
-		if p["install_path"] != "/home/shuki/domains/example.com/public_html" {
-			t.Errorf("install_path = %v, want /home/shuki/domains/example.com/public_html", p["install_path"])
+		if p["install_path"] != "/home/alice/domains/example.com/public_html" {
+			t.Errorf("install_path = %v, want /home/alice/domains/example.com/public_html", p["install_path"])
 		}
-		if p["os_user"] != "shuki" {
-			t.Errorf("os_user = %v, want shuki", p["os_user"])
+		if p["os_user"] != "alice" {
+			t.Errorf("os_user = %v, want alice", p["os_user"])
 		}
 		if p["install_id"] != installID {
 			t.Errorf("install_id = %v, want %s", p["install_id"], installID)
@@ -140,13 +140,13 @@ func TestMagicLinkMint_HappyPath_SubdirectoryInstall(t *testing.T) {
 	const domainID = "01ARZ3NDEKTSV4RRFFQ69G5SU2"
 
 	r, wpRepo, dRepo, uRepo, agent := magicLinkRouter(t, owner, false)
-	seedReadyWPInstall(t, wpRepo, dRepo, uRepo, owner, installID, domainID, "example.com", "/home/shuki/domains/example.com/public_html", "blog")
+	seedReadyWPInstall(t, wpRepo, dRepo, uRepo, owner, installID, domainID, "example.com", "/home/alice/domains/example.com/public_html", "blog")
 
 	const fakeFile = "dotnext-sso-BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB.php"
 	agent.callFn = func(ctx context.Context, command string, params any) (json.RawMessage, error) {
 		p := params.(map[string]any)
-		if p["install_path"] != "/home/shuki/domains/example.com/public_html/blog" {
-			t.Errorf("install_path = %v, want /home/shuki/domains/example.com/public_html/blog", p["install_path"])
+		if p["install_path"] != "/home/alice/domains/example.com/public_html/blog" {
+			t.Errorf("install_path = %v, want /home/alice/domains/example.com/public_html/blog", p["install_path"])
 		}
 		return fakeAgentResponse(fakeFile, 1700000000), nil
 	}
@@ -185,7 +185,7 @@ func TestMagicLinkMint_CrossUserReturns404(t *testing.T) {
 	const domainID = "01ARZ3NDEKTSV4RRFFQ69G5XU2"
 
 	r, wpRepo, dRepo, uRepo, _ := magicLinkRouter(t, intruder, false)
-	seedReadyWPInstall(t, wpRepo, dRepo, uRepo, owner, installID, domainID, "example.com", "/home/shuki/domains/example.com/public_html", "")
+	seedReadyWPInstall(t, wpRepo, dRepo, uRepo, owner, installID, domainID, "example.com", "/home/alice/domains/example.com/public_html", "")
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/applications/"+installID+"/magic-link", nil)
 	w := httptest.NewRecorder()
@@ -202,7 +202,7 @@ func TestMagicLinkMint_InstallNotReady(t *testing.T) {
 	const domainID = "01ARZ3NDEKTSV4RRFFQ69G5NR2"
 
 	r, wpRepo, dRepo, uRepo, _ := magicLinkRouter(t, owner, false)
-	seedReadyWPInstall(t, wpRepo, dRepo, uRepo, owner, installID, domainID, "example.com", "/home/shuki/domains/example.com/public_html", "")
+	seedReadyWPInstall(t, wpRepo, dRepo, uRepo, owner, installID, domainID, "example.com", "/home/alice/domains/example.com/public_html", "")
 	wpRepo.installs[installID].Status = "installing"
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/applications/"+installID+"/magic-link", nil)
@@ -223,7 +223,7 @@ func TestMagicLinkMint_UnsupportedAppType(t *testing.T) {
 	const domainID = "01ARZ3NDEKTSV4RRFFQ69G5NW2"
 
 	r, wpRepo, dRepo, uRepo, _ := magicLinkRouter(t, owner, false)
-	seedReadyWPInstall(t, wpRepo, dRepo, uRepo, owner, installID, domainID, "example.com", "/home/shuki/domains/example.com/public_html", "")
+	seedReadyWPInstall(t, wpRepo, dRepo, uRepo, owner, installID, domainID, "example.com", "/home/alice/domains/example.com/public_html", "")
 	// phpbb has no SSO-file handler yet — ssoAgentCommandFor returns
 	// (_, false), so the mint handler should 409 with unsupported_app_type.
 	wpRepo.installs[installID].AppType = "phpbb"
@@ -258,7 +258,7 @@ func TestMagicLinkMint_DispatchByAppType(t *testing.T) {
 			domainID := "01ARZ3NDEKTSV4RRFFQ69G5D00"
 
 			r, wpRepo, dRepo, uRepo, ag := magicLinkRouter(t, owner, false)
-			seedReadyWPInstall(t, wpRepo, dRepo, uRepo, owner, installID, domainID, tc.appType+".example.com", "/home/shuki/domains/"+tc.appType+"/public_html", "")
+			seedReadyWPInstall(t, wpRepo, dRepo, uRepo, owner, installID, domainID, tc.appType+".example.com", "/home/alice/domains/"+tc.appType+"/public_html", "")
 			wpRepo.installs[installID].AppType = tc.appType
 
 			const fakeFile = "dotnext-sso-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA.php"
@@ -286,7 +286,7 @@ func TestMagicLinkMint_AgentError_Returns502(t *testing.T) {
 	const domainID = "01ARZ3NDEKTSV4RRFFQ69G5AG2"
 
 	r, wpRepo, dRepo, uRepo, agent := magicLinkRouter(t, owner, false)
-	seedReadyWPInstall(t, wpRepo, dRepo, uRepo, owner, installID, domainID, "example.com", "/home/shuki/domains/example.com/public_html", "")
+	seedReadyWPInstall(t, wpRepo, dRepo, uRepo, owner, installID, domainID, "example.com", "/home/alice/domains/example.com/public_html", "")
 	agent.callErr = errors.New("agent timeout")
 
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/applications/"+installID+"/magic-link", nil)
@@ -307,7 +307,7 @@ func TestMagicLinkMint_AgentReturnsEmptyFileName_Returns502(t *testing.T) {
 	const domainID = "01ARZ3NDEKTSV4RRFFQ69G5EM2"
 
 	r, wpRepo, dRepo, uRepo, agent := magicLinkRouter(t, owner, false)
-	seedReadyWPInstall(t, wpRepo, dRepo, uRepo, owner, installID, domainID, "example.com", "/home/shuki/domains/example.com/public_html", "")
+	seedReadyWPInstall(t, wpRepo, dRepo, uRepo, owner, installID, domainID, "example.com", "/home/alice/domains/example.com/public_html", "")
 	agent.callFn = func(ctx context.Context, command string, params any) (json.RawMessage, error) {
 		return json.RawMessage(`{"file_name":"","expires_at_unix":0}`), nil
 	}
@@ -327,12 +327,12 @@ func TestComposeInstallPath(t *testing.T) {
 	cases := []struct {
 		docRoot, subdir, want string
 	}{
-		{"/home/shuki/domains/x.com/public_html", "", "/home/shuki/domains/x.com/public_html"},
-		{"/home/shuki/domains/x.com/public_html", "blog", "/home/shuki/domains/x.com/public_html/blog"},
-		{"/home/shuki/domains/x.com/public_html", "/blog", "/home/shuki/domains/x.com/public_html/blog"},
-		{"/home/shuki/domains/x.com/public_html", "blog/", "/home/shuki/domains/x.com/public_html/blog"},
-		{"/home/shuki/domains/x.com/public_html/", "blog", "/home/shuki/domains/x.com/public_html/blog"},
-		{"/home/shuki/domains/x.com/public_html", "wp/site", "/home/shuki/domains/x.com/public_html/wp/site"},
+		{"/home/alice/domains/x.com/public_html", "", "/home/alice/domains/x.com/public_html"},
+		{"/home/alice/domains/x.com/public_html", "blog", "/home/alice/domains/x.com/public_html/blog"},
+		{"/home/alice/domains/x.com/public_html", "/blog", "/home/alice/domains/x.com/public_html/blog"},
+		{"/home/alice/domains/x.com/public_html", "blog/", "/home/alice/domains/x.com/public_html/blog"},
+		{"/home/alice/domains/x.com/public_html/", "blog", "/home/alice/domains/x.com/public_html/blog"},
+		{"/home/alice/domains/x.com/public_html", "wp/site", "/home/alice/domains/x.com/public_html/wp/site"},
 	}
 	for _, c := range cases {
 		got := composeInstallPath(c.docRoot, c.subdir)

@@ -90,16 +90,16 @@ Single command updates every English `docsHtml.*` key from the markdown source.
    **Remove old PHP-era mappings** that no longer apply:
    ```js
    // remove (or comment out):
-   { src: '/home/shuki/projects/dotnext/docs/cli-reference.md',     key: 'platformCli' },   // superseded by site/platform/cli.md
-   { src: '/home/shuki/projects/dotnext/docs/architecture.md',      key: 'platformStack' }, // superseded by site/platform/stack.md
-   { src: '/home/shuki/projects/dotnext/docs/architecture.md',      key: 'platformAgent' }, // superseded
-   { src: '/home/shuki/projects/dotnext/docs/diagnostic-logs.md',   key: 'support' },       // superseded
-   { src: '/home/shuki/projects/dotnext/docs/ssl.md',               key: 'ssl' },
-   { src: '/home/shuki/projects/dotnext/docs/security.md',          key: 'security' },
-   { src: '/home/shuki/projects/dotnext/docs/mail.md',              key: 'email' },
-   { src: '/home/shuki/projects/dotnext/docs/dns.md',               key: 'DnsMail' },       // dns.md and mail.md are now separate pages
-   { src: '/home/shuki/projects/dotnext/docs/backups.md',           key: 'backups' },
-   { src: '/home/shuki/projects/dotnext-security/docs/CLI.md',      key: 'firewall' },      // superseded by site/firewall.md
+   { src: '<repo-root>/docs/cli-reference.md',     key: 'platformCli' },   // superseded by site/platform/cli.md
+   { src: '<repo-root>/docs/architecture.md',      key: 'platformStack' }, // superseded by site/platform/stack.md
+   { src: '<repo-root>/docs/architecture.md',      key: 'platformAgent' }, // superseded
+   { src: '<repo-root>/docs/diagnostic-logs.md',   key: 'support' },       // superseded
+   { src: '<repo-root>/docs/ssl.md',               key: 'ssl' },
+   { src: '<repo-root>/docs/security.md',          key: 'security' },
+   { src: '<repo-root>/docs/mail.md',              key: 'email' },
+   { src: '<repo-root>/docs/dns.md',               key: 'DnsMail' },       // dns.md and mail.md are now separate pages
+   { src: '<repo-root>/docs/backups.md',           key: 'backups' },
+   { src: '<security-repo>/docs/CLI.md',      key: 'firewall' },      // superseded by site/firewall.md
    ```
 
 3. **Add the new keys to every language's `docsHtml` block in `ui.ts`** — `sync-docs.mjs` only updates *existing* keys (the regex is `\\s+${key}: \\\`…\\\``). Bootstrap each new key once with an empty value:
@@ -630,4 +630,4 @@ The markdown source lives in the dotnext2 repo and versions with the panel. If y
 - A missing translation — fix in `ui.ts` directly under the appropriate language block (no need to round-trip through markdown).
 - An out-of-date screenshot — replace under `public/docs-assets/`; no markdown change needed.
 
-For new features that need a brand-new doc page: contact the dotnext2 maintainer (`shukivaknin@gmail.com`); the new page should be drafted here in `docs/site/` before you add the corresponding `docsHtml.<key>` literal.
+For new features that need a brand-new doc page: contact the dotnext2 maintainer (`khalequzzaman17@gmail.com`); the new page should be drafted here in `docs/site/` before you add the corresponding `docsHtml.<key>` literal.

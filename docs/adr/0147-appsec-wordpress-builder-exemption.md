@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-22
 **Status:** Accepted — live-verified on 10.0.3.14 (revised after reporter feedback)
-**Owner:** shuki
+**Owner:** dotNext maintainers
 **Issue:** GH #404
 
 ## Context

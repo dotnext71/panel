@@ -2,7 +2,7 @@
 
 **Date**: 2026-06-16
 **Status**: Proposed
-**Deciders**: shuki + Claude
+**Deciders**: dotNext maintainers
 **Related**: ADR-0023 (M9 PHP-FPM per-user pools), M18 (per-user cgroup
 slices), M25 (unix-socket lockdown), M34 (per-user egress firewall), the
 Docker-app subsystem. Implements GH #203.

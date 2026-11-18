@@ -2,7 +2,7 @@
 
 **Date**: 2026-06-14
 **Status**: Accepted
-**Deciders**: shuki + Claude
+**Deciders**: dotNext maintainers
 **Related**: ADR-0023 (M9 PHP-FPM pool manager), ADR-0025 (per-user systemd slices), ADR-0031 (PHP extensions), ADR-0067 (M13 SSH sandbox). Fixes GH #184.
 
 ## Context

@@ -20726,8 +20726,8 @@ RESOLV
   sshd -t 2>/dev/null && { systemctl reload ssh 2>/dev/null || systemctl reload sshd 2>/dev/null || true; }
 
   # Sweep dotnext-specific log files outside the dirs we already rm -rf'd.
-  rm -f /var/log/php-fpm-pma.log* 2>/dev/null || true
-  rm -f /var/log/php-fpm-shukivaknin.log* 2>/dev/null || true
+  # Per-user FPM logs (one file per operator account) from any earlier test run.
+  rm -f /var/log/php-fpm-*.log* 2>/dev/null || true
   rm -f /var/log/dotnext-update.log* 2>/dev/null || true
 
   _log "removing PHP-FPM dotnext pools"

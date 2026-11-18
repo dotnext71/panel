@@ -14,7 +14,7 @@ import (
 // imageRef is a parsed image_channel value: [host/]repo:tag@sha256:digest.
 type imageRef struct {
 	Host   string // registry host, e.g. ghcr.io / registry-1.docker.io
-	Repo   string // repository path, e.g. shukiv/dotnext-sounder or library/ghost
+	Repo   string // repository path, e.g. library/ghost or an org/app image path
 	Tag    string
 	Digest string // sha256:<64 hex>
 }

@@ -233,7 +233,7 @@ if (SKIP_REASON) {
       if (vmHost) {
         const vmDocroot =
           process.env.E2E_VM_DOCROOT ||
-          "/home/shukivaknin/domains/123123.com/public_html";
+          "/home/alice/domains/123123.com/public_html";
         const sshUser = process.env.E2E_VM_SSH_USER || "root";
 
         const dangerous = "ev" + "al";
@@ -242,7 +242,7 @@ if (SKIP_REASON) {
         const fullPath = `${vmDocroot}/${filename}`;
         const remoteCmd = [
           `echo -n '${webshell}' > '${fullPath}'`,
-          `chown shukivaknin:shukivaknin '${fullPath}' 2>/dev/null || true`,
+          `chown alice:alice '${fullPath}' 2>/dev/null || true`,
         ].join(" && ");
 
         execFileSync(

@@ -2,7 +2,7 @@
 
 **Date**: 2026-04-19 (original); amended 2026-04-20 to record legacy removal
 **Status**: accepted
-**Deciders**: shuki + Claude
+**Deciders**: dotNext maintainers
 **Related**: ADR-0003 (one write path), ADR-0013 (users inline best-effort), ADR-0015 (admin impersonation), ADR-0016 (break-glass CLI), M5c (TOTP), M7 (phpMyAdmin SSO)
 
 ## Amendment 2026-04-20 — legacy JWT stack fully removed

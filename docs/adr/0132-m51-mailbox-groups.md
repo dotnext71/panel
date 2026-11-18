@@ -2,11 +2,11 @@
 
 **Date**: 2026-06-17 (accepted 2026-06-18)
 **Status**: Accepted
-**Deciders**: shuki + Claude (receive mechanism via @johnnyq doc pointer, #200/#201)
+**Deciders**: dotNext maintainers
 **Related**: ADR-0042 (mailbox schema), ADR-0045 (Stalwart v0.16 SQL-directory, registry-as-projection), ADR-0002 (DB is source of truth), ADR-0004 (reconciler-driven convergence), #199 alias-identity finding
 
 > Forward-looking. Blueprint: `plans/m51-mailbox-groups.md`. GitHub issue
-> shukiv/dotnext-panel#201. Decisions below reflect live probes against
+> dotnext71/panel#201. Decisions below reflect live probes against
 > Stalwart 0.16.9 on the .14 test host (2026-06-17), not a guess.
 
 ## Context

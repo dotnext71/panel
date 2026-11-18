@@ -3,7 +3,7 @@
 **Date**: 2026-06-14
 **Status**: accepted
 **Amends**: ADR-0122 (messages were "manual bodies.tar only")
-**Deciders**: shukiv
+**Deciders**: dotNext maintainers
 
 ## Context
 

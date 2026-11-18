@@ -2,7 +2,7 @@
 
 **Date**: 2026-06-15
 **Status**: Accepted
-**Deciders**: shuki + Claude
+**Deciders**: dotNext maintainers
 **Related**: ADR-0067 (M13 SSH shell sandbox / bwrap), ADR-0086/0092 (AppArmor profiles). Surfaced while e2e-testing GH #184.
 
 ## Context

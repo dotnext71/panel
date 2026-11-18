@@ -43,7 +43,7 @@ func TestHestiaSourceUser(t *testing.T) {
 		{"/backup/itflowapp.2026-07-05_16-10-38.tar.gz", "itflowapp"},
 		{"itflow-app_prod.2026-01-02_03-04-05.tar", "itflow-app_prod"},
 		// Renamed sample without the timestamp — ambiguous, must return "".
-		{"/home/shuki/hestia-sample.tar", ""},
+		{"/home/alice/hestia-sample.tar", ""},
 		// cPanel name is not a Hestia backup name.
 		{"cpmove-foo.tar.gz", ""},
 		{"random.tar", ""},

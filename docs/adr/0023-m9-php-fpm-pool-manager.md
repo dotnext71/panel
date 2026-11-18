@@ -1,6 +1,6 @@
 **Date:** 2026-04-17
 **Status:** Accepted
-**Deciders:** Shuki
+**Deciders:** dotNext maintainers
 
 **Cross-reference (2026-04-18):** Runtime placement of per-user pools refined by ADR-0025 (per-user systemd slices). ADR-0025 specifies the systemd unit + slice placement that hosts those pools.
 

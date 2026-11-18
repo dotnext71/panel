@@ -2,7 +2,7 @@
 
 **Date**: 2026-06-15
 **Status**: Accepted
-**Deciders**: shuki + Claude
+**Deciders**: dotNext maintainers
 **Related**: ADR-0125 (M50 directory privacy — rejected tenant `.htaccess`
 files; DB-as-truth), ADR-0023 (M9 nginx/PHP-FPM), the Rule Builder
 (`models.NginxRule` + `internal/nginxrules`). Enables cPanel/DA/Hestia

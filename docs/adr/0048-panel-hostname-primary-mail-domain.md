@@ -2,7 +2,7 @@
 
 **Date**: 2026-04-22
 **Status**: accepted
-**Deciders**: shuki + Claude
+**Deciders**: dotNext maintainers
 **Related**: ADR-0041 (M6 mail storage), ADR-0042 (SQL directory), ADR-0047 (pdns-recursor local self-resolution — prerequisite for this ADR's `/webmail` UX), ADR-0002 (DB as source of truth)
 
 ## Context

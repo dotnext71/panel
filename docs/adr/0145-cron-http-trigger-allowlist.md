@@ -2,7 +2,7 @@
 
 **Date:** 2026-06-22
 **Status:** Accepted
-**Owner:** shuki
+**Owner:** dotNext maintainers
 **Issue:** GH #400 (Part B)
 
 ## Context
